@@ -1,0 +1,9 @@
+产物不满意：
+1. kvstore.go 的 Put 方法中，分段锁的释放与布隆过滤器的更新被分为了两个独立步骤。Put 先对分段加写锁完成数据写入后立即释放分段锁，再单独对 bloomMu 加锁调用 bloomFilter.Add。在分段锁释放与 bloomMu 加锁之间的窗口期内，另一个 goroutine 的 Get 操作会先查询布隆过滤器，此时 bloomFilter.MightContain 返回 false，Get 直接返回 `("", false)` 跳过了分段数据的查找，而实际上该键已经成功写入了分段 map 中。这导致并发场景下 Put 与 Get 之间的数据一致性被破坏，使用者可能读到错误的"键不存在"结果。根因是 Put 方法未保证分段数据写入与布隆过滤器标记的原子性，正确做法是在持有分段写锁期间同步完成布隆过滤器的 Add 操作，确保数据可见性与布隆过滤器标记总是同步生效，再将 bloomMu 的加锁移到 seg.mu.Lock 之后的同一临界区内。
+
+2. kvstore_test.go 的 TestConcurrentPutAndGet 测试中，Get 方法的返回值没有被校验。该测试启动了两个 goroutine 分别并发执行 Put 和 Get，但 Get 的调用结果被完全丢弃，没有用 ok 和 val 与预期值做任何断言比较。这导致布隆过滤器更新与分段锁释放之间的竞态条件即使真实存在，测试也永远输出 PASS，无法暴露 Put 后 Get 立即返回 `("", false)` 的并发一致性问题。根因是测试只编写了并发调用的骨架而忽略了返回值验证，正确做法是在 Get 之后校验 ok 的值，对于已经通过 Put 写入的键应当确保 Get 返回的 ok 为 true 且 val 匹配写入值。
+
+过程不满意：
+1. 模型在刚收到提示词后的第 1 至第 2 步只执行了 view_folder 和 file_search 探索项目目录结构，第 3 步就立即用 todo_write 创建了包含 4 项子任务的计划列表，而此时尚未阅读提示词中的需求细节也未分析现有代码的逻辑结构。从思考过程记录看，模型在第 4 步才开始声称"修复现有代码"，后续实际执行中又经历了 getSegmentIndex 负数索引 bug 修复和布隆过滤器哈希重写两轮代码修改，与最初的 Todo 计划并无明确对应关系。这违反了标注规范中"不能在刚收到任务时就直接创建 TodoList，应先分析问题再规划"的准则。正确做法是先通读提示词与需求文档，理清模块职责边界后再制定执行计划。
+
+2. 模型在写完 kvstore_test.go 的全部 51 个测试用例并行运行 `go test ./internal/kvstore/ -v` 后拿到 PASS 结果，随后在思考过程的总结中声称"所有 51 个测试全部通过"，并列举了"并发测试：并发 Put/Get/Delete/BatchPut/RangeScan/Snapshot（共 12 个并发测试）"作为覆盖范围的证据。但 TestConcurrentPutAndGet 中 Get 的返回值从未被校验，TestConcurrentSnapshotAndWrite 中的 snapshot 数据也仅遍历而未被断言。模型将测试框架的 PASS 等同于功能验证通过，属于典型的对测试覆盖率的虚假满足，把测试跑通了等同于功能正确了。正确做法是运行测试后逐一审视每个并发测试的断言完备性，确保并发场景下的关键语义有真实校验。

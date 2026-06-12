@@ -1,0 +1,11 @@
+产物不满意：
+1. 在 job_queue.go 的 executeJob 方法中，当任务执行失败但尚未超过最大重试次数需要重新入队时，代码将任务状态设为 `JobStatusPending` 而非 `JobStatusFailed`。触发场景是任意 handler 返回 error 且 RetryCount 小于等于 MaxRetries 时。job.go 中明确定义了 `JobStatusFailed` 常量，docs/jobqueue.md 文档也将其描述为"执行失败（等待重试）"状态，但 executeJob 第 344 行将状态直接写为 Pending，导致从未有任何任务进入 Failed 状态。这造成通过 GetJobStatus 查询任务时，等待首次执行的新任务和等待重试的失败任务都显示为 `pending`，完全无法从状态上区分两类语义不同的等待阶段。根本原因是模型在实现重试逻辑时忽略了已定义的 Failed 中间态，将两种不同阶段的 Pending 合并处理。解决方案是重试入队前将 status 设为 `JobStatusFailed`，确保状态机完整覆盖任务生命周期。
+
+2. 在 job_queue.go 的 CompletedCount 方法中，通过统计 results map 的 map 长度来返回已完成任务数，但 storeResult 方法对任务成功完成（第 323 行）和任务进入死信队列（第 335 行）两个分支都调用了 storeResult 写入同一个 results map，导致 CompletedCount 实际返回的是成功任务与死信任务的数量之和。触发场景是队列中同时存在正常完成的任务和耗尽重试次数进入死信队列的任务时，CompletedCount 给出的数值与直观的"已完成"语义不符，会造成运维监控场景下的统计失真。现有单元测试 TestCompletedCount 只提交了全部成功的任务来验证，未覆盖混合成功与死信的场景，因此测试未能发现此问题。解决方案是为成功完成和死信分别维护独立的计数字段，或在 results 中增加成功或失败的标记位用于过滤统计。
+
+过程不满意：
+1. 模型在刚收到提示词后的第一步操作就是调用 todo_write 创建了 9 项子任务计划，之后才开始用 view_folder 和 view_files 工具探索项目目录结构、阅读 go.mod 配置以及查看其他模块的代码风格。根据标注规范中的过程质量检查标准，正确做法是先全面分析需求文档和项目骨架，理清模块职责边界和技术约束后，再制定与实际情况匹配的执行计划。这种先规划后分析的顺序颠倒了推理流程，虽然本任务代码实现上没有因此产生直接的架构缺陷，但这种行为模式反映出模型在任务启动阶段缺乏先探索再决策的正确推理习惯。
+
+2. 模型在探索项目结构的阶段，除了查看 go.mod 和当前为空的 jobqueue 目录外，还特意用 view_files 查看了 delaysched/scheduler.go 和 connpool/pool.go 以及 connpool/pool_test.go 的完整源码。这些模块与 jobqueue 任务之间不存在依赖关系或接口关联，查看它们属于不必要的探索行为，模型在同一个 view_files 调用中批量读取了这些无关模块的源码，说明并非出于定位特定代码的目的而是想通过浏览其他模块了解项目代码风格，但这种泛化的探索方式增加了无关信息的读取量，降低了任务执行的聚焦度和效率。正确做法是将探索范围限定在本任务提示词明确要求的 `internal/jobqueue/` 包及相关基础设施文件中。
+
+3. 模型在完成两步探索后一次性写入了完整的 job_queue.go（包含 496 行业务逻辑）和 jobqueue_test.go（包含 1130 行测试代码）两个大文件，然后才首次运行测试。这种"全量写完再测"的方式导致后续发现 TestPoolSize_BlockingWhenFull 和 TestStop_WaitsForRunningJobs 两个测试失败时，排查范围覆盖了整个文件而非仅最后新增的代码段。虽然模型通过三次精准的 edit_file_search_replace 操作成功修复了问题，但正确做法是采用增量开发策略，先实现核心入队与优先级队列逻辑并编写对应测试验证通过，再逐步叠加延迟队列、协程池、重试机制等特性，每完成一个特性立即运行测试确认。

@@ -1,0 +1,8 @@
+产物不满意：
+1. gateway.go 中 MockUpstreamHandler 的 SetResponse 方法直接写入 statusCode 和 responseBody 两个字段而未加任何互斥锁保护，而 ServeHTTP 方法在另一 goroutine 中不加锁地读取同样的字段。当测试用例在并发场景下调用了 SetResponse 修改响应内容的同时请求到达，可能读到不一致的状态码和响应体组合。根因是 SetResponse 被设计为公开的可变方法但遗漏了并发保护，应将 statusCode 和 responseBody 两个字段与已有的 countMu 互斥锁统一管理，或者将它们的写操作限制在并发请求启动之前完成。
+2. circuit.go 中 FailureEntry 结构体定义了 Success bool 字段，但 RecordFailure 方法始终将其写为 false，RecordSuccess 方法从未向 failures 切片追加任何条目。countRecentFailures 方法中的 `if !entry.Success` 条件判断因 entry.Success 恒为 false 而从未起到过滤作用，成了没有任何实际效果的死代码。根因是模型在定义数据结构时考虑了成功/失败混合记录的设计，但实际实现走的是 RecordSuccess 直接清空 failure 切片的简化路径，未将两种策略统一，应当移除 Success 字段或真正在 RecordSuccess 中也追加成功条目。
+3. ratelimit.go 中定义了 RateLimiterStats 结构体及其 RecordAllowed、RecordDenied、GetStats 三个方法，同时还定义了 extractPort 辅助函数。但这两组代码在整个 gateway 包中从未被任何生产代码或测试用例引用，属于无用的死代码。模型可能将这些功能作为预留扩展接口编写，但在提示词未要求的情况下写入了未使用的代码，违反了精简原则，应当删除这些未被引用的代码以保持包的整洁。
+
+过程不满意：
+1. 模型在收到提示词后完成了对 gateway 包现有代码的阅读，但紧接着就去阅读了 internal/connpool/ 目录下的 pool.go 和 pool_test.go 以及 docs/connpool.md，声称"查看其他模块的代码风格保持一致性"。connpool 是另一个独立任务 task007 的代码，与 gateway 功能完全无关。这种跨任务阅读其它包代码的行为不仅浪费时间，还可能导致模型从无关任务中引入不一致的设计模式。正确做法是只关注当前任务所需的 gateway 包和项目根级别的 go.mod 配置文件，无需阅读其它任务包。
+2. 模型在创建 12 项 todo 计划后直接将所有功能代码写入 gateway.go 和 gateway_test.go 两个大文件，然后一次性运行全量测试。首次测试发现 3 个 bug（路由健康检查默认行为、熔断器成功重置、健康检查空间隔保护），虽然第二轮全修了，但验证节奏偏晚。如果采用增量开发方式，每完成一个子功能（路由、鉴权、限流、熔断）就立即运行对应的单元测试，这些 bug 可以在更早的环节被定位和修复，减少单次改动的范围并降低误改风险。
