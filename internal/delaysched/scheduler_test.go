@@ -1180,8 +1180,8 @@ func TestScheduler_Cron_NaturalTimerEndToEnd(t *testing.T) {
 	expectedFirst := registerTime.Add(time.Minute).Truncate(time.Minute)
 	waitDuration := expectedFirst.Sub(registerTime)
 
-	// 如果等待时间太短（< 2 秒），可能存在竞态，跳过
-	if waitDuration < 2*time.Second {
+	// 如果等待时间太短（< 500ms），可能存在竞态，跳过
+	if waitDuration < 500*time.Millisecond {
 		t.Skipf("skip: wait duration %v too short, may have race condition", waitDuration)
 	}
 
@@ -1235,8 +1235,21 @@ func TestScheduler_Cron_NaturalTimerEndToEnd(t *testing.T) {
 			waitDuration+10*time.Second)
 	}
 
-	// 3. 给调度器一点时间完成后处理（重新入堆）
-	time.Sleep(100 * time.Millisecond)
+	// 3. 轮询等待调度器完成后处理（executeTask 将任务重新入堆）
+	// 轮询直到：任务存在、状态回到 Pending、且第二次 ExecuteAt 晚于第一次
+	rescheduleDeadline := time.Now().Add(2 * time.Second)
+	var rescheduled bool
+	for time.Now().Before(rescheduleDeadline) {
+		t, gerr := s.GetTask(taskID)
+		if gerr == nil && t.Status == StatusPending && t.ExecuteAt.After(expectedFirst) {
+			rescheduled = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !rescheduled {
+		t.Fatalf("task was not rescheduled within 2s after first execution")
+	}
 
 	// 4. 验证后处理逻辑：任务已被重新入堆，第二次 ExecuteAt 也是 minute-aligned
 	task, err = s.GetTask(taskID)
@@ -1274,11 +1287,8 @@ func waitForNextMinuteBoundary(t *testing.T) {
 			t.Logf("waitForNextMinuteBoundary: reached second=%d at %v", now.Second(), now)
 			return
 		}
-		// 否则继续等待，每 1 秒检查一次
+		// 否则继续等待到 second=55
 		sleepDur := time.Duration(55-now.Second()) * time.Second
-		if sleepDur < 0 {
-			sleepDur = 500 * time.Millisecond
-		}
 		t.Logf("waitForNextMinuteBoundary: current second=%d, waiting %v", now.Second(), sleepDur)
 		time.Sleep(sleepDur)
 	}

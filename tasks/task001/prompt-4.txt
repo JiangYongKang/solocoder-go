@@ -1,0 +1,3 @@
+你的 HTTP 网关模块中，gateway_test.go 的 TestMockUpstreamHandler_ConcurrentHealthToggle 测试里的永假断言仍未移除，需要修复：
+1. gateway_test.go 第 1164 行仍然存在 `if h != true && h != false` 表达式。Go 的 bool 类型只有 true 和 false，该判断分支永远不会被触发，是一行死代码。应将其移除，或替换为有实际检测意义的条件。
+2. 修复后运行 go test ./internal/gateway/ -v -count=3，需要让所有测试连续 3 次稳定通过。

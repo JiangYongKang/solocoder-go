@@ -1,0 +1,4 @@
+你的内存 KV 存储模块中，kvstore_test.go 的 TestConcurrentBatchPutAndGet_Consistency 测试在数据完整性校验上仍存在覆盖盲区，需要修复：
+1. 动态键抽样验证的迭代索引公式为 `(s * iterations) / samplesPerWriter`，在 iterations=200 且 samplesPerWriter=10 时产生的采样迭代为 0,20,40,...,180，完全遗漏了迭代 181-199 范围内的键。如果 BatchPut 在最后几轮迭代出现静默丢失，当前抽样策略无法检测。应使用更均匀覆盖全部迭代范围的抽样方式或随机采样。
+2. 测试末尾对预存键 init_5 到 init_9 的验证只检查了键非空，但在并发写入过程中 writer 的 BatchPut 会重复覆盖 init_0 到 init_4（通过 `wid%baseBatchSize`），如果并发逻辑存在越界错误意外污染了 init_5 到 init_9，当前仅检查非空的断言无法检测。应对 init_5 到 init_9 同时验证值精确等于原始值 `initval_5` 到 `initval_9`。
+3. 运行 go test ./internal/kvstore/ -v，需要让所有测试通过。

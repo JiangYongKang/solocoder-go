@@ -32,9 +32,7 @@ type LogRotator struct {
 	cleanOnce sync.Once
 	wg        sync.WaitGroup
 
-	clock          func() time.Time
-	onCompressStart func(path string)
-	onCompressEnd   func(path string, err error)
+	clock func() time.Time
 }
 
 func New(config *Config) (*LogRotator, error) {
@@ -220,17 +218,7 @@ func (lr *LogRotator) rotate(fw *fileWriter) error {
 		go func(src string, targetPath string) {
 			defer lr.wg.Done()
 
-			if lr.onCompressStart != nil {
-				lr.onCompressStart(src)
-			}
-
-			compressErr := compressAndRemove(src)
-
-			if lr.onCompressEnd != nil {
-				lr.onCompressEnd(src, compressErr)
-			}
-
-			if compressErr != nil {
+			if err := compressAndRemove(src); err != nil {
 				return
 			}
 			lr.cleanOldBackups(targetPath)

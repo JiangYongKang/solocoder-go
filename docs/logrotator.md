@@ -319,6 +319,10 @@ rotate() 触发切分
 
 ## 竞态测试设计方法
 
+### 设计原则
+
+不在生产代码（`LogRotator` 结构体）中嵌入任何测试专用钩子（回调、channel、信号量等），所有测试观察机制完全运行在测试侧。生产代码只包含业务逻辑，不暴露任何测试专用接口。
+
 ### 测试目标
 
 验证压缩 goroutine 与清理操作之间的并发安全性，确保：
@@ -328,52 +332,50 @@ rotate() 触发切分
 3. 产生的 `.gz` 文件都是完整且可解压的（非截断或损坏）
 4. 多个压缩 goroutine 并发执行时最终状态一致
 
-### 测试钩子
+### 测试侧观察机制 — 文件系统高频轮询
 
-`LogRotator` 提供两个可注入的测试钩子，用于在压缩 goroutine 执行期间插入同步检查点：
+在测试中启动独立的监控 goroutine，以极短间隔（1ms）持续轮询目标目录，在整个压缩/清理生命周期内捕获文件系统中间状态快照：
 
 ```go
-type LogRotator struct {
-    // ...
-    onCompressStart func(path string)     // 压缩开始前调用，此时源文件必须存在
-    onCompressEnd   func(path string, err error)  // 压缩完成后、清理前调用
+type fsSnapshot struct {
+    origBackups map[string]int64   // name → size (未压缩的 .log 备份)
+    gzBackups   map[string]int64   // name → size (.gz 压缩备份)
 }
+
+// 监控 goroutine: 每 1ms 采集一次快照
+go func() {
+    ticker := time.NewTicker(1 * time.Millisecond)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-monitorDone:
+            return
+        case <-ticker.C:
+            snap := takeSnapshot(dir)  // 读取目录 → 构建 fsSnapshot
+            snapshots = append(snapshots, snap)
+        }
+    }
+}()
 ```
 
-**钩子调用时序**：
-
-```
-compress goroutine 启动
-    │
-    ├─ onCompressStart(src)     ← 检查点 1：源文件必须存在
-    │
-    ├─ compressAndRemove(src)   ← 压缩 + 删除源文件
-    │
-    ├─ onCompressEnd(src, err)  ← 检查点 2：源文件应已删除，.gz 应存在且有效
-    │
-    └─ cleanOldBackups(path)    ← 数量清理（仅统计 .gz）
-```
+**为什么轮询有效**：即使 1ms 间隔看起来很短，相对文件系统操作而言已经足够长。单次 `compressAndRemove` 通常需要几十到几百微秒（写入 gzip header、copy 数据、flush、rename/remove），1ms 的轮询间隔足以捕捉到至少一个包含中间状态的快照。
 
 ### TestCompressAndCleanupRace 设计
 
-此测试通过 `onCompressEnd` 钩子在压缩 goroutine 的关键执行窗口内插入检查点，捕获中间状态：
+此测试通过文件系统轮询追踪每个压缩操作的完整生命周期：
 
 **配置**：`MaxFileSize=100`，`MaxBackups=2`，`Compress=true`，连续写入 15 条大日志触发多轮切分。
 
-**检查点 1 — `onCompressStart`**：
-- 验证源文件在压缩开始时仍然存在
-- 如果源文件已被其他 goroutine 的 `cleanOldBackups` 删除，说明存在竞态条件
-
-**检查点 2 — `onCompressEnd`**：
-- 验证源文件已被 `compressAndRemove` 删除（非被其他 goroutine 提前删除）
-- 验证对应的 `.gz` 文件已生成
-- 验证 `.gz` 文件可被 `gzip.NewReader` 正确解压（非截断或损坏）
-- 此时 `cleanOldBackups` 尚未执行，确保检查点观察的是压缩完成瞬间的真实状态
+**生命周期追踪**：
+- 记录每个原始备份 `.log` 文件首次和最后一次被观察到的快照索引（`firstSeenOrig`, `lastSeenOrig`）
+- 记录每个对应 `.gz` 文件首次和最后一次被观察到的快照索引（`firstSeenGz`, `lastSeenGz`）
+- 对每个原始备份验证：其 `.gz` 的最后出现索引 ≥ 原始的最后出现索引（即 `.gz` 不会在原始备份被删除前消失）
+- 验证确实观察到了未压缩的 `.log` 备份（`sawOrigBackup=true`）和 `.gz` 备份（`sawGzBackup=true`），证明监控 goroutine 确实捕捉到了中间状态
 
 **最终一致性验证**（`Close()` 之后）：
 - 无原始 `.log` 备份文件残留
 - `.gz` 文件数不超过 `MaxBackups`
-- 所有 `.gz` 文件可正确解压
+- 所有 `.gz` 文件可被 `gzip.NewReader` 正确解压（非截断/损坏）
 
 ### TestConcurrentRotateWithCompress 设计
 
@@ -382,20 +384,20 @@ compress goroutine 启动
 **配置**：4 个 goroutine 各写 50 条日志，`MaxFileSize=500`，`MaxBackups=3`，`Compress=true`。
 
 **验证项**：
-- 通过 `onCompressEnd` + `atomic` 计数器确认压缩操作确实发生
+- 监控 goroutine 确认至少观察到了 `.log` 或 `.gz` 备份，证明压缩/轮转确实发生
 - `Close()` 后无原始 `.log` 备份残留
 - `.gz` 文件数不超过 `MaxBackups`
 - 每个 `.gz` 文件可正确解压（非截断/损坏）
 
 ### Race Detector 使用
 
-由于 Windows/386 环境不支持 Go 内置 race detector，上述测试通过同步原语（`onCompressStart`/`onCompressEnd` 钩子 + `sync.Mutex` + `sync/atomic`）在压缩 goroutine 执行期间主动观察中间状态来替代 race detector 的功能。在支持 race detector 的平台上，可以额外运行：
+在支持 race detector 的平台上（linux/amd64、darwin/amd64、windows/amd64 等），可以额外运行：
 
 ```bash
 go test ./internal/logrotator/ -race -v
 ```
 
-来检测潜在的数据竞争。
+来检测内存级别的数据竞争。Windows/386 环境不支持 `-race`，此时通过文件系统高频轮询 + 生命周期追踪替代 race detector 的功能。
 
 ### 七、关闭流程
 

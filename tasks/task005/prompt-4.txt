@@ -1,0 +1,4 @@
+你的日志文件轮转器模块中，为测试目的在生产代码中嵌入了测试钩子，需要重构：
+1. logrotator.go 的 LogRotator 结构体中存在 onCompressStart 和 onCompressEnd 两个回调字段，这两个字段仅在 rotate 方法的压缩 goroutine 中被调用，在生产环境中始终为 nil，不属于业务功能范畴。应将这些测试专用的回调从生产结构体中移除，改用测试端的方式（如 channel 通知、sync.WaitGroup 控制 goroutine 执行时机、或测试 goroutine 中轮询文件系统）来观察压缩 goroutine 执行期间的中间状态。
+2. 重构后确保 TestCompressAndCleanupRace 仍然能够验证压缩 goroutine 执行期间的并发安全，不能因为移除钩子而让测试退化为仅检查最终文件状态的串行化验证。
+3. 运行 go test ./internal/logrotator/ -v，需要让所有测试通过。

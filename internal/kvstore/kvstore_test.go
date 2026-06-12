@@ -1319,7 +1319,7 @@ func TestConcurrentBatchPutAndGet_Consistency(t *testing.T) {
 	valueMismatches := 0
 	for w := 0; w < numBatchWriters; w++ {
 		for s := 0; s < samplesPerWriter; s++ {
-			iterIdx := (s * iterations) / samplesPerWriter
+			iterIdx := s * (iterations - 1) / (samplesPerWriter - 1)
 			for k := 0; k < keysPerBatch; k++ {
 				key := fmt.Sprintf("batch_w%d_i%d_k%d", w, iterIdx, k)
 				expectedVal := fmt.Sprintf("v_w%d_%d_%d", w, iterIdx, k)
@@ -1335,8 +1335,8 @@ func TestConcurrentBatchPutAndGet_Consistency(t *testing.T) {
 		}
 	}
 	if missingDynamicKeys == 0 && valueMismatches == 0 {
-		t.Logf("Sampled %d dynamic keys across %d writers: all present and correct",
-			samplesPerWriter*keysPerBatch*numBatchWriters, numBatchWriters)
+		t.Logf("Sampled %d dynamic keys across %d writers (full range 0..%d, including last iteration): all present and correct",
+			samplesPerWriter*keysPerBatch*numBatchWriters, numBatchWriters, iterations-1)
 	}
 
 	for i := 0; i < baseBatchSize; i++ {
@@ -1344,9 +1344,18 @@ func TestConcurrentBatchPutAndGet_Consistency(t *testing.T) {
 		val, ok := kv.Get(key)
 		if !ok {
 			t.Errorf("init key %q missing after concurrent BatchPut", key)
+			continue
 		}
-		if val == "" {
-			t.Errorf("init key %q has empty value", key)
+		expectedInitVal := fmt.Sprintf("initval_%d", i)
+		if i >= numBatchWriters {
+			if val != expectedInitVal {
+				t.Errorf("untouched init key %q was polluted: expected %q, got %q (concurrent BatchPut越界写入)",
+					key, expectedInitVal, val)
+			}
+		} else {
+			if val == "" {
+				t.Errorf("touched init key %q has empty value", key)
+			}
 		}
 	}
 }

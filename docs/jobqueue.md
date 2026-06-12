@@ -175,16 +175,30 @@ type JobQueue struct {
 ### 生命周期阶段说明
 
 1. **入队阶段**：通过 `Enqueue()` 或 `EnqueueWithRetry()` 提交任务
+   - 新任务初始状态为 `JobStatusPending`
    - 指定 `Delay > 0` → 进入延迟队列（DelayQueue）
    - 指定 `Delay = 0` → 直接进入优先级队列（PriorityQueue）
 
 2. **等待阶段**：
    - 延迟队列中的任务等待 `ReadyTime` 到达后转入优先级队列
    - 优先级队列中的任务按优先级+入队时间排序，等待调度
+   - **两类等待状态的语义区分（通过 `GetJobStatus()` 查询）**：
+     - `JobStatusPending`：**首次等待执行**。状态为 Pending 的任务从未被 Handler 执行过，是刚入队的全新任务，`RetryCount == 0`，`Error == nil`。
+     - `JobStatusFailed`：**执行失败后等待重试**。状态为 Failed 的任务已经被 Handler 执行过至少一次且返回了 error，`RetryCount >= 1`，`Error` 字段保存上一次失败的原因，正处于指数退避的延迟等待期，等待下一次重试调度。
+   - 两类状态的任务均可能位于优先级队列（ReadyTime 已到）或延迟队列（等待 ReadyTime）中，不依赖所在堆类型区分，仅通过 `Status` 字段判断。
+   - **使用示例**：
+     ```go
+     status, _ := jq.GetJobStatus(jobID)
+     if status == jobqueue.JobStatusPending {
+         fmt.Println("任务尚未开始执行，首次等待中")
+     } else if status == jobqueue.JobStatusFailed {
+         fmt.Println("任务执行过但失败了，正在等待重试")
+     }
+     ```
 
 3. **调度阶段**：
    - `dispatchLoop` 协程循环检查队列
-   - 从优先级队列取出队首任务
+   - 从优先级队列取出队首任务（状态可能为 Pending 或 Failed）
    - 尝试获取协程池信号量（sem），获取失败则阻塞等待
 
 4. **执行阶段**：
@@ -193,10 +207,26 @@ type JobQueue struct {
    - 调用用户注册的 `JobHandler` 执行任务逻辑
 
 5. **结束阶段**：
-   - **成功**：状态 → `JobStatusCompleted`，结果存入 results
+   - **成功**：状态 → `JobStatusCompleted`，结果存入 `successResults`
    - **失败**：`RetryCount++`
-     - 仍可重试：计算指数退避延迟 → 重新进入延迟队列等待重试
-     - 超过最大重试：状态 → `JobStatusDeadLetter`，移入死信队列
+     - 仍可重试（`RetryCount <= MaxRetries`）：状态 → `JobStatusFailed`，计算指数退避延迟 → 重新进入延迟队列等待重试
+     - 超过最大重试（`RetryCount > MaxRetries`）：状态 → `JobStatusDeadLetter`，移入死信队列，结果存入 `deadLetterResults`
+
+### 3.1 状态机流转规则总结
+
+| 当前状态 | 触发事件 | 下一状态 | RetryCount 变化 | Error 字段 |
+|----------|----------|----------|-----------------|------------|
+| （新建任务） | `Enqueue()` / `EnqueueWithRetry()` | `Pending` | 赋值为 0 | 清空为 nil |
+| `Pending` | 被调度取出进入协程池 | `Running` | 不变 | 不变（保持 nil） |
+| `Failed` | 重试延迟到期，被调度取出 | `Running` | 不变 | 保留上一次错误值 |
+| `Running` | Handler 返回 `nil error` | `Completed` | 不变 | 清空为 nil |
+| `Running` | Handler 返回 error，且 `RetryCount+1 <= MaxRetries` | `Failed` | 加 1 | 设置为本次错误 |
+| `Running` | Handler 返回 error，且 `RetryCount+1 > MaxRetries` | `DeadLetter` | 加 1 | 设置为本次错误 |
+
+**状态迁移关键约束**：
+- `Pending` 只能来自新建任务入队，只能转为 `Running`
+- `Failed` 只能来自 `Running` 执行失败（未超过重试上限），不能从 Pending 直接跳转
+- 等待阶段是 Pending 还是 Failed，与任务在「优先级队列」还是「延迟队列」中无关，仅由任务的执行历史决定
 
 ## 4. 核心算法与策略
 
@@ -362,11 +392,34 @@ jq.EnqueueWithRetry("no-retry-job", 1, data, 0, 0)
 
 ### 5.4 监控与统计
 
-队列内部将结果分开存储为两个独立的 map：
-- `successResults`：仅存储**成功完成**的任务结果（状态为 `JobStatusCompleted`）
-- `deadLetterResults`：仅存储**失败且已放弃**的任务结果（状态为 `JobStatusDeadLetter`）
+#### 5.4.1 结果存储机制
 
-对应的统计 API 语义如下：
+队列内部将结果分开存储为两个独立的 map，确保成功与失败（死信）语义互斥且可独立统计：
+- `successResults`：仅存储**成功完成**的任务结果（状态为 `JobStatusCompleted`）
+  - 进入条件：Handler 返回 `nil error`
+  - `JobResult.Error == nil`，`JobResult.Result` 保存 Handler 返回值
+- `deadLetterResults`：仅存储**失败且已放弃**的任务结果（状态为 `JobStatusDeadLetter`）
+  - 进入条件：Handler 返回 error，且 `RetryCount > MaxRetries`
+  - `JobResult.Error` 保存最后一次失败原因，`JobResult.Result == nil`
+
+#### 5.4.2 统计方法语义定义
+
+| 方法 | 返回值类型 | 精确语义 | 计数来源 |
+|------|-----------|----------|----------|
+| `PendingCount()` | int | 所有**尚未开始执行**的任务总数，包括首次等待和等待重试的 | 优先级队列长度 + 延迟队列长度 + 等待调度槽位的任务数 |
+| `ActiveCount()` | int | **正在执行中**的任务数（状态为 Running 的 worker 协程数） | 原子计数器 `activeCount` |
+| `CompletedCount()` | int | **成功完成**的任务总数（仅包含 Handler 返回 nil error 的） | `len(successResults)` |
+| `FailedCount()` | int | **失败且已放弃**的任务总数（仅包含已进入死信队列的） | `len(deadLetterResults)` |
+| `DeadLetterCount()` | int | 死信队列中保存的任务结构体数（与 FailedCount 同步增长） | `len(deadLetters)` |
+| `TaskCount()` (Total) | `Pending + Active + Completed + Failed` | 系统中所有生命周期阶段的任务总数 | 各项求和 |
+
+**关键恒等式**：
+```
+CompletedCount() + FailedCount() = 总已结束任务数
+```
+即：所有通过 `Enqueue()` / `EnqueueWithRetry()` 入队且不再处于等待或执行中状态的任务，要么计入 Completed（成功），要么计入 Failed（死信），两者之和等于已结束任务总数，不会重复计数也不会遗漏。
+
+#### 5.4.3 使用示例
 
 ```go
 // 获取各阶段任务数量
@@ -379,15 +432,26 @@ deadLetters := jq.DeadLetterCount() // 死信队列中的任务数
 fmt.Printf("统计: pending=%d, active=%d, completed=%d, failed=%d, dead=%d\n",
     pending, active, completed, failed, deadLetters)
 
-// 注：CompletedCount() + FailedCount() = 总已结束任务数
-
-// 获取死信任务详情
-dls := jq.GetDeadLetters()
-for _, job := range dls {
-    fmt.Printf("死信任务: %s, 重试次数: %d, 错误: %v\n",
-        job.ID, job.RetryCount, job.Error)
+// 验证总已结束任务数
+totalEnqueued := 1000  // 假设总共入队了 1000 个任务
+totalFinished := jq.CompletedCount() + jq.FailedCount()
+totalInFlight := pending + active
+if totalFinished + totalInFlight != totalEnqueued {
+    fmt.Println("警告：任务数不匹配，可能有任务状态异常")
 }
-jq.ClearDeadLetters()  // 清空死信队列
+
+// 死信队列告警示例
+if jq.FailedCount() > 10 {
+    fmt.Printf("告警：已有 %d 个任务进入死信队列，请检查处理\n", jq.FailedCount())
+
+    // 获取死信任务详情
+    dls := jq.GetDeadLetters()
+    for _, job := range dls {
+        fmt.Printf("死信任务: %s, 重试次数: %d, 错误: %v\n",
+            job.ID, job.RetryCount, job.Error)
+    }
+    jq.ClearDeadLetters()  // 处理完毕后清空死信队列
+}
 
 // 查询任务结果（同时查找 successResults 和 deadLetterResults）
 result, err := jq.GetResult("job-123")
@@ -396,6 +460,23 @@ if err == nil {
         fmt.Printf("任务最终失败（已入死信）: %v\n", result.Error)
     } else {
         fmt.Printf("任务成功: %v\n", result.Result)
+    }
+}
+
+// 通过 GetJobStatus 区分两类等待（监控示例）
+status, err := jq.GetJobStatus("job-456")
+if err == nil {
+    switch status {
+    case jobqueue.JobStatusPending:
+        fmt.Println("任务首次等待中，尚未执行")
+    case jobqueue.JobStatusFailed:
+        fmt.Println("任务曾失败，正在等待重试")
+    case jobqueue.JobStatusRunning:
+        fmt.Println("任务正在执行")
+    case jobqueue.JobStatusCompleted:
+        fmt.Println("任务已成功完成")
+    case jobqueue.JobStatusDeadLetter:
+        fmt.Println("任务已进入死信，重试耗尽")
     }
 }
 

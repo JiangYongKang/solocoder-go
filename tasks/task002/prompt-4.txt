@@ -1,0 +1,4 @@
+你的内存分片存储模块中，cluster.go 存在死代码和不可达回滚路径，需要清理：
+1. cluster.go 的 migrateOnRemove 方法中，第 235 行 `if tid == removedShardID` 和第 260 行 `if sid == removedShardID` 两个守卫检查是死代码。因为 RemoveShard 已经先在哈希环中移除了该分片的所有虚拟节点，GetReplicaNodes 返回的节点集合不可能包含被移除的 ID；remainingShardIDs 在构造时也已排除了该 ID。应移除这些永远不会被触发的分支。
+2. cluster.go 的 RemoveShard 方法中，migrateOnRemove 始终返回 nil，第 99 行回滚分支 `c.hashRing.AddNode(shardID)` 永远不可达。既然当前实现不会产生迁移错误，要么移除不可达的回滚逻辑保持代码简洁，要么为 migrateOnRemove 补充真实的错误返回路径使回滚有意义。
+3. 修复后运行 go test ./internal/shardkv/ -v，需要让所有测试通过。

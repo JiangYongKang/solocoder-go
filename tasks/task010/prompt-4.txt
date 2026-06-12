@@ -1,0 +1,4 @@
+你的内存任务队列模块的文档需要补充完善：
+1. docs/jobqueue.md 中缺少对任务状态机中 Pending 和 Failed 两类等待状态的语义区分说明。当前代码中 executeJob 在任务失败待重试时将状态设为 Failed 而非 Pending，文档应解释 Pending 表示等待首次执行的新任务，Failed 表示执行失败后等待重试的任务，并说明这两类状态在 GetJobStatus 中如何被区分。
+2. docs/jobqueue.md 中缺少对 CompletedCount 和 FailedCount 两个统计方法返回值的语义定义。当前代码中 CompletedCount 仅统计成功完成的任务数（基于 successResults），FailedCount 仅统计进入死信队列的任务数（基于 deadLetterResults），文档应说明这两个计数的准确含义和两者的总和等于总已结束任务数。
+3. 在 docs/jobqueue.md 中更新相关内容，确保文档描述与实际代码实现一致。

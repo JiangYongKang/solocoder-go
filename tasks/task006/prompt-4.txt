@@ -1,0 +1,4 @@
+你的延迟任务调度器模块中，scheduler_test.go 的 Cron 端到端测试存在死代码和脆弱的时序假设，需要修复：
+1. waitForNextMinuteBoundary 函数中第 1279 行 `if sleepDur < 0` 分支是死代码。函数入口已通过 `now.Second() >= 55` 提前返回，后续计算 `sleepDur = 55 - now.Second()` 时 now.Second() 必定小于 55，差值恒为正，sleepDur 永远不会小于 0。应移除该永假分支。
+2. TestScheduler_Cron_NaturalTimerEndToEnd 在第 1239 行使用 `time.Sleep(100 * time.Millisecond)` 等待调度器后处理完成（executeTask 将任务重新入堆），这是硬编码的时序假设。在负载较高的环境下 100ms 可能不足以完成重新入堆，导致后续 GetTask 断言在任务尚未入堆时拿到 nil 而失败。应改用轮询等待或 channel 信号来确认任务已被重新入堆，而非依赖固定时长休眠。
+3. 运行 go test ./internal/delaysched/ -v -count=3，需要让所有测试连续 3 次稳定通过。

@@ -1160,10 +1160,7 @@ func TestMockUpstreamHandler_ConcurrentHealthToggle(t *testing.T) {
 			localReads := int64(0)
 			for i := 0; i < iterations; i++ {
 				idx := (readerID*iterations + i) % numMocks
-				h := mocks[idx].HealthCheck()
-				if h != true && h != false {
-					atomic.AddInt64(&panics, 1)
-				}
+				_ = mocks[idx].HealthCheck()
 				localReads++
 			}
 			atomic.AddInt64(&totalReads, localReads)

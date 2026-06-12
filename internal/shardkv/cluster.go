@@ -94,12 +94,7 @@ func (c *ShardKVCluster) RemoveShard(shardID string) error {
 
 	c.hashRing.RemoveNode(shardID)
 
-	err := c.migrateOnRemove(shardID)
-	if err != nil {
-		c.hashRing.AddNode(shardID)
-		shard.SetStatus(ShardStatusUp)
-		return err
-	}
+	c.migrateOnRemove(shardID)
 
 	c.mu.Lock()
 	delete(c.shards, shardID)
@@ -172,7 +167,7 @@ func (c *ShardKVCluster) migrateOnAdd(newShardID string) {
 	}
 }
 
-func (c *ShardKVCluster) migrateOnRemove(removedShardID string) error {
+func (c *ShardKVCluster) migrateOnRemove(removedShardID string) {
 	c.migratingMu.Lock()
 	c.migrating = true
 	c.migratingMu.Unlock()
@@ -232,9 +227,6 @@ func (c *ShardKVCluster) migrateOnRemove(removedShardID string) error {
 			if needed <= 0 {
 				break
 			}
-			if tid == removedShardID {
-				continue
-			}
 			c.mu.RLock()
 			targetShard, exists := c.shards[tid]
 			c.mu.RUnlock()
@@ -257,9 +249,6 @@ func (c *ShardKVCluster) migrateOnRemove(removedShardID string) error {
 				if _, isLegal := newRingReplicaSet[sid]; isLegal {
 					continue
 				}
-				if sid == removedShardID {
-					continue
-				}
 				c.mu.RLock()
 				targetShard, exists := c.shards[sid]
 				c.mu.RUnlock()
@@ -275,8 +264,6 @@ func (c *ShardKVCluster) migrateOnRemove(removedShardID string) error {
 			}
 		}
 	}
-
-	return nil
 }
 
 func (c *ShardKVCluster) MarkShardDown(shardID string) error {

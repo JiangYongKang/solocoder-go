@@ -899,6 +899,53 @@ func TestCleanerWithTTL(t *testing.T) {
 	}
 }
 
+type fsSnapshot struct {
+	origBackups map[string]int64
+	gzBackups   map[string]int64
+}
+
+func takeSnapshot(dir string) *fsSnapshot {
+	snap := &fsSnapshot{
+		origBackups: make(map[string]int64),
+		gzBackups:   make(map[string]int64),
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return snap
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name == "app.log" {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if strings.HasSuffix(name, ".log") && !strings.HasSuffix(name, ".log.gz") {
+			snap.origBackups[name] = info.Size()
+		}
+		if strings.HasSuffix(name, ".gz") {
+			snap.gzBackups[name] = info.Size()
+		}
+	}
+	return snap
+}
+
+func (s *fsSnapshot) copy() *fsSnapshot {
+	cp := &fsSnapshot{
+		origBackups: make(map[string]int64, len(s.origBackups)),
+		gzBackups:   make(map[string]int64, len(s.gzBackups)),
+	}
+	for k, v := range s.origBackups {
+		cp.origBackups[k] = v
+	}
+	for k, v := range s.gzBackups {
+		cp.gzBackups[k] = v
+	}
+	return cp
+}
+
 func TestCompressAndCleanupRace(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "app.log")
@@ -925,53 +972,36 @@ func TestCompressAndCleanupRace(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	type checkpoint struct {
-		srcPath  string
-		srcExist bool
-		gzExist  bool
-		gzValid  bool
-	}
+	var snapshotsMu sync.Mutex
+	var snapshots []*fsSnapshot
+	var sawOrigBackup atomic.Bool
+	var sawGzBackup atomic.Bool
 
-	var checkpoints []checkpoint
-	var cpMu sync.Mutex
-	var compressCount int32
-
-	lr.onCompressEnd = func(srcPath string, compressErr error) {
-		entry := checkpoint{srcPath: srcPath}
-
-		if _, err := os.Stat(srcPath); err == nil {
-			entry.srcExist = true
-		}
-
-		gzPath := srcPath + ".gz"
-		if info, err := os.Stat(gzPath); err == nil && info.Size() > 0 {
-			entry.gzExist = true
-			gzFile, err := os.Open(gzPath)
-			if err == nil {
-				gr, err := gzip.NewReader(gzFile)
-				if err == nil {
-					_, err = io.ReadAll(gr)
-					gr.Close()
-					if err == nil {
-						entry.gzValid = true
-					}
+	monitorDone := make(chan struct{})
+	monitorWg := sync.WaitGroup{}
+	monitorWg.Add(1)
+	go func() {
+		defer monitorWg.Done()
+		ticker := time.NewTicker(1 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-monitorDone:
+				return
+			case <-ticker.C:
+				snap := takeSnapshot(dir)
+				snapshotsMu.Lock()
+				snapshots = append(snapshots, snap)
+				if len(snap.origBackups) > 0 {
+					sawOrigBackup.Store(true)
 				}
-				gzFile.Close()
+				if len(snap.gzBackups) > 0 {
+					sawGzBackup.Store(true)
+				}
+				snapshotsMu.Unlock()
 			}
 		}
-
-		cpMu.Lock()
-		checkpoints = append(checkpoints, entry)
-		cpMu.Unlock()
-
-		atomic.AddInt32(&compressCount, 1)
-	}
-
-	lr.onCompressStart = func(srcPath string) {
-		if _, err := os.Stat(srcPath); err != nil {
-			t.Errorf("compress goroutine started but source file already missing: %s", srcPath)
-		}
-	}
+	}()
 
 	for i := 0; i < 15; i++ {
 		if err := lr.Log(LevelInfo, fmt.Sprintf("%s-%d", msg, i)); err != nil {
@@ -982,28 +1012,77 @@ func TestCompressAndCleanupRace(t *testing.T) {
 	lr.Sync()
 	lr.Close()
 
-	cpMu.Lock()
-	cps := checkpoints
-	cpMu.Unlock()
+	close(monitorDone)
+	monitorWg.Wait()
 
-	totalCompress := int(atomic.LoadInt32(&compressCount))
-	if totalCompress == 0 {
-		t.Fatal("expected at least one compression to occur")
+	snapshotsMu.Lock()
+	totalSnapshots := len(snapshots)
+	snapshotsMu.Unlock()
+
+	t.Logf("captured %d filesystem snapshots during compression lifecycle", totalSnapshots)
+
+	if totalSnapshots == 0 {
+		t.Fatal("failed to capture any filesystem snapshots, monitor goroutine may not have run")
 	}
 
-	t.Logf("observed %d compression checkpoints out of %d total", len(cps), totalCompress)
+	if !sawOrigBackup.Load() {
+		t.Error("never observed an uncompressed .log backup during the test - " +
+			"either no rotation occurred or monitor missed intermediate state")
+	}
 
-	for i, cp := range cps {
-		if cp.srcExist {
-			t.Errorf("checkpoint %d: source file %s should have been deleted by compressAndRemove before this checkpoint", i, cp.srcPath)
+	if !sawGzBackup.Load() {
+		t.Error("never observed a .gz compressed backup during the test")
+	}
+
+	snapshotsMu.Lock()
+	firstSeenOrig := make(map[string]int)
+	lastSeenOrig := make(map[string]int)
+	firstSeenGz := make(map[string]int)
+	lastSeenGz := make(map[string]int)
+
+	for i, snap := range snapshots {
+		for name := range snap.origBackups {
+			if strings.HasPrefix(name, "app.") {
+				if _, exists := firstSeenOrig[name]; !exists {
+					firstSeenOrig[name] = i
+				}
+				lastSeenOrig[name] = i
+			}
 		}
-		if !cp.gzExist {
-			t.Errorf("checkpoint %d: .gz file should exist after compressAndRemove for %s", i, cp.srcPath)
-		}
-		if !cp.gzValid {
-			t.Errorf("checkpoint %d: .gz file for %s is not valid gzip", i, cp.srcPath)
+		for name := range snap.gzBackups {
+			if _, exists := firstSeenGz[name]; !exists {
+				firstSeenGz[name] = i
+			}
+			lastSeenGz[name] = i
 		}
 	}
+	snapshotsMu.Unlock()
+
+	t.Logf("observed %d distinct original backups, %d distinct .gz backups during test",
+		len(firstSeenOrig), len(firstSeenGz))
+
+	for origName, firstIdx := range firstSeenOrig {
+		gzName := origName + ".gz"
+		lastIdx := lastSeenOrig[origName]
+		gzFirst, _ := firstSeenGz[gzName]
+		gzLast, gzHasLast := lastSeenGz[gzName]
+
+		t.Logf("  %s: seen snapshots [%d..%d], %s: firstSeen=%v lastSeen=%v",
+			origName, firstIdx, lastIdx, gzName, gzFirst, gzLast)
+
+		if !gzHasLast {
+			t.Errorf("%s was created but its corresponding %s was never observed (lastSeen missing)",
+				origName, gzName)
+			continue
+		}
+
+		if gzLast < lastIdx {
+			t.Errorf("race: %s last seen at snapshot %d, but %s last seen at %d -- "+
+				".gz disappeared before original was removed (possibly truncated)",
+				gzName, gzLast, origName, lastIdx)
+		}
+	}
+	_ = firstSeenGz
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1030,6 +1109,32 @@ func TestCompressAndCleanupRace(t *testing.T) {
 
 	if gzBackups > cfg.MaxBackups {
 		t.Errorf("gz backups = %d exceeds MaxBackups = %d", gzBackups, cfg.MaxBackups)
+	}
+
+	if gzBackups == 0 {
+		t.Error("expected at least one .gz backup after Close")
+	}
+
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".gz") {
+			continue
+		}
+		gzPath := filepath.Join(dir, name)
+		gzFile, err := os.Open(gzPath)
+		if err != nil {
+			t.Fatalf("open gz %s error: %v", name, err)
+		}
+		gr, err := gzip.NewReader(gzFile)
+		if err != nil {
+			t.Fatalf("gzip reader for %s error: %v (may be corrupted by race)", name, err)
+		}
+		_, err = io.ReadAll(gr)
+		gr.Close()
+		gzFile.Close()
+		if err != nil {
+			t.Fatalf("read gz %s error: %v (may be truncated by race)", name, err)
+		}
 	}
 
 	t.Logf("final state: %d .gz backups, %d original backups", gzBackups, origBackups)
@@ -1059,10 +1164,36 @@ func TestConcurrentRotateWithCompress(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	var compressCount int32
-	lr.onCompressEnd = func(srcPath string, compressErr error) {
-		atomic.AddInt32(&compressCount, 1)
-	}
+	var snapshotsMu sync.Mutex
+	var snapshots []*fsSnapshot
+	var sawOrigBackup atomic.Bool
+	var sawGzBackup atomic.Bool
+
+	monitorDone := make(chan struct{})
+	monitorWg := sync.WaitGroup{}
+	monitorWg.Add(1)
+	go func() {
+		defer monitorWg.Done()
+		ticker := time.NewTicker(1 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-monitorDone:
+				return
+			case <-ticker.C:
+				snap := takeSnapshot(dir)
+				snapshotsMu.Lock()
+				snapshots = append(snapshots, snap)
+				if len(snap.origBackups) > 0 {
+					sawOrigBackup.Store(true)
+				}
+				if len(snap.gzBackups) > 0 {
+					sawGzBackup.Store(true)
+				}
+				snapshotsMu.Unlock()
+			}
+		}
+	}()
 
 	goroutines := 4
 	msgsPerGoroutine := 50
@@ -1086,11 +1217,17 @@ func TestConcurrentRotateWithCompress(t *testing.T) {
 	lr.Sync()
 	lr.Close()
 
-	totalCompress := int(atomic.LoadInt32(&compressCount))
-	t.Logf("concurrent: %d compressions completed", totalCompress)
+	close(monitorDone)
+	monitorWg.Wait()
 
-	if totalCompress == 0 {
-		t.Error("expected compressions during concurrent writes")
+	snapshotsMu.Lock()
+	totalSnapshots := len(snapshots)
+	snapshotsMu.Unlock()
+
+	t.Logf("concurrent: captured %d filesystem snapshots", totalSnapshots)
+
+	if !sawOrigBackup.Load() && !sawGzBackup.Load() {
+		t.Error("neither .log nor .gz backups observed - compression/rotation may not have occurred")
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -1133,7 +1270,7 @@ func TestConcurrentRotateWithCompress(t *testing.T) {
 		}
 		gr, err := gzip.NewReader(gzFile)
 		if err != nil {
-			t.Errorf("gzip reader for %s error: %v (corrupted)", name, err)
+			t.Errorf("gzip reader for %s error: %v (corrupted by race?)", name, err)
 			gzFile.Close()
 			continue
 		}
@@ -1141,7 +1278,7 @@ func TestConcurrentRotateWithCompress(t *testing.T) {
 		gr.Close()
 		gzFile.Close()
 		if err != nil {
-			t.Errorf("read gz %s error: %v (truncated)", name, err)
+			t.Errorf("read gz %s error: %v (truncated by race?)", name, err)
 		}
 	}
 
