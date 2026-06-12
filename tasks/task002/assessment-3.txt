@@ -1,0 +1,7 @@
+产物不满意：
+1. cluster.go 的 migrateOnRemove 方法中第 235 行 `if tid == removedShardID` 检查是死代码。因为 RemoveShard 已先调用 hashRing.RemoveNode 从哈希环中移除该分片的全部虚拟节点，后续 GetReplicaNodes 返回的 newRingReplicas 不可能包含已移除的分片 ID。同理第 260 行 fallback 循环中的 `if sid == removedShardID` 也是死代码，因为 remainingShardIDs 在构造时已通过 `id != removedShardID` 排除了该分片。两处检查不影响功能正确性，但说明模型在调整 RemoveNode 的执行顺序后未系统性推导新执行流下各分支的可达性，添加了冗余的防御代码。
+2. cluster.go 的 RemoveShard 方法中第 99 行 `c.hashRing.AddNode(shardID)` 回滚路径无法被触发，因为 migrateOnRemove 方法的 return nil 语句在第 279 行，函数体内所有操作通过 ForcePut 完成且不产生任何错误返回值，回滚分支永远走不到。文档 docs/shardkv.md 将回滚描述为"migrateOnRemove 失败时，先调用 AddNode 把被移除节点重新挂回哈希环"，但实际运行中不存在触发条件，文档承诺的回滚保证在当前实现下是空保障。
+
+过程不满意：
+1. 模型在读取 cluster.go 和测试文件后仅用三行文本得出"现在我清楚了所有问题"就进入了修改阶段，中间没有展开讨论修复方案的设计细节，没有对比"调整 RemoveNode 调用顺序"和"仅修改 migrateOnRemove 内部逻辑"两种方案的优劣，也没有预判调整顺序后 migrateOnRemove 内部代码哪些部分会因此变为冗余。虽然提示词已经指明了根因方向，但作为修复任务仍应形成明确的修复计划而非直接跳到编码。
+2. 模型在总结中声称"重写 cluster.go 的关键部分"，但实际上只对 RemoveShard 方法做了两行调序（RemoveNode 和 AddNode 回滚），对 migrateOnRemove 方法做了 existingReplicas 的范围限定和 target 选取逻辑的替换。改动范围精确且克制，本质是定向修复而非重写，总结文档中夸大了修改规模，属于对自身产物的描述失真。

@@ -1,0 +1,5 @@
+你修复后的内存分片存储模块仍然存在迁移时序问题，需要修复：
+1. cluster.go 的 migrateOnRemove 方法中，通过 GetReplicaNodes 选取数据迁移目标时使用的哈希环仍包含待删除分片。因为 RemoveNode 在 migrateOnRemove 返回后才执行，旧环的节点排序与新环不同，部分旧环中选定的目标在新环中可能不是合法 replica，导致数据迁移后分布偏离新哈希环预期。
+2. cluster.go 的 migrateOnRemove 方法中，existingReplicas 计数遍历了全部存活分片，但未限定在"新环合法 replica 集合"范围内。非合法 replica 上的陈旧副本被计入已有副本数后会使 needed 被低估，导致合法 replica 节点上缺少应有的数据副本。
+3. 修复后运行 go test ./internal/shardkv/ -v，需要让所有测试通过。
+4. 在 docs/shardkv.md 中更新模块文档，说明数据迁移的哈希环一致性和目标选取约束。

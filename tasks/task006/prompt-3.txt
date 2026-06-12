@@ -1,0 +1,6 @@
+你修复后的延迟任务调度器模块仍然存在一些问题，需要修复：
+1. scheduler.go 的 runLoop 方法中，堆顶清理循环新增了 `|| task.Status == StatusRunning` 作为跳过条件。但任务的执行流程是先从堆中 Pop 弹出再被标记为 Running 状态，任务不可能同时处于堆内和 Running 状态，这行代码是永假死代码，应移除。
+2. scheduler_test.go 中用 TestScheduler_Cron_FirstExecuteByCronSemantics 和 TestScheduler_Cron_NextExecuteSemantics 替换了原有的 TestScheduler_AddCron 测试。但 FirstExecuteByCronSemantics 只校验了 ExecuteAt 时间计算未触发实际调度，NextExecuteSemantics 通过 RescheduleDelay 手动改到近未来逼近而绕过了 runLoop 中 `time.NewTimer(waitTime)` 的自然 Cron 唤醒路径，缺少让 Cron 任务依靠 Timer 自然等待并按 Cron 时间触发执行的完整端到端测试。
+3. 修复后为该模块补充不依赖 Reschedule 干预的自然 Cron 调度端到端测试，验证 Cron 任务从入队、Timer 自然等待到异步执行的后处理逻辑在完整调度路径下正确。
+4. 运行 go test ./internal/delaysched/ -v，需要让所有测试通过。
+5. 在 docs/delaysched.md 中更新模块文档，说明 Cron 调度的端到端验证策略和异步执行模型。

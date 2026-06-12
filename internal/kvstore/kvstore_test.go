@@ -1252,10 +1252,14 @@ func TestConcurrentBatchPutAndGet_Consistency(t *testing.T) {
 
 	var wg sync.WaitGroup
 	var phantomMisses int64
+	var batchPutErrors int64
 
 	numBatchWriters := 5
 	numReaders := 10
 	iterations := 200
+	keysPerBatch := 5
+	expectedDynamicKeys := numBatchWriters * iterations * keysPerBatch
+	expectedTotalKeys := expectedDynamicKeys + baseBatchSize
 
 	for w := 0; w < numBatchWriters; w++ {
 		wg.Add(1)
@@ -1263,12 +1267,13 @@ func TestConcurrentBatchPutAndGet_Consistency(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
 				pairs := make(map[string]string)
-				for k := 0; k < 5; k++ {
+				for k := 0; k < keysPerBatch; k++ {
 					pairs[fmt.Sprintf("batch_w%d_i%d_k%d", wid, i, k)] = fmt.Sprintf("v_w%d_%d_%d", wid, i, k)
 				}
 				pairs[fmt.Sprintf("init_%d", wid%baseBatchSize)] = fmt.Sprintf("updated_by_w%d_i%d", wid, i)
 				err := kv.BatchPut(pairs)
 				if err != nil {
+					atomic.AddInt64(&batchPutErrors, 1)
 					t.Errorf("BatchPut failed: %v", err)
 				}
 			}
@@ -1292,12 +1297,57 @@ func TestConcurrentBatchPutAndGet_Consistency(t *testing.T) {
 
 	wg.Wait()
 
+	if batchPutErrors > 0 {
+		t.Errorf("Found %d BatchPut errors during concurrent writes", batchPutErrors)
+	}
+
 	if phantomMisses > 0 {
 		t.Errorf("Found %d phantom misses during concurrent BatchPut+Get", phantomMisses)
 	}
 
-	if kv.Count() < baseBatchSize {
-		t.Errorf("expected at least %d keys, got %d", baseBatchSize, kv.Count())
+	finalCount := kv.Count()
+	if finalCount != expectedTotalKeys {
+		t.Errorf("expected exactly %d keys (%d dynamic + %d init), got %d (diff: %+d)",
+			expectedTotalKeys, expectedDynamicKeys, baseBatchSize,
+			finalCount, finalCount-expectedTotalKeys)
+	} else {
+		t.Logf("Data integrity verified: %d total keys match expected count", finalCount)
+	}
+
+	samplesPerWriter := 10
+	missingDynamicKeys := 0
+	valueMismatches := 0
+	for w := 0; w < numBatchWriters; w++ {
+		for s := 0; s < samplesPerWriter; s++ {
+			iterIdx := (s * iterations) / samplesPerWriter
+			for k := 0; k < keysPerBatch; k++ {
+				key := fmt.Sprintf("batch_w%d_i%d_k%d", w, iterIdx, k)
+				expectedVal := fmt.Sprintf("v_w%d_%d_%d", w, iterIdx, k)
+				val, ok := kv.Get(key)
+				if !ok {
+					missingDynamicKeys++
+					t.Errorf("dynamic key %q missing after concurrent BatchPut (data integrity violation)", key)
+				} else if val != expectedVal {
+					valueMismatches++
+					t.Errorf("dynamic key %q value mismatch: expected %q, got %q", key, expectedVal, val)
+				}
+			}
+		}
+	}
+	if missingDynamicKeys == 0 && valueMismatches == 0 {
+		t.Logf("Sampled %d dynamic keys across %d writers: all present and correct",
+			samplesPerWriter*keysPerBatch*numBatchWriters, numBatchWriters)
+	}
+
+	for i := 0; i < baseBatchSize; i++ {
+		key := fmt.Sprintf("init_%d", i)
+		val, ok := kv.Get(key)
+		if !ok {
+			t.Errorf("init key %q missing after concurrent BatchPut", key)
+		}
+		if val == "" {
+			t.Errorf("init key %q has empty value", key)
+		}
 	}
 }
 

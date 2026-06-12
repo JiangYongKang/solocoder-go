@@ -1,0 +1,7 @@
+你修复后的连接池管理器模块仍然存在一些问题，需要修复：
+1. pool.go 的 Get 方法中 deadline 变量被放在了外层 for 循环内部用短声明创建，每次外层循环迭代都会重新生成一个完整的 WaitTimeout 截止时间。当一个等待 goroutine 回到外层循环再次进入等待时拿到全新的 deadline，WaitTimeout 被重置，导致调用者实际等待时间可能远超配置的超时值。
+2. pool_test.go 的 TestReclaimIdleTimeout_WakesWaitingGet 和 TestReclaimIdleTimeout_WakesMultipleWaiters 两个测试并未验证 reclaimIdleTimeout 中新增的 cond.Broadcast 能否唤醒阻塞中的 Get 调用者。两个测试的等待 goroutine 均在空闲超时回收完成之后才启动，实际唤醒路径依赖的是 Put 方法中已有的 cond.Signal 而非回收的 Broadcast。
+3. pool_test.go 的 TestReclaimIdleTimeout_WakesWaitingGet 中等待 120ms 的步骤没有任何回收逻辑可触发，属于无意义休眠延长的测试时间。
+4. 修复后为该模块补充真正验证空闲超时回收唤醒阻塞等待者场景的单元测试，等待 goroutine 先阻塞，空闲超时回收触发 Broadcast 后验证等待者被唤醒并成功创建新连接。
+5. 运行 go test ./internal/connpool/ -v，需要让所有测试通过。
+6. 在 docs/connpool.md 中更新模块文档，说明修复后的超时保证机制和回收唤醒的验证策略。

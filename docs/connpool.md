@@ -161,9 +161,19 @@ Get()
 ```
 
 **等待唤醒机制说明：**
+- `deadline` 在 `Get()` 函数最外层声明，整个调用生命周期内只设置一次，确保超时时间不被重置
+- 第一次进入等待模式时通过 `if deadline.IsZero()` 判断后才设置 `deadline = now + WaitTimeout` 并启动超时协程
 - 超时检查 `time.Now().After(deadline)` 在持有锁的状态下执行，保证原子性
 - 超时协程触发时会先获取锁再 Broadcast，确保等待者被唤醒后能立即检测到超时
 - 避免了锁外关闭通道、锁内检查通道可能导致的"假等待"问题
+
+**超时保证机制：**
+`Get()` 方法的超时控制采用"单一截止时间"设计：
+- `deadline` 变量声明在函数最外层（`var deadline time.Time`），贯穿整个调用生命周期
+- 无论外层 `for` 循环迭代多少次，`deadline` 只会在第一次进入等待模式时设置一次
+- 后续循环中即使被唤醒后因竞争失败再次进入等待，也会复用同一个截止时间
+- 这保证了调用者的实际等待时间不会超过配置的 `WaitTimeout`，避免了"无限等待"问题
+- 实现细节见 [Get()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/connpool/pool.go#L145-L226)
 
 ### 4.3 连接归还流程 (Put)
 
@@ -293,12 +303,50 @@ Close()
 
 **关键性能优化：**
 - **Ping nil 优化**：当 `Ping` 配置为 `nil` 时，跳过空闲连接借用前的心跳检测，避免不必要的锁释放和重新获取开销。该优化在 [getIdle()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/connpool/pool.go#L111-L143) 中通过 `if p.cfg.Ping != nil` 判断实现
-- **原子超时检查**：等待模式下的超时检查在持有锁的状态下执行，确保与 `cond.Wait()` 的原子性，避免"假等待"问题。实现见 [Get()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/connpool/pool.go#L145-L222)
+- **原子超时检查**：等待模式下的超时检查在持有锁的状态下执行，确保与 `cond.Wait()` 的原子性，避免"假等待"问题。实现见 [Get()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/connpool/pool.go#L145-L226)
 - **回收即时唤醒**：空闲超时回收和心跳检测回收后立即调用 `cond.Broadcast()` 唤醒阻塞的 Get 调用者，减少请求延迟。实现见 [reclaimIdleTimeout()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/connpool/pool.go#L403-L431) 和 [checkHeartbeats()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/connpool/pool.go#L337-L382)
 
-## 7. 使用示例
+## 7. 核心机制验证策略
 
-### 7.1 基础使用：数据库连接池
+### 7.1 超时保证机制验证
+
+**测试目标**：验证 `Get()` 方法的超时时间不会被意外重置，确保调用者等待时间不超过配置的 `WaitTimeout`。
+
+**验证方式**：
+- 构造并发场景，让 `Get()` 调用者在被唤醒后因竞争失败而多次进入外层循环
+- 验证总等待时间仍然接近 `WaitTimeout`，而非 `WaitTimeout * 循环次数`
+- 关键测试：`TestGet_WaitTimeout`、`TestWaitTimeout_AtomicCheck`
+
+### 7.2 回收唤醒机制验证
+
+**测试目标**：验证 `reclaimIdleTimeout()` 在回收超时空闲连接后，能够通过 `cond.Broadcast()` 正确唤醒阻塞中的 `Get()` 调用者。
+
+**验证策略**：利用 Go 同一包内可访问私有字段和方法的特性，精确控制测试时序：
+
+1. **禁用自动回收**：将 `IdleTimeout` 设置为 1 小时，避免后台协程的自动回收干扰
+2. **先阻塞等待**：启动 `Get()` 调用使其进入 `cond.Wait()` 阻塞状态
+3. **归还连接**：调用 `Put()` 归还连接，此时 `Put()` 会调用 `cond.Signal()`，但测试代码会在 `Get()` 被唤醒前抢占锁
+4. **手动修改状态**：持有锁的状态下修改 `idleConn.lastUsed` 为很久以前，使其满足超时条件
+5. **内联执行回收逻辑**：在持有锁的状态下直接执行回收逻辑（避免重复加锁导致死锁），包括：
+   - 遍历 `idleList` 移除超时连接
+   - 递减 `count` 释放容量
+   - 调用 `cond.Broadcast()` 唤醒所有等待者
+6. **验证唤醒结果**：
+   - 验证 `Get()` 被成功唤醒
+   - 验证获取到的是新创建的连接（ID 不同），而非被回收的旧连接
+   - 验证旧连接已被正确关闭
+
+**关键测试**：
+- `TestReclaimIdleTimeout_BroadcastWakesBlockedGet`：验证单个阻塞等待者被回收唤醒
+- `TestReclaimIdleTimeout_BroadcastWakesMultipleBlockedGets`：验证多个阻塞等待者同时被回收唤醒
+
+**反模式说明**：
+- ❌ **错误方式**：先执行完回收，再启动 `Get()` 等待。此时实际唤醒路径是 `Put()` 的 `cond.Signal()`，而非回收的 `cond.Broadcast()`
+- ❌ **无意义休眠**：测试中加入没有对应触发逻辑的 `time.Sleep()`，只会延长测试时间而不验证任何功能
+
+## 8. 使用示例
+
+### 8.1 基础使用：数据库连接池
 
 ```go
 package main
@@ -363,7 +411,7 @@ func main() {
 }
 ```
 
-### 7.2 非阻塞模式（WaitTimeout=0）
+### 8.2 非阻塞模式（WaitTimeout=0）
 
 ```go
 cfg := connpool.Config{
@@ -383,7 +431,7 @@ if err == connpool.ErrPoolExhausted {
 }
 ```
 
-### 7.3 监控连接池状态
+### 8.3 监控连接池状态
 
 ```go
 go func() {
@@ -398,7 +446,7 @@ go func() {
 }()
 ```
 
-### 7.4 模拟连接测试
+### 8.4 模拟连接测试
 
 ```go
 // 单元测试风格的模拟连接
@@ -430,7 +478,7 @@ func TestBasic(t *testing.T) {
 }
 ```
 
-## 8. 文件结构
+## 9. 文件结构
 
 ```
 internal/connpool/

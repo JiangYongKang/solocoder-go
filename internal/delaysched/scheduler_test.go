@@ -1160,3 +1160,126 @@ func TestScheduler_RepeatCancel_NoMemoryLeak(t *testing.T) {
 		t.Errorf("after canceling all %d repeat tasks, TaskCount = %d (expected 0) — memory leak?", n, count)
 	}
 }
+
+// ------------------------------ Cron End-to-End Tests ------------------------------
+
+// 验证 Cron 任务完整端到端路径：入队 → Timer 自然等待 → 执行 → 重新入堆
+// 本测试不使用 Reschedule 干预，完全依靠调度器的自然 Timer 唤醒机制
+func TestScheduler_Cron_NaturalTimerEndToEnd(t *testing.T) {
+	// 如果当前秒数很小，先等待到接近分钟切换（秒 >= 55），这样测试能在几秒内完成
+	waitForNextMinuteBoundary(t)
+
+	s := NewScheduler()
+	s.Start()
+	defer s.Stop()
+
+	// 记录调度器注册任务时的时间
+	registerTime := time.Now()
+
+	// 计算预期的首次执行时间：下一分钟 00 秒
+	expectedFirst := registerTime.Add(time.Minute).Truncate(time.Minute)
+	waitDuration := expectedFirst.Sub(registerTime)
+
+	// 如果等待时间太短（< 2 秒），可能存在竞态，跳过
+	if waitDuration < 2*time.Second {
+		t.Skipf("skip: wait duration %v too short, may have race condition", waitDuration)
+	}
+
+	t.Logf("Cron end-to-end: registerTime=%v, expectedFirst=%v, waitDuration=%v",
+		registerTime, expectedFirst, waitDuration)
+
+	firstExecuted := make(chan time.Time, 1)
+	cronExpr := "* * * * *"
+
+	taskID := "cron-end-to-end"
+	err := s.AddCronWithID(taskID, 0, cronExpr, func(_ context.Context) {
+		execTime := time.Now()
+		t.Logf("Cron task executed at %v (expected first=%v)", execTime, expectedFirst)
+		select {
+		case firstExecuted <- execTime:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("AddCronWithID failed: %v", err)
+	}
+
+	// 1. 验证首次 ExecuteAt 由 Cron 计算正确
+	task, err := s.GetTask(taskID)
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+	// 首次执行时间必须是 minute-aligned（秒=0）
+	if task.ExecuteAt.Second() != 0 {
+		t.Fatalf("initial ExecuteAt should be minute-aligned (second=0), got %v (second=%d)",
+			task.ExecuteAt, task.ExecuteAt.Second())
+	}
+	// 误差在 2 秒内
+	diff := task.ExecuteAt.Sub(expectedFirst)
+	if diff < -2*time.Second || diff > 2*time.Second {
+		t.Fatalf("initial ExecuteAt = %v, expected ≈ %v (diff=%v)",
+			task.ExecuteAt, expectedFirst, diff)
+	}
+
+	// 2. 等待 Timer 自然唤醒并执行（不走 Reschedule 捷径）
+	select {
+	case actualExecTime := <-firstExecuted:
+		// 验证实际执行时间与预期的误差（允许 ±3 秒）
+		execDiff := actualExecTime.Sub(expectedFirst)
+		if execDiff < -3*time.Second || execDiff > 3*time.Second {
+			t.Errorf("task executed at %v, expected ≈ %v (diff=%v, outside ±3s tolerance)",
+				actualExecTime, expectedFirst, execDiff)
+		}
+	case <-time.After(waitDuration + 10*time.Second):
+		t.Fatalf("Cron task did not execute within expected time window (expected within %v)",
+			waitDuration+10*time.Second)
+	}
+
+	// 3. 给调度器一点时间完成后处理（重新入堆）
+	time.Sleep(100 * time.Millisecond)
+
+	// 4. 验证后处理逻辑：任务已被重新入堆，第二次 ExecuteAt 也是 minute-aligned
+	task, err = s.GetTask(taskID)
+	if err != nil {
+		t.Fatalf("GetTask after first execution failed: %v — task was not rescheduled correctly", err)
+	}
+	// 状态必须回到 Pending
+	if task.Status != StatusPending {
+		t.Errorf("expected StatusPending after reschedule, got %v", task.Status)
+	}
+	// 第二次执行时间也必须是 minute-aligned（秒=0）
+	if task.ExecuteAt.Second() != 0 {
+		t.Errorf("second ExecuteAt should be minute-aligned (second=0), got %v (second=%d)",
+			task.ExecuteAt, task.ExecuteAt.Second())
+	}
+	// 第二次执行时间应晚于第一次预期执行时间
+	if !task.ExecuteAt.After(expectedFirst) {
+		t.Errorf("second ExecuteAt %v should be after first execution time %v",
+			task.ExecuteAt, expectedFirst)
+	}
+	// RepeatType 和 CronExpr 必须保持正确
+	if task.RepeatType != RepeatCron {
+		t.Errorf("expected RepeatType = RepeatCron, got %v", task.RepeatType)
+	}
+	if task.CronExpr != cronExpr {
+		t.Errorf("expected CronExpr = %q, got %q", cronExpr, task.CronExpr)
+	}
+}
+
+// 等待当前时间接近分钟切换（秒 >= 55），这样测试能快速完成
+func waitForNextMinuteBoundary(t *testing.T) {
+	for {
+		now := time.Now()
+		if now.Second() >= 55 {
+			t.Logf("waitForNextMinuteBoundary: reached second=%d at %v", now.Second(), now)
+			return
+		}
+		// 否则继续等待，每 1 秒检查一次
+		sleepDur := time.Duration(55-now.Second()) * time.Second
+		if sleepDur < 0 {
+			sleepDur = 500 * time.Millisecond
+		}
+		t.Logf("waitForNextMinuteBoundary: current second=%d, waiting %v", now.Second(), sleepDur)
+		time.Sleep(sleepDur)
+	}
+}

@@ -1,0 +1,5 @@
+你修复后的内存 KV 存储模块仍然存在测试质量问题，需要修复：
+1. kvstore_test.go 的 TestConcurrentBatchPutAndGet_Consistency 测试中，5 个 writer goroutine 通过 BatchPut 在 200 次迭代中各创建 5 个唯一键共计 5000 个动态键，加上 10 个预存键预期键数应为 5010，但最终计数断言只校验了 `>= 10`（仅覆盖 0.2% 的数据）。如果 BatchPut 在并发场景下出现部分写入失败或键静默丢失，该断言无法检测。
+2. 修复后为该模块的并发 BatchPut 场景补充更严格的数据完整性校验，包括最终键数接近预期值和至少部分动态键可通过 Get 正确取回。
+3. 运行 go test ./internal/kvstore/ -v，需要让所有测试通过。
+4. 在 docs/kvstore.md 中更新模块文档，说明并发批量写入的一致性验证策略。

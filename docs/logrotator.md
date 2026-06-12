@@ -315,6 +315,88 @@ rotate() 触发切分
 
 5. **与 TTL 清理的协同**：TTL 过期清理独立于数量清理运行，它会同时删除过期的 `.log` 和 `.gz` 文件，不受上述流水线影响。
 
+---
+
+## 竞态测试设计方法
+
+### 测试目标
+
+验证压缩 goroutine 与清理操作之间的并发安全性，确保：
+
+1. `cleanOldBackups` 不会在压缩 goroutine 读取源文件前将其删除
+2. `compressAndRemove` 完成后原始备份文件被正确删除
+3. 产生的 `.gz` 文件都是完整且可解压的（非截断或损坏）
+4. 多个压缩 goroutine 并发执行时最终状态一致
+
+### 测试钩子
+
+`LogRotator` 提供两个可注入的测试钩子，用于在压缩 goroutine 执行期间插入同步检查点：
+
+```go
+type LogRotator struct {
+    // ...
+    onCompressStart func(path string)     // 压缩开始前调用，此时源文件必须存在
+    onCompressEnd   func(path string, err error)  // 压缩完成后、清理前调用
+}
+```
+
+**钩子调用时序**：
+
+```
+compress goroutine 启动
+    │
+    ├─ onCompressStart(src)     ← 检查点 1：源文件必须存在
+    │
+    ├─ compressAndRemove(src)   ← 压缩 + 删除源文件
+    │
+    ├─ onCompressEnd(src, err)  ← 检查点 2：源文件应已删除，.gz 应存在且有效
+    │
+    └─ cleanOldBackups(path)    ← 数量清理（仅统计 .gz）
+```
+
+### TestCompressAndCleanupRace 设计
+
+此测试通过 `onCompressEnd` 钩子在压缩 goroutine 的关键执行窗口内插入检查点，捕获中间状态：
+
+**配置**：`MaxFileSize=100`，`MaxBackups=2`，`Compress=true`，连续写入 15 条大日志触发多轮切分。
+
+**检查点 1 — `onCompressStart`**：
+- 验证源文件在压缩开始时仍然存在
+- 如果源文件已被其他 goroutine 的 `cleanOldBackups` 删除，说明存在竞态条件
+
+**检查点 2 — `onCompressEnd`**：
+- 验证源文件已被 `compressAndRemove` 删除（非被其他 goroutine 提前删除）
+- 验证对应的 `.gz` 文件已生成
+- 验证 `.gz` 文件可被 `gzip.NewReader` 正确解压（非截断或损坏）
+- 此时 `cleanOldBackups` 尚未执行，确保检查点观察的是压缩完成瞬间的真实状态
+
+**最终一致性验证**（`Close()` 之后）：
+- 无原始 `.log` 备份文件残留
+- `.gz` 文件数不超过 `MaxBackups`
+- 所有 `.gz` 文件可正确解压
+
+### TestConcurrentRotateWithCompress 设计
+
+此测试验证多 goroutine 并发写入时压缩与清理的最终一致性：
+
+**配置**：4 个 goroutine 各写 50 条日志，`MaxFileSize=500`，`MaxBackups=3`，`Compress=true`。
+
+**验证项**：
+- 通过 `onCompressEnd` + `atomic` 计数器确认压缩操作确实发生
+- `Close()` 后无原始 `.log` 备份残留
+- `.gz` 文件数不超过 `MaxBackups`
+- 每个 `.gz` 文件可正确解压（非截断/损坏）
+
+### Race Detector 使用
+
+由于 Windows/386 环境不支持 Go 内置 race detector，上述测试通过同步原语（`onCompressStart`/`onCompressEnd` 钩子 + `sync.Mutex` + `sync/atomic`）在压缩 goroutine 执行期间主动观察中间状态来替代 race detector 的功能。在支持 race detector 的平台上，可以额外运行：
+
+```bash
+go test ./internal/logrotator/ -race -v
+```
+
+来检测潜在的数据竞争。
+
 ### 七、关闭流程
 
 ```
@@ -444,10 +526,9 @@ lr.Close()
 ```
 logs/
 ├── app.log              ← 当前正在写入的文件
-├── app.1.log            ← 未被压缩的旧备份（如压缩仍在进行中）
-├── app.2.log.gz         ← 已压缩的备份
-├── app.3.log.gz
-└── app.4.log.gz
+├── app.1.log.gz         ← 已压缩的备份（原始 .log 已被 compressAndRemove 删除）
+├── app.2.log.gz
+└── app.3.log.gz
 ```
 
 按天切分后目录结构：

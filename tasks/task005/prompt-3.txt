@@ -1,0 +1,6 @@
+你修复后的日志文件轮转器模块仍然存在一些测试和代码质量问题，需要修复：
+1. logrotator_test.go 中 TestCompressRemovesOriginalFile 和 TestCompressBackup 两个测试验证逻辑高度重叠，都是创建 Compress=true 的 LogRotator、触发多次大小切分后检查原始备份文件被删除且 .gz 文件内容正确，区别仅在于一个遍历所有 .gz 而另一个只验证第一个找到的 .gz 文件。冗余约 85 行测试代码，应合并为一个完整验证或差异化场景。
+2. logrotator_test.go 的 TestCompressAndCleanupRace 测试命名暗示验证压缩与清理的竞态条件，但实际实现只是顺序触发多轮切分后在 Close 时检查最终文件列表，未在压缩 goroutine 执行期间通过同步原语插入中间状态检查点，也未使用 -race 标志验证数据竞争。测试实际验证的是"多轮压缩串行化的最终一致性"而非竞态窗口内的并发安全。
+3. 修复后为该模块补充真正能验证压缩与清理并发场景的单元测试，需要在压缩 goroutine 执行期间观察中间状态或使用 race detector 验证数据竞争。
+4. 运行 go test ./internal/logrotator/ -v，需要让所有测试通过。
+5. 在 docs/logrotator.md 中更新模块文档，说明竞态测试的设计方法和验证目标。

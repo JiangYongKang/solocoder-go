@@ -370,7 +370,7 @@ func (s *Scheduler) runLoop() {
 
 		for s.heap.Len() > 0 {
 			task := (*s.heap)[0]
-			if task.Status == StatusCancelled || task.Status == StatusDone || task.Status == StatusRunning {
+			if task.Status == StatusCancelled || task.Status == StatusDone {
 				heap.Pop(s.heap)
 				continue
 			}

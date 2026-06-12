@@ -92,8 +92,11 @@ func (c *ShardKVCluster) RemoveShard(shardID string) error {
 
 	shard.SetStatus(ShardStatusMigrating)
 
+	c.hashRing.RemoveNode(shardID)
+
 	err := c.migrateOnRemove(shardID)
 	if err != nil {
+		c.hashRing.AddNode(shardID)
 		shard.SetStatus(ShardStatusUp)
 		return err
 	}
@@ -102,8 +105,6 @@ func (c *ShardKVCluster) RemoveShard(shardID string) error {
 	delete(c.shards, shardID)
 	delete(c.downShards, shardID)
 	c.mu.Unlock()
-
-	c.hashRing.RemoveNode(shardID)
 
 	return nil
 }
@@ -185,10 +186,10 @@ func (c *ShardKVCluster) migrateOnRemove(removedShardID string) error {
 	c.mu.RLock()
 	removedShard := c.shards[removedShardID]
 	replicaCount := c.config.ReplicaCount
-	allShardIDs := make([]string, 0, len(c.shards))
+	remainingShardIDs := make([]string, 0, len(c.shards))
 	for id := range c.shards {
 		if id != removedShardID {
-			allShardIDs = append(allShardIDs, id)
+			remainingShardIDs = append(remainingShardIDs, id)
 		}
 	}
 	c.mu.RUnlock()
@@ -200,9 +201,18 @@ func (c *ShardKVCluster) migrateOnRemove(removedShardID string) error {
 			continue
 		}
 
+		newRingReplicas := c.hashRing.GetReplicaNodes(key, replicaCount)
+		newRingReplicaSet := make(map[string]struct{}, len(newRingReplicas))
+		for _, n := range newRingReplicas {
+			newRingReplicaSet[n] = struct{}{}
+		}
+
 		existingReplicas := 0
 		c.mu.RLock()
-		for _, sid := range allShardIDs {
+		for _, sid := range remainingShardIDs {
+			if _, isLegal := newRingReplicaSet[sid]; !isLegal {
+				continue
+			}
 			s, exists := c.shards[sid]
 			if !exists || s.Status() == ShardStatusDown {
 				continue
@@ -218,36 +228,51 @@ func (c *ShardKVCluster) migrateOnRemove(removedShardID string) error {
 			continue
 		}
 
-		targets := c.hashRing.GetReplicaNodes(key, replicaCount+10)
-		replicaSet := make(map[string]struct{})
-		for _, tid := range targets {
-			replicaSet[tid] = struct{}{}
-		}
-
-		for _, sid := range allShardIDs {
+		for _, tid := range newRingReplicas {
 			if needed <= 0 {
 				break
 			}
-			if _, isReplica := replicaSet[sid]; !isReplica {
+			if tid == removedShardID {
 				continue
 			}
-			if sid == removedShardID {
-				continue
-			}
-
 			c.mu.RLock()
-			targetShard, exists := c.shards[sid]
+			targetShard, exists := c.shards[tid]
 			c.mu.RUnlock()
 			if !exists || targetShard.Status() == ShardStatusDown {
 				continue
 			}
-
 			if targetShard.HasKey(key) {
 				continue
 			}
 
 			targetShard.ForcePut(key, val)
 			needed--
+		}
+
+		if needed > 0 {
+			for _, sid := range remainingShardIDs {
+				if needed <= 0 {
+					break
+				}
+				if _, isLegal := newRingReplicaSet[sid]; isLegal {
+					continue
+				}
+				if sid == removedShardID {
+					continue
+				}
+				c.mu.RLock()
+				targetShard, exists := c.shards[sid]
+				c.mu.RUnlock()
+				if !exists || targetShard.Status() == ShardStatusDown {
+					continue
+				}
+				if targetShard.HasKey(key) {
+					continue
+				}
+
+				targetShard.ForcePut(key, val)
+				needed--
+			}
 		}
 	}
 

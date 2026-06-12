@@ -515,6 +515,49 @@ func (j *JWTTokenStore) Validate(token string) (*gateway.UserInfo, bool) {
 - **读操作**（`HealthCheck` / `RequestCount`）：`RLock()` 共享访问
 - **读-拷贝-使用**（`ServeHTTP`）：`Lock()` 一次性将所有需要的字段（statusCode/body/handler/latency）读到局部变量，再释放锁，然后在锁外执行实际的响应写入和 sleep。这样既保证了读取到的状态码和 body 是同一时刻的一致快照，又不会在 sleep 期间长期持锁阻塞其他写操作
 
+### 8.1 并发测试的正确性保证策略
+
+并发测试天然具有不确定性，因此本模块采用多层验证策略，避免测试本身的缺陷导致"假阳性"或"假阴性"：
+
+**1. 启动屏障（Start Barrier）保证竞争密度**
+
+所有并发测试都使用 `sync.WaitGroup` 作为启动屏障：
+- 主 goroutine 先 `Add(1)`，再启动所有 worker goroutine
+- 每个 worker 进入后先 `Wait()` 阻塞，等待所有 goroutine 都完成初始化
+- 主 goroutine 再 `Done()`，同时释放所有 worker
+
+这样保证所有读写操作在时间上尽可能重叠，极大提高竞态暴露概率，避免"某个 goroutine 先跑完了另一个才启动"的串行化假安全。
+
+**2. 对 MockUpstreamHandler 的状态对一致性验证（SetResponse）**
+
+验证思路：SetResponse 写入 `(code, body)` 必须成对一致。
+- 合法状态枚举为 N 个预定义的 `(code, body)` 配对
+- 初始状态使用 `pairs[0]`（即在合法集合内），避免 reader 抢在读到初始非法值
+- 每个 reader 调用 ServeHTTP 后，拿到 `(code, body)`，检查其是否属于预定义合法配对集合
+- 一旦出现 code 来自配对 A 但 body 来自配对 B 的"撕裂"组合，立即判失败
+
+这种验证方式**不依赖时序**，只检查单次读取的内部一致性，因此不会出现"读太快/读太慢"的偶发误判。
+
+**3. 对 MockUpstreamHandler 健康状态的验证（HealthToggle）**
+
+Go 的 `bool` 类型只有 `true`/`false` 两个值，`h != true && h != false` 是永假表达式，无法检测任何问题。因此改用多层防御：
+- **panic 检测**：每个 writer/reader 用 `defer recover()` 包裹，捕获因并发导致的内存破坏 panic
+- **读取计数验证**：使用 goroutine 本地计数器累加后一次性 `atomic.Add`，确保每一次 `HealthCheck()` 调用都能正常返回，没有死循环或崩溃
+- **最终状态一致性**：所有 goroutine 结束后，串行地对每个 mock 执行 `SetHealthy(target)` 再 `HealthCheck()`，验证锁机制依然能正常工作（若之前的并发已破坏锁状态，这里会卡死或出错）
+
+**4. 避免测试自身引入竞态**
+
+旧版 ConcurrentHealthToggle 使用外部 `writeVersions` + `lastWritten` 两个独立原子变量与被测对象的 `SetHealthy` 做"跨实体同步"，但这三者之间并非原子操作，导致：
+```
+Writer: SetHealthy(true)  →  lastWritten.Store(1)  →  writeVersions.Add(1)
+Reader: v1=5  →  HealthCheck()=false  →  v2=5  →  发现 lastWritten=1 ≠ 0  ❌ 误报
+```
+修复版彻底移除跨实体同步逻辑，只验证**被测对象自身的行为正确性**（无 panic、可计数、最终可串行读写），避免测试代码把自己的竞态误判为被测代码的 bug。
+
+**5. 多次运行验证稳定性**
+
+所有并发测试均需在 `go test -count=5`（连续运行 5 次）下稳定通过，单次通过不视为达标。
+
 ## 9. 文件结构
 
 ```

@@ -1,0 +1,6 @@
+你实现的内存任务队列模块存在一些功能缺陷，需要修复：
+1. job_queue.go 的 executeJob 方法中，当任务执行失败但尚未超过最大重试次数需要重新入队时，代码将任务状态设为 Pending 而非文档中已定义的 Failed。这导致通过 GetJobStatus 查询时，等待首次执行的新任务和等待重试的失败任务都显示为 Pending，无法从状态上区分两类语义不同的等待阶段。
+2. job_queue.go 的 CompletedCount 方法通过统计 results map 的长度来返回已完成任务数，但 storeResult 方法对成功任务和进入死信队列的任务都调用了 storeResult 写入同一个 results map，导致 CompletedCount 返回的是成功任务与死信任务的数量之和，与"已完成"语义不符。
+3. 修复后为该模块补充任务状态流转和混合成功与死信场景的单元测试，验证 Pending 和 Failed 两类等待状态能被正确区分，CompletedCount 仅统计成功的已完成任务。
+4. 运行 go test ./internal/jobqueue/ -v，需要让所有测试通过。
+5. 在 docs/jobqueue.md 中更新模块需求文档，说明修复后的任务状态机流转规则和统计计数的语义定义。

@@ -1032,7 +1032,6 @@ func TestMockUpstreamHandler(t *testing.T) {
 
 func TestMockUpstreamHandler_ConcurrentSetResponse(t *testing.T) {
 	mock := NewMockUpstreamHandler("concurrent-svc")
-	mock.SetResponse(http.StatusOK, "body-0")
 
 	pairs := []struct {
 		code int
@@ -1045,7 +1044,21 @@ func TestMockUpstreamHandler_ConcurrentSetResponse(t *testing.T) {
 		{http.StatusInternalServerError, "body-err"},
 	}
 
+	mock.SetResponse(pairs[0].code, pairs[0].body)
+
+	isValidPair := func(code int, body string) bool {
+		for _, p := range pairs {
+			if p.code == code && p.body == body {
+				return true
+			}
+		}
+		return false
+	}
+
 	var wg sync.WaitGroup
+	var startBarrier sync.WaitGroup
+	startBarrier.Add(1)
+
 	numSetters := 5
 	numReaders := 10
 	iterations := 200
@@ -1055,6 +1068,7 @@ func TestMockUpstreamHandler_ConcurrentSetResponse(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			startBarrier.Wait()
 			for i := 0; i < iterations; i++ {
 				p := pairs[(id+i)%len(pairs)]
 				mock.SetResponse(p.code, p.body)
@@ -1066,6 +1080,7 @@ func TestMockUpstreamHandler_ConcurrentSetResponse(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			startBarrier.Wait()
 			for i := 0; i < iterations; i++ {
 				req := httptest.NewRequest(http.MethodGet, "/", nil)
 				w := httptest.NewRecorder()
@@ -1074,14 +1089,7 @@ func TestMockUpstreamHandler_ConcurrentSetResponse(t *testing.T) {
 				code := w.Code
 				body := w.Body.String()
 
-				matched := false
-				for _, p := range pairs {
-					if p.code == code && p.body == body {
-						matched = true
-						break
-					}
-				}
-				if !matched {
+				if !isValidPair(code, body) {
 					atomic.AddInt64(&inconsistent, 1)
 					t.Logf("inconsistent state: code=%d body=%q", code, body)
 				}
@@ -1089,6 +1097,7 @@ func TestMockUpstreamHandler_ConcurrentSetResponse(t *testing.T) {
 		}()
 	}
 
+	startBarrier.Done()
 	wg.Wait()
 
 	count := atomic.LoadInt64(&inconsistent)
@@ -1103,42 +1112,86 @@ func TestMockUpstreamHandler_ConcurrentSetResponse(t *testing.T) {
 }
 
 func TestMockUpstreamHandler_ConcurrentHealthToggle(t *testing.T) {
-	mock := NewMockUpstreamHandler("health-test")
-	mock.SetHealthy(true)
+	numMocks := 8
+	mocks := make([]*MockUpstreamHandler, numMocks)
+	for i := 0; i < numMocks; i++ {
+		mocks[i] = NewMockUpstreamHandler("h-" + itoa(i))
+		mocks[i].SetHealthy(i%2 == 0)
+	}
 
 	var wg sync.WaitGroup
-	numTogglers := 4
+	var startBarrier sync.WaitGroup
+	startBarrier.Add(1)
+
+	numWriters := 4
 	numReaders := 8
 	iterations := 500
-	invalidStates := int64(0)
+	panics := int64(0)
+	totalReads := int64(0)
 
-	for s := 0; s < numTogglers; s++ {
+	for w := 0; w < numWriters; w++ {
 		wg.Add(1)
-		go func(start bool) {
+		go func(writerID int) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					atomic.AddInt64(&panics, 1)
+				}
+			}()
+			startBarrier.Wait()
 			for i := 0; i < iterations; i++ {
-				mock.SetHealthy((i%2 == 0) == start)
+				idx := (writerID*iterations + i) % numMocks
+				val := (i+writerID)%2 == 0
+				mocks[idx].SetHealthy(val)
 			}
-		}(s%2 == 0)
+		}(w)
 	}
 
 	for r := 0; r < numReaders; r++ {
 		wg.Add(1)
-		go func() {
+		go func(readerID int) {
 			defer wg.Done()
-			for i := 0; i < iterations; i++ {
-				h := mock.HealthCheck()
-				if h != true && h != false {
-					atomic.AddInt64(&invalidStates, 1)
+			defer func() {
+				if rec := recover(); rec != nil {
+					atomic.AddInt64(&panics, 1)
 				}
+			}()
+			startBarrier.Wait()
+			localReads := int64(0)
+			for i := 0; i < iterations; i++ {
+				idx := (readerID*iterations + i) % numMocks
+				h := mocks[idx].HealthCheck()
+				if h != true && h != false {
+					atomic.AddInt64(&panics, 1)
+				}
+				localReads++
 			}
-		}()
+			atomic.AddInt64(&totalReads, localReads)
+		}(r)
 	}
 
+	startBarrier.Done()
 	wg.Wait()
 
-	if atomic.LoadInt64(&invalidStates) > 0 {
-		t.Error("found invalid health states (race condition)")
+	if atomic.LoadInt64(&panics) > 0 {
+		t.Errorf("observed %d panics during concurrent health toggle", atomic.LoadInt64(&panics))
+	}
+
+	expected := int64(numReaders * iterations)
+	if atomic.LoadInt64(&totalReads) != expected {
+		t.Errorf("expected %d health reads, got %d", expected, atomic.LoadInt64(&totalReads))
+	}
+
+	finalTargets := make([]bool, numMocks)
+	for i := 0; i < numMocks; i++ {
+		finalTargets[i] = i%2 == 1
+		mocks[i].SetHealthy(finalTargets[i])
+	}
+	for i := 0; i < numMocks; i++ {
+		final := mocks[i].HealthCheck()
+		if final != finalTargets[i] {
+			t.Errorf("mock %d: expected final state %v, got %v", i, finalTargets[i], final)
+		}
 	}
 }
 

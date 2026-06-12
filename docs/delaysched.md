@@ -103,7 +103,7 @@ type Scheduler struct {
 
 ### 3.3 taskHeap（最小堆）
 
-实现了 Go 标准库 `container/heap` 接口的最小堆，元素为 `*Task`，按 `ExecuteAt` 升序排列。堆中可能残留状态已变更为 Cancelled/Done/Running 的元素，在调度循环的每次迭代开始时会从堆顶批量清理。
+实现了 Go 标准库 `container/heap` 接口的最小堆，元素为 `*Task`，按 `ExecuteAt` 升序排列。堆中可能残留状态已变更为 Cancelled/Done 的元素，在调度循环的每次迭代开始时会从堆顶批量清理（StatusRunning 的任务不可能存在于堆中，因为被标记 Running 之前已从堆 Pop 移除）。
 
 ### 3.4 枚举类型
 
@@ -145,8 +145,8 @@ type Scheduler struct {
     加锁
     检查调度器是否停止 -> 退出
     
-    // 惰性清理堆顶无效任务（已 Cancelled/Done/Running 但仍在堆顶的）
-    while 堆非空 且 堆顶任务状态为 Cancelled/Done/Running:
+    // 惰性清理堆顶无效任务（已 Cancelled/Done 但仍在堆顶的）
+    while 堆非空 且 堆顶任务状态为 Cancelled/Done:
         Pop 堆顶
         continue
     
@@ -492,7 +492,7 @@ time.Sleep(8 * time.Second)
 
 ## 7. 测试覆盖
 
-单元测试位于 `internal/delaysched/scheduler_test.go`，当前共 **40** 个测试用例，覆盖核心功能、Cron 语义、内存泄漏等维度。
+单元测试位于 `internal/delaysched/scheduler_test.go`，当前共 **41** 个测试用例，覆盖核心功能、Cron 语义、内存泄漏、异步调度等维度。
 
 ### 7.1 最小堆单元测试
 
@@ -556,6 +556,56 @@ time.Sleep(8 * time.Second)
 - `TestScheduler_AddCron_InvalidExpr`：无效表达式（语法错误、小时=25）被拒绝
 - `TestScheduler_AddCronWithID_Duplicate`：重复 ID 返回错误
 
+### 7.6.1 Cron 端到端自然调度测试
+
+`TestScheduler_Cron_NaturalTimerEndToEnd` 是**核心端到端验证测试**，完全不依赖 Reschedule 干预，覆盖完整调度路径：`入队 → Cron 时间计算 → Timer 自然等待 → 到期唤醒 → 异步执行 → 后处理重新入堆`。
+
+#### 验证策略
+
+由于 Cron 最小粒度为分钟，测试采用"边界等待 + 精确对齐"的策略在可控时间内完成验证：
+
+1. **等待分钟边界**：`waitForNextMinuteBoundary(t)` 循环检查当前秒数，直到 `second >= 55` 才进入正式测试，确保只需等待 5~10 秒即可到达下一分钟整点。
+
+2. **注册任务**：使用 `* * * * *`（每分钟）Cron 表达式注册任务，delay=0。此时：
+   - 注册时间 T0 约为 `XX:55:xx`
+   - 预期首次执行时间 = `nextCronTime("* * * * *", T0)` = `(T0 + 1min).Truncate(minute)` = 下一分钟整点
+
+3. **前置校验**：通过 `GetTask()` 验证初始 ExecuteAt 满足：
+   - `Second() == 0`（对齐到分钟整点）
+   - 与预期时间的误差在 ±2 秒内
+
+4. **自然等待执行**：使用 `select` 等待最多 `waitDuration + 10s`，完全依赖调度器内部的 `time.NewTimer(waitTime)` 机制触发，**不调用 Reschedule 或任何其他 API**。
+
+5. **执行时间校验**：实际执行时间与预期 Cron 时间的误差在 ±3 秒内，验证 Timer 精度与调度唤醒时延。
+
+6. **后处理校验**：任务执行完毕后 100ms，再次 `GetTask()` 验证：
+   - 状态回到 `StatusPending`（证明 `executeTask` 的重新入堆逻辑正常）
+   - 第二次 ExecuteAt 的 `Second() == 0`（Cron 对齐保持）
+   - 第二次 ExecuteAt > 首次预期执行时间（时间推进正确）
+   - `RepeatType == RepeatCron`、`CronExpr == "* * * * *"`（元数据未被破坏）
+
+#### 实际运行示例
+
+测试日志展示了端到端路径的精确性：
+```
+waitForNextMinuteBoundary: current second=44, waiting 11s
+waitForNextMinuteBoundary: reached second=55 at 16:37:55
+Cron end-to-end: registerTime=16:37:55, expectedFirst=16:38:00, waitDuration=4.62s
+Cron task executed at 16:38:00.0005 (expected first=16:38:00)
+PASS
+```
+实际执行与预期 Cron 时间的误差仅 **0.5ms**，验证了调度精度。
+
+### 7.6.2 伪调度路径与端到端路径的区别
+
+| 测试 | 关键特征 | 覆盖路径 |
+|------|----------|----------|
+| `TestScheduler_Cron_FirstExecuteByCronSemantics` | 只验证 ExecuteAt 计算，不触发执行 | 仅 `AddCron → nextCronTime → tasks map` |
+| `TestScheduler_Cron_NextExecuteSemantics` | 使用 `RescheduleDelay` 手动触发第一次执行 | 绕过 `time.NewTimer` 自然等待路径 |
+| `TestScheduler_Cron_NaturalTimerEndToEnd` | 无任何 API 干预，纯自然调度 | 完整路径：Add → 堆排序 → Timer → 唤醒 → 执行 → 后处理 → 重新入堆 |
+
+三种测试互补，共同保证 Cron 调度语义的正确性。
+
 ### 7.7 内存泄漏专项测试
 
 - `TestScheduler_CancelPending_NoMemoryLeak`：1000 轮，每轮 AddWithID 100 个任务 + Cancel 100 个任务；验证：
@@ -567,7 +617,18 @@ time.Sleep(8 * time.Second)
 
 ## 8. 设计权衡与注意事项
 
-1. **异步执行模型**：任务在独立 goroutine 中运行，调度循环永不阻塞，代价是每个运行中任务占用一个 goroutine。对于高吞吐短任务场景，可考虑 worker pool 模式的未来扩展。
+1. **异步执行模型详解**：
+
+   调度器采用 **"调度循环 + 任务独立 goroutine"** 的异步并发模型：
+
+   - **调度循环（runLoop）**：在独立 goroutine 中运行，负责检查堆顶、创建定时器、唤醒处理。**永远不会被单个任务的执行时长阻塞**。检测到任务到期后，立即通过 `go s.executeTask(task)` 将任务交给新 goroutine 执行，然后继续下一轮调度。
+
+   - **任务执行（executeTask）**：每个任务在独立 goroutine 中运行，使用 `taskWg.Add(1)` / `taskWg.Done()` 进行生命周期追踪。外层包裹 `recover()` 捕获 panic，保证调度器整体不崩溃。
+
+   - **Stop 的两阶段等待**：`Stop()` 会先等待调度循环退出（`s.wg.Wait()`），再等待所有已启动的任务 goroutine 完成（`s.taskWg.Wait()`），确保 Stop 返回时无任何残留协程。
+
+   **优势**：长耗时任务不会阻塞其他任务的按时调度，可放心注册任意时长的任务函数。
+   **代价**：每个运行中任务占用一个 goroutine。对于极高吞吐（每秒数万级）且任务极短的场景，可考虑未来扩展 worker pool 模式。
 
 2. **Cron 精度对齐到分钟**：所有 Cron 计算均使用 `.Truncate(time.Minute)`，避免 `time.Now()` 的亚毫秒抖动导致匹配失败。首次执行和后续执行的 ExecuteAt 始终是"分钟整点"。
 
@@ -576,3 +637,5 @@ time.Sleep(8 * time.Second)
 4. **heap 惰性清理**：Cancel Pending 任务时主动从堆中 Remove，但如果任务已被 Pop 出堆（极端竞态），堆的惰性清理（runLoop 每次迭代扫描堆顶）会兜底移除无效条目，确保正确性。
 
 5. **taskWg 的作用**：Stop 时必须等待所有运行中任务结束，否则可能出现调度器已销毁但任务仍引用其 ctx 的问题。对 Stop 的延迟敏感的场景，可以在 Stop 前先 Cancel 所有周期性任务。
+
+6. **永假代码的清理**：runLoop 中堆顶清理仅检查 `StatusCancelled` 和 `StatusDone`。`StatusRunning` 的任务不可能同时存在于堆中，因为任务流程是 **先 Pop → 再标记 Running**，不存在"堆中 Running"的中间状态。

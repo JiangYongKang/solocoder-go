@@ -1,0 +1,5 @@
+你修复后的 HTTP 网关模块仍然存在一些测试质量问题，需要修复：
+1. gateway_test.go 的 TestMockUpstreamHandler_ConcurrentHealthToggle 测试中，断言条件使用了 `h != true && h != false` 来检测并发安全。Go 的 bool 类型只有 true 和 false 两个值，该表达式永假，无论是否存在并发问题此分支都不会被触发，测试形同虚设。
+2. gateway_test.go 的 TestMockUpstreamHandler_ConcurrentSetResponse 测试初始化时用 `SetResponse(http.StatusOK, "body-0")` 设置了一个初始状态码与响应体组合，但 "body-0" 不在验证用的合法配对列表中。如果读 goroutine 抢先读到该初始状态，会被误判为不一致，导致偶发性的测试假失败。
+3. 修复后运行 go test ./internal/gateway/ -v，需要让所有测试通过。
+4. 在 docs/gateway.md 中更新模块文档，说明并发测试的正确性保证策略。

@@ -882,14 +882,14 @@ func TestReclaimIdleTimeout_ReleasesCapacity(t *testing.T) {
 	_ = p.Put(c3)
 }
 
-func TestReclaimIdleTimeout_WakesWaitingGet(t *testing.T) {
+func TestReclaimIdleTimeout_BroadcastWakesBlockedGet(t *testing.T) {
 	var closed []int
 	var mu sync.Mutex
 
 	p, err := NewPool(Config{
-		InitialCap:  2,
-		MaxCap:      2,
-		IdleTimeout: 60 * time.Millisecond,
+		InitialCap:  1,
+		MaxCap:      1,
+		IdleTimeout: 1 * time.Hour,
 		WaitTimeout: 5 * time.Second,
 		Factory:     makeFactory(),
 		Close:       makeClose(&closed, &mu),
@@ -900,71 +900,76 @@ func TestReclaimIdleTimeout_WakesWaitingGet(t *testing.T) {
 	defer p.Close()
 
 	c1, _ := p.Get()
-	c2, _ := p.Get()
+	mc1 := c1.(*mockConn)
 
-	_ = p.Put(c1)
-	_ = p.Put(c2)
-
-	time.Sleep(120 * time.Millisecond)
-
-	mu.Lock()
-	closedCount := len(closed)
-	mu.Unlock()
-	if closedCount != 2 {
-		t.Fatalf("expected 2 connections reclaimed, got %d", closedCount)
-	}
-	if p.Len() != 0 {
-		t.Fatalf("expected Len=0 after reclaim, got %d", p.Len())
-	}
-
-	active1, _ := p.Get()
-	active2, _ := p.Get()
-
-	if p.Len() != 2 {
-		t.Fatalf("expected Len=2, got %d", p.Len())
-	}
-
-	var wg sync.WaitGroup
-	var success int64
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			c, err := p.Get()
-			if err == nil && c != nil {
-				atomic.AddInt64(&success, 1)
-				time.Sleep(10 * time.Millisecond)
-				_ = p.Put(c)
-			}
-		}()
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	if atomic.LoadInt64(&success) != 0 {
-		t.Fatalf("no Get should succeed yet, got %d", atomic.LoadInt64(&success))
-	}
-
-	_ = p.Put(active1)
-
-	time.Sleep(120 * time.Millisecond)
-
-	_ = p.Put(active2)
-
+	var getErr error
+	var gotConn Conn
 	done := make(chan struct{})
 	go func() {
-		wg.Wait()
+		gotConn, getErr = p.Get()
 		close(done)
 	}()
 
+	time.Sleep(50 * time.Millisecond)
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for all Gets to complete")
+		t.Fatal("Get should be blocked")
+	default:
 	}
 
-	if atomic.LoadInt64(&success) != 3 {
-		t.Errorf("expected 3 successful Gets, got %d", atomic.LoadInt64(&success))
+	_ = p.Put(c1)
+
+	p.mu.Lock()
+	if p.idleList.Len() == 1 {
+		ic := p.idleList.Front().Value.(*idleConn)
+		ic.lastUsed = time.Now().Add(-2 * time.Hour)
 	}
+
+	var expired []*idleConn
+	now := time.Now()
+	for e := p.idleList.Front(); e != nil; {
+		ic := e.Value.(*idleConn)
+		next := e.Next()
+		if now.Sub(ic.lastUsed) > p.cfg.IdleTimeout {
+			p.idleList.Remove(e)
+			expired = append(expired, ic)
+			atomic.AddInt32(&p.count, -1)
+		}
+		e = next
+	}
+
+	if len(expired) > 0 {
+		p.cond.Broadcast()
+	}
+	p.mu.Unlock()
+
+	for _, ic := range expired {
+		_ = p.cfg.Close(ic.conn)
+	}
+
+	select {
+	case <-done:
+		if getErr != nil {
+			t.Fatalf("expected successful Get, got: %v", getErr)
+		}
+		if gotConn == nil {
+			t.Fatal("expected non-nil connection")
+		}
+		mcGot := gotConn.(*mockConn)
+		if mcGot.id == mc1.id {
+			t.Error("expected new connection, got the recycled one")
+		}
+		mu.Lock()
+		closedCount := len(closed)
+		mu.Unlock()
+		if closedCount != 1 {
+			t.Errorf("expected 1 connection closed by reclaim, got %d", closedCount)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Get should have been woken up by reclaimIdleTimeout's Broadcast")
+	}
+
+	_ = p.Put(gotConn)
 }
 
 func TestWaitTimeout_AtomicCheck(t *testing.T) {
@@ -1053,14 +1058,14 @@ func TestPingNil_NoUnnecessaryLocking(t *testing.T) {
 	}
 }
 
-func TestReclaimIdleTimeout_WakesMultipleWaiters(t *testing.T) {
+func TestReclaimIdleTimeout_BroadcastWakesMultipleBlockedGets(t *testing.T) {
 	var closed []int
 	var mu sync.Mutex
 
 	p, err := NewPool(Config{
 		InitialCap:  3,
 		MaxCap:      3,
-		IdleTimeout: 60 * time.Millisecond,
+		IdleTimeout: 1 * time.Hour,
 		WaitTimeout: 5 * time.Second,
 		Factory:     makeFactory(),
 		Close:       makeClose(&closed, &mu),
@@ -1071,35 +1076,15 @@ func TestReclaimIdleTimeout_WakesMultipleWaiters(t *testing.T) {
 	defer p.Close()
 
 	conns := make([]Conn, 3)
+	connIds := make([]int, 3)
 	for i := 0; i < 3; i++ {
 		conns[i], _ = p.Get()
-	}
-	for i := 0; i < 3; i++ {
-		_ = p.Put(conns[i])
-	}
-
-	time.Sleep(120 * time.Millisecond)
-
-	mu.Lock()
-	closedCount := len(closed)
-	mu.Unlock()
-	if closedCount != 3 {
-		t.Fatalf("expected 3 connections reclaimed, got %d", closedCount)
-	}
-	if p.Len() != 0 {
-		t.Fatalf("expected Len=0 after reclaim, got %d", p.Len())
-	}
-
-	conns = make([]Conn, 3)
-	for i := 0; i < 3; i++ {
-		conns[i], _ = p.Get()
-	}
-	if p.Len() != 3 {
-		t.Fatalf("expected Len=3, got %d", p.Len())
+		connIds[i] = conns[i].(*mockConn).id
 	}
 
 	var wg sync.WaitGroup
 	var success int64
+	var gotIds sync.Map
 
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
@@ -1108,6 +1093,9 @@ func TestReclaimIdleTimeout_WakesMultipleWaiters(t *testing.T) {
 			c, err := p.Get()
 			if err == nil && c != nil {
 				atomic.AddInt64(&success, 1)
+				mc := c.(*mockConn)
+				gotIds.Store(mc.id, true)
+				time.Sleep(10 * time.Millisecond)
 				_ = p.Put(c)
 			}
 		}()
@@ -1122,6 +1110,36 @@ func TestReclaimIdleTimeout_WakesMultipleWaiters(t *testing.T) {
 		_ = p.Put(c)
 	}
 
+	p.mu.Lock()
+	if p.idleList.Len() == 3 {
+		for e := p.idleList.Front(); e != nil; e = e.Next() {
+			ic := e.Value.(*idleConn)
+			ic.lastUsed = time.Now().Add(-2 * time.Hour)
+		}
+	}
+
+	var expired []*idleConn
+	now := time.Now()
+	for e := p.idleList.Front(); e != nil; {
+		ic := e.Value.(*idleConn)
+		next := e.Next()
+		if now.Sub(ic.lastUsed) > p.cfg.IdleTimeout {
+			p.idleList.Remove(e)
+			expired = append(expired, ic)
+			atomic.AddInt32(&p.count, -1)
+		}
+		e = next
+	}
+
+	if len(expired) > 0 {
+		p.cond.Broadcast()
+	}
+	p.mu.Unlock()
+
+	for _, ic := range expired {
+		_ = p.cfg.Close(ic.conn)
+	}
+
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -1131,11 +1149,24 @@ func TestReclaimIdleTimeout_WakesMultipleWaiters(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("all waiting Gets should have completed after Put")
+		t.Fatal("all waiting Gets should have completed after reclaim Broadcast")
 	}
 
 	if atomic.LoadInt64(&success) != 3 {
 		t.Errorf("expected 3 successful Gets, got %d", atomic.LoadInt64(&success))
+	}
+
+	mu.Lock()
+	closedCount := len(closed)
+	mu.Unlock()
+	if closedCount != 3 {
+		t.Errorf("expected 3 connections closed by reclaim, got %d", closedCount)
+	}
+
+	for _, oldId := range connIds {
+		if _, exists := gotIds.Load(oldId); exists {
+			t.Errorf("expected new connections, but got old connection id=%d", oldId)
+		}
 	}
 }
 

@@ -143,6 +143,8 @@ func (p *Pool) getIdle() (*idleConn, bool) {
 }
 
 func (p *Pool) Get() (Conn, error) {
+	var deadline time.Time
+
 	for {
 		p.mu.Lock()
 		if p.closed {
@@ -190,18 +192,20 @@ func (p *Pool) Get() (Conn, error) {
 			return nil, ErrPoolExhausted
 		}
 
-		deadline := time.Now().Add(p.cfg.WaitTimeout)
+		if deadline.IsZero() {
+			deadline = time.Now().Add(p.cfg.WaitTimeout)
 
-		go func(d time.Time) {
-			select {
-			case <-time.After(time.Until(d)):
-				p.mu.Lock()
-				p.cond.Broadcast()
-				p.mu.Unlock()
-			case <-p.stopCh:
-				return
-			}
-		}(deadline)
+			go func(d time.Time) {
+				select {
+				case <-time.After(time.Until(d)):
+					p.mu.Lock()
+					p.cond.Broadcast()
+					p.mu.Unlock()
+				case <-p.stopCh:
+					return
+				}
+			}(deadline)
+		}
 
 		for {
 			if p.closed {
