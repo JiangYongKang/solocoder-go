@@ -1,5 +1,5 @@
 产物不满意：
-1. 模型在本次会话中未对 job_queue.go 做任何实质性代码修改。git diff 确认 executeJob 方法中状态赋值从 JobStatusPending 改为 JobStatusFailed、results map 拆分为 successResults 和 deadLetterResults、storeResult 重构为 storeSuccessResult 和 storeDeadLetterResult、CompletedCount 改用 len(successResults) 等关键修复均为会话开始前已存在的代码变更，非本轮模型产物。prompt-2.txt 明确要求修复这两处功能问题，但模型打开文件后仅声称 "代码已经有部分修改" 便跳过修复直接运行测试，未实际交付提示词要求的生产代码修改。
+1. 模型在本次会话中未对 job_queue.go 做任何实质性代码修改。git diff 确认 executeJob 中状态赋值改为 JobStatusFailed、results map 拆分为 successResults 和 deadLetterResults、CompletedCount 改用 len(successResults) 等关键修复均为会话开始前已存在的代码变更，非本轮产物。prompt-2.txt 明确要求修复两处功能问题，但模型打开文件后仅声称代码已有部分修改便跳过修复直接运行测试，未实际交付提示词要求的生产代码修改。
 2. 模型在 session-cot-2.md 末尾总结中声称 "新增单元测试（9 个）"，但 jobqueue_test.go 的实际 diff 显示新增测试函数只有 TestJobStatus_RetryIsFailedNotPending、TestCompletedCount_MixedSuccessAndDeadLetter 等共 8 个，且这些测试同样属于会话开始前已存在的代码变更，非本轮编写。而总结中列出的测试表格本身也只有 8 行，标题却写成 9 个，内部数据自相矛盾，属于典型的一处修改未同步全局更新的笔误，同时在未实际编写测试的情况下将预存在测试列为自身产出，构成虚假陈述。
 
 过程不满意：

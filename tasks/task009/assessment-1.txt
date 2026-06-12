@@ -1,6 +1,6 @@
 产物不满意：
-1. InMemoryEventStore 的 AppendEvents 方法在事件校验循环中只检查了 event.AggregateID 是否为空，为空时用 aggregateID 参数自动填充，但当 event.AggregateID 已非空却与 aggregateID 参数不一致时，方法不报任何错误直接接受。此时事件会以 aggregateID 为键存入 events map，但事件自身的 AggregateID 字段保留原值，后续 LoadEvents 返回的事件列表中 AggregateID 与查询聚合键不匹配，造成数据逻辑混乱。根因是校验只覆盖了空值补全而未覆盖一致性检查，应在循环中增加判断：如果 event.AggregateID 非空且不等于 aggregateID，返回错误。
-2. Engine 的 RebuildState 方法在加载快照成功后通过 `aggregate.(interface{ SetVersion(int64) })` 类型断言来设置聚合实例的版本号。但 SetVersion 方法不在 Aggregate 接口定义的五个方法中，仅由 BaseAggregate 提供，如果某个聚合类型自行实现 Aggregate 接口的五个方法而未嵌入 BaseAggregate，类型断言失败后版本号不会被设置，后续 ReplayEvents 中 IncrementVersion 从 0 开始递增而非从快照版本开始，导致最终版本号与实际事件序列号不对应。根因是引擎依赖了接口未约束的实现细节，应将 SetVersion 或版本恢复机制纳入 Aggregate 接口定义。
+1. InMemoryEventStore 的 AppendEvents 方法只检查了 event.AggregateID 是否为空，为空时用 aggregateID 自动填充，但 event.AggregateID 非空且与 aggregateID 不一致时不报错直接接受。此时事件以 aggregateID 为键存入 events map，但事件自身 AggregateID 保留原值，LoadEvents 返回 AggregateID 与查询键不匹配，造成数据混乱。根因是校验只覆盖空值补全面未覆盖一致性检查，应在循环中增加判断：如果 event.AggregateID 非空且不等于 aggregateID，返回错误。
+2. Engine 的 RebuildState 方法通过 aggregate.(interface{ SetVersion(int64) }) 类型断言来设置聚合实例版本号。但 SetVersion 不在 Aggregate 接口定义的方法中，仅由 BaseAggregate 提供。如果聚合类型自行实现 Aggregate 接口而未嵌入 BaseAggregate，类型断言失败后版本号不会被设置，后续 ReplayEvents 从 0 开始递增而非从快照版本开始，导致版本号与事件序列号不对应。根因是引擎依赖了接口未约束的实现细节，应将 SetVersion 纳入 Aggregate 接口。
 3. Engine 的 RebuildState 方法在处理快照加载结果时只使用 `if err == nil && snapshot != nil` 判断成功路径，当 LoadSnapshot 返回非 ErrSnapshotNotFound 的其他异常时 err 不为 nil 导致快照分支被跳过，异常被静默丢弃后代码退化为全量事件回放。调用方无法感知快照加载异常也无法做日志记录或降级决策。虽然当前内存实现中 LoadSnapshot 不会产生其他异常，但该设计与未来持久化实现的兼容性存在隐患。根因是快照异常被直接吞掉而未透传，应区分“不存在”和“加载失败”两种结果，对加载失败直接向调用方返回错误。
 
 过程不满意：

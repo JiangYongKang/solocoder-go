@@ -1,6 +1,6 @@
 产物不满意：
-1. gateway.go 中 MockUpstreamHandler 的 SetResponse 方法直接写入 statusCode 和 responseBody 两个字段而未加任何互斥锁保护，而 ServeHTTP 方法在另一 goroutine 中不加锁地读取同样的字段。当测试用例在并发场景下调用了 SetResponse 修改响应内容的同时请求到达，可能读到不一致的状态码和响应体组合。根因是 SetResponse 被设计为公开的可变方法但遗漏了并发保护，应将 statusCode 和 responseBody 两个字段与已有的 countMu 互斥锁统一管理，或者将它们的写操作限制在并发请求启动之前完成。
-2. circuit.go 中 FailureEntry 结构体定义了 Success bool 字段，但 RecordFailure 方法始终将其写为 false，RecordSuccess 方法从未向 failures 切片追加任何条目。countRecentFailures 方法中的 `if !entry.Success` 条件判断因 entry.Success 恒为 false 而从未起到过滤作用，成了没有任何实际效果的死代码。根因是模型在定义数据结构时考虑了成功/失败混合记录的设计，但实际实现走的是 RecordSuccess 直接清空 failure 切片的简化路径，未将两种策略统一，应当移除 Success 字段或真正在 RecordSuccess 中也追加成功条目。
+1. gateway.go 中 MockUpstreamHandler 的 SetResponse 方法直接写入 statusCode 和 responseBody 两个字段而未加互斥锁保护，ServeHTTP 在另一 goroutine 中不加锁读取同样的字段。并发场景下 SetResponse 修改响应内容的同时请求到达，可能读到不一致的状态码与响应体组合。根因是 SetResponse 作为公开可变方法遗漏了并发保护，应将这两个字段与已有的 countMu 互斥锁统一管理，或将写操作限制在并发请求启动前完成。
+2. circuit.go 中 FailureEntry 结构体定义了 Success 字段，但 RecordFailure 始终将其写为 false，RecordSuccess 从未向 failures 切片追加条目。countRecentFailures 中 `if !entry.Success` 条件因 entry.Success 恒为 false 从未起到过滤作用，属于死代码。根因是模型设计数据结构时考虑了成功/失败混合记录，但实现时走的是 RecordSuccess 直接清空切片的简化路径，未统一两种策略。应移除 Success 字段或在 RecordSuccess 中也追加成功条目。
 3. ratelimit.go 中定义了 RateLimiterStats 结构体及其 RecordAllowed、RecordDenied、GetStats 三个方法，同时还定义了 extractPort 辅助函数。但这两组代码在整个 gateway 包中从未被任何生产代码或测试用例引用，属于无用的死代码。模型可能将这些功能作为预留扩展接口编写，但在提示词未要求的情况下写入了未使用的代码，违反了精简原则，应当删除这些未被引用的代码以保持包的整洁。
 
 过程不满意：

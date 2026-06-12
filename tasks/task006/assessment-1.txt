@@ -1,7 +1,7 @@
 产物不满意：
-1. scheduler.go 的 Cancel 方法在取消处于 Pending 状态的任务时，将任务状态设为 StatusCancelled 并从最小堆中移除，但没有调用 `delete(s.tasks, id)` 清理 tasks map 中的条目。runLoop 中的堆顶清理循环虽然会 Pop 掉已取消任务，但同样只清除了堆中的元素而未同步删除 map 中的映射。由于被取消的任务已不在堆中，executeTask 永远不会被调用，导致这些任务的 map 条目永久残留。如果一个长期运行的调度器频繁注册并取消任务，tasks map 会无限增长造成内存泄漏。正确做法是在 Cancel 从堆中移除任务后立即执行 `delete(s.tasks, id)`，或在 runLoop 清理堆顶无效任务时同步从 map 中删除。
+1. scheduler.go 的 Cancel 方法取消 Pending 状态的任务时，将任务从最小堆中移除但没有调用 delete(s.tasks, id) 清理 tasks map。runLoop 的堆顶清理循环也只清除堆中元素而未同步删除 map 映射。被取消的任务已不在堆中，executeTask 永远不会被调用，导致 map 条目永久残留。如果调度器频繁注册并取消任务，tasks map 会无限增长造成内存泄漏。正确做法是在 Cancel 从堆中移除任务后立即执行 delete(s.tasks, id)，或在 runLoop 清理堆顶无效任务时同步从 map 中删除。
 
-2. scheduler.go 的 executeTask 方法内部通过 `go func()` 启动了一个 goroutine 执行任务函数，但紧接着又通过 `<-done` channel 阻塞等待该 goroutine 结束，这使得 runLoop 调度循环仍然被任务执行所阻塞，实际上同一时刻只能运行一个任务。goroutine 创建和 channel 同步的开销完全没有带来并发执行的好处，唯一的作用是通过 recover 捕获 panic。正确的做法是去掉多余的 goroutine 和 channel，直接在 executeTask 方法内部用 defer 加 recover 包裹 `task.Func(ctx)` 调用，简化为同步调用即可。
+2. scheduler.go 的 executeTask 方法内部通过 go func() 启动 goroutine 执行任务函数，但又通过 <-done channel 阻塞等待该 goroutine 结束，使得 runLoop 调度循环仍然被任务执行阻塞，同一时刻只能运行一个任务。goroutine 和 channel 的开销完全没有带来并发好处，唯一的作用是 recover 捕获 panic。正确做法是去掉多余的 goroutine 和 channel，直接在 executeTask 内部用 defer 加 recover 包裹 task.Func(ctx) 调用即可。
 
 3. scheduler_test.go 的 TestScheduler_AddCron 测试用例使用 `"* * * * *"` 作为 Cron 表达式，该表达式匹配每一分钟，首次执行时间距离当前时间极短，几乎等同于立即执行。整个测试仅验证了 Cron 任务被调度执行了一次，根本没有检验周期性执行是否符合 Cron 语义，也未能覆盖步长、范围、多值枚举等复杂表达式的调度正确性。由于 nextCronTime 的暴力遍历算法对 `* * * * *` 始终在第一次迭代就命中，等于完全绕过了 Cron 时间计算的核心逻辑。应使用 `"*/5 * * * *"` 等具体表达式并验证多次执行的时间点是否匹配预期。
 

@@ -1,5 +1,5 @@
 产物不满意：
-1. logrotator.go 的 LogRotator 结构体中新增了 onCompressStart 和 onCompressEnd 两个测试钩子字段，这两个回调仅在 rotate 方法的压缩 goroutine 中被调用，用于让测试代码在压缩执行期间观察中间状态。这些字段在生产环境中始终为 nil，不属于业务功能范畴，却增加了结构体复杂度。这是典型的"生产代码向测试妥协"——为了在测试中获取压缩 goroutine 执行期间的状态而修改生产代码的架构，违背了标注规范中"写测试时遇到 mock 困难应该调整测试方案而非改变生产代码的架构"的原则。正确做法是在测试中使用 channel 通知、sync.WaitGroup 控制协程执行时机或直接在测试 goroutine 中轮询文件系统来观察中间状态，而不是在生产结构体中嵌入测试专用回调。
+1. logrotator.go 的 LogRotator 结构体中新增了 onCompressStart 和 onCompressEnd 两个测试钩子字段，仅在 rotate 方法的压缩 goroutine 中被调用，用于让测试代码观察中间状态。这些字段在生产环境中始终为 nil，增加了结构体复杂度。这是典型的生产代码向测试妥协——为了在测试中获取压缩执行期间的状态而修改生产代码架构，违背了标注规范要求。正确做法是在测试中使用 channel 通知、sync.WaitGroup 控制协程执行时机或轮询文件系统来观察中间状态，而不是在生产结构体中嵌入测试专用回调。
 2. TestCompressAndCleanupRace 的 onCompressStart 钩子仅在压缩开始前验证源文件是否存在，但当 Compress 为 true 时 cleanOldBackups 只操作 .gz 文件而不触碰原始备份文件，因此该检查点实际检测的是 rotateBySize 的 rename 操作是否有问题，而非压缩与清理之间的竞态条件。提示词要求验证"压缩 goroutine 执行期间的并发安全"，但该钩子的检查逻辑与竞态窗口之间缺乏直接对应关系，检测到的异常只能反映文件重命名失败而无法揭示压缩与清理的并发冲突。应在 onCompressStart 中额外检查是否存在已被其他 goroutine 压缩完成的同名 .gz 文件来反映并发冲突。
 
 过程不满意：
