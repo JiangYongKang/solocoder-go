@@ -1,0 +1,7 @@
+你实现的延迟任务调度器模块存在一些问题，需要修复：
+1. scheduler.go 的 Cancel 方法在取消处于 Pending 状态的任务时，将任务从最小堆中移除了但没有清理 tasks map 中的条目。被取消的任务永远不会被 executeTask 执行，导致这些任务的 map 条目永久残留。如果调度器长期运行且频繁注册取消任务，tasks map 会无限增长造成内存泄漏。
+2. scheduler.go 的 executeTask 方法内部启动了一个 goroutine 执行任务函数，但紧接着又通过 channel 阻塞等待该 goroutine 结束，使得 runLoop 调度循环仍然被任务执行所阻塞，goroutine 和 channel 的开销没有带来实际的并发收益。
+3. scheduler_test.go 的 TestScheduler_AddCron 测试使用 `* * * * *` 作为 Cron 表达式，该表达式首次执行时间极短几乎等同于立即执行，完全绕过了 Cron 时间计算的核心逻辑，不能检验周期性调度是否符合 Cron 语义。
+4. 修复后为该模块补充内存泄漏场景和 Cron 语义验证场景的单元测试。
+5. 运行 go test ./internal/delaysched/ -v，需要让所有测试通过。
+6. 在 docs/delaysched.md 中更新模块需求文档，说明修复后的任务取消清理机制和 Cron 表达式支持范围。

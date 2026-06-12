@@ -2,9 +2,7 @@ package gateway
 
 import (
 	"net/http"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -105,49 +103,6 @@ func (rl *RateLimiter) Reset(key string) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	delete(rl.tokens, key)
-}
-
-type RateLimiterStats struct {
-	mu      sync.Mutex
-	allowed map[string]int
-	denied  map[string]int
-}
-
-func NewRateLimiterStats() *RateLimiterStats {
-	return &RateLimiterStats{
-		allowed: make(map[string]int),
-		denied:  make(map[string]int),
-	}
-}
-
-func (s *RateLimiterStats) RecordAllowed(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.allowed[key]++
-}
-
-func (s *RateLimiterStats) RecordDenied(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.denied[key]++
-}
-
-func (s *RateLimiterStats) GetStats(key string) (allowed, denied int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.allowed[key], s.denied[key]
-}
-
-func extractPort(hostport string) int {
-	colon := strings.LastIndex(hostport, ":")
-	if colon == -1 {
-		return 0
-	}
-	port, err := strconv.Atoi(hostport[colon+1:])
-	if err != nil {
-		return 0
-	}
-	return port
 }
 
 func min(a, b int) int {

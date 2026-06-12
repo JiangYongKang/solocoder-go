@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+// ------------------------------ Min-Heap Unit Tests ------------------------------
+
 func TestMinHeap_PushPop(t *testing.T) {
 	h := &taskHeap{}
 	heap.Init(h)
@@ -122,6 +124,8 @@ func TestMinHeap_Fix(t *testing.T) {
 		t.Errorf("expected task 1 after fix, got %s", popped.ID)
 	}
 }
+
+// ------------------------------ Scheduler Lifecycle & Basic Tests ------------------------------
 
 func TestNewScheduler(t *testing.T) {
 	s := NewScheduler()
@@ -260,6 +264,8 @@ func TestScheduler_Add_DuplicateID(t *testing.T) {
 	}
 }
 
+// ------------------------------ Cancel Tests ------------------------------
+
 func TestScheduler_Cancel(t *testing.T) {
 	s := NewScheduler()
 	s.Start()
@@ -301,19 +307,26 @@ func TestScheduler_Cancel_NotFound(t *testing.T) {
 	}
 }
 
-func TestScheduler_Cancel_AlreadyCancelled(t *testing.T) {
+// Cancel Pending 任务后 tasks map 被清理，再次 Cancel 应返回 ErrTaskNotFound
+func TestScheduler_Cancel_AlreadyCancelled_ReturnsNotFound(t *testing.T) {
 	s := NewScheduler()
 	s.Start()
 	defer s.Stop()
 
 	_ = s.AddWithID("twice", 500*time.Millisecond, func(_ context.Context) {})
-	_ = s.Cancel("twice")
-
 	err := s.Cancel("twice")
 	if err != nil {
-		t.Errorf("cancelling already cancelled task should return nil, got %v", err)
+		t.Fatalf("first Cancel failed: %v", err)
+	}
+
+	// 由于 Pending 任务被取消时从 tasks map 中移除了，第二次取消找不到任务
+	err = s.Cancel("twice")
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Errorf("expected ErrTaskNotFound for second Cancel (task removed from map), got %v", err)
 	}
 }
+
+// ------------------------------ Reschedule Tests ------------------------------
 
 func TestScheduler_Reschedule(t *testing.T) {
 	s := NewScheduler()
@@ -400,6 +413,8 @@ func TestScheduler_Reschedule_LaterTime(t *testing.T) {
 	}
 }
 
+// ------------------------------ Interval Repeat Tests ------------------------------
+
 func TestScheduler_AddInterval(t *testing.T) {
 	s := NewScheduler()
 	s.Start()
@@ -481,6 +496,8 @@ func TestScheduler_AddIntervalWithID_Duplicate(t *testing.T) {
 		t.Errorf("expected ErrTaskAlreadyExists, got %v", err)
 	}
 }
+
+// ------------------------------ Cron Expression Parsing ------------------------------
 
 func TestCron_Validate(t *testing.T) {
 	tests := []struct {
@@ -569,35 +586,128 @@ func TestCron_NextTime_StepAndRange(t *testing.T) {
 	}
 }
 
-func TestScheduler_AddCron(t *testing.T) {
+// ------------------------------ Cron Scheduler Semantic Tests ------------------------------
+
+// 验证首次执行时间根据 Cron 表达式计算，而非立即执行
+func TestScheduler_Cron_FirstExecuteByCronSemantics(t *testing.T) {
 	s := NewScheduler()
 	s.Start()
 	defer s.Stop()
 
-	done := make(chan struct{}, 1)
-	start := time.Now()
+	now := time.Now()
+	// 选择 5 分钟后的精确分钟，这样 Cron "M * * * *" 的首次执行就是 now+5min
+	targetMinute := (now.Minute() + 5) % 60
+	cronExpr := fmt.Sprintf("%d * * * *", targetMinute)
 
-	nextMinute := start.Add(2 * time.Minute).Minute()
+	taskID := "cron-first-semantic"
+	err := s.AddCronWithID(taskID, 0, cronExpr, func(_ context.Context) {})
+	if err != nil {
+		t.Fatalf("AddCronWithID failed: %v", err)
+	}
+
+	task, err := s.GetTask(taskID)
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+
+	// 首次执行时间的 Minute 必须等于 targetMinute（验证 Cron 语义，而非立即执行）
+	if task.ExecuteAt.Minute() != targetMinute {
+		t.Errorf("expected first ExecuteAt minute = %d (Cron semantics), got %d (ExecuteAt=%v)",
+			targetMinute, task.ExecuteAt.Minute(), task.ExecuteAt)
+	}
+
+	// 验证首次执行时间在合理范围内（不超过 1 小时）
+	upperBound := now.Add(65 * time.Minute)
+	if task.ExecuteAt.After(upperBound) {
+		t.Errorf("first ExecuteAt %v is too far in future (upper bound %v)", task.ExecuteAt, upperBound)
+	}
+	lowerBound := now.Add(4*time.Minute - 10*time.Second)
+	if task.ExecuteAt.Before(lowerBound) {
+		t.Errorf("first ExecuteAt %v is too early (lower bound %v)", task.ExecuteAt, lowerBound)
+	}
+
+	// 验证 RepeatType = RepeatCron 且 CronExpr 正确存储
+	if task.RepeatType != RepeatCron {
+		t.Errorf("expected RepeatType = RepeatCron, got %v", task.RepeatType)
+	}
+	if task.CronExpr != cronExpr {
+		t.Errorf("expected CronExpr = %q, got %q", cronExpr, task.CronExpr)
+	}
+}
+
+// 验证 Cron 任务第一次执行完毕后，第二次执行时间符合 Cron 语义
+func TestScheduler_Cron_NextExecuteSemantics(t *testing.T) {
+	s := NewScheduler()
+	s.Start()
+	defer s.Stop()
+
+	firstExecuted := make(chan struct{}, 1)
+	var firstExecuteAt time.Time
+
+	// 先用通配 Cron 让首次 ExecuteAt = 下一分钟 00 秒
 	cronExpr := "* * * * *"
 
-	_, err := s.AddCron(10*time.Millisecond, cronExpr, func(_ context.Context) {
+	// 添加 Cron 任务，delay=0，首次执行时间由 Cron 决定（下一分钟）
+	err := s.AddCronWithID("cron-next-semantic", 0, cronExpr, func(_ context.Context) {
 		select {
-		case done <- struct{}{}:
+		case firstExecuted <- struct{}{}:
+			firstExecuteAt = time.Now()
 		default:
 		}
 	})
 	if err != nil {
-		t.Fatalf("AddCron failed: %v", err)
+		t.Fatalf("AddCronWithID failed: %v", err)
 	}
-	_ = nextMinute
 
+	// 先确认首次 ExecuteAt 由 Cron 计算（而非立即执行）
+	task, err := s.GetTask("cron-next-semantic")
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+	// 秒必须为 0（Cron 对齐到分钟边界）
+	if task.ExecuteAt.Second() != 0 {
+		t.Errorf("expected first ExecuteAt to be minute-aligned (second=0), got %v (second=%d)",
+			task.ExecuteAt, task.ExecuteAt.Second())
+	}
+
+	// 将任务的执行时间手动改到很近的未来，以快速触发第一次实际执行
+	err = s.RescheduleDelay("cron-next-semantic", 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("RescheduleDelay to near future failed: %v", err)
+	}
+
+	// 等待第一次执行
 	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Error("cron task did not execute in time")
+	case <-firstExecuted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first cron execution did not happen after reschedule")
+	}
+
+	// 给调度器一点时间把任务重新入堆
+	time.Sleep(80 * time.Millisecond)
+
+	task, err = s.GetTask("cron-next-semantic")
+	if err != nil {
+		t.Fatalf("GetTask after first exec failed: %v", err)
+	}
+
+	// 第二次执行时间应该是 firstExecuteAt 之后的下一分钟 00 秒
+	expectedNext := firstExecuteAt.Add(time.Minute).Truncate(time.Minute)
+	// 允许 ±5 秒误差
+	diff := task.ExecuteAt.Sub(expectedNext)
+	if diff < -5*time.Second || diff > 5*time.Second {
+		t.Errorf("expected next ExecuteAt ≈ %v (minute-aligned after first exec), got %v (diff=%v)",
+			expectedNext, task.ExecuteAt, diff)
+	}
+
+	// 验证第二次也是 minute-aligned
+	if task.ExecuteAt.Second() != 0 {
+		t.Errorf("expected next ExecuteAt to be minute-aligned (second=0), got %v (second=%d)",
+			task.ExecuteAt, task.ExecuteAt.Second())
 	}
 }
 
+// 验证无效 Cron 表达式在注册时被拒绝
 func TestScheduler_AddCron_InvalidExpr(t *testing.T) {
 	s := NewScheduler()
 	s.Start()
@@ -629,6 +739,8 @@ func TestScheduler_AddCronWithID_Duplicate(t *testing.T) {
 		t.Errorf("expected ErrTaskAlreadyExists, got %v", err)
 	}
 }
+
+// ------------------------------ Task Query & Other Tests ------------------------------
 
 func TestScheduler_GetTask(t *testing.T) {
 	s := NewScheduler()
@@ -864,6 +976,7 @@ func TestScheduler_Cancel_WhileRunning(t *testing.T) {
 	<-started
 
 	err := s.Cancel("running-task")
+	// 对于执行中的一次性任务，应返回 ErrTaskRunning
 	if !errors.Is(err, ErrTaskRunning) {
 		t.Errorf("expected ErrTaskRunning, got %v", err)
 	}
@@ -871,9 +984,10 @@ func TestScheduler_Cancel_WhileRunning(t *testing.T) {
 	release <- struct{}{}
 	time.Sleep(50 * time.Millisecond)
 
+	// 一次性任务执行完毕后被从 map 清理，再次 Cancel 返回 ErrTaskNotFound
 	err = s.Cancel("running-task")
-	if err != nil && !errors.Is(err, ErrTaskNotFound) {
-		t.Errorf("expected nil or ErrTaskNotFound after completion, got %v", err)
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Errorf("expected ErrTaskNotFound after completion (map cleaned), got %v", err)
 	}
 }
 
@@ -918,5 +1032,131 @@ func TestScheduler_NegativeDelay(t *testing.T) {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
 		t.Error("negative delay task did not execute immediately")
+	}
+}
+
+// ------------------------------ Memory Leak Tests ------------------------------
+
+// 验证：批量注册并取消 Pending 任务后，tasks map 不会无限增长
+func TestScheduler_CancelPending_NoMemoryLeak(t *testing.T) {
+	s := NewScheduler()
+	s.Start()
+	defer s.Stop()
+
+	const iterations = 1000
+	const batchSize = 100
+
+	for i := 0; i < iterations; i++ {
+		// 每轮添加一批任务
+		for j := 0; j < batchSize; j++ {
+			id := fmt.Sprintf("leak-pending-%d-%d", i, j)
+			err := s.AddWithID(id, 10*time.Minute, func(_ context.Context) {})
+			if err != nil {
+				t.Fatalf("iteration %d AddWithID failed: %v", i, err)
+			}
+		}
+		// 每轮再逐一取消
+		for j := 0; j < batchSize; j++ {
+			id := fmt.Sprintf("leak-pending-%d-%d", i, j)
+			err := s.Cancel(id)
+			if err != nil {
+				t.Fatalf("iteration %d Cancel failed: %v", i, err)
+			}
+		}
+	}
+
+	// 所有任务都被取消，TaskCount 应为 0
+	if count := s.TaskCount(); count != 0 {
+		t.Errorf("after %d iterations of add+cancel, TaskCount = %d (expected 0) — memory leak?",
+			iterations, count)
+	}
+
+	// 直接检查 tasks map 大小（通过取消一个不存在的 id 不能检查，但我们可以通过 TaskCount 间接验证）
+	// 额外验证：再次添加 1 个任务后 TaskCount = 1
+	singleID := "leak-verification-single"
+	_ = s.AddWithID(singleID, 10*time.Minute, func(_ context.Context) {})
+	if count := s.TaskCount(); count != 1 {
+		t.Errorf("after adding single task, TaskCount = %d (expected 1) — stale entries remain?", count)
+	}
+	_ = s.Cancel(singleID)
+	if count := s.TaskCount(); count != 0 {
+		t.Errorf("after canceling single task, TaskCount = %d (expected 0)", count)
+	}
+}
+
+// 验证：一次性任务执行完毕后，tasks map 中的条目被清理
+func TestScheduler_CompletedOneTime_NoMemoryLeak(t *testing.T) {
+	s := NewScheduler()
+	s.Start()
+	defer s.Stop()
+
+	const n = 100
+	var wg sync.WaitGroup
+	wg.Add(n)
+
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("complete-once-%d", i)
+		err := s.AddWithID(id, 10*time.Millisecond, func(_ context.Context) {
+			wg.Done()
+		})
+		if err != nil {
+			t.Fatalf("AddWithID %s failed: %v", id, err)
+		}
+	}
+
+	wg.Wait()
+	// 给调度器一些时间执行清理
+	time.Sleep(100 * time.Millisecond)
+
+	if count := s.TaskCount(); count != 0 {
+		t.Errorf("after %d one-time tasks completed, TaskCount = %d (expected 0) — memory leak?", n, count)
+	}
+}
+
+// 验证：周期性任务被取消后（即使是在 Running 状态下取消），tasks map 最终被清理
+func TestScheduler_RepeatCancel_NoMemoryLeak(t *testing.T) {
+	s := NewScheduler()
+	s.Start()
+	defer s.Stop()
+
+	const n = 50
+	var counts [50]int32
+	var wg sync.WaitGroup
+	wg.Add(n)
+
+	for i := 0; i < n; i++ {
+		i := i
+		id := fmt.Sprintf("repeat-cancel-leak-%d", i)
+		err := s.AddIntervalWithID(id, 10*time.Millisecond, 100*time.Millisecond, func(_ context.Context) {
+			atomic.AddInt32(&counts[i], 1)
+			// 第一次执行完成后释放 wg
+			if atomic.LoadInt32(&counts[i]) == 1 {
+				wg.Done()
+			}
+		})
+		if err != nil {
+			t.Fatalf("AddIntervalWithID %s failed: %v", id, err)
+		}
+	}
+
+	// 等待所有任务至少执行一次（此时它们处于已执行或 Pending 下一轮的状态）
+	wg.Wait()
+
+	// 取消所有周期性任务
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("repeat-cancel-leak-%d", i)
+		err := s.Cancel(id)
+		// 某些任务可能正处于 Running，此时返回 ErrTaskRunning；但 Cancel 会将其标记为 Cancelled，
+		// executeTask 完成后会清理
+		if err != nil && !errors.Is(err, ErrTaskRunning) {
+			t.Fatalf("Cancel %s unexpected error: %v", id, err)
+		}
+	}
+
+	// 等待所有 Running 中的任务执行完毕并清理
+	time.Sleep(300 * time.Millisecond)
+
+	if count := s.TaskCount(); count != 0 {
+		t.Errorf("after canceling all %d repeat tasks, TaskCount = %d (expected 0) — memory leak?", n, count)
 	}
 }

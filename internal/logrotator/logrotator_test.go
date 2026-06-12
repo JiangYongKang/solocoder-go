@@ -2,6 +2,7 @@ package logrotator
 
 import (
 	"compress/gzip"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -472,7 +473,6 @@ func TestCompressBackup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	defer lr.Close()
 
 	for i := 0; i < 5; i++ {
 		if err := lr.Log(LevelInfo, msg); err != nil {
@@ -486,6 +486,17 @@ func TestCompressBackup(t *testing.T) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("ReadDir() error = %v", err)
+	}
+
+	hasOrig := false
+	for _, e := range entries {
+		name := e.Name()
+		if name != "app.log" && strings.HasSuffix(name, ".log") && !strings.HasSuffix(name, ".log.gz") {
+			hasOrig = true
+		}
+	}
+	if hasOrig {
+		t.Error("original backup files should be deleted after compression")
 	}
 
 	hasGz := false
@@ -892,4 +903,260 @@ func listFileNames(entries []os.DirEntry) []string {
 		names[i] = e.Name()
 	}
 	return names
+}
+
+func TestCompressRemovesOriginalFile(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "app.log")
+
+	msg := strings.Repeat("data-to-compress", 10)
+
+	cfg := &Config{
+		LevelFileMap: map[Level]string{
+			LevelDebug: logPath,
+			LevelInfo:  logPath,
+			LevelWarn:  logPath,
+			LevelError: logPath,
+		},
+		RotationMode:  RotationModeSize,
+		MaxFileSize:   150,
+		MaxBackups:    10,
+		Compress:      true,
+		TTL:           0,
+		CleanInterval: 0,
+	}
+
+	lr, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	for i := 0; i < 4; i++ {
+		if err := lr.Log(LevelInfo, msg); err != nil {
+			t.Fatalf("Log() #%d error = %v", i, err)
+		}
+	}
+
+	lr.Sync()
+	lr.Close()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+
+	var hasOrigBackup bool
+	var hasGzBackup int
+	for _, e := range entries {
+		name := e.Name()
+		if name == "app.log" {
+			continue
+		}
+		if strings.HasSuffix(name, ".log") && !strings.HasSuffix(name, ".log.gz") {
+			hasOrigBackup = true
+			t.Logf("found uncompressed original backup: %s", name)
+		}
+		if strings.HasSuffix(name, ".gz") {
+			hasGzBackup++
+		}
+	}
+
+	if hasOrigBackup {
+		t.Error("original backup files should be deleted after compression, only .gz should remain")
+	}
+
+	if hasGzBackup == 0 {
+		t.Errorf("expected at least one .gz backup, got files: %v", listFileNames(entries))
+	}
+
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, ".gz") {
+			gzPath := filepath.Join(dir, name)
+			gzFile, err := os.Open(gzPath)
+			if err != nil {
+				t.Fatalf("open gz error: %v", err)
+			}
+			gr, err := gzip.NewReader(gzFile)
+			if err != nil {
+				t.Fatalf("gzip reader error: %v", err)
+			}
+			content, err := io.ReadAll(gr)
+			gr.Close()
+			gzFile.Close()
+			if err != nil {
+				t.Fatalf("read gz content error: %v", err)
+			}
+			if !strings.Contains(string(content), "data-to-compress") {
+				t.Errorf("gz content missing expected data in %s", name)
+			}
+		}
+	}
+}
+
+func TestCompressAndCleanupRace(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "app.log")
+
+	msg := strings.Repeat("race-test-data", 5)
+
+	cfg := &Config{
+		LevelFileMap: map[Level]string{
+			LevelDebug: logPath,
+			LevelInfo:  logPath,
+			LevelWarn:  logPath,
+			LevelError: logPath,
+		},
+		RotationMode:  RotationModeSize,
+		MaxFileSize:   120,
+		MaxBackups:    2,
+		Compress:      true,
+		TTL:           0,
+		CleanInterval: 0,
+	}
+
+	lr, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	rotateCount := 8
+	for i := 0; i < rotateCount; i++ {
+		if err := lr.Log(LevelInfo, fmt.Sprintf("%s-%d", msg, i)); err != nil {
+			t.Fatalf("Log() #%d error = %v", i, err)
+		}
+	}
+
+	lr.Sync()
+	lr.Close()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+
+	var origBackups []string
+	var gzBackups []string
+	for _, e := range entries {
+		name := e.Name()
+		if name == "app.log" {
+			continue
+		}
+		if strings.HasSuffix(name, ".log") {
+			origBackups = append(origBackups, name)
+		}
+		if strings.HasSuffix(name, ".gz") {
+			gzBackups = append(gzBackups, name)
+		}
+	}
+
+	if len(origBackups) > 0 {
+		t.Errorf("expected no uncompressed original backups, but found: %v", origBackups)
+	}
+
+	expectedBackups := cfg.MaxBackups
+	if len(gzBackups) > expectedBackups {
+		t.Errorf("too many .gz backups: got %d, want <= %d, backups: %v", len(gzBackups), expectedBackups, gzBackups)
+	}
+
+	if len(gzBackups) == 0 {
+		t.Errorf("expected at least some .gz backups, got none, all files: %v", listFileNames(entries))
+	}
+
+	t.Logf("result: %d .gz backups, %d original backups", len(gzBackups), len(origBackups))
+	t.Logf("all files: %v", listFileNames(entries))
+
+	for _, name := range gzBackups {
+		gzPath := filepath.Join(dir, name)
+		gzFile, err := os.Open(gzPath)
+		if err != nil {
+			t.Fatalf("open gz %s error: %v", name, err)
+		}
+		gr, err := gzip.NewReader(gzFile)
+		if err != nil {
+			t.Fatalf("gzip reader for %s error: %v (file may be corrupted due to race)", name, err)
+		}
+		_, err = io.ReadAll(gr)
+		gr.Close()
+		gzFile.Close()
+		if err != nil {
+			t.Fatalf("read gz %s content error: %v (file may be truncated due to race)", name, err)
+		}
+	}
+}
+
+func TestConcurrentRotateWithCompress(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "app.log")
+
+	cfg := &Config{
+		LevelFileMap: map[Level]string{
+			LevelDebug: logPath,
+			LevelInfo:  logPath,
+			LevelWarn:  logPath,
+			LevelError: logPath,
+		},
+		RotationMode:  RotationModeSize,
+		MaxFileSize:   500,
+		MaxBackups:    3,
+		Compress:      true,
+		TTL:           0,
+		CleanInterval: 0,
+	}
+
+	lr, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	goroutines := 4
+	msgsPerGoroutine := 50
+	done := make(chan bool, goroutines)
+
+	for g := 0; g < goroutines; g++ {
+		go func(id int) {
+			for i := 0; i < msgsPerGoroutine; i++ {
+				lvl := Level(id % 4)
+				msg := fmt.Sprintf("goroutine-%d msg-%d data-%s", id, i, strings.Repeat("x", 20))
+				_ = lr.Log(lvl, msg)
+			}
+			done <- true
+		}(g)
+	}
+
+	for g := 0; g < goroutines; g++ {
+		<-done
+	}
+
+	lr.Sync()
+	lr.Close()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+
+	var origBackups, gzBackups int
+	for _, e := range entries {
+		name := e.Name()
+		if name == "app.log" {
+			continue
+		}
+		if strings.HasSuffix(name, ".log") {
+			origBackups++
+		}
+		if strings.HasSuffix(name, ".gz") {
+			gzBackups++
+		}
+	}
+
+	if origBackups > 0 {
+		t.Errorf("found %d uncompressed original backups, should be 0", origBackups)
+	}
+
+	if gzBackups > cfg.MaxBackups {
+		t.Errorf("gz backups = %d, exceed MaxBackups = %d", gzBackups, cfg.MaxBackups)
+	}
+
+	t.Logf("concurrent test result: %d .gz backups, %d original backups", gzBackups, origBackups)
 }

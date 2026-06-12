@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -616,25 +617,50 @@ func TestConcurrentGet(t *testing.T) {
 func TestConcurrentPutAndGet(t *testing.T) {
 	kv := NewKVStore()
 
-	var wg sync.WaitGroup
+	numKeys := 500
+	for i := 0; i < numKeys; i++ {
+		kv.Put(fmt.Sprintf("pkey%d", i), fmt.Sprintf("pval%d", i))
+	}
 
-	wg.Add(1)
+	var wg sync.WaitGroup
+	var getErrors int64
+	var valueMismatches int64
+
+	wg.Add(2)
+
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 500; i++ {
-			kv.Put(fmt.Sprintf("pkey%d", i), fmt.Sprintf("pval%d", i))
+		for i := 0; i < numKeys; i++ {
+			kv.Put(fmt.Sprintf("pkey%d", i), fmt.Sprintf("pval_updated_%d", i))
 		}
 	}()
 
-	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 500; i++ {
-			kv.Get(fmt.Sprintf("pkey%d", i))
+		for i := 0; i < numKeys; i++ {
+			val, ok := kv.Get(fmt.Sprintf("pkey%d", i))
+			if !ok {
+				atomic.AddInt64(&getErrors, 1)
+				t.Errorf("Get returned ok=false for key pkey%d which was pre-populated (concurrent consistency violation)", i)
+				continue
+			}
+			expectedOld := fmt.Sprintf("pval%d", i)
+			expectedNew := fmt.Sprintf("pval_updated_%d", i)
+			if val != expectedOld && val != expectedNew {
+				atomic.AddInt64(&valueMismatches, 1)
+				t.Errorf("Get returned unexpected value for pkey%d: got %q, expected %q or %q", i, val, expectedOld, expectedNew)
+			}
 		}
 	}()
 
 	wg.Wait()
+
+	if getErrors > 0 {
+		t.Errorf("found %d Get consistency errors (ok=false for pre-existing keys)", getErrors)
+	}
+	if valueMismatches > 0 {
+		t.Errorf("found %d value mismatches during concurrent Put/Get", valueMismatches)
+	}
 }
 
 func TestConcurrentDelete(t *testing.T) {
@@ -1107,5 +1133,232 @@ func TestErrors_Values(t *testing.T) {
 	}
 	if ErrNilSnapshot == nil {
 		t.Error("ErrNilSnapshot should not be nil")
+	}
+}
+
+func TestConcurrentPutGet_SameKey_Consistency(t *testing.T) {
+	kv := NewKVStore()
+
+	const key = "shared_hot_key"
+	kv.Put(key, "initial")
+
+	var wg sync.WaitGroup
+	var phantomMisses int64
+	var totalGets int64
+
+	numWriters := 10
+	numReaders := 20
+	iterationsPerGoroutine := 1000
+
+	for w := 0; w < numWriters; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iterationsPerGoroutine; i++ {
+				kv.Put(key, fmt.Sprintf("writer_%d_iter_%d", id, i))
+			}
+		}(w)
+	}
+
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterationsPerGoroutine; i++ {
+				_, ok := kv.Get(key)
+				atomic.AddInt64(&totalGets, 1)
+				if !ok {
+					atomic.AddInt64(&phantomMisses, 1)
+					t.Errorf("PHANTOM MISS: Get returned ok=false for key %q which should always exist (concurrent consistency violation)", key)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if phantomMisses > 0 {
+		t.Errorf("Detected %d phantom misses out of %d total Gets - concurrent consistency is broken!", phantomMisses, totalGets)
+	} else {
+		t.Logf("All %d Gets returned ok=true during concurrent writes (no phantom misses)", totalGets)
+	}
+
+	_, ok := kv.Get(key)
+	if !ok {
+		t.Error("Final check: key should exist after all goroutines complete")
+	}
+}
+
+func TestConcurrentPutGet_MultipleKeys_NoPhantomMisses(t *testing.T) {
+	kv := NewKVStore()
+
+	numKeys := 200
+	for i := 0; i < numKeys; i++ {
+		kv.Put(fmt.Sprintf("k%03d", i), fmt.Sprintf("v%03d_initial", i))
+	}
+
+	var wg sync.WaitGroup
+	var phantomMisses int64
+
+	numWriters := 5
+	numReaders := 15
+	iterations := 500
+
+	for w := 0; w < numWriters; w++ {
+		wg.Add(1)
+		go func(wid int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				idx := i % numKeys
+				kv.Put(fmt.Sprintf("k%03d", idx), fmt.Sprintf("w%d_v%d", wid, i))
+			}
+		}(w)
+	}
+
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				idx := i % numKeys
+				key := fmt.Sprintf("k%03d", idx)
+				_, ok := kv.Get(key)
+				if !ok {
+					atomic.AddInt64(&phantomMisses, 1)
+					t.Errorf("PHANTOM MISS on key %q during concurrent Put/Get", key)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if phantomMisses > 0 {
+		t.Errorf("Found %d phantom misses across %d readers x %d iterations", phantomMisses, numReaders, iterations)
+	}
+
+	if kv.Count() != numKeys {
+		t.Errorf("expected %d keys after concurrent ops, got %d", numKeys, kv.Count())
+	}
+}
+
+func TestConcurrentBatchPutAndGet_Consistency(t *testing.T) {
+	kv := NewKVStore()
+
+	baseBatchSize := 10
+	for i := 0; i < baseBatchSize; i++ {
+		kv.Put(fmt.Sprintf("init_%d", i), fmt.Sprintf("initval_%d", i))
+	}
+
+	var wg sync.WaitGroup
+	var phantomMisses int64
+
+	numBatchWriters := 5
+	numReaders := 10
+	iterations := 200
+
+	for w := 0; w < numBatchWriters; w++ {
+		wg.Add(1)
+		go func(wid int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				pairs := make(map[string]string)
+				for k := 0; k < 5; k++ {
+					pairs[fmt.Sprintf("batch_w%d_i%d_k%d", wid, i, k)] = fmt.Sprintf("v_w%d_%d_%d", wid, i, k)
+				}
+				pairs[fmt.Sprintf("init_%d", wid%baseBatchSize)] = fmt.Sprintf("updated_by_w%d_i%d", wid, i)
+				err := kv.BatchPut(pairs)
+				if err != nil {
+					t.Errorf("BatchPut failed: %v", err)
+				}
+			}
+		}(w)
+	}
+
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func(rid int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				key := fmt.Sprintf("init_%d", (rid+i)%baseBatchSize)
+				_, ok := kv.Get(key)
+				if !ok {
+					atomic.AddInt64(&phantomMisses, 1)
+					t.Errorf("PHANTOM MISS on pre-populated key %q during concurrent BatchPut", key)
+				}
+			}
+		}(r)
+	}
+
+	wg.Wait()
+
+	if phantomMisses > 0 {
+		t.Errorf("Found %d phantom misses during concurrent BatchPut+Get", phantomMisses)
+	}
+
+	if kv.Count() < baseBatchSize {
+		t.Errorf("expected at least %d keys, got %d", baseBatchSize, kv.Count())
+	}
+}
+
+func TestConcurrentPutDeleteAndGet_NoInconsistency(t *testing.T) {
+	kv := NewKVStore()
+
+	numKeys := 100
+	for i := 0; i < numKeys; i++ {
+		kv.Put(fmt.Sprintf("cdkey_%d", i), fmt.Sprintf("cdval_%d", i))
+	}
+
+	var wg sync.WaitGroup
+	var getErrors int64
+
+	numPutters := 5
+	numDeleters := 5
+	numReaders := 10
+	iterations := 300
+
+	for p := 0; p < numPutters; p++ {
+		wg.Add(1)
+		go func(pid int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				idx := (pid*iterations + i) % numKeys
+				kv.Put(fmt.Sprintf("cdkey_%d", idx), fmt.Sprintf("p%d_cdval_%d", pid, i))
+			}
+		}(p)
+	}
+
+	for d := 0; d < numDeleters; d++ {
+		wg.Add(1)
+		go func(did int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				idx := (did*iterations + i) % numKeys
+				kv.Delete(fmt.Sprintf("cdkey_%d", idx))
+			}
+		}(d)
+	}
+
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				for k := 0; k < numKeys; k++ {
+					key := fmt.Sprintf("cdkey_%d", k)
+					val, ok := kv.Get(key)
+					if ok && val == "" {
+						atomic.AddInt64(&getErrors, 1)
+						t.Errorf("INCONSISTENCY: key %q returned ok=true with empty value", key)
+					}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if getErrors > 0 {
+		t.Errorf("Detected %d value inconsistencies during concurrent Put/Delete/Get", getErrors)
 	}
 }

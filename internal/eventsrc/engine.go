@@ -1,5 +1,7 @@
 package eventsrc
 
+import "errors"
+
 type EventSourcingEngine struct {
 	eventStore    EventStore
 	snapshotStore SnapshotStore
@@ -51,19 +53,21 @@ func (e *EventSourcingEngine) RebuildState(aggregate Aggregate) error {
 	fromVersion := int64(0)
 
 	snapshot, err := e.snapshotStore.LoadSnapshot(aggregateID)
-	if err == nil && snapshot != nil {
+	if err != nil {
+		if !errors.Is(err, ErrSnapshotNotFound) {
+			return err
+		}
+	} else if snapshot != nil {
 		if err := aggregate.UnmarshalState(snapshot.State); err != nil {
 			return err
 		}
 		fromVersion = snapshot.Version
-		if base, ok := aggregate.(interface{ SetVersion(int64) }); ok {
-			base.SetVersion(snapshot.Version)
-		}
+		aggregate.SetVersion(snapshot.Version)
 	}
 
 	events, err := e.eventStore.LoadEvents(aggregateID, fromVersion)
 	if err != nil {
-		if err == ErrAggregateNotFound && fromVersion == 0 {
+		if errors.Is(err, ErrAggregateNotFound) && fromVersion == 0 {
 			return nil
 		}
 		return err

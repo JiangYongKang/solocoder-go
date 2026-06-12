@@ -48,6 +48,7 @@
 **方法说明：**
 - `AggregateID()`：返回聚合实例的唯一标识
 - `Version()`：返回聚合实例的当前版本号
+- `SetVersion(version int64)`：设置聚合实例的版本号（快照恢复时使用）
 - `Apply(event *Event) error`：应用事件到聚合实例，更新内部状态
 - `MarshalState() ([]byte, error)`：将聚合状态序列化为字节数组
 - `UnmarshalState(data []byte) error`：从字节数组反序列化恢复聚合状态
@@ -120,12 +121,19 @@
               v
          EventStore.AppendEvents()
               |
-              +-- 校验聚合ID有效性
-              +-- 校验事件列表非空
+              +-- 校验聚合ID有效性（空ID -> ErrInvalidAggregateID）
+              +-- 校验事件列表非空（空列表 -> ErrInvalidEvent）
+              +-- 校验每个事件非空（nil事件 -> ErrEventNil）
+              +-- 校验事件的AggregateID一致性
+              |     |
+              |     +-- 事件AggregateID非空且与目标聚合ID不一致 -> ErrAggregateIDMismatch
+              |     +-- 事件AggregateID为空 -> 后续自动填充目标聚合ID
+              |
               +-- 校验当前版本与期望版本是否一致
               |     |
               |     +-- 不一致 -> 返回 ErrVersionConflict
               |
+              +-- 为每个事件设置AggregateID（如为空）
               +-- 为每个事件分配递增的版本号
               +-- 将事件追加到事件列表
               +-- 更新聚合实例版本号
@@ -133,6 +141,13 @@
               v
          返回成功
 ```
+
+**事件校验策略说明：**
+- 每个事件在追加前都会进行严格校验，确保数据一致性
+- 如果事件已设置 `AggregateID`，则必须与目标聚合ID完全一致，否则返回 `ErrAggregateIDMismatch` 错误
+- 如果事件未设置 `AggregateID`（为空字符串），则在追加时自动填充为目标聚合ID
+- 事件校验在版本校验和实际写入之前完成，确保部分失败不会导致数据不一致
+- 所有校验均在获取写锁之前完成，避免持锁期间的无效计算
 
 **乐观锁机制说明：**
 - 每次追加事件时需要传入期望版本号
@@ -145,31 +160,70 @@
 调用方 -> EventSourcingEngine.RebuildState(aggregate)
               |
               v
-         1. 尝试加载快照
+         1. 校验参数有效性
               |
-              +-- 快照存在
+              +-- aggregate为nil -> 返回 ErrAggregateNil
+              +-- aggregate.AggregateID()为空 -> 返回 ErrInvalidAggregateID
+              |
+              v
+         2. 尝试加载快照
+              |
+              +-- 加载快照出错
               |     |
-              |     +-- 从快照反序列化状态到聚合
-              |     +-- 设置聚合版本为快照版本
-              |     +-- fromVersion = 快照版本
+              |     +-- 错误为 ErrSnapshotNotFound
+              |     |     |
+              |     |     +-- 视为无快照，fromVersion = 0，继续
+              |     |
+              |     +-- 其他错误（如存储异常）
+              |           |
+              |           +-- 直接向调用方返回错误，不做降级处理
               |
-              +-- 快照不存在
+              +-- 快照加载成功且非空
                     |
-                    +-- fromVersion = 0
+                    +-- aggregate.UnmarshalState(snapshot.State)
+                    |     |
+                    |     +-- 失败 -> 返回反序列化错误
+                    |
+                    +-- fromVersion = snapshot.Version
+                    +-- aggregate.SetVersion(snapshot.Version)  // 通过接口直接调用
               |
               v
-         2. 加载 fromVersion 之后的所有事件
+         3. 加载 fromVersion 之后的所有事件
               |
-              v
-         3. 按顺序回放事件
+              +-- 加载出错
+              |     |
+              |     +-- ErrAggregateNotFound 且 fromVersion == 0
+              |     |     |
+              |     |     +-- 视为新建聚合，返回nil（无状态）
+              |     |
+              |     +-- 其他错误 -> 返回错误
+              |
+              +-- 加载成功
+                    |
+                    v
+         4. 按顺序回放事件
               |
               +-- 遍历事件列表
               +-- 逐个调用 aggregate.Apply(event)
-              +-- 每个事件应用后版本号递增
+              +-- 任何事件应用失败 -> 返回错误
               |
               v
          返回成功，聚合状态为最新
 ```
+
+**状态重建错误处理机制说明：**
+- **快照加载错误分类处理**：
+  - `ErrSnapshotNotFound` 视为正常情况（无快照），继续从版本0开始全量回放
+  - 其他任何快照加载错误（如底层存储异常、数据损坏等）都会直接返回给调用方，不会静默降级
+  - 确保调用方能感知快照系统的异常，而不是默默回退到全量回放导致性能问题
+- **版本号设置保证**：
+  - `SetVersion` 方法已纳入 `Aggregate` 接口约束，所有聚合实现必须提供该方法
+  - 快照恢复时通过接口直接调用 `aggregate.SetVersion(snapshot.Version)`，无需类型断言
+  - 保证无论聚合是否嵌入 `BaseAggregate`，版本号都能被正确设置，避免后续事件回放版本错位
+- **事件加载错误分类处理**：
+  - 仅当没有快照（fromVersion==0）且聚合不存在时，才视为新建聚合返回nil
+  - 已有快照但后续事件加载失败时，直接返回错误，避免基于不完整数据构建状态
+- **事件回放错误**：任何 `Apply` 错误都会中断回放并向上传播，确保状态一致性
 
 ### 3. 快照生成流程
 
@@ -432,9 +486,10 @@ func main() {
 |---------|------|
 | `ErrAggregateNotFound` | 聚合实例不存在 |
 | `ErrVersionConflict` | 版本冲突（乐观锁校验失败） |
-| `ErrInvalidEvent` | 无效事件 |
+| `ErrInvalidEvent` | 无效事件（空事件列表） |
 | `ErrSnapshotNotFound` | 快照不存在 |
 | `ErrAggregateNil` | 聚合实例为空 |
 | `ErrEventNil` | 事件为空 |
 | `ErrSnapshotNil` | 快照为空 |
-| `ErrInvalidAggregateID` | 无效的聚合ID |
+| `ErrInvalidAggregateID` | 无效的聚合ID（空字符串） |
+| `ErrAggregateIDMismatch` | 事件的AggregateID与目标聚合ID不匹配 |

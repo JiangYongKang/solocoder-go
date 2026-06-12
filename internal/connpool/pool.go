@@ -11,8 +11,6 @@ import (
 var (
 	ErrPoolClosed    = errors.New("connpool: pool is closed")
 	ErrPoolExhausted = errors.New("connpool: pool exhausted")
-	ErrConnExpired   = errors.New("connpool: connection expired")
-	ErrConnBad       = errors.New("connpool: bad connection")
 )
 
 type Factory func() (Conn, error)
@@ -73,9 +71,6 @@ func NewPool(cfg Config) (*Pool, error) {
 	}
 	if cfg.Close == nil {
 		cfg.Close = func(Conn) error { return nil }
-	}
-	if cfg.Ping == nil {
-		cfg.Ping = func(Conn) error { return nil }
 	}
 
 	p := &Pool{
@@ -148,8 +143,6 @@ func (p *Pool) getIdle() (*idleConn, bool) {
 }
 
 func (p *Pool) Get() (Conn, error) {
-	var deadline time.Time
-
 	for {
 		p.mu.Lock()
 		if p.closed {
@@ -197,38 +190,29 @@ func (p *Pool) Get() (Conn, error) {
 			return nil, ErrPoolExhausted
 		}
 
-		if deadline.IsZero() {
-			deadline = time.Now().Add(p.cfg.WaitTimeout)
-		}
+		deadline := time.Now().Add(p.cfg.WaitTimeout)
 
-		timedOut := make(chan struct{})
-		stopped := make(chan struct{})
-		go func() {
+		go func(d time.Time) {
 			select {
-			case <-time.After(time.Until(deadline)):
+			case <-time.After(time.Until(d)):
 				p.mu.Lock()
 				p.cond.Broadcast()
 				p.mu.Unlock()
-				close(timedOut)
-			case <-stopped:
+			case <-p.stopCh:
 				return
 			}
-		}()
+		}(deadline)
 
 		for {
 			if p.closed {
-				close(stopped)
 				p.mu.Unlock()
 				return nil, ErrPoolClosed
 			}
-			select {
-			case <-timedOut:
+			if time.Now().After(deadline) {
 				p.mu.Unlock()
 				return nil, ErrPoolExhausted
-			default:
 			}
 			if p.idleList.Len() > 0 || atomic.LoadInt32(&p.count) < int32(p.cfg.MaxCap) {
-				close(stopped)
 				break
 			}
 			p.cond.Wait()
@@ -434,6 +418,10 @@ func (p *Pool) reclaimIdleTimeout() {
 			atomic.AddInt32(&p.count, -1)
 		}
 		e = next
+	}
+
+	if len(expired) > 0 {
+		p.cond.Broadcast()
 	}
 	p.mu.Unlock()
 

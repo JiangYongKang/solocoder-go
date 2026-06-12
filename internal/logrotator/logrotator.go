@@ -151,17 +151,28 @@ func (lr *LogRotator) Log(level Level, message string) error {
 			continue
 		}
 
-		if err := lr.checkAndRotate(path, fw, int64(len(data))); err != nil {
-			return err
-		}
+		needTimeRotate := lr.needsTimeRotate(fw)
 
-		fw = lr.writers[path]
+		if needTimeRotate {
+			if err := lr.rotate(fw); err != nil {
+				return err
+			}
+			fw = lr.writers[path]
+		}
 
 		n, err := fw.file.Write(data)
 		if err != nil {
 			return fmt.Errorf("write log failed: %w", err)
 		}
 		fw.size += int64(n)
+
+		if lr.config.RotationMode == RotationModeSize &&
+			lr.config.MaxFileSize > 0 &&
+			fw.size >= lr.config.MaxFileSize {
+			if err := lr.rotate(fw); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -183,19 +194,6 @@ func (lr *LogRotator) pathsForLevel(level Level) []string {
 	return paths
 }
 
-func (lr *LogRotator) checkAndRotate(path string, fw *fileWriter, incomingSize int64) error {
-	needsSizeRotate := lr.config.RotationMode == RotationModeSize &&
-		lr.config.MaxFileSize > 0 &&
-		fw.size+incomingSize > lr.config.MaxFileSize
-
-	if needsSizeRotate || lr.needsTimeRotate(fw) {
-		if err := lr.rotate(fw); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (lr *LogRotator) rotate(fw *fileWriter) error {
 	if err := fw.file.Close(); err != nil {
 		return fmt.Errorf("close old log file failed: %w", err)
@@ -208,14 +206,6 @@ func (lr *LogRotator) rotate(fw *fileWriter) error {
 		backupPath = lr.rotateByTime(fw.path, fw.date)
 	}
 
-	if lr.config.Compress && backupPath != "" {
-		lr.wg.Add(1)
-		go func(src string) {
-			defer lr.wg.Done()
-			_ = compressFile(src)
-		}(backupPath)
-	}
-
 	newFw, err := lr.openWriter(fw.path)
 	if err != nil {
 		return err
@@ -223,7 +213,18 @@ func (lr *LogRotator) rotate(fw *fileWriter) error {
 
 	lr.writers[fw.path] = newFw
 
-	lr.cleanOldBackups(fw.path)
+	if lr.config.Compress && backupPath != "" {
+		lr.wg.Add(1)
+		go func(src string, targetPath string) {
+			defer lr.wg.Done()
+			if err := compressAndRemove(src); err != nil {
+				return
+			}
+			lr.cleanOldBackups(targetPath)
+		}(backupPath, fw.path)
+	} else if !lr.config.Compress {
+		lr.cleanOldBackups(fw.path)
+	}
 
 	return nil
 }
@@ -236,11 +237,14 @@ func (lr *LogRotator) rotateBySize(path string) string {
 	for {
 		index++
 		candidate := fmt.Sprintf("%s.%d%s", base, index, ext)
+		candidateGz := candidate + ".gz"
 		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			if err := os.Rename(path, candidate); err != nil {
-				return ""
+			if _, errGz := os.Stat(candidateGz); os.IsNotExist(errGz) {
+				if err := os.Rename(path, candidate); err != nil {
+					return ""
+				}
+				return candidate
 			}
-			return candidate
 		}
 	}
 }
@@ -251,8 +255,11 @@ func (lr *LogRotator) rotateByTime(path, oldDate string) string {
 	candidate := fmt.Sprintf("%s.%s%s", base, oldDate, ext)
 
 	if _, err := os.Stat(candidate); err == nil {
-		now := lr.clock()
-		candidate = fmt.Sprintf("%s.%s-%d%s", base, oldDate, now.UnixNano(), ext)
+		candidateGz := candidate + ".gz"
+		if _, errGz := os.Stat(candidateGz); errGz == nil {
+			now := lr.clock()
+			candidate = fmt.Sprintf("%s.%s-%d%s", base, oldDate, now.UnixNano(), ext)
+		}
 	}
 
 	if err := os.Rename(path, candidate); err != nil {
@@ -282,6 +289,17 @@ func (lr *LogRotator) cleanOldBackups(path string) {
 			continue
 		}
 		name := entry.Name()
+
+		if lr.config.Compress {
+			if !strings.HasSuffix(name, ".gz") {
+				continue
+			}
+		} else {
+			if strings.HasSuffix(name, ".gz") {
+				continue
+			}
+		}
+
 		origName := name
 		if strings.HasSuffix(name, ".gz") {
 			origName = strings.TrimSuffix(name, ".gz")
@@ -314,24 +332,43 @@ func (lr *LogRotator) cleanOldBackups(path string) {
 	}
 }
 
-func compressFile(src string) error {
+func compressAndRemove(src string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	defer srcFile.Close()
 
 	dstPath := src + ".gz"
 	dstFile, err := os.Create(dstPath)
 	if err != nil {
+		srcFile.Close()
 		return err
 	}
-	defer dstFile.Close()
 
 	gzWriter := gzip.NewWriter(dstFile)
-	defer gzWriter.Close()
 
-	if _, err := io.Copy(gzWriter, srcFile); err != nil {
+	_, copyErr := io.Copy(gzWriter, srcFile)
+	gzCloseErr := gzWriter.Close()
+	dstCloseErr := dstFile.Close()
+	srcCloseErr := srcFile.Close()
+
+	if copyErr != nil {
+		os.Remove(dstPath)
+		return copyErr
+	}
+	if gzCloseErr != nil {
+		os.Remove(dstPath)
+		return gzCloseErr
+	}
+	if dstCloseErr != nil {
+		os.Remove(dstPath)
+		return dstCloseErr
+	}
+	if srcCloseErr != nil {
+		return srcCloseErr
+	}
+
+	if err := os.Remove(src); err != nil {
 		return err
 	}
 

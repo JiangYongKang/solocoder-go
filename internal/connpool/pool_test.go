@@ -808,3 +808,387 @@ func TestIdleTimeout_ActiveConnNotReclaimed(t *testing.T) {
 		t.Errorf("expected still 1 after put active back, got %d", afterPut)
 	}
 }
+
+func TestReclaimIdleTimeout_ReleasesCapacity(t *testing.T) {
+	var closed []int
+	var mu sync.Mutex
+
+	p, err := NewPool(Config{
+		InitialCap:  3,
+		MaxCap:      3,
+		IdleTimeout: 60 * time.Millisecond,
+		WaitTimeout: 5 * time.Second,
+		Factory:     makeFactory(),
+		Close:       makeClose(&closed, &mu),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer p.Close()
+
+	if p.Len() != 3 {
+		t.Fatalf("expected Len=3 initially, got %d", p.Len())
+	}
+	if p.IdleCount() != 3 {
+		t.Fatalf("expected IdleCount=3 initially, got %d", p.IdleCount())
+	}
+
+	time.Sleep(120 * time.Millisecond)
+
+	mu.Lock()
+	closedCount := len(closed)
+	mu.Unlock()
+	if closedCount != 3 {
+		t.Errorf("expected 3 connections reclaimed, got %d", closedCount)
+	}
+	if p.Len() != 0 {
+		t.Errorf("expected Len=0 after reclaim, got %d", p.Len())
+	}
+	if p.IdleCount() != 0 {
+		t.Errorf("expected IdleCount=0 after reclaim, got %d", p.IdleCount())
+	}
+
+	c1, err := p.Get()
+	if err != nil {
+		t.Fatalf("expected to create new connection after reclaim, got: %v", err)
+	}
+	if c1 == nil {
+		t.Fatal("expected non-nil connection")
+	}
+	if p.Len() != 1 {
+		t.Errorf("expected Len=1 after creating new conn, got %d", p.Len())
+	}
+
+	c2, err := p.Get()
+	if err != nil {
+		t.Fatalf("expected to create second new connection, got: %v", err)
+	}
+	c3, err := p.Get()
+	if err != nil {
+		t.Fatalf("expected to create third new connection, got: %v", err)
+	}
+
+	if p.Len() != 3 {
+		t.Errorf("expected Len=3 at MaxCap, got %d", p.Len())
+	}
+
+	_, err = p.Get()
+	if err != ErrPoolExhausted {
+		t.Errorf("expected ErrPoolExhausted, got %v", err)
+	}
+
+	_ = p.Put(c1)
+	_ = p.Put(c2)
+	_ = p.Put(c3)
+}
+
+func TestReclaimIdleTimeout_WakesWaitingGet(t *testing.T) {
+	var closed []int
+	var mu sync.Mutex
+
+	p, err := NewPool(Config{
+		InitialCap:  2,
+		MaxCap:      2,
+		IdleTimeout: 60 * time.Millisecond,
+		WaitTimeout: 5 * time.Second,
+		Factory:     makeFactory(),
+		Close:       makeClose(&closed, &mu),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer p.Close()
+
+	c1, _ := p.Get()
+	c2, _ := p.Get()
+
+	_ = p.Put(c1)
+	_ = p.Put(c2)
+
+	time.Sleep(120 * time.Millisecond)
+
+	mu.Lock()
+	closedCount := len(closed)
+	mu.Unlock()
+	if closedCount != 2 {
+		t.Fatalf("expected 2 connections reclaimed, got %d", closedCount)
+	}
+	if p.Len() != 0 {
+		t.Fatalf("expected Len=0 after reclaim, got %d", p.Len())
+	}
+
+	active1, _ := p.Get()
+	active2, _ := p.Get()
+
+	if p.Len() != 2 {
+		t.Fatalf("expected Len=2, got %d", p.Len())
+	}
+
+	var wg sync.WaitGroup
+	var success int64
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := p.Get()
+			if err == nil && c != nil {
+				atomic.AddInt64(&success, 1)
+				time.Sleep(10 * time.Millisecond)
+				_ = p.Put(c)
+			}
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if atomic.LoadInt64(&success) != 0 {
+		t.Fatalf("no Get should succeed yet, got %d", atomic.LoadInt64(&success))
+	}
+
+	_ = p.Put(active1)
+
+	time.Sleep(120 * time.Millisecond)
+
+	_ = p.Put(active2)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for all Gets to complete")
+	}
+
+	if atomic.LoadInt64(&success) != 3 {
+		t.Errorf("expected 3 successful Gets, got %d", atomic.LoadInt64(&success))
+	}
+}
+
+func TestWaitTimeout_AtomicCheck(t *testing.T) {
+	p, err := NewPool(Config{
+		InitialCap:  1,
+		MaxCap:      1,
+		WaitTimeout: 100 * time.Millisecond,
+		Factory:     makeFactory(),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer p.Close()
+
+	c, _ := p.Get()
+
+	start := time.Now()
+	_, err = p.Get()
+	elapsed := time.Since(start)
+
+	if err != ErrPoolExhausted {
+		t.Errorf("expected ErrPoolExhausted, got %v", err)
+	}
+
+	if elapsed < 90*time.Millisecond || elapsed > 150*time.Millisecond {
+		t.Errorf("expected wait ~100ms, waited %v", elapsed)
+	}
+
+	_ = p.Put(c)
+}
+
+func TestPingNil_NoUnnecessaryLocking(t *testing.T) {
+	var mu sync.Mutex
+	var pingCallCount int64
+
+	pinger := func(c Conn) error {
+		atomic.AddInt64(&pingCallCount, 1)
+		mu.Lock()
+		defer mu.Unlock()
+		return nil
+	}
+
+	tests := []struct {
+		name     string
+		ping     PingFunc
+		wantPing bool
+	}{
+		{"PingIsNil", nil, false},
+		{"PingIsSet", pinger, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			atomic.StoreInt64(&pingCallCount, 0)
+
+			p, err := NewPool(Config{
+				InitialCap: 3,
+				MaxCap:     3,
+				Factory:    makeFactory(),
+				Ping:       tt.ping,
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			defer p.Close()
+
+			for i := 0; i < 10; i++ {
+				c, err := p.Get()
+				if err != nil {
+					t.Fatalf("Get failed: %v", err)
+				}
+				_ = p.Put(c)
+			}
+
+			calls := atomic.LoadInt64(&pingCallCount)
+			if tt.wantPing {
+				if calls == 0 {
+					t.Error("expected Ping to be called when set, but it wasn't")
+				}
+			} else {
+				if calls != 0 {
+					t.Errorf("expected no Ping calls when nil, got %d", calls)
+				}
+			}
+		})
+	}
+}
+
+func TestReclaimIdleTimeout_WakesMultipleWaiters(t *testing.T) {
+	var closed []int
+	var mu sync.Mutex
+
+	p, err := NewPool(Config{
+		InitialCap:  3,
+		MaxCap:      3,
+		IdleTimeout: 60 * time.Millisecond,
+		WaitTimeout: 5 * time.Second,
+		Factory:     makeFactory(),
+		Close:       makeClose(&closed, &mu),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer p.Close()
+
+	conns := make([]Conn, 3)
+	for i := 0; i < 3; i++ {
+		conns[i], _ = p.Get()
+	}
+	for i := 0; i < 3; i++ {
+		_ = p.Put(conns[i])
+	}
+
+	time.Sleep(120 * time.Millisecond)
+
+	mu.Lock()
+	closedCount := len(closed)
+	mu.Unlock()
+	if closedCount != 3 {
+		t.Fatalf("expected 3 connections reclaimed, got %d", closedCount)
+	}
+	if p.Len() != 0 {
+		t.Fatalf("expected Len=0 after reclaim, got %d", p.Len())
+	}
+
+	conns = make([]Conn, 3)
+	for i := 0; i < 3; i++ {
+		conns[i], _ = p.Get()
+	}
+	if p.Len() != 3 {
+		t.Fatalf("expected Len=3, got %d", p.Len())
+	}
+
+	var wg sync.WaitGroup
+	var success int64
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := p.Get()
+			if err == nil && c != nil {
+				atomic.AddInt64(&success, 1)
+				_ = p.Put(c)
+			}
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if atomic.LoadInt64(&success) != 0 {
+		t.Fatalf("no Get should succeed yet, got %d", atomic.LoadInt64(&success))
+	}
+
+	for _, c := range conns {
+		_ = p.Put(c)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("all waiting Gets should have completed after Put")
+	}
+
+	if atomic.LoadInt64(&success) != 3 {
+		t.Errorf("expected 3 successful Gets, got %d", atomic.LoadInt64(&success))
+	}
+}
+
+func TestHeartbeatReclaim_ReleasesCapacity(t *testing.T) {
+	var mu sync.Mutex
+	var closed []int
+
+	pinger := makePing()
+
+	p, err := NewPool(Config{
+		InitialCap:        2,
+		MaxCap:            2,
+		HeartbeatInterval: 50 * time.Millisecond,
+		WaitTimeout:       5 * time.Second,
+		Factory:           makeFactory(),
+		Ping:              pinger,
+		Close:             makeClose(&closed, &mu),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer p.Close()
+
+	c1, _ := p.Get()
+	c2, _ := p.Get()
+
+	mc1 := c1.(*mockConn)
+	mc1.alive = false
+
+	_ = p.Put(c1)
+	_ = p.Put(c2)
+
+	time.Sleep(120 * time.Millisecond)
+
+	mu.Lock()
+	closedCount := len(closed)
+	mu.Unlock()
+	if closedCount < 1 {
+		t.Errorf("expected at least 1 bad connection reclaimed, got %d", closedCount)
+	}
+
+	goodConn, err := p.Get()
+	if err != nil {
+		t.Fatalf("expected to get connection after reclaim, got: %v", err)
+	}
+	if goodConn == nil {
+		t.Fatal("expected non-nil connection")
+	}
+
+	mc := goodConn.(*mockConn)
+	if !mc.alive {
+		t.Error("expected alive connection, got dead one")
+	}
+
+	_ = p.Put(goodConn)
+}

@@ -26,15 +26,14 @@ const (
 )
 
 var (
-	ErrInvalidFormat      = errors.New("secenv: invalid envelope format")
-	ErrInvalidVersion     = errors.New("secenv: unsupported format version")
-	ErrKeyNotFound        = errors.New("secenv: key version not found")
-	ErrInvalidSignature   = errors.New("secenv: invalid HMAC signature")
-	ErrInvalidTag         = errors.New("secenv: invalid GCM authentication tag")
-	ErrReplayDetected     = errors.New("secenv: replay attack detected")
-	ErrInvalidKeySize     = errors.New("secenv: invalid key size, must be 32 bytes")
-	ErrEmptyData          = errors.New("secenv: empty data")
-	ErrInvalidSequence    = errors.New("secenv: invalid sequence number")
+	ErrInvalidFormat    = errors.New("secenv: invalid envelope format")
+	ErrInvalidVersion   = errors.New("secenv: unsupported format version")
+	ErrKeyNotFound      = errors.New("secenv: key version not found")
+	ErrInvalidSignature = errors.New("secenv: invalid HMAC signature")
+	ErrInvalidTag       = errors.New("secenv: invalid GCM authentication tag")
+	ErrReplayDetected   = errors.New("secenv: replay attack detected")
+	ErrInvalidKeySize   = errors.New("secenv: invalid key size, must be 32 bytes")
+	ErrEmptyData        = errors.New("secenv: empty data")
 )
 
 type KeyVersion struct {
@@ -320,10 +319,6 @@ func NewSecureEnvelopeWithKeyManager(km *KeyManager, replayWindow uint64) *Secur
 }
 
 func (se *SecureEnvelope) Encrypt(plaintext []byte) ([]byte, error) {
-	if len(plaintext) == 0 {
-		return nil, ErrEmptyData
-	}
-
 	se.mu.Lock()
 	defer se.mu.Unlock()
 

@@ -133,6 +133,26 @@ type CircuitBreaker struct {
 - HalfOpen 状态：有限放行探测请求，全成功 → 关闭，任一失败 → 重新打开
 - Closed 状态下成功请求清空失败窗口（服务正常就重置计数）
 
+**熔断器记录机制说明：**
+
+`FailureEntry` 只记录失败请求的时间戳，不记录成功请求。这样设计的原因是：
+
+1. **简化计数逻辑**：滑动窗口只需统计失败数量，无需过滤成功记录
+2. **内存效率高**：仅保留失败条目，成功时直接清空切片（O(1)）
+3. **语义清晰**：`failures` 切片名符其实，只存放失败事件
+
+```go
+type FailureEntry struct {
+    Time time.Time // 失败请求发生的时间
+}
+```
+
+状态流转中的计数行为：
+- **Closed → RecordFailure**：追加到 `failures` 切片，计算窗口内失败数 ≥ 阈值则跳闸
+- **Closed → RecordSuccess**：直接清空 `failures` 切片（一次成功即重置失败计数）
+- **HalfOpen → RecordFailure**：立即跳闸回 Open，无需看窗口
+- **HalfOpen → RecordSuccess**：半开成功计数 +1，达到 `halfOpenMaxRequests` 则转 Closed
+
 ### 3.6 HealthChecker - 健康检查器
 
 ```go
@@ -173,11 +193,12 @@ type UpstreamHandler interface {
 ```
 
 上游服务必须实现此接口。模块内提供了 `MockUpstreamHandler` 用于测试，支持：
-- 自定义响应状态码和响应体
+- 自定义响应状态码和响应体（**原子更新**，保证状态码与 body 一致）
 - 切换健康/不健康状态
 - 注入人为延迟（模拟慢请求）
 - 设置自定义 Handler
 - 统计请求调用次数
+- 所有可变字段均由统一的 `sync.RWMutex` 保护，并发安全
 
 ### 3.8 类型别名与辅助类型
 
@@ -481,9 +502,18 @@ func (j *JWTTokenStore) Validate(token string) (*gateway.UserInfo, bool) {
 | `CircuitBreaker.*` | `sync.Mutex` | 状态机变更需原子性，所有操作加锁 |
 | `HealthChecker.upstreams` | `sync.RWMutex` | 探测轮询与路由查询并发进行 |
 | `MemoryTokenStore.tokens` | `sync.RWMutex` | 读多写少场景 |
-| `MockUpstreamHandler` 各字段 | 按字段加锁 / `atomic` | 请求计数用 mutex，健康状态用 RWMutex |
+| `MockUpstreamHandler.*` | 单一 `sync.RWMutex` | 所有可变字段（healthy/statusCode/body/count/latency/customHandler）由同一把锁保护，保证响应状态码与 body 读取的一致性，避免并发下出现"旧状态码+新响应体"的撕裂 |
 
 中间件本身是无状态的（只读配置），可以被任意并发调用。
+
+**MockUpstreamHandler 并发保证策略：**
+
+修复前：`statusCode` 与 `responseBody` 为裸字段，`SetResponse` 写入时不加锁，`ServeHTTP` 读取时也不加锁。并发场景下可能出现"调用方刚改完 statusCode 还没改 body，请求就读到了新状态码 + 旧响应体"的数据撕裂问题。
+
+修复后：所有可变字段由**单一 `sync.RWMutex`** 统一保护：
+- **写操作**（`SetResponse` / `SetHealthy` / `SetLatency` / `SetCustomHandler` / `ResetCount`）：`Lock()` 独占访问
+- **读操作**（`HealthCheck` / `RequestCount`）：`RLock()` 共享访问
+- **读-拷贝-使用**（`ServeHTTP`）：`Lock()` 一次性将所有需要的字段（statusCode/body/handler/latency）读到局部变量，再释放锁，然后在锁外执行实际的响应写入和 sleep。这样既保证了读取到的状态码和 body 是同一时刻的一致快照，又不会在 sleep 期间长期持锁阻塞其他写操作
 
 ## 9. 文件结构
 

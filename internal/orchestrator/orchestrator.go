@@ -154,6 +154,40 @@ func (o *Orchestrator) SetTaskRetry(id string, maxRetry int) error {
 	return nil
 }
 
+func (o *Orchestrator) UpdateTaskFunc(id string, fn TaskFunc) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.running {
+		return ErrOrchestratorRunning
+	}
+
+	task, exists := o.tasks[id]
+	if !exists {
+		return ErrTaskNotFound
+	}
+
+	task.Func = fn
+	return nil
+}
+
+func (o *Orchestrator) UpdateTaskTimeout(id string, timeout time.Duration) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.running {
+		return ErrOrchestratorRunning
+	}
+
+	task, exists := o.tasks[id]
+	if !exists {
+		return ErrTaskNotFound
+	}
+
+	task.Timeout = timeout
+	return nil
+}
+
 func (o *Orchestrator) ValidateDAG() error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -244,15 +278,15 @@ func (o *Orchestrator) topologicalSort() ([]string, error) {
 	return result, nil
 }
 
-func (o *Orchestrator) shouldSkip(taskID string) (bool, string) {
+func (o *Orchestrator) shouldSkip(taskID string) (bool, string, error) {
 	task := o.tasks[taskID]
 	for _, dep := range task.Dependencies {
 		depResult := o.results[dep]
 		if depResult.Status == StatusFailed || depResult.Status == StatusTimeout || depResult.Status == StatusSkipped {
-			return true, dep
+			return true, dep, depResult.Error
 		}
 	}
-	return false, ""
+	return false, "", nil
 }
 
 func (o *Orchestrator) Run(ctx context.Context) (*ExecutionReport, error) {
@@ -348,10 +382,10 @@ func (o *Orchestrator) runScheduler(actx context.Context, taskSet map[string]*Ta
 	for id := range taskSet {
 		if readyCount[id] == 0 {
 			o.mu.Lock()
-			skip, depID := o.shouldSkip(id)
+			skip, depID, depErr := o.shouldSkip(id)
 			if skip {
 				o.results[id].Status = StatusSkipped
-				o.results[id].Error = fmt.Errorf("skipped due to failure in dependency '%s'", depID)
+				o.results[id].Error = fmt.Errorf("skipped due to failure in dependency '%s': %w", depID, depErr)
 			}
 			o.mu.Unlock()
 
@@ -404,10 +438,10 @@ loop:
 				readyCount[successor]--
 				if readyCount[successor] == 0 {
 					o.mu.Lock()
-					skip, depID := o.shouldSkip(successor)
+					skip, depID, depErr := o.shouldSkip(successor)
 					if skip {
 						o.results[successor].Status = StatusSkipped
-						o.results[successor].Error = fmt.Errorf("skipped due to failure in dependency '%s'", depID)
+						o.results[successor].Error = fmt.Errorf("skipped due to failure in dependency '%s': %w", depID, depErr)
 					}
 					o.mu.Unlock()
 

@@ -35,6 +35,9 @@ func (s *InMemoryEventStore) AppendEvents(aggregateID string, expectedVersion in
 		if e == nil {
 			return ErrEventNil
 		}
+		if e.AggregateID != "" && e.AggregateID != aggregateID {
+			return ErrAggregateIDMismatch
+		}
 	}
 
 	s.mu.Lock()
@@ -46,9 +49,7 @@ func (s *InMemoryEventStore) AppendEvents(aggregateID string, expectedVersion in
 	}
 
 	for _, event := range events {
-		if event.AggregateID == "" {
-			event.AggregateID = aggregateID
-		}
+		event.AggregateID = aggregateID
 		currentVersion++
 		event.Version = currentVersion
 		s.events[aggregateID] = append(s.events[aggregateID], event)

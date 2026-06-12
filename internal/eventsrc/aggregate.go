@@ -3,6 +3,7 @@ package eventsrc
 type Aggregate interface {
 	AggregateID() string
 	Version() int64
+	SetVersion(version int64)
 	Apply(event *Event) error
 	MarshalState() ([]byte, error)
 	UnmarshalState(data []byte) error

@@ -21,15 +21,13 @@ func DefaultShardKVConfig() ShardKVConfig {
 }
 
 type ShardKVCluster struct {
-	mu            sync.RWMutex
-	config        ShardKVConfig
-	hashRing      *HashRing
-	shards        map[string]*Shard
-	downShards    map[string]struct{}
-	migrating     bool
-	migratingMu   sync.Mutex
-	keyOwnerCache map[string]string
-	cacheMu       sync.RWMutex
+	mu          sync.RWMutex
+	config      ShardKVConfig
+	hashRing    *HashRing
+	shards      map[string]*Shard
+	downShards  map[string]struct{}
+	migrating   bool
+	migratingMu sync.Mutex
 }
 
 func NewShardKVCluster() *ShardKVCluster {
@@ -51,11 +49,10 @@ func NewShardKVClusterWithConfig(config ShardKVConfig) *ShardKVCluster {
 	}
 
 	return &ShardKVCluster{
-		config:        config,
-		hashRing:      NewHashRing(config.VirtualNodes),
-		shards:        make(map[string]*Shard),
-		downShards:    make(map[string]struct{}),
-		keyOwnerCache: make(map[string]string),
+		config:     config,
+		hashRing:   NewHashRing(config.VirtualNodes),
+		shards:     make(map[string]*Shard),
+		downShards: make(map[string]struct{}),
 	}
 }
 
@@ -72,8 +69,6 @@ func (c *ShardKVCluster) AddShard(shardID string) error {
 	c.mu.Unlock()
 
 	c.hashRing.AddNode(shardID)
-
-	c.invalidateCache()
 
 	if nodeCount > 0 {
 		c.migrateOnAdd(shardID)
@@ -109,7 +104,6 @@ func (c *ShardKVCluster) RemoveShard(shardID string) error {
 	c.mu.Unlock()
 
 	c.hashRing.RemoveNode(shardID)
-	c.invalidateCache()
 
 	return nil
 }
@@ -190,6 +184,7 @@ func (c *ShardKVCluster) migrateOnRemove(removedShardID string) error {
 
 	c.mu.RLock()
 	removedShard := c.shards[removedShardID]
+	replicaCount := c.config.ReplicaCount
 	allShardIDs := make([]string, 0, len(c.shards))
 	for id := range c.shards {
 		if id != removedShardID {
@@ -205,7 +200,41 @@ func (c *ShardKVCluster) migrateOnRemove(removedShardID string) error {
 			continue
 		}
 
+		existingReplicas := 0
+		c.mu.RLock()
 		for _, sid := range allShardIDs {
+			s, exists := c.shards[sid]
+			if !exists || s.Status() == ShardStatusDown {
+				continue
+			}
+			if s.HasKey(key) {
+				existingReplicas++
+			}
+		}
+		c.mu.RUnlock()
+
+		needed := replicaCount - existingReplicas
+		if needed <= 0 {
+			continue
+		}
+
+		targets := c.hashRing.GetReplicaNodes(key, replicaCount+10)
+		replicaSet := make(map[string]struct{})
+		for _, tid := range targets {
+			replicaSet[tid] = struct{}{}
+		}
+
+		for _, sid := range allShardIDs {
+			if needed <= 0 {
+				break
+			}
+			if _, isReplica := replicaSet[sid]; !isReplica {
+				continue
+			}
+			if sid == removedShardID {
+				continue
+			}
+
 			c.mu.RLock()
 			targetShard, exists := c.shards[sid]
 			c.mu.RUnlock()
@@ -213,25 +242,12 @@ func (c *ShardKVCluster) migrateOnRemove(removedShardID string) error {
 				continue
 			}
 
-			alreadyHas := false
-			c.mu.RLock()
-			shardsCopy := make(map[string]*Shard, len(c.shards))
-			for k, v := range c.shards {
-				shardsCopy[k] = v
-			}
-			c.mu.RUnlock()
-
-			for _, s := range shardsCopy {
-				if s.ID() != removedShardID && s.ID() != sid && s.Status() != ShardStatusDown && s.HasKey(key) {
-					alreadyHas = true
-					break
-				}
+			if targetShard.HasKey(key) {
+				continue
 			}
 
 			targetShard.ForcePut(key, val)
-			if !alreadyHas {
-				break
-			}
+			needed--
 		}
 	}
 
@@ -249,7 +265,6 @@ func (c *ShardKVCluster) MarkShardDown(shardID string) error {
 
 	shard.SetStatus(ShardStatusDown)
 	c.downShards[shardID] = struct{}{}
-	c.invalidateCache()
 
 	return nil
 }
@@ -263,13 +278,12 @@ func (c *ShardKVCluster) MarkShardUp(shardID string) error {
 		return fmt.Errorf("shard %s not found", shardID)
 	}
 
+	c.syncFromReplicas(shardID)
+
 	c.mu.Lock()
 	shard.SetStatus(ShardStatusUp)
 	delete(c.downShards, shardID)
-	c.invalidateCache()
 	c.mu.Unlock()
-
-	c.syncFromReplicas(shardID)
 
 	return nil
 }
@@ -445,11 +459,6 @@ func (c *ShardKVCluster) Put(key string, value []byte) error {
 	wg.Wait()
 
 	if successCount >= c.config.WriteQuorum {
-		c.cacheMu.Lock()
-		if len(writeNodes) > 0 {
-			c.keyOwnerCache[key] = writeNodes[0]
-		}
-		c.cacheMu.Unlock()
 		return nil
 	}
 
@@ -509,10 +518,6 @@ func (c *ShardKVCluster) Delete(key string) error {
 	}
 
 	wg.Wait()
-
-	c.cacheMu.Lock()
-	delete(c.keyOwnerCache, key)
-	c.cacheMu.Unlock()
 
 	if successCount >= c.config.WriteQuorum {
 		return nil
@@ -600,12 +605,6 @@ func (c *ShardKVCluster) TotalDataCount() int {
 
 func (c *ShardKVCluster) GetConfig() ShardKVConfig {
 	return c.config
-}
-
-func (c *ShardKVCluster) invalidateCache() {
-	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
-	c.keyOwnerCache = make(map[string]string)
 }
 
 func (c *ShardKVCluster) IsMigrating() bool {

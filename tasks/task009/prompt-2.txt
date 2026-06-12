@@ -1,0 +1,7 @@
+你实现的事件溯源引擎模块存在一些问题，需要修复：
+1. InMemoryEventStore 的 AppendEvents 方法在事件校验循环中只检查了 event.AggregateID 是否为空，当 event.AggregateID 已非空却与 aggregateID 参数不一致时不报任何错误直接接受，造成事件存储中的聚合键与事件自身的 AggregateID 不匹配的数据混乱。
+2. Engine 的 RebuildState 方法在快照加载成功后通过类型断言来设置聚合实例的版本号，但 SetVersion 方法不在 Aggregate 接口约束内，如果聚合类型未嵌入 BaseAggregate 则版本号不会被设置，后续事件回放从 0 开始而非从快照版本开始。
+3. Engine 的 RebuildState 方法中，当 LoadSnapshot 返回非 ErrSnapshotNotFound 的异常时不向调用方报告错误，而是退化为全量事件回放，调用方无法感知快照加载异常。
+4. 修复后为该模块补充聚合 ID 不一致场景和快照加载异常场景的单元测试。
+5. 运行 go test ./internal/eventsrc/ -v，需要让所有测试通过。
+6. 在 docs/eventsrc.md 中更新模块需求文档，说明修复后的事件校验策略和状态重建的错误处理机制。

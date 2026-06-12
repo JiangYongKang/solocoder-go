@@ -1,0 +1,6 @@
+你实现的日志文件轮转器模块存在一些问题，需要修复：
+1. logrotator.go 的 rotate 方法中，压缩 goroutine 异步启动后 cleanOldBackups 在同一把锁持有期间同步执行。当备份数达到上限时，cleanOldBackups 可能在压缩 goroutine 读取源文件前就将其删除，导致压缩失败。
+2. logrotator.go 的 compressFile 函数只完成了压缩写入 .gz 文件的操作，压缩结束后没有删除原始备份文件，原始文件和压缩文件同时保留造成双倍的磁盘占用。
+3. 修复后为该模块补充压缩与清理并发场景的单元测试，验证在备份数达到上限时压缩仍能正确完成且原始文件被正确清理。
+4. 运行 go test ./internal/logrotator/ -v，需要让所有测试通过。
+5. 在 docs/logrotator.md 中更新模块需求文档，说明修复后的压缩与清理的同步机制。

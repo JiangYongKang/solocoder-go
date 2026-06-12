@@ -327,15 +327,14 @@ func (g *Gateway) GetUpstream(name string) (UpstreamHandler, bool) {
 }
 
 type MockUpstreamHandler struct {
-	name           string
-	healthy        bool
-	healthyMu      sync.RWMutex
-	statusCode     int
-	responseBody   string
-	requestCount   int64
-	countMu        sync.Mutex
-	customHandler  HandlerFunc
-	latency        time.Duration
+	name          string
+	mu            sync.RWMutex
+	healthy       bool
+	statusCode    int
+	responseBody  string
+	requestCount  int64
+	customHandler HandlerFunc
+	latency       time.Duration
 }
 
 func NewMockUpstreamHandler(name string) *MockUpstreamHandler {
@@ -352,56 +351,66 @@ func (m *MockUpstreamHandler) Name() string {
 }
 
 func (m *MockUpstreamHandler) HealthCheck() bool {
-	m.healthyMu.RLock()
-	defer m.healthyMu.RUnlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.healthy
 }
 
 func (m *MockUpstreamHandler) SetHealthy(healthy bool) {
-	m.healthyMu.Lock()
-	defer m.healthyMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.healthy = healthy
 }
 
 func (m *MockUpstreamHandler) SetResponse(statusCode int, body string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.statusCode = statusCode
 	m.responseBody = body
 }
 
 func (m *MockUpstreamHandler) SetLatency(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.latency = d
 }
 
 func (m *MockUpstreamHandler) SetCustomHandler(h HandlerFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.customHandler = h
 }
 
 func (m *MockUpstreamHandler) RequestCount() int64 {
-	m.countMu.Lock()
-	defer m.countMu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.requestCount
 }
 
 func (m *MockUpstreamHandler) ResetCount() {
-	m.countMu.Lock()
-	defer m.countMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.requestCount = 0
 }
 
 func (m *MockUpstreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	m.countMu.Lock()
+	m.mu.Lock()
 	m.requestCount++
-	m.countMu.Unlock()
+	latency := m.latency
+	customHandler := m.customHandler
+	statusCode := m.statusCode
+	body := m.responseBody
+	m.mu.Unlock()
 
-	if m.latency > 0 {
-		time.Sleep(m.latency)
+	if latency > 0 {
+		time.Sleep(latency)
 	}
 
-	if m.customHandler != nil {
-		m.customHandler(w, r)
+	if customHandler != nil {
+		customHandler(w, r)
 		return
 	}
 
-	w.WriteHeader(m.statusCode)
-	w.Write([]byte(m.responseBody))
+	w.WriteHeader(statusCode)
+	w.Write([]byte(body))
 }

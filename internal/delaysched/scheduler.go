@@ -14,7 +14,7 @@ import (
 var (
 	ErrTaskNotFound      = errors.New("task not found")
 	ErrTaskAlreadyExists = errors.New("task already exists")
-	ErrTaskRunning       = errors.New("task is running and cannot be cancelled")
+	ErrTaskRunning       = errors.New("task is running and cannot be cancelled immediately")
 	ErrInvalidCronExpr   = errors.New("invalid cron expression")
 	ErrSchedulerStopped  = errors.New("scheduler is stopped")
 )
@@ -88,6 +88,7 @@ type Scheduler struct {
 	stopCh   chan struct{}
 	wakeCh   chan struct{}
 	wg       sync.WaitGroup
+	taskWg   sync.WaitGroup
 	ctx      context.Context
 	cancel   context.CancelFunc
 	nextID   uint64
@@ -142,19 +143,16 @@ func (s *Scheduler) AddAt(executeAt time.Time, fn TaskFunc) (string, error) {
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.running {
-		s.mu.Unlock()
 		return "", ErrSchedulerStopped
 	}
 	if _, exists := s.tasks[id]; exists {
-		s.mu.Unlock()
 		return "", ErrTaskAlreadyExists
 	}
 	s.tasks[id] = task
 	heap.Push(s.heap, task)
 	s.wake()
-	s.mu.Unlock()
-
 	return id, nil
 }
 
@@ -163,13 +161,6 @@ func (s *Scheduler) AddWithID(id string, delay time.Duration, fn TaskFunc) error
 }
 
 func (s *Scheduler) AddAtWithID(id string, executeAt time.Time, fn TaskFunc) error {
-	s.mu.Lock()
-	if !s.running {
-		s.mu.Unlock()
-		return ErrSchedulerStopped
-	}
-	s.mu.Unlock()
-
 	task := &Task{
 		ID:         id,
 		ExecuteAt:  executeAt,
@@ -179,19 +170,16 @@ func (s *Scheduler) AddAtWithID(id string, executeAt time.Time, fn TaskFunc) err
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.running {
-		s.mu.Unlock()
 		return ErrSchedulerStopped
 	}
 	if _, exists := s.tasks[id]; exists {
-		s.mu.Unlock()
 		return ErrTaskAlreadyExists
 	}
 	s.tasks[id] = task
 	heap.Push(s.heap, task)
 	s.wake()
-	s.mu.Unlock()
-
 	return nil
 }
 
@@ -210,25 +198,26 @@ func (s *Scheduler) AddCron(delay time.Duration, cronExpr string, fn TaskFunc) (
 		return "", err
 	}
 	id := s.generateID()
-	return s.addRepeat(id, time.Now().Add(delay), fn, RepeatCron, 0, cronExpr)
+	firstAt, err := nextCronTime(cronExpr, time.Now().Add(delay))
+	if err != nil {
+		return "", err
+	}
+	return s.addRepeat(id, firstAt, fn, RepeatCron, 0, cronExpr)
 }
 
 func (s *Scheduler) AddCronWithID(id string, delay time.Duration, cronExpr string, fn TaskFunc) error {
 	if err := validateCron(cronExpr); err != nil {
 		return err
 	}
-	_, err := s.addRepeat(id, time.Now().Add(delay), fn, RepeatCron, 0, cronExpr)
+	firstAt, err := nextCronTime(cronExpr, time.Now().Add(delay))
+	if err != nil {
+		return err
+	}
+	_, err = s.addRepeat(id, firstAt, fn, RepeatCron, 0, cronExpr)
 	return err
 }
 
 func (s *Scheduler) addRepeat(id string, executeAt time.Time, fn TaskFunc, rt RepeatType, interval time.Duration, cronExpr string) (string, error) {
-	s.mu.Lock()
-	if !s.running {
-		s.mu.Unlock()
-		return "", ErrSchedulerStopped
-	}
-	s.mu.Unlock()
-
 	task := &Task{
 		ID:         id,
 		ExecuteAt:  executeAt,
@@ -240,19 +229,16 @@ func (s *Scheduler) addRepeat(id string, executeAt time.Time, fn TaskFunc, rt Re
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.running {
-		s.mu.Unlock()
 		return "", ErrSchedulerStopped
 	}
 	if _, exists := s.tasks[id]; exists {
-		s.mu.Unlock()
 		return "", ErrTaskAlreadyExists
 	}
 	s.tasks[id] = task
 	heap.Push(s.heap, task)
 	s.wake()
-	s.mu.Unlock()
-
 	return id, nil
 }
 
@@ -265,21 +251,27 @@ func (s *Scheduler) Cancel(id string) error {
 		return ErrTaskNotFound
 	}
 
-	if task.Status == StatusRunning {
+	switch task.Status {
+	case StatusPending:
+		if task.index >= 0 && task.index < s.heap.Len() && (*s.heap)[task.index] == task {
+			heap.Remove(s.heap, task.index)
+		}
+		delete(s.tasks, id)
+		s.wake()
+		return nil
+	case StatusRunning:
+		if task.RepeatType == RepeatNone {
+			return ErrTaskRunning
+		}
+		task.Status = StatusCancelled
 		return ErrTaskRunning
-	}
-
-	if task.Status == StatusCancelled || task.Status == StatusDone {
+	case StatusCancelled:
+		return nil
+	case StatusDone:
+		return nil
+	default:
 		return nil
 	}
-
-	task.Status = StatusCancelled
-
-	if task.index >= 0 && task.index < s.heap.Len() && (*s.heap)[task.index] == task {
-		heap.Remove(s.heap, task.index)
-	}
-	s.wake()
-	return nil
 }
 
 func (s *Scheduler) Reschedule(id string, newExecuteAt time.Time) error {
@@ -363,6 +355,7 @@ func (s *Scheduler) Stop() {
 	s.mu.Unlock()
 
 	s.wg.Wait()
+	s.taskWg.Wait()
 }
 
 func (s *Scheduler) runLoop() {
@@ -377,7 +370,7 @@ func (s *Scheduler) runLoop() {
 
 		for s.heap.Len() > 0 {
 			task := (*s.heap)[0]
-			if task.Status == StatusCancelled || task.Status == StatusDone {
+			if task.Status == StatusCancelled || task.Status == StatusDone || task.Status == StatusRunning {
 				heap.Pop(s.heap)
 				continue
 			}
@@ -402,8 +395,9 @@ func (s *Scheduler) runLoop() {
 		if waitTime <= 0 {
 			heap.Pop(s.heap)
 			task.Status = StatusRunning
+			s.taskWg.Add(1)
 			s.mu.Unlock()
-			s.executeTask(task)
+			go s.executeTask(task)
 			continue
 		}
 
@@ -423,35 +417,32 @@ func (s *Scheduler) runLoop() {
 }
 
 func (s *Scheduler) executeTask(task *Task) {
-	done := make(chan struct{})
-	go func() {
+	defer s.taskWg.Done()
+
+	func() {
 		defer func() {
 			recover()
-			close(done)
 		}()
 		ctx, cancel := context.WithCancel(s.ctx)
 		defer cancel()
 		task.Func(ctx)
 	}()
-	<-done
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if task.Status == StatusCancelled {
 		delete(s.tasks, task.ID)
-		s.mu.Unlock()
 		return
 	}
 
 	if task.RepeatType == RepeatNone {
 		task.Status = StatusDone
 		delete(s.tasks, task.ID)
-		s.mu.Unlock()
 		return
 	}
 
 	if _, exists := s.tasks[task.ID]; !exists {
-		task.Status = StatusDone
-		s.mu.Unlock()
 		return
 	}
 
@@ -464,7 +455,6 @@ func (s *Scheduler) executeTask(task *Task) {
 		if err != nil {
 			delete(s.tasks, task.ID)
 			task.Status = StatusDone
-			s.mu.Unlock()
 			return
 		}
 		nextExecuteAt = next
@@ -474,7 +464,6 @@ func (s *Scheduler) executeTask(task *Task) {
 	task.Status = StatusPending
 	heap.Push(s.heap, task)
 	s.wake()
-	s.mu.Unlock()
 }
 
 func validateCron(expr string) error {

@@ -1332,3 +1332,664 @@ func TestRun_DeepDAG(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdateTaskFunc_Basic(t *testing.T) {
+	o := NewOrchestrator()
+
+	o.AddTask("a", "A", func(ctx context.Context) (interface{}, error) {
+		return "old", nil
+	}, 0)
+
+	err := o.UpdateTaskFunc("a", func(ctx context.Context) (interface{}, error) {
+		return "new", nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	report, err := o.Run(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected Run error: %v", err)
+	}
+
+	result := report.TaskResults["a"]
+	if result.Output != "new" {
+		t.Errorf("expected updated output 'new', got %v", result.Output)
+	}
+}
+
+func TestUpdateTaskFunc_NotFound(t *testing.T) {
+	o := NewOrchestrator()
+
+	err := o.UpdateTaskFunc("nope", func(ctx context.Context) (interface{}, error) {
+		return nil, nil
+	})
+	if err != ErrTaskNotFound {
+		t.Errorf("expected ErrTaskNotFound, got %v", err)
+	}
+}
+
+func TestUpdateTaskFunc_WhileRunning(t *testing.T) {
+	o := NewOrchestrator()
+
+	o.AddTask("slow", "Slow", func(ctx context.Context) (interface{}, error) {
+		time.Sleep(200 * time.Millisecond)
+		return nil, nil
+	}, 0)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		o.Run(context.Background())
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	err := o.UpdateTaskFunc("slow", func(ctx context.Context) (interface{}, error) {
+		return nil, nil
+	})
+	if err != ErrOrchestratorRunning {
+		t.Errorf("expected ErrOrchestratorRunning, got %v", err)
+	}
+
+	wg.Wait()
+}
+
+func TestUpdateTaskTimeout_Basic(t *testing.T) {
+	o := NewOrchestrator()
+
+	o.AddTask("a", "A", func(ctx context.Context) (interface{}, error) {
+		time.Sleep(200 * time.Millisecond)
+		return "ok", nil
+	}, 1*time.Second)
+
+	o.UpdateTaskTimeout("a", 20*time.Millisecond)
+
+	report, _ := o.Run(context.Background())
+
+	result := report.TaskResults["a"]
+	if result.Status != StatusTimeout {
+		t.Errorf("expected StatusTimeout after timeout update, got %s", result.Status)
+	}
+}
+
+func TestUpdateTaskTimeout_NotFound(t *testing.T) {
+	o := NewOrchestrator()
+
+	err := o.UpdateTaskTimeout("nope", 5*time.Second)
+	if err != ErrTaskNotFound {
+		t.Errorf("expected ErrTaskNotFound, got %v", err)
+	}
+}
+
+func TestUpdateTaskFunc_ThenRetry(t *testing.T) {
+	o := NewOrchestrator()
+
+	o.AddTask("a", "A", func(ctx context.Context) (interface{}, error) {
+		return "a-ok", nil
+	}, 0)
+	o.AddTask("b", "B", func(ctx context.Context) (interface{}, error) {
+		return nil, errors.New("b has a bug")
+	}, 0, "a")
+	o.AddTask("c", "C", func(ctx context.Context) (interface{}, error) {
+		return "c-ok", nil
+	}, 0, "b")
+
+	report1, _ := o.Run(context.Background())
+
+	if report1.TaskResults["a"].Status != StatusSuccess {
+		t.Fatalf("a should be Success, got %s", report1.TaskResults["a"].Status)
+	}
+	if report1.TaskResults["b"].Status != StatusFailed {
+		t.Fatalf("b should be Failed, got %s", report1.TaskResults["b"].Status)
+	}
+	if report1.TaskResults["c"].Status != StatusSkipped {
+		t.Fatalf("c should be Skipped, got %s", report1.TaskResults["c"].Status)
+	}
+
+	var aExecCount int32
+	originalAFunc := o.tasks["a"].Func
+	o.tasks["a"].Func = func(ctx context.Context) (interface{}, error) {
+		atomic.AddInt32(&aExecCount, 1)
+		return originalAFunc(ctx)
+	}
+
+	err := o.UpdateTaskFunc("b", func(ctx context.Context) (interface{}, error) {
+		return "b-fixed", nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected UpdateTaskFunc error: %v", err)
+	}
+
+	retryReport, err := o.RetryTask(context.Background(), "b")
+	if err != nil {
+		t.Fatalf("unexpected RetryTask error: %v", err)
+	}
+
+	if atomic.LoadInt32(&aExecCount) != 0 {
+		t.Errorf("task a should not be re-executed during retry, got %d executions", aExecCount)
+	}
+
+	if retryReport.TaskResults["a"].Status != StatusSuccess {
+		t.Errorf("a should remain Success after retry, got %s", retryReport.TaskResults["a"].Status)
+	}
+	if retryReport.TaskResults["b"].Status != StatusSuccess {
+		t.Errorf("b should be Success after fix, got %s", retryReport.TaskResults["b"].Status)
+	}
+	if retryReport.TaskResults["b"].Output != "b-fixed" {
+		t.Errorf("b output should be 'b-fixed', got %v", retryReport.TaskResults["b"].Output)
+	}
+	if retryReport.TaskResults["c"].Status != StatusSuccess {
+		t.Errorf("c should be Success after fix, got %s", retryReport.TaskResults["c"].Status)
+	}
+}
+
+func TestUpdateTaskFunc_RetryRootCause(t *testing.T) {
+	o := NewOrchestrator()
+
+	rootCause := errors.New("database connection refused")
+
+	o.AddTask("a", "A", func(ctx context.Context) (interface{}, error) {
+		return nil, rootCause
+	}, 0)
+	o.AddTask("b", "B", func(ctx context.Context) (interface{}, error) {
+		return "b-ok", nil
+	}, 0, "a")
+	o.AddTask("c", "C", func(ctx context.Context) (interface{}, error) {
+		return "c-ok", nil
+	}, 0, "b")
+
+	o.Run(context.Background())
+
+	o.UpdateTaskFunc("a", func(ctx context.Context) (interface{}, error) {
+		return "a-recovered", nil
+	})
+
+	retryReport, _ := o.RetryTask(context.Background(), "a")
+
+	if !retryReport.Success {
+		t.Error("expected retry to succeed")
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		if retryReport.TaskResults[id].Status != StatusSuccess {
+			t.Errorf("task %s should be Success, got %s", id, retryReport.TaskResults[id].Status)
+		}
+	}
+}
+
+func TestErrorPropagation_DeepChain(t *testing.T) {
+	o := NewOrchestrator()
+
+	rootErr := errors.New("root cause: invalid API key")
+
+	depth := 5
+	fn := func(id string, errToReturn error) TaskFunc {
+		return func(ctx context.Context) (interface{}, error) {
+			if errToReturn != nil {
+				return nil, errToReturn
+			}
+			return id + "-ok", nil
+		}
+	}
+
+	o.AddTask("t0", "T0", fn("t0", rootErr), 0)
+	for i := 1; i < depth; i++ {
+		id := fmt.Sprintf("t%d", i)
+		dep := fmt.Sprintf("t%d", i-1)
+		o.AddTask(id, id, fn(id, nil), 0, dep)
+	}
+
+	report, err := o.Run(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	t0Result := report.TaskResults["t0"]
+	if t0Result.Status != StatusFailed {
+		t.Fatalf("t0 should be Failed, got %s", t0Result.Status)
+	}
+	if t0Result.Error != rootErr {
+		t.Errorf("t0 Error should be root cause, got %v", t0Result.Error)
+	}
+
+	for i := 1; i < depth; i++ {
+		id := fmt.Sprintf("t%d", i)
+		prevID := fmt.Sprintf("t%d", i-1)
+		result := report.TaskResults[id]
+		if result.Status != StatusSkipped {
+			t.Errorf("task %s should be Skipped, got %s", id, result.Status)
+			continue
+		}
+		if result.Error == nil {
+			t.Errorf("task %s: expected non-nil error", id)
+			continue
+		}
+		errMsg := result.Error.Error()
+		if errMsg == "" {
+			t.Errorf("task %s: expected non-empty error message", id)
+		}
+		if !containsString(errMsg, prevID) {
+			t.Errorf("task %s: error should mention direct dependency '%s', got '%s'", id, prevID, errMsg)
+		}
+		if i == 1 {
+			if !errors.Is(result.Error, rootErr) {
+				t.Errorf("task %s: expected error chain to wrap root cause via errors.Is, got %v", id, result.Error)
+			}
+		}
+	}
+
+	if depth >= 2 {
+		lastID := fmt.Sprintf("t%d", depth-1)
+		lastErr := report.TaskResults[lastID].Error
+		if !errors.Is(lastErr, rootErr) {
+			t.Errorf("deepest task %s: error chain should ultimately contain root cause via errors.Is, got %v", lastID, lastErr)
+		}
+	}
+}
+
+func TestErrorPropagation_TimeoutCause(t *testing.T) {
+	o := NewOrchestrator()
+
+	o.AddTask("slow", "Slow", func(ctx context.Context) (interface{}, error) {
+		time.Sleep(200 * time.Millisecond)
+		return nil, nil
+	}, 20*time.Millisecond)
+	o.AddTask("mid", "Mid", func(ctx context.Context) (interface{}, error) {
+		return "mid", nil
+	}, 0, "slow")
+	o.AddTask("end", "End", func(ctx context.Context) (interface{}, error) {
+		return "end", nil
+	}, 0, "mid")
+
+	report, _ := o.Run(context.Background())
+
+	slowResult := report.TaskResults["slow"]
+	if slowResult.Status != StatusTimeout {
+		t.Fatalf("slow should be Timeout, got %s", slowResult.Status)
+	}
+
+	for _, id := range []string{"mid", "end"} {
+		result := report.TaskResults[id]
+		if result.Status != StatusSkipped {
+			t.Errorf("task %s should be Skipped, got %s", id, result.Status)
+			continue
+		}
+		if result.Error == nil {
+			t.Errorf("task %s should have error", id)
+			continue
+		}
+		if !errors.Is(result.Error, ErrTimeout) {
+			t.Errorf("task %s: expected error chain to contain ErrTimeout, got %v", id, result.Error)
+		}
+	}
+}
+
+func TestErrorPropagation_MultiDep(t *testing.T) {
+	o := NewOrchestrator()
+
+	errA := errors.New("a failed badly")
+
+	o.AddTask("a", "A", func(ctx context.Context) (interface{}, error) { return nil, errA }, 0)
+	o.AddTask("b", "B", func(ctx context.Context) (interface{}, error) { return "b-ok", nil }, 0)
+	o.AddTask("c", "C", func(ctx context.Context) (interface{}, error) { return "c-ok", nil }, 0, "a", "b")
+
+	report, _ := o.Run(context.Background())
+
+	cResult := report.TaskResults["c"]
+	if cResult.Status != StatusSkipped {
+		t.Fatalf("c should be Skipped, got %s", cResult.Status)
+	}
+	if !errors.Is(cResult.Error, errA) {
+		t.Errorf("c's error should wrap errA via errors.Is, got %v", cResult.Error)
+	}
+}
+
+func TestUpdateTaskFunc_UpdateTimeoutThenRetry(t *testing.T) {
+	o := NewOrchestrator()
+
+	o.AddTask("a", "A", func(ctx context.Context) (interface{}, error) {
+		time.Sleep(100 * time.Millisecond)
+		return "a-ok", nil
+	}, 20*time.Millisecond)
+	o.AddTask("b", "B", func(ctx context.Context) (interface{}, error) {
+		return "b-ok", nil
+	}, 0, "a")
+
+	report1, _ := o.Run(context.Background())
+
+	if report1.TaskResults["a"].Status != StatusTimeout {
+		t.Fatalf("a should be Timeout, got %s", report1.TaskResults["a"].Status)
+	}
+
+	o.UpdateTaskTimeout("a", 200*time.Millisecond)
+
+	retryReport, _ := o.RetryTask(context.Background(), "a")
+
+	if retryReport.TaskResults["a"].Status != StatusSuccess {
+		t.Errorf("a should be Success after timeout increase, got %s", retryReport.TaskResults["a"].Status)
+	}
+	if retryReport.TaskResults["b"].Status != StatusSuccess {
+		t.Errorf("b should be Success after timeout increase, got %s", retryReport.TaskResults["b"].Status)
+	}
+}
+
+type customDBError struct {
+	Code    int
+	Message string
+}
+
+func (e *customDBError) Error() string {
+	return fmt.Sprintf("database error code=%d: %s", e.Code, e.Message)
+}
+
+func TestErrorPropagation_CustomErrorsWithErrorsAs(t *testing.T) {
+	o := NewOrchestrator()
+
+	rootErr := &customDBError{Code: 1045, Message: "Access denied for user"}
+
+	depth := 4
+	o.AddTask("t0", "T0", func(ctx context.Context) (interface{}, error) {
+		return nil, rootErr
+	}, 0)
+	for i := 1; i < depth; i++ {
+		id := fmt.Sprintf("t%d", i)
+		dep := fmt.Sprintf("t%d", i-1)
+		o.AddTask(id, id, func(ctx context.Context) (interface{}, error) {
+			return "ok", nil
+		}, 0, dep)
+	}
+
+	report, _ := o.Run(context.Background())
+
+	lastID := fmt.Sprintf("t%d", depth-1)
+	lastErr := report.TaskResults[lastID].Error
+
+	var dbErr *customDBError
+	if !errors.As(lastErr, &dbErr) {
+		t.Errorf("expected errors.As to find customDBError in chain, got %v", lastErr)
+	}
+	if dbErr != nil {
+		if dbErr.Code != 1045 {
+			t.Errorf("expected code 1045, got %d", dbErr.Code)
+		}
+		if dbErr.Message != "Access denied for user" {
+			t.Errorf("unexpected message: %s", dbErr.Message)
+		}
+	}
+}
+
+func TestErrorPropagation_VeryDeepChain(t *testing.T) {
+	o := NewOrchestrator()
+
+	rootErr := errors.New("very deep root cause")
+	depth := 20
+
+	o.AddTask("t0", "T0", func(ctx context.Context) (interface{}, error) {
+		return nil, rootErr
+	}, 0)
+	for i := 1; i < depth; i++ {
+		id := fmt.Sprintf("t%d", i)
+		dep := fmt.Sprintf("t%d", i-1)
+		o.AddTask(id, id, func(ctx context.Context) (interface{}, error) {
+			return nil, nil
+		}, 0, dep)
+	}
+
+	report, err := o.Run(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	firstResult := report.TaskResults["t0"]
+	if firstResult.Status != StatusFailed {
+		t.Fatalf("t0 should be Failed, got %s", firstResult.Status)
+	}
+
+	for i := 1; i < depth; i++ {
+		id := fmt.Sprintf("t%d", i)
+		result := report.TaskResults[id]
+		if result.Status != StatusSkipped {
+			t.Errorf("task %s should be Skipped, got %s", id, result.Status)
+			continue
+		}
+		if result.Error == nil {
+			t.Errorf("task %s should have non-nil error", id)
+			continue
+		}
+		if !errors.Is(result.Error, rootErr) {
+			t.Errorf("task %s: errors.Is should find root cause in chain, got %v", id, result.Error)
+		}
+	}
+
+	lastID := fmt.Sprintf("t%d", depth-1)
+	lastResult := report.TaskResults[lastID]
+	errStr := lastResult.Error.Error()
+	if len(errStr) < len("very deep root cause") {
+		t.Errorf("expected error string to be substantial, got length %d: %s", len(errStr), errStr)
+	}
+}
+
+func TestUpdateTaskFunc_CombinedRetryScenario(t *testing.T) {
+	o := NewOrchestrator()
+
+	dbErr := &customDBError{Code: 2003, Message: "Can't connect to MySQL server"}
+
+	o.AddTask("validate", "Validate Input", func(ctx context.Context) (interface{}, error) {
+		return "validated", nil
+	}, 0)
+
+	o.AddTask("fetch_db", "Fetch from DB", func(ctx context.Context) (interface{}, error) {
+		return nil, dbErr
+	}, 100*time.Millisecond, "validate")
+
+	o.AddTask("process", "Process Data", func(ctx context.Context) (interface{}, error) {
+		return "processed", nil
+	}, 0, "fetch_db")
+
+	o.AddTask("notify", "Notify Users", func(ctx context.Context) (interface{}, error) {
+		return "notified", nil
+	}, 0, "process")
+
+	report1, _ := o.Run(context.Background())
+
+	if report1.TaskResults["validate"].Status != StatusSuccess {
+		t.Fatalf("validate should be Success, got %s", report1.TaskResults["validate"].Status)
+	}
+	if report1.TaskResults["fetch_db"].Status != StatusFailed {
+		t.Fatalf("fetch_db should be Failed, got %s", report1.TaskResults["fetch_db"].Status)
+	}
+
+	var foundDBErr *customDBError
+	if !errors.As(report1.TaskResults["notify"].Error, &foundDBErr) {
+		t.Errorf("notify's error should trace back to customDBError via errors.As, got %v", report1.TaskResults["notify"].Error)
+	}
+
+	var validateExecCount int32
+	origValidate := o.tasks["validate"].Func
+	o.tasks["validate"].Func = func(ctx context.Context) (interface{}, error) {
+		atomic.AddInt32(&validateExecCount, 1)
+		return origValidate(ctx)
+	}
+
+	errFunc := o.UpdateTaskFunc("fetch_db", func(ctx context.Context) (interface{}, error) {
+		return []string{"row1", "row2", "row3"}, nil
+	})
+	if errFunc != nil {
+		t.Fatalf("unexpected UpdateTaskFunc error: %v", errFunc)
+	}
+
+	errTimeout := o.UpdateTaskTimeout("fetch_db", 5*time.Second)
+	if errTimeout != nil {
+		t.Fatalf("unexpected UpdateTaskTimeout error: %v", errTimeout)
+	}
+
+	retryReport, retryErr := o.RetryTask(context.Background(), "fetch_db")
+	if retryErr != nil {
+		t.Fatalf("unexpected RetryTask error: %v", retryErr)
+	}
+
+	if !retryReport.Success {
+		t.Error("expected overall success after retry")
+	}
+
+	if atomic.LoadInt32(&validateExecCount) != 0 {
+		t.Errorf("validate should not be re-executed, got %d runs", validateExecCount)
+	}
+
+	if retryReport.TaskResults["validate"].Status != StatusSuccess {
+		t.Errorf("validate should still be Success, got %s", retryReport.TaskResults["validate"].Status)
+	}
+
+	fetchResult := retryReport.TaskResults["fetch_db"]
+	if fetchResult.Status != StatusSuccess {
+		t.Errorf("fetch_db should be Success, got %s", fetchResult.Status)
+	}
+	rows, ok := fetchResult.Output.([]string)
+	if !ok || len(rows) != 3 {
+		t.Errorf("expected 3 rows output, got %v", fetchResult.Output)
+	}
+
+	if retryReport.TaskResults["process"].Status != StatusSuccess {
+		t.Errorf("process should be Success, got %s", retryReport.TaskResults["process"].Status)
+	}
+	if retryReport.TaskResults["notify"].Status != StatusSuccess {
+		t.Errorf("notify should be Success, got %s", retryReport.TaskResults["notify"].Status)
+	}
+}
+
+func TestErrorPropagation_SkippedCausePropagates(t *testing.T) {
+	o := NewOrchestrator()
+
+	rootErr := errors.New("root boom")
+
+	o.AddTask("a", "A", func(ctx context.Context) (interface{}, error) {
+		return nil, rootErr
+	}, 0)
+	o.AddTask("b", "B", func(ctx context.Context) (interface{}, error) {
+		return "b", nil
+	}, 0, "a")
+	o.AddTask("c", "C", func(ctx context.Context) (interface{}, error) {
+		return "c", nil
+	}, 0, "b")
+
+	report, _ := o.Run(context.Background())
+
+	bErr := report.TaskResults["b"].Error
+	if bErr == nil {
+		t.Fatal("b should have error")
+	}
+	if !errors.Is(bErr, rootErr) {
+		t.Errorf("b's error should contain root via errors.Is, got %v", bErr)
+	}
+
+	cErr := report.TaskResults["c"].Error
+	if cErr == nil {
+		t.Fatal("c should have error")
+	}
+	if !errors.Is(cErr, bErr) {
+		t.Errorf("c's error should wrap b's error via errors.Is, got %v", cErr)
+	}
+	if !errors.Is(cErr, rootErr) {
+		t.Errorf("c's error should still contain original root via errors.Is, got %v", cErr)
+	}
+}
+
+func TestUpdateTaskTimeout_WhileRunning(t *testing.T) {
+	o := NewOrchestrator()
+
+	o.AddTask("slow", "Slow", func(ctx context.Context) (interface{}, error) {
+		time.Sleep(200 * time.Millisecond)
+		return nil, nil
+	}, 0)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		o.Run(context.Background())
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	err := o.UpdateTaskTimeout("slow", 5*time.Second)
+	if err != ErrOrchestratorRunning {
+		t.Errorf("expected ErrOrchestratorRunning, got %v", err)
+	}
+
+	wg.Wait()
+}
+
+func TestRetryTask_MultipleRetriesWithFix(t *testing.T) {
+	o := NewOrchestrator()
+
+	var aAttempts int32
+
+	o.AddTask("a", "A", func(ctx context.Context) (interface{}, error) {
+		a := atomic.AddInt32(&aAttempts, 1)
+		return nil, fmt.Errorf("attempt %d fails", a)
+	}, 0)
+	o.AddTask("b", "B", func(ctx context.Context) (interface{}, error) {
+		return "b-ok", nil
+	}, 0, "a")
+	o.AddTask("c", "C", func(ctx context.Context) (interface{}, error) {
+		return "c-ok", nil
+	}, 0, "b")
+
+	r1, _ := o.Run(context.Background())
+	if r1.TaskResults["a"].Status != StatusFailed {
+		t.Fatalf("run 1: a should be Failed")
+	}
+	if atomic.LoadInt32(&aAttempts) != 1 {
+		t.Errorf("run 1: expected 1 attempt for a, got %d", atomic.LoadInt32(&aAttempts))
+	}
+
+	r2, err2 := o.RetryTask(context.Background(), "a")
+	if err2 != nil {
+		t.Fatalf("retry 1 error: %v", err2)
+	}
+	if r2.TaskResults["a"].Status != StatusFailed {
+		t.Errorf("retry 1: a should still be Failed")
+	}
+	if atomic.LoadInt32(&aAttempts) != 2 {
+		t.Errorf("retry 1: expected 2 attempts for a, got %d", atomic.LoadInt32(&aAttempts))
+	}
+
+	o.UpdateTaskFunc("a", func(ctx context.Context) (interface{}, error) {
+		return "a-fixed", nil
+	})
+
+	r3, err3 := o.RetryTask(context.Background(), "a")
+	if err3 != nil {
+		t.Fatalf("retry 2 error: %v", err3)
+	}
+	if !r3.Success {
+		t.Error("retry 2: expected overall success after fix")
+	}
+	if r3.TaskResults["a"].Output != "a-fixed" {
+		t.Errorf("retry 2: expected 'a-fixed', got %v", r3.TaskResults["a"].Output)
+	}
+	if r3.TaskResults["b"].Status != StatusSuccess {
+		t.Errorf("retry 2: b should be Success, got %s", r3.TaskResults["b"].Status)
+	}
+	if r3.TaskResults["c"].Status != StatusSuccess {
+		t.Errorf("retry 2: c should be Success, got %s", r3.TaskResults["c"].Status)
+	}
+	if atomic.LoadInt32(&aAttempts) != 2 {
+		t.Errorf("after fix, aAttempts should still be 2 (fixed func replaced), got %d", atomic.LoadInt32(&aAttempts))
+	}
+}
+
+func containsString(s, substr string) bool {
+	return len(s) >= len(substr) &&
+		(len(substr) == 0 || indexOf(s, substr) >= 0)
+}
+
+func indexOf(s, substr string) int {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}

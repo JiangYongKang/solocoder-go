@@ -43,7 +43,7 @@ type Config struct {
 - `MaxCap` 必须大于 0，否则 `NewPool` 返回错误
 - `InitialCap` 默认为 0，超过 `MaxCap` 时自动截断为 `MaxCap`
 - `MaxIdle` 默认为 `MaxCap`，超过 `MaxCap` 时自动截断为 `MaxCap`
-- `Ping` 默认空实现（返回 nil），认为所有连接均可用
+- `Ping` 默认为 `nil`，此时跳过心跳检测以避免不必要的锁开销；若设置则在借用空闲连接和心跳检测时调用
 - `Close` 默认空实现（返回 nil），不做任何资源释放
 
 ### 3.2 Pool - 连接池主体
@@ -97,8 +97,6 @@ type CloseFunc func(Conn) error         // 连接关闭函数签名
 |----------|------|----------|
 | `ErrPoolClosed` | 连接池已关闭 | 已关闭的池上调用 Get/Put |
 | `ErrPoolExhausted` | 连接池耗尽 | 无空闲连接且达到 MaxCap，WaitTimeout=0 或等待超时 |
-| `ErrConnExpired` | 连接已过期 | 预留错误，当前在内部处理 |
-| `ErrConnBad` | 连接不可用 | 预留错误，当前在内部处理 |
 
 ## 4. 连接生命周期管理流程
 
@@ -136,7 +134,7 @@ Get()
    │     └─ 遍历 idleList 头部开始
    │     └─ 取出 idleConn
    │     ├─ MaxLifetime 检查：过期 → count--, Close(conn), 继续
-   │     ├─ Ping 检查：失败 → count--, Close(conn), 继续
+   │     ├─ Ping 检查（仅当 Ping != nil）：失败 → count--, Close(conn), 继续
    │     └─ 通过所有检查 → 加入 active, 返回 conn
    │
    ├─ 无空闲连接，尝试创建新连接
@@ -149,18 +147,23 @@ Get()
    ├─ 无空闲且达到 MaxCap
    │     ├─ WaitTimeout == 0 → 返回 ErrPoolExhausted
    │     │
-   │     └─ WaitTimeout > 0 → 等待模式
-   │           ├─ 设置 deadline = now + WaitTimeout
-   │           ├─ 启动超时协程：到时 Broadcast 并关闭 timedOut
-   │           ├─ [内层循环：等待条件]
-   │           │     ├─ closed → 返回 ErrPoolClosed
-   │           │     ├─ timedOut → 返回 ErrPoolExhausted
-   │           │     ├─ idleList>0 或 count<MaxCap → 跳出等待
+   │     └─ WaitTimeout > 0 → 等待模式（原子超时检查）
+   │           ├─ deadline = now + WaitTimeout
+   │           ├─ 启动超时协程：到时获取锁 → Broadcast → 释放锁
+   │           ├─ [内层循环：所有检查在持有锁状态下执行]
+   │           │     ├─ 检查 closed → 返回 ErrPoolClosed
+   │           │     ├─ 检查 time.Now().After(deadline) → 返回 ErrPoolExhausted
+   │           │     ├─ 检查 idleList>0 或 count<MaxCap → 跳出等待
    │           │     └─ cond.Wait() → 挂起等待 Signal/Broadcast
    │           └─ 条件满足 → mu.Unlock()，回到外层循环重试
    │
    └─ 返回 (conn, error)
 ```
+
+**等待唤醒机制说明：**
+- 超时检查 `time.Now().After(deadline)` 在持有锁的状态下执行，保证原子性
+- 超时协程触发时会先获取锁再 Broadcast，确保等待者被唤醒后能立即检测到超时
+- 避免了锁外关闭通道、锁内检查通道可能导致的"假等待"问题
 
 ### 4.3 连接归还流程 (Put)
 
@@ -237,10 +240,16 @@ idleTimeoutLoop（后台协程，IdleTimeout/2 驱动）
       │           └─ 加入 expired 列表
       │           └─ count--
       │
+      ├─ len(expired) > 0 → cond.Broadcast()（唤醒阻塞的 Get 调用者）
       ├─ mu.Unlock()
       │
       └─ 遍历 expired，逐个调用 Close(conn)
 ```
+
+**回收唤醒机制说明：**
+- 当有空闲连接因超时而被回收时，总连接数 `count` 减少，释放了创建新连接的容量
+- 此时调用 `cond.Broadcast()` 立即唤醒所有阻塞中的 `Get` 调用者，使它们有机会创建新连接
+- 避免了等待者只能等到自身超时后才能重试的不必要延迟
 
 ### 4.6 连接池关闭流程
 
@@ -274,13 +283,18 @@ Close()
 
 这种策略保证了热点连接被持续复用，而冷连接在资源紧张时优先被释放。
 
-## 6. 线程安全说明
+## 6. 线程安全与性能优化说明
 
 连接池是完全并发安全的：
 - 所有内部状态访问受 `mu` 互斥锁保护
 - 总连接数 `count` 使用 `atomic` 原子操作，在创建新连接的 CAS 阶段减少锁持有时间
 - 等待唤醒使用 `sync.Cond`，避免忙等待导致的 CPU 空转
 - 后台协程通过 `stopCh` + `WaitGroup` 实现优雅退出
+
+**关键性能优化：**
+- **Ping nil 优化**：当 `Ping` 配置为 `nil` 时，跳过空闲连接借用前的心跳检测，避免不必要的锁释放和重新获取开销。该优化在 [getIdle()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/connpool/pool.go#L111-L143) 中通过 `if p.cfg.Ping != nil` 判断实现
+- **原子超时检查**：等待模式下的超时检查在持有锁的状态下执行，确保与 `cond.Wait()` 的原子性，避免"假等待"问题。实现见 [Get()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/connpool/pool.go#L145-L222)
+- **回收即时唤醒**：空闲超时回收和心跳检测回收后立即调用 `cond.Broadcast()` 唤醒阻塞的 Get 调用者，减少请求延迟。实现见 [reclaimIdleTimeout()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/connpool/pool.go#L403-L431) 和 [checkHeartbeats()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/connpool/pool.go#L337-L382)
 
 ## 7. 使用示例
 

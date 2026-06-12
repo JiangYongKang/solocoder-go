@@ -763,3 +763,230 @@ func TestTestAccount_Apply_InsufficientBalance(t *testing.T) {
 		t.Error("expected error for insufficient balance")
 	}
 }
+
+func TestInMemoryEventStore_AppendEvents_AggregateIDMismatch(t *testing.T) {
+	store := NewInMemoryEventStore()
+
+	event := NewEvent("different-id", "TestEvent", []byte("data"), 0)
+	err := store.AppendEvents("agg-1", 0, []*Event{event})
+	if !errors.Is(err, ErrAggregateIDMismatch) {
+		t.Errorf("expected ErrAggregateIDMismatch, got %v", err)
+	}
+}
+
+func TestInMemoryEventStore_AppendEvents_AggregateIDMismatchInMultipleEvents(t *testing.T) {
+	store := NewInMemoryEventStore()
+
+	events := []*Event{
+		NewEvent("agg-1", "Event1", []byte("data1"), 0),
+		NewEvent("wrong-id", "Event2", []byte("data2"), 0),
+	}
+	err := store.AppendEvents("agg-1", 0, events)
+	if !errors.Is(err, ErrAggregateIDMismatch) {
+		t.Errorf("expected ErrAggregateIDMismatch, got %v", err)
+	}
+
+	version, err := store.GetVersion("agg-1")
+	if !errors.Is(err, ErrAggregateNotFound) {
+		t.Errorf("expected ErrAggregateNotFound after failed append, got version %d, err %v", version, err)
+	}
+}
+
+func TestInMemoryEventStore_AppendEvents_EmptyEventAggregateIDIsFilled(t *testing.T) {
+	store := NewInMemoryEventStore()
+
+	event := NewEvent("", "TestEvent", []byte("data"), 0)
+	err := store.AppendEvents("agg-1", 0, []*Event{event})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	loadedEvents, err := store.LoadEvents("agg-1", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(loadedEvents) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(loadedEvents))
+	}
+	if loadedEvents[0].AggregateID != "agg-1" {
+		t.Errorf("expected event AggregateID to be 'agg-1', got '%s'", loadedEvents[0].AggregateID)
+	}
+}
+
+type errorSnapshotStore struct {
+	loadError error
+}
+
+func (s *errorSnapshotStore) SaveSnapshot(snapshot *Snapshot) error {
+	return nil
+}
+
+func (s *errorSnapshotStore) LoadSnapshot(aggregateID string) (*Snapshot, error) {
+	return nil, s.loadError
+}
+
+func TestEventSourcingEngine_RebuildState_SnapshotLoadError(t *testing.T) {
+	eventStore := NewInMemoryEventStore()
+	customErr := errors.New("custom snapshot load error")
+	snapshotStore := &errorSnapshotStore{loadError: customErr}
+	engine := NewEventSourcingEngine(eventStore, snapshotStore)
+
+	account := NewTestAccount("acc-1")
+	err := engine.RebuildState(account)
+	if !errors.Is(err, customErr) {
+		t.Errorf("expected custom snapshot load error, got %v", err)
+	}
+}
+
+func TestEventSourcingEngine_RebuildState_SnapshotNotFoundFallsBack(t *testing.T) {
+	eventStore := NewInMemoryEventStore()
+	snapshotStore := NewInMemorySnapshotStore()
+	engine := NewEventSourcingEngine(eventStore, snapshotStore)
+
+	createdData, _ := json.Marshal(map[string]interface{}{"owner": "Test"})
+	err := eventStore.AppendEvents("acc-1", 0, []*Event{
+		NewEvent("acc-1", "AccountCreated", createdData, 0),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	account := NewTestAccount("acc-1")
+	err = engine.RebuildState(account)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if account.Owner != "Test" {
+		t.Errorf("expected owner 'Test', got '%s'", account.Owner)
+	}
+	if account.Version() != 1 {
+		t.Errorf("expected version 1, got %d", account.Version())
+	}
+}
+
+func TestEventSourcingEngine_RebuildState_SetVersionViaInterface(t *testing.T) {
+	eventStore := NewInMemoryEventStore()
+	snapshotStore := NewInMemorySnapshotStore()
+	engine := NewEventSourcingEngine(eventStore, snapshotStore)
+
+	aggregateID := "acc-setversion"
+
+	createdData, _ := json.Marshal(map[string]interface{}{"owner": "SetVersionTest"})
+	depositData, _ := json.Marshal(map[string]interface{}{"amount": 500.0})
+
+	err := eventStore.AppendEvents(aggregateID, 0, []*Event{
+		NewEvent(aggregateID, "AccountCreated", createdData, 0),
+		NewEvent(aggregateID, "Deposit", depositData, 0),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	account := NewTestAccount(aggregateID)
+	err = engine.RebuildState(account)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = engine.CreateSnapshot(account)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	withdrawData, _ := json.Marshal(map[string]interface{}{"amount": 100.0})
+	err = eventStore.AppendEvents(aggregateID, 2, []*Event{
+		NewEvent(aggregateID, "Withdraw", withdrawData, 0),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	rebuiltAccount := NewTestAccount(aggregateID)
+	err = engine.RebuildState(rebuiltAccount)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if rebuiltAccount.Version() != 3 {
+		t.Errorf("expected version 3 after rebuild from snapshot, got %d", rebuiltAccount.Version())
+	}
+	if rebuiltAccount.Balance != 400.0 {
+		t.Errorf("expected balance 400.0, got %f", rebuiltAccount.Balance)
+	}
+}
+
+type customAggregate struct {
+	id      string
+	version int64
+	data    string
+}
+
+func (a *customAggregate) AggregateID() string {
+	return a.id
+}
+
+func (a *customAggregate) Version() int64 {
+	return a.version
+}
+
+func (a *customAggregate) SetVersion(version int64) {
+	a.version = version
+}
+
+func (a *customAggregate) Apply(event *Event) error {
+	a.data = string(event.Data)
+	a.version++
+	return nil
+}
+
+func (a *customAggregate) MarshalState() ([]byte, error) {
+	return []byte(a.data), nil
+}
+
+func (a *customAggregate) UnmarshalState(data []byte) error {
+	a.data = string(data)
+	return nil
+}
+
+func TestAggregateInterface_SetVersionOnCustomAggregate(t *testing.T) {
+	eventStore := NewInMemoryEventStore()
+	snapshotStore := NewInMemorySnapshotStore()
+	engine := NewEventSourcingEngine(eventStore, snapshotStore)
+
+	aggregateID := "custom-agg"
+
+	snapshot := NewSnapshot(aggregateID, 5, []byte("snapshot-state"))
+	err := snapshotStore.SaveSnapshot(snapshot)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	initialEvents := make([]*Event, 5)
+	for i := 0; i < 5; i++ {
+		initialEvents[i] = NewEvent(aggregateID, "Init", []byte("init"), 0)
+	}
+	err = eventStore.AppendEvents(aggregateID, 0, initialEvents)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	event := NewEvent(aggregateID, "Update", []byte("event-data"), 0)
+	err = eventStore.AppendEvents(aggregateID, 5, []*Event{event})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	customAgg := &customAggregate{id: aggregateID}
+	err = engine.RebuildState(customAgg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if customAgg.Version() != 6 {
+		t.Errorf("expected version 6 (5 from snapshot + 1 from event), got %d", customAgg.Version())
+	}
+	if customAgg.data != "event-data" {
+		t.Errorf("expected data 'event-data', got '%s'", customAgg.data)
+	}
+}
+

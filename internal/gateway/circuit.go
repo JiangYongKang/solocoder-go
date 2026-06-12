@@ -70,10 +70,8 @@ func (cb *CircuitBreaker) RecordFailure() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	now := time.Now()
 	cb.failures = append(cb.failures, FailureEntry{
-		Time:    now,
-		Success: false,
+		Time: time.Now(),
 	})
 
 	switch cb.state {
@@ -117,13 +115,10 @@ func (cb *CircuitBreaker) countRecentFailures() int {
 	cutoff := time.Now().Add(-cb.windowSize)
 	count := 0
 	for i := len(cb.failures) - 1; i >= 0; i-- {
-		entry := cb.failures[i]
-		if entry.Time.Before(cutoff) {
+		if cb.failures[i].Time.Before(cutoff) {
 			break
 		}
-		if !entry.Success {
-			count++
-		}
+		count++
 	}
 	return count
 }

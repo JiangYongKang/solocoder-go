@@ -6,8 +6,8 @@
 
 - **DAG 依赖调度**：支持定义任务间的有向无环图依赖关系，调度器按拓扑顺序并发执行任务
 - **超时控制**：每个任务支持配置独立的执行超时时间，超时后自动取消并标记为 Timeout
-- **错误传播**：任务失败时，所有直接或间接依赖该失败任务的后继任务标记为 Skipped，不依赖失败任务的其他分支继续正常执行
-- **局部重试**：支持对 DAG 中失败的单个任务及其下游进行重试，已成功完成的上游任务不重复执行
+- **错误传播**：任务失败时，错误信息沿依赖链向上传播，所有直接或间接依赖该失败任务的后继任务标记为 Skipped，并携带完整错误原因；不依赖失败任务的其他分支继续正常执行
+- **局部重试**：支持对 DAG 中失败的单个任务及其下游进行重试，已成功完成的上游任务不重复执行；重试前可通过 API 动态更新任务的执行函数和超时配置以修复问题
 - **结果聚合**：所有任务执行完毕后，将每个任务的状态、输出结果和耗时汇总为整体执行报告
 
 ## 核心结构体
@@ -62,6 +62,8 @@
 | NewOrchestrator() | 创建新的编排器实例 |
 | AddTask(id, name, fn, timeout, ...deps) | 添加任务，指定 ID、名称、执行函数、超时时间和前置依赖 |
 | SetTaskRetry(id, maxRetry) | 设置任务的最大重试次数 |
+| UpdateTaskFunc(id, fn) error | 在重试前更新任务的执行函数（编排器未运行时） |
+| UpdateTaskTimeout(id, timeout) error | 在重试前更新任务的超时时间（编排器未运行时） |
 | ValidateDAG() error | 验证 DAG 的合法性（检测环和无效依赖） |
 | Run(ctx) (*ExecutionReport, error) | 执行整个 DAG，返回执行报告 |
 | RetryTask(ctx, taskID) (*ExecutionReport, error) | 重试失败任务及其下游 |
@@ -152,6 +154,26 @@ Pending → Running → Success
 2. 不依赖失败任务的其他分支不受影响，继续正常执行
 3. 如果一个任务同时依赖成功和失败的任务，该任务标记为 Skipped
 4. Skipped 状态会沿依赖链继续传播（间接后继也会被跳过）
+5. **错误原因链传播**：Skipped 任务的 Error 字段会递归包装上游失败原因，使用 `errors.Is` 可沿整条依赖链定位根因
+
+### 错误传播实现细节
+
+`shouldSkip` 方法在检测到上游失败时，会同时返回：
+- `skip: bool` — 是否需要跳过
+- `depID: string` — 导致跳过的直接依赖 ID
+- `depErr: error` — 该依赖上记录的实际错误（本身可能是另一个 Skipped 任务的包装错误）
+
+标记 Skipped 时使用 `fmt.Errorf` 的 `%w` 动词进行递归包装：
+
+```go
+o.results[id].Error = fmt.Errorf("skipped due to failure in dependency '%s': %w", depID, depErr)
+```
+
+因此，对于依赖链 `t0(根因失败) → t1 → t2 → t3`：
+- t3.Error 的字符串形如：
+  `skipped due to failure in dependency 't2': skipped due to failure in dependency 't1': skipped due to failure in dependency 't0': <根因错误>`
+- `errors.Is(t3.Error, rootErr)` 返回 `true`
+- `errors.Is(t3.Error, ErrTimeout)` 也能匹配到超时类型的根因
 
 ## 局部重试流程
 
@@ -159,7 +181,10 @@ Pending → Running → Success
 1. 初始执行：
    A(Success) → B(Failed) → C(Skipped) → D(Skipped)
 
-2. 修复 B 的函数后，调用 RetryTask(ctx, "B")：
+2. 调用 UpdateTaskFunc("B", newFn) 替换 B 的执行函数以修复 Bug
+   - 也可调用 UpdateTaskTimeout 调整超时配置
+
+3. 调用 RetryTask(ctx, "B")：
 
    - 收集重试目标：B 及其所有下游 = {B, C, D}
    - 将 B、C、D 的状态重置为 Pending
@@ -167,12 +192,35 @@ Pending → Running → Success
    - 以重试目标子集作为 taskSet 重新运行调度器
    - 重试目标中仅统计内部的依赖关系（A 不在 taskSet 中，不计入 readyCount）
 
-3. 重试结果：
+4. 重试结果：
    A 仍为 Success
    B → Success（修复后）
    C → Success
    D → Success
 ```
+
+### 重试的典型步骤
+
+```
+Run 发现失败
+    ↓
+查看失败任务的 Error，定位根因
+    ↓
+UpdateTaskFunc / UpdateTaskTimeout 修正问题
+    ↓
+RetryTask(ctx, failedTaskID) 触发局部重试
+    ↓
+获得新的 ExecutionReport
+```
+
+### 可重试的任务状态
+
+只有以下状态的任务可作为 RetryTask 的入口：
+- **Failed**：执行函数返回错误或 panic
+- **Timeout**：执行超时
+- **Skipped**：本身未执行，但上游已被修复（可通过重试其上游恢复，或直接重试本节点时同时重置下游）
+
+若任务状态为 Success 或 Running，调用 RetryTask 将返回 `ErrCannotRetry` 或 `ErrOrchestratorRunning`。
 
 ## 超时控制
 
@@ -252,6 +300,91 @@ if err != nil {
 }
 
 fmt.Printf("重试结果: success=%v\n", retryReport.Success)
+```
+
+### 局部重试 + 修复函数
+
+```go
+// 首次执行，部分任务失败（如数据库连接错误）
+report, _ := o.Run(context.Background())
+
+// 查看失败原因，用 errors.Is / errors.As 溯源根因
+if !report.Success {
+    fetchResult := report.TaskResults["fetch_db"]
+    if fetchResult.Status == StatusFailed {
+        var dbErr *MyDBError
+        if errors.As(fetchResult.Error, &dbErr) {
+            log.Printf("DB error code=%d: %s", dbErr.Code, dbErr.Message)
+        }
+    }
+
+    // 用修复后的函数替换原有逻辑（例如切换到备用数据源）
+    o.UpdateTaskFunc("fetch_db", func(ctx context.Context) (interface{}, error) {
+        return backupDB.Query(ctx, "SELECT ...")
+    })
+
+    // 如果是超时问题，也可以放宽超时时间
+    o.UpdateTaskTimeout("fetch_db", 30*time.Second)
+
+    // 仅重试失败节点及其下游，已成功的上游不复用
+    retryReport, err := o.RetryTask(context.Background(), "fetch_db")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("重试后整体结果: success=%v\n", retryReport.Success)
+}
+```
+
+### 多次重试 + 最终修复
+
+```go
+// 第 1 次运行：失败
+r1, _ := o.Run(ctx)
+if !r1.Success {
+    // 第 1 次重试：沿用旧函数，可能因外部临时故障自愈
+    r2, err := o.RetryTask(ctx, "failed_id")
+    if err != nil { log.Fatal(err) }
+
+    if !r2.Success {
+        // 第 2 次重试：替换为修复后的函数再试
+        o.UpdateTaskFunc("failed_id", fixedFunc)
+        r3, _ := o.RetryTask(ctx, "failed_id")
+    }
+}
+```
+
+### 深度依赖链错误溯源
+
+```go
+// DAG: t0 → t1 → t2 → t3 → t4
+// t0 因业务错误失败
+rootErr := &MyAppError{Code: "AUTH_TOKEN_EXPIRED"}
+o.AddTask("t0", "根节点", func(ctx context.Context) (interface{}, error) {
+    return nil, rootErr
+}, 0)
+// ... t1-t4 依次链式依赖
+
+report, _ := o.Run(ctx)
+
+// 从最末端任务 t4 的错误一路用 errors.Is / errors.As 找到根因
+t4Err := report.TaskResults["t4"].Error
+
+var appErr *MyAppError
+if errors.As(t4Err, &appErr) {
+    log.Printf("根因: code=%s", appErr.Code) // AUTH_TOKEN_EXPIRED
+}
+
+// 也可以验证错误类型
+if errors.Is(t4Err, rootErr) {
+    log.Println("t4 错误链中找到了原始错误对象")
+}
+
+// 错误链字符串形式示例：
+// skipped due to failure in dependency 't3':
+//   skipped due to failure in dependency 't2':
+//     skipped due to failure in dependency 't1':
+//       skipped due to failure in dependency 't0':
+//         MyAppError code=AUTH_TOKEN_EXPIRED
 ```
 
 ### 超时与重试组合

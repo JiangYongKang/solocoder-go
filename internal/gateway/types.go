@@ -75,8 +75,7 @@ func (s *MemoryTokenStore) Validate(token string) (*UserInfo, bool) {
 }
 
 type FailureEntry struct {
-	Time    time.Time
-	Success bool
+	Time time.Time
 }
 
 type CircuitBreakerState int

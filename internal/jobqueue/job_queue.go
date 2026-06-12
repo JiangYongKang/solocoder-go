@@ -43,7 +43,8 @@ type JobQueue struct {
 	wg               sync.WaitGroup
 	nextID           uint64
 	idMu             sync.Mutex
-	results          map[string]*JobResult
+	successResults   map[string]*JobResult
+	deadLetterResults map[string]*JobResult
 	resultsMu        sync.RWMutex
 	notifyChan       map[string]chan struct{}
 	notifyMu         sync.Mutex
@@ -73,7 +74,8 @@ func NewJobQueue(cfg Config) (*JobQueue, error) {
 		shutdownCh:  make(chan struct{}),
 		wakeCh:      make(chan struct{}),
 		sem:         make(chan struct{}, cfg.PoolSize),
-		results:     make(map[string]*JobResult),
+		successResults:   make(map[string]*JobResult),
+		deadLetterResults: make(map[string]*JobResult),
 		notifyChan:  make(map[string]chan struct{}),
 	}, nil
 }
@@ -320,7 +322,7 @@ func (jq *JobQueue) executeJob(job *Job) {
 		job.Status = JobStatusCompleted
 		job.Result = result
 		job.Error = nil
-		jq.storeResult(job.ID, result, nil)
+		jq.storeSuccessResult(job.ID, result)
 		jq.notifyJobComplete(job.ID)
 		delete(jq.jobs, job.ID)
 		return
@@ -332,7 +334,7 @@ func (jq *JobQueue) executeJob(job *Job) {
 	if job.RetryCount > job.MaxRetries {
 		job.Status = JobStatusDeadLetter
 		jq.deadLetters = append(jq.deadLetters, job)
-		jq.storeResult(job.ID, nil, err)
+		jq.storeDeadLetterResult(job.ID, err)
 		jq.notifyJobComplete(job.ID)
 		delete(jq.jobs, job.ID)
 		return
@@ -341,7 +343,7 @@ func (jq *JobQueue) executeJob(job *Job) {
 	backoff := job.BackoffDelay()
 	job.ReadyTime = time.Now().Add(backoff)
 	job.EnqueueTime = time.Now()
-	job.Status = JobStatusPending
+	job.Status = JobStatusFailed
 	heap.Push(jq.dq, job)
 	jq.wake()
 }
@@ -360,14 +362,34 @@ func (jq *JobQueue) safeExecute(job *Job) (result interface{}, err error) {
 	return jq.handler(ctx, job)
 }
 
-func (jq *JobQueue) storeResult(jobID string, result interface{}, err error) {
+func (jq *JobQueue) storeSuccessResult(jobID string, result interface{}) {
 	jq.resultsMu.Lock()
 	defer jq.resultsMu.Unlock()
-	jq.results[jobID] = &JobResult{
+	jq.successResults[jobID] = &JobResult{
 		JobID:  jobID,
 		Result: result,
+		Error:  nil,
+	}
+}
+
+func (jq *JobQueue) storeDeadLetterResult(jobID string, err error) {
+	jq.resultsMu.Lock()
+	defer jq.resultsMu.Unlock()
+	jq.deadLetterResults[jobID] = &JobResult{
+		JobID:  jobID,
+		Result: nil,
 		Error:  err,
 	}
+}
+
+func (jq *JobQueue) lookupResult(jobID string) (*JobResult, bool) {
+	if res, ok := jq.successResults[jobID]; ok {
+		return res, true
+	}
+	if res, ok := jq.deadLetterResults[jobID]; ok {
+		return res, true
+	}
+	return nil, false
 }
 
 func (jq *JobQueue) notifyJobComplete(jobID string) {
@@ -381,7 +403,7 @@ func (jq *JobQueue) notifyJobComplete(jobID string) {
 
 func (jq *JobQueue) WaitForResult(ctx context.Context, jobID string) (*JobResult, error) {
 	jq.resultsMu.RLock()
-	if res, ok := jq.results[jobID]; ok {
+	if res, ok := jq.lookupResult(jobID); ok {
 		jq.resultsMu.RUnlock()
 		return res, nil
 	}
@@ -403,7 +425,7 @@ func (jq *JobQueue) WaitForResult(ctx context.Context, jobID string) (*JobResult
 		}
 	} else {
 		jq.resultsMu.RLock()
-		if res, ok := jq.results[jobID]; ok {
+		if res, ok := jq.lookupResult(jobID); ok {
 			jq.resultsMu.RUnlock()
 			return res, nil
 		}
@@ -418,7 +440,7 @@ func (jq *JobQueue) WaitForResult(ctx context.Context, jobID string) (*JobResult
 
 	jq.resultsMu.RLock()
 	defer jq.resultsMu.RUnlock()
-	if res, ok := jq.results[jobID]; ok {
+	if res, ok := jq.lookupResult(jobID); ok {
 		return res, nil
 	}
 	return nil, ErrJobNotFound
@@ -427,7 +449,7 @@ func (jq *JobQueue) WaitForResult(ctx context.Context, jobID string) (*JobResult
 func (jq *JobQueue) GetResult(jobID string) (*JobResult, error) {
 	jq.resultsMu.RLock()
 	defer jq.resultsMu.RUnlock()
-	if res, ok := jq.results[jobID]; ok {
+	if res, ok := jq.lookupResult(jobID); ok {
 		return res, nil
 	}
 	return nil, ErrJobNotFound
@@ -446,7 +468,7 @@ func (jq *JobQueue) GetJobStatus(jobID string) (JobStatus, error) {
 	}
 	jq.resultsMu.RLock()
 	defer jq.resultsMu.RUnlock()
-	if _, ok := jq.results[jobID]; ok {
+	if _, ok := jq.successResults[jobID]; ok {
 		return JobStatusCompleted, nil
 	}
 	return "", ErrJobNotFound
@@ -485,11 +507,18 @@ func (jq *JobQueue) ClearDeadLetters() {
 func (jq *JobQueue) CompletedCount() int {
 	jq.resultsMu.RLock()
 	defer jq.resultsMu.RUnlock()
-	return len(jq.results)
+	return len(jq.successResults)
+}
+
+func (jq *JobQueue) FailedCount() int {
+	jq.resultsMu.RLock()
+	defer jq.resultsMu.RUnlock()
+	return len(jq.deadLetterResults)
 }
 
 func (jq *JobQueue) ClearResults() {
 	jq.resultsMu.Lock()
 	defer jq.resultsMu.Unlock()
-	jq.results = make(map[string]*JobResult)
+	jq.successResults = make(map[string]*JobResult)
+	jq.deadLetterResults = make(map[string]*JobResult)
 }

@@ -1035,3 +1035,360 @@ func TestHashKeyDeterminism(t *testing.T) {
 		t.Fatal("different keys produced same hash (unlikely collision)")
 	}
 }
+
+func TestMigration_RemoveShard_NoOverCopy(t *testing.T) {
+	config := ShardKVConfig{
+		VirtualNodes: 100,
+		ReplicaCount: 2,
+		WriteQuorum:  2,
+	}
+	cluster := NewShardKVClusterWithConfig(config)
+
+	cluster.AddShard("shard1")
+	cluster.AddShard("shard2")
+	cluster.AddShard("shard3")
+	cluster.AddShard("shard4")
+	cluster.WaitForMigration()
+
+	for i := 0; i < 200; i++ {
+		key := fmt.Sprintf("overcopy-%d", i)
+		err := cluster.Put(key, []byte(fmt.Sprintf("val-%d", i)))
+		if err != nil {
+			t.Fatalf("put error: %v", err)
+		}
+	}
+
+	for i := 0; i < 200; i++ {
+		key := fmt.Sprintf("overcopy-%d", i)
+		replicas := cluster.hashRing.GetReplicaNodes(key, config.ReplicaCount)
+		count := 0
+		for _, sid := range replicas {
+			s, ok := cluster.GetShard(sid)
+			if ok && s.HasKey(key) {
+				count++
+			}
+		}
+		if count != config.ReplicaCount {
+			t.Fatalf("key %s expected %d replicas before removal, got %d", key, config.ReplicaCount, count)
+		}
+	}
+
+	err := cluster.RemoveShard("shard3")
+	if err != nil {
+		t.Fatalf("remove shard error: %v", err)
+	}
+	cluster.WaitForMigration()
+
+	for i := 0; i < 200; i++ {
+		key := fmt.Sprintf("overcopy-%d", i)
+		_, err := cluster.Get(key)
+		if err != nil {
+			t.Fatalf("key %s lost after removal: %v", key, err)
+		}
+	}
+
+	totalReplicaCount := 0
+	shardIDs := cluster.GetShardIDs()
+	for _, sid := range shardIDs {
+		s, _ := cluster.GetShard(sid)
+		totalReplicaCount += s.DataCount()
+	}
+
+	expectedTotal := 200 * config.ReplicaCount
+	if totalReplicaCount != expectedTotal {
+		t.Fatalf("expected total replica count %d (200 keys * %d replicas), got %d",
+			expectedTotal, config.ReplicaCount, totalReplicaCount)
+	}
+}
+
+func TestMigration_AddShard_ReplicaCountCorrect(t *testing.T) {
+	config := ShardKVConfig{
+		VirtualNodes: 100,
+		ReplicaCount: 3,
+		WriteQuorum:  3,
+	}
+	cluster := NewShardKVClusterWithConfig(config)
+
+	cluster.AddShard("s1")
+	cluster.AddShard("s2")
+	cluster.AddShard("s3")
+	cluster.WaitForMigration()
+
+	for i := 0; i < 150; i++ {
+		key := fmt.Sprintf("addmig-%d", i)
+		cluster.Put(key, []byte("v"))
+	}
+
+	totalBefore := 0
+	for _, sid := range cluster.GetShardIDs() {
+		s, _ := cluster.GetShard(sid)
+		totalBefore += s.DataCount()
+	}
+	expectedBefore := 150 * config.ReplicaCount
+	if totalBefore != expectedBefore {
+		t.Fatalf("before add: expected %d total replicas, got %d", expectedBefore, totalBefore)
+	}
+
+	cluster.AddShard("s4")
+	cluster.AddShard("s5")
+	cluster.WaitForMigration()
+
+	totalAfter := 0
+	for _, sid := range cluster.GetShardIDs() {
+		s, _ := cluster.GetShard(sid)
+		totalAfter += s.DataCount()
+	}
+	expectedAfter := 150 * config.ReplicaCount
+	if totalAfter != expectedAfter {
+		t.Fatalf("after add: expected %d total replicas, got %d", expectedAfter, totalAfter)
+	}
+
+	for i := 0; i < 150; i++ {
+		key := fmt.Sprintf("addmig-%d", i)
+		_, err := cluster.Get(key)
+		if err != nil {
+			t.Fatalf("key %s not found after add shards: %v", key, err)
+		}
+	}
+}
+
+func TestMigration_TotalKeysConsistency(t *testing.T) {
+	config := ShardKVConfig{
+		VirtualNodes: 50,
+		ReplicaCount: 1,
+		WriteQuorum:  1,
+	}
+	cluster := NewShardKVClusterWithConfig(config)
+
+	cluster.AddShard("a")
+	cluster.AddShard("b")
+	cluster.WaitForMigration()
+
+	for i := 0; i < 500; i++ {
+		cluster.Put(fmt.Sprintf("tk-%d", i), []byte("data"))
+	}
+
+	totalUnique := cluster.TotalDataCount()
+	if totalUnique != 500 {
+		t.Fatalf("expected 500 unique keys, got %d", totalUnique)
+	}
+
+	cluster.AddShard("c")
+	cluster.AddShard("d")
+	cluster.AddShard("e")
+	cluster.WaitForMigration()
+
+	totalAfterAdd := cluster.TotalDataCount()
+	if totalAfterAdd != 500 {
+		t.Fatalf("after adding shards: expected 500 unique keys, got %d", totalAfterAdd)
+	}
+
+	cluster.RemoveShard("c")
+	cluster.RemoveShard("d")
+	cluster.WaitForMigration()
+
+	totalAfterRemove := cluster.TotalDataCount()
+	if totalAfterRemove != 500 {
+		t.Fatalf("after removing shards: expected 500 unique keys, got %d", totalAfterRemove)
+	}
+
+	for i := 0; i < 500; i++ {
+		key := fmt.Sprintf("tk-%d", i)
+		val, err := cluster.Get(key)
+		if err != nil {
+			t.Fatalf("key %s missing: %v", key, err)
+		}
+		if string(val) != "data" {
+			t.Fatalf("key %s value corrupted", key)
+		}
+	}
+}
+
+func TestFailover_RecoveryTiming(t *testing.T) {
+	config := ShardKVConfig{
+		VirtualNodes: 100,
+		ReplicaCount: 2,
+		WriteQuorum:  2,
+	}
+	cluster := NewShardKVClusterWithConfig(config)
+
+	cluster.AddShard("node-A")
+	cluster.AddShard("node-B")
+	cluster.AddShard("node-C")
+	cluster.WaitForMigration()
+
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("rectime-%d", i)
+		cluster.Put(key, []byte(fmt.Sprintf("value-%d", i)))
+	}
+
+	cluster.MarkShardDown("node-A")
+
+	for i := 100; i < 200; i++ {
+		key := fmt.Sprintf("rectime-%d", i)
+		cluster.Put(key, []byte(fmt.Sprintf("value-%d", i)))
+	}
+
+	err := cluster.MarkShardUp("node-A")
+	if err != nil {
+		t.Fatalf("mark up error: %v", err)
+	}
+
+	nodeA, _ := cluster.GetShard("node-A")
+	if nodeA.Status() != ShardStatusUp {
+		t.Fatal("expected node-A to be Up after MarkShardUp returns")
+	}
+
+	for i := 0; i < 200; i++ {
+		key := fmt.Sprintf("rectime-%d", i)
+		val, err := cluster.Get(key)
+		if err != nil {
+			t.Fatalf("key %s not found immediately after recovery: %v", key, err)
+		}
+		expected := []byte(fmt.Sprintf("value-%d", i))
+		if !bytes.Equal(val, expected) {
+			t.Fatalf("key %s value mismatch after recovery", key)
+		}
+	}
+
+	recoveredCount := 0
+	for i := 0; i < 200; i++ {
+		key := fmt.Sprintf("rectime-%d", i)
+		if nodeA.HasKey(key) {
+			recoveredCount++
+		}
+	}
+
+	if recoveredCount == 0 {
+		t.Fatal("node-A should have some keys after recovery, got 0")
+	}
+	t.Logf("node-A recovered %d keys out of 200", recoveredCount)
+}
+
+func TestFailover_RecoveryDataIntegrity(t *testing.T) {
+	config := ShardKVConfig{
+		VirtualNodes: 80,
+		ReplicaCount: 3,
+		WriteQuorum:  2,
+	}
+	cluster := NewShardKVClusterWithConfig(config)
+
+	for i := 1; i <= 5; i++ {
+		cluster.AddShard(fmt.Sprintf("n%d", i))
+	}
+	cluster.WaitForMigration()
+
+	for i := 0; i < 300; i++ {
+		key := fmt.Sprintf("integrity-%d", i)
+		val := []byte(fmt.Sprintf("payload-%06d", i))
+		cluster.Put(key, val)
+	}
+
+	cluster.MarkShardDown("n2")
+	cluster.MarkShardDown("n4")
+
+	for i := 300; i < 400; i++ {
+		key := fmt.Sprintf("integrity-%d", i)
+		val := []byte(fmt.Sprintf("payload-%06d", i))
+		err := cluster.Put(key, val)
+		if err != nil {
+			t.Fatalf("put during downtime failed: %v", err)
+		}
+	}
+
+	cluster.MarkShardUp("n2")
+	cluster.WaitForMigration()
+
+	for i := 0; i < 400; i++ {
+		key := fmt.Sprintf("integrity-%d", i)
+		expected := []byte(fmt.Sprintf("payload-%06d", i))
+		val, err := cluster.Get(key)
+		if err != nil {
+			t.Fatalf("key %s missing after n2 recovery: %v", key, err)
+		}
+		if !bytes.Equal(val, expected) {
+			t.Fatalf("key %s value mismatch after n2 recovery", key)
+		}
+	}
+
+	cluster.MarkShardUp("n4")
+	cluster.WaitForMigration()
+
+	for i := 0; i < 400; i++ {
+		key := fmt.Sprintf("integrity-%d", i)
+		expected := []byte(fmt.Sprintf("payload-%06d", i))
+		val, err := cluster.Get(key)
+		if err != nil {
+			t.Fatalf("key %s missing after n4 recovery: %v", key, err)
+		}
+		if !bytes.Equal(val, expected) {
+			t.Fatalf("key %s value mismatch after n4 recovery", key)
+		}
+	}
+}
+
+func TestMigration_RemoveShard_ReplicaPreservation(t *testing.T) {
+	config := ShardKVConfig{
+		VirtualNodes: 100,
+		ReplicaCount: 2,
+		WriteQuorum:  2,
+	}
+	cluster := NewShardKVClusterWithConfig(config)
+
+	cluster.AddShard("x1")
+	cluster.AddShard("x2")
+	cluster.AddShard("x3")
+	cluster.AddShard("x4")
+	cluster.AddShard("x5")
+	cluster.WaitForMigration()
+
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("preserve-%d", i)
+		cluster.Put(key, []byte("v"))
+	}
+
+	preRemoveData := make(map[string]map[string]bool)
+	for _, sid := range cluster.GetShardIDs() {
+		s, _ := cluster.GetShard(sid)
+		preRemoveData[sid] = make(map[string]bool)
+		for _, k := range s.GetAllKeys() {
+			preRemoveData[sid][k] = true
+		}
+	}
+
+	err := cluster.RemoveShard("x3")
+	if err != nil {
+		t.Fatalf("remove error: %v", err)
+	}
+	cluster.WaitForMigration()
+
+	for sid, keys := range preRemoveData {
+		if sid == "x3" {
+			continue
+		}
+		s, ok := cluster.GetShard(sid)
+		if !ok {
+			continue
+		}
+		for k := range keys {
+			if !s.HasKey(k) {
+				t.Logf("warning: key %s disappeared from shard %s", k, sid)
+			}
+		}
+	}
+
+	remainingShards := cluster.GetShardIDs()
+	if len(remainingShards) != 4 {
+		t.Fatalf("expected 4 shards, got %d", len(remainingShards))
+	}
+
+	totalReplicas := 0
+	for _, sid := range remainingShards {
+		s, _ := cluster.GetShard(sid)
+		totalReplicas += s.DataCount()
+	}
+	expected := 100 * config.ReplicaCount
+	if totalReplicas != expected {
+		t.Fatalf("expected %d total replicas after removal, got %d", expected, totalReplicas)
+	}
+}

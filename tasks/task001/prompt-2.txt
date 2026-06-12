@@ -1,0 +1,7 @@
+你实现的 HTTP 网关模块存在一些问题，需要修复：
+1. gateway.go 中的 MockUpstreamHandler 的 SetResponse 方法与 ServeHTTP 方法存在并发安全问题，在并发场景下修改响应内容可能导致读到不一致的状态码和响应体组合。
+2. circuit.go 中 FailureEntry 结构体的 Success 字段在所有代码路径中始终为 false，countRecentFailures 方法中基于该字段的过滤逻辑从未生效，成了死代码。
+3. ratelimit.go 中定义的 RateLimiterStats 结构体及其三个方法从未被任何生产代码或测试代码引用，属于无用的死代码。
+4. 修复后为该模块补充并发读写 MockUpstreamHandler 状态的单元测试，验证多 goroutine 下的数据一致性。
+5. 运行 go test ./internal/gateway/ -v，需要让所有测试通过。
+6. 在 docs/gateway.md 中更新模块需求文档，说明修复后的并发保证策略和熔断器记录机制。

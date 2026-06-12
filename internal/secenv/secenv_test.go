@@ -68,20 +68,78 @@ func TestEncryptDecryptBasic(t *testing.T) {
 	}
 }
 
-func TestEncryptEmptyData(t *testing.T) {
+func TestEncryptDecryptEmptyData(t *testing.T) {
 	se, err := NewSecureEnvelope(nil)
 	if err != nil {
 		t.Fatalf("NewSecureEnvelope failed: %v", err)
 	}
 
-	_, err = se.Encrypt([]byte{})
-	if err != ErrEmptyData {
-		t.Errorf("expected ErrEmptyData, got %v", err)
+	envelope, err := se.Encrypt([]byte{})
+	if err != nil {
+		t.Fatalf("Encrypt empty slice should succeed, got %v", err)
 	}
 
-	_, err = se.Encrypt(nil)
-	if err != ErrEmptyData {
-		t.Errorf("expected ErrEmptyData for nil, got %v", err)
+	se2 := NewSecureEnvelopeWithKeyManager(se.GetKeyManager(), 1000)
+	decrypted, err := se2.Decrypt(envelope)
+	if err != nil {
+		t.Fatalf("Decrypt empty envelope should succeed, got %v", err)
+	}
+	if len(decrypted) != 0 {
+		t.Errorf("expected empty decrypted data, got %d bytes", len(decrypted))
+	}
+
+	envelopeNil, err := se.Encrypt(nil)
+	if err != nil {
+		t.Fatalf("Encrypt nil should succeed, got %v", err)
+	}
+
+	se3 := NewSecureEnvelopeWithKeyManager(se.GetKeyManager(), 1000)
+	decryptedNil, err := se3.Decrypt(envelopeNil)
+	if err != nil {
+		t.Fatalf("Decrypt nil envelope should succeed, got %v", err)
+	}
+	if len(decryptedNil) != 0 {
+		t.Errorf("expected empty decrypted data for nil input, got %d bytes", len(decryptedNil))
+	}
+}
+
+func TestEncryptEmptyDataEnvelopeSize(t *testing.T) {
+	se, err := NewSecureEnvelope(nil)
+	if err != nil {
+		t.Fatalf("NewSecureEnvelope failed: %v", err)
+	}
+
+	envelope, err := se.Encrypt([]byte{})
+	if err != nil {
+		t.Fatalf("Encrypt empty data failed: %v", err)
+	}
+
+	expectedSize := 1 + 4 + 8 + NonceSize + 0 + GCMTagSize + HMACSize
+	if len(envelope) != expectedSize {
+		t.Errorf("expected envelope size %d for empty plaintext, got %d", expectedSize, len(envelope))
+	}
+}
+
+func TestReplayDetectionOnEmptyData(t *testing.T) {
+	se, err := NewSecureEnvelope(nil)
+	if err != nil {
+		t.Fatalf("NewSecureEnvelope failed: %v", err)
+	}
+
+	envelope, err := se.Encrypt([]byte{})
+	if err != nil {
+		t.Fatalf("Encrypt empty data failed: %v", err)
+	}
+
+	se2 := NewSecureEnvelopeWithKeyManager(se.GetKeyManager(), 1000)
+	_, err = se2.Decrypt(envelope)
+	if err != nil {
+		t.Fatalf("First decrypt of empty data should succeed, got %v", err)
+	}
+
+	_, err = se2.Decrypt(envelope)
+	if err != ErrReplayDetected {
+		t.Errorf("replayed empty data envelope should be rejected, got %v", err)
 	}
 }
 
@@ -1015,5 +1073,108 @@ func TestNonceUniqueness(t *testing.T) {
 			t.Errorf("duplicate nonce detected at iteration %d", i)
 		}
 		nonces[nonce] = true
+	}
+}
+
+func TestSequenceNumberMonotonicallyIncreasing(t *testing.T) {
+	se, err := NewSecureEnvelope(nil)
+	if err != nil {
+		t.Fatalf("NewSecureEnvelope failed: %v", err)
+	}
+
+	var prevSeq uint64
+	for i := 0; i < 10; i++ {
+		envelope, err := se.Encrypt([]byte("seq test"))
+		if err != nil {
+			t.Fatalf("Encrypt %d failed: %v", i, err)
+		}
+
+		seqNum := binary.BigEndian.Uint64(envelope[5:13])
+		if i == 0 {
+			if seqNum != 1 {
+				t.Errorf("first sequence number should be 1, got %d", seqNum)
+			}
+		} else {
+			if seqNum <= prevSeq {
+				t.Errorf("sequence number not monotonic: got %d, prev %d", seqNum, prevSeq)
+			}
+		}
+		prevSeq = seqNum
+	}
+}
+
+func TestSequenceNumberInEnvelopeMatchesInternal(t *testing.T) {
+	se, err := NewSecureEnvelope(nil)
+	if err != nil {
+		t.Fatalf("NewSecureEnvelope failed: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		envelope, err := se.Encrypt([]byte("test"))
+		if err != nil {
+			t.Fatalf("Encrypt %d failed: %v", i, err)
+		}
+
+		seqInEnvelope := binary.BigEndian.Uint64(envelope[5:13])
+		internalSeq := se.CurrentSequence()
+		if seqInEnvelope != internalSeq {
+			t.Errorf("envelope seq %d != internal seq %d", seqInEnvelope, internalSeq)
+		}
+	}
+}
+
+func TestSequenceReplayOutOfOrder(t *testing.T) {
+	rp := NewReplayProtector(100)
+
+	if err := rp.CheckAndUpdate(1, 10); err != nil {
+		t.Fatalf("CheckAndUpdate(10) failed: %v", err)
+	}
+
+	if err := rp.CheckAndUpdate(1, 10); err != ErrReplayDetected {
+		t.Errorf("same sequence should be replay, got %v", err)
+	}
+
+	if err := rp.CheckAndUpdate(1, 9); err != ErrReplayDetected {
+		t.Errorf("lower sequence should be replay, got %v", err)
+	}
+
+	if err := rp.CheckAndUpdate(1, 1); err != ErrReplayDetected {
+		t.Errorf("much lower sequence should be replay, got %v", err)
+	}
+
+	if err := rp.CheckAndUpdate(1, 11); err != nil {
+		t.Errorf("next sequence should succeed, got %v", err)
+	}
+}
+
+func TestSequenceGapJump(t *testing.T) {
+	rp := NewReplayProtector(10)
+
+	if err := rp.CheckAndUpdate(1, 1); err != nil {
+		t.Fatalf("CheckAndUpdate(1) failed: %v", err)
+	}
+
+	if err := rp.CheckAndUpdate(1, 12); err != ErrReplayDetected {
+		t.Errorf("seq 12 should be rejected (12 >= 1+10=11), got %v", err)
+	}
+
+	if err := rp.CheckAndUpdate(1, 11); err != ErrReplayDetected {
+		t.Errorf("seq 11 should be rejected (11 >= 1+10=11), got %v", err)
+	}
+
+	if err := rp.CheckAndUpdate(1, 10); err != nil {
+		t.Fatalf("seq 10 should succeed (10 > 1 and 10 < 1+10), got %v", err)
+	}
+
+	if err := rp.CheckAndUpdate(1, 19); err != nil {
+		t.Fatalf("seq 19 should succeed (19 > 10 and 19 < 10+10=20), got %v", err)
+	}
+
+	if err := rp.CheckAndUpdate(1, 29); err != ErrReplayDetected {
+		t.Errorf("seq 29 should be rejected (29 >= 19+10=29), got %v", err)
+	}
+
+	if err := rp.CheckAndUpdate(1, 28); err != nil {
+		t.Fatalf("seq 28 should succeed (28 > 19 and 28 < 19+10=29), got %v", err)
 	}
 }

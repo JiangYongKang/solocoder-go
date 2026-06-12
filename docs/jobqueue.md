@@ -63,15 +63,17 @@ type Job struct {
 
 ### 2.3 JobStatus
 
-任务状态枚举：
+任务状态枚举，各状态语义严格区分：
 
 | 状态 | 说明 |
 |------|------|
-| `JobStatusPending` | 等待执行中（队列中或延迟队列中） |
-| `JobStatusRunning` | 正在执行 |
-| `JobStatusCompleted` | 执行成功完成 |
-| `JobStatusFailed` | 执行失败（等待重试） |
-| `JobStatusDeadLetter` | 超过最大重试次数，进入死信队列 |
+| `JobStatusPending` | **首次等待执行**：新任务入队后尚未被执行过，在队列中等待调度 |
+| `JobStatusRunning` | 正在执行中：已被 worker 协程取出，正在调用 Handler |
+| `JobStatusCompleted` | **执行成功**：Handler 返回 nil error，任务正常结束 |
+| `JobStatusFailed` | **执行失败，等待重试**：Handler 返回 error，但未超过最大重试次数，在延迟队列中等待重试 |
+| `JobStatusDeadLetter` | **执行失败，已放弃**：超过最大重试次数，移入死信队列，不再重试 |
+
+> **关键区分**：`Pending` 表示从未执行过的新任务在等待，`Failed` 表示执行失败后在等待重试。通过 `GetJobStatus()` 可明确区分这两种不同语义的等待状态。
 
 ### 2.4 JobResult
 
@@ -102,7 +104,7 @@ type JobQueue struct {
 
 ## 3. 任务生命周期
 
-任务从创建到结束的完整状态流转：
+任务从创建到结束的完整状态流转（修复后的状态机）：
 
 ```
                          ┌──────────────┐
@@ -112,49 +114,62 @@ type JobQueue struct {
                                 ▼
                     ┌──────────────────────┐
                     │   JobStatusPending   │
+                    │  (首次等待执行)      │
                     └──────────┬───────────┘
                                │
-           ┌───────────────────┼───────────────────┐
-           │                   │                   │
-     delay > 0           delay = 0          retry after fail
-           │                   │                   │
-           ▼                   ▼                   │
-    ┌─────────────┐    ┌──────────────┐            │
-    │  DelayQueue │    │ PriorityQueue│            │
-    └──────┬──────┘    └──────┬───────┘            │
-           │                  │                    │
-           │  time passes     │  dispatchLoop      │
-           └─────────────────>│  picks job         │
-                              ▼                    │
-                    ┌──────────────────┐           │
-                    │ acquire sem slot │           │
-                    └────────┬─────────┘           │
-                             │                     │
-                             ▼                     │
-                    ┌──────────────────┐           │
-                    │ JobStatusRunning │           │
-                    └────────┬─────────┘           │
-                             │                     │
-                 ┌───────────┴───────────┐         │
-                 │                       │         │
-                 ▼                       ▼         │
-       ┌──────────────────┐   ┌──────────────────┐ │
-       │  Handler 成功    │   │   Handler 失败    │ │
-       └────────┬─────────┘   └────────┬─────────┘ │
-                │                      │           │
-                │                      ▼           │
-                │             RetryCount++         │
-                │                      │           │
-                │          ┌───────────┴───────┐   │
-                │          │                   │   │
-                │          ▼                   ▼   │
-                │  RetryCount > MaxRetries   否则 ─┘
-                │          │
-                ▼          ▼
-    ┌────────────────────┐  ┌──────────────────────┐
-    │ JobStatusCompleted │  │  JobStatusDeadLetter │
-    │  (Result stored)   │  │ (移入 DeadLetters)   │
+           ┌───────────────────┼────────────────────┐
+           │                   │                    │
+     delay > 0           delay = 0                  │
+           │                   │                    │
+           ▼                   ▼                    │
+    ┌─────────────┐    ┌──────────────┐             │
+    │  DelayQueue │    │ PriorityQueue│             │
+    └──────┬──────┘    └──────┬───────┘             │
+           │                  │                     │
+           │  time passes     │  dispatchLoop       │
+           └─────────────────>│  picks job          │
+                              ▼                     │
+                    ┌──────────────────┐            │
+                    │ acquire sem slot │            │
+                    └────────┬─────────┘            │
+                             │                      │
+                             ▼                      │
+                    ┌──────────────────┐            │
+                    │ JobStatusRunning │            │
+                    └────────┬─────────┘            │
+                             │                      │
+                 ┌───────────┴───────────┐          │
+                 │                       │          │
+                 ▼                       ▼          │
+       ┌──────────────────┐   ┌──────────────────┐  │
+       │  Handler 成功    │   │   Handler 失败    │  │
+       └────────┬─────────┘   └────────┬─────────┘  │
+                │                      │            │
+                │                      ▼            │
+                │             RetryCount++          │
+                │                      │            │
+                │          ┌───────────┴───────┐    │
+                │          │                   │    │
+                │          ▼                   ▼    │
+                │  RetryCount > MaxRetries   否则   │
+                │          │                   │    │
+                ▼          ▼                   │    │
+    ┌────────────────────┐  ┌──────────────────────┐ │
+    │ JobStatusCompleted │  │  JobStatusFailed     │─┘
+    │(存入 successResults)│ │(等待重试，存入延迟队列)│
     └────────────────────┘  └──────────────────────┘
+                                          │
+                                          ▼
+                    （重试到期后重新进入 Running）
+                                          │
+                                          ▼
+                    （重试成功 → Completed，重试耗尽 → DeadLetter）
+                                          │
+                                          ▼
+                          ┌──────────────────────┐
+                          │ JobStatusDeadLetter  │
+                          │(存入 deadLetterResults)│
+                          └──────────────────────┘
 ```
 
 ### 生命周期阶段说明
@@ -347,21 +362,44 @@ jq.EnqueueWithRetry("no-retry-job", 1, data, 0, 0)
 
 ### 5.4 监控与统计
 
+队列内部将结果分开存储为两个独立的 map：
+- `successResults`：仅存储**成功完成**的任务结果（状态为 `JobStatusCompleted`）
+- `deadLetterResults`：仅存储**失败且已放弃**的任务结果（状态为 `JobStatusDeadLetter`）
+
+对应的统计 API 语义如下：
+
 ```go
 // 获取各阶段任务数量
-pending := jq.PendingCount()      // 等待执行的任务数
-active := jq.ActiveCount()        // 正在执行的任务数
-completed := jq.CompletedCount()  // 已完成的任务数
-deadLetters := jq.DeadLetterCount() // 死信队列任务数
+pending := jq.PendingCount()      // 等待执行的任务数（Pending + Failed 状态，在队列中）
+active := jq.ActiveCount()        // 正在执行的任务数（Running 状态）
+completed := jq.CompletedCount()  // 仅成功完成的任务数（存入 successResults）
+failed := jq.FailedCount()        // 仅进入死信队列的任务数（存入 deadLetterResults）
+deadLetters := jq.DeadLetterCount() // 死信队列中的任务数
+
+fmt.Printf("统计: pending=%d, active=%d, completed=%d, failed=%d, dead=%d\n",
+    pending, active, completed, failed, deadLetters)
+
+// 注：CompletedCount() + FailedCount() = 总已结束任务数
 
 // 获取死信任务详情
 dls := jq.GetDeadLetters()
 for _, job := range dls {
-    fmt.Printf("死信任务: %s, 错误: %v\n", job.ID, job.Error)
+    fmt.Printf("死信任务: %s, 重试次数: %d, 错误: %v\n",
+        job.ID, job.RetryCount, job.Error)
 }
 jq.ClearDeadLetters()  // 清空死信队列
 
-// 清理历史结果
+// 查询任务结果（同时查找 successResults 和 deadLetterResults）
+result, err := jq.GetResult("job-123")
+if err == nil {
+    if result.Error != nil {
+        fmt.Printf("任务最终失败（已入死信）: %v\n", result.Error)
+    } else {
+        fmt.Printf("任务成功: %v\n", result.Result)
+    }
+}
+
+// 清理历史结果（同时清空 successResults 和 deadLetterResults）
 jq.ClearResults()
 ```
 

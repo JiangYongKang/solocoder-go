@@ -1030,6 +1030,236 @@ func TestMockUpstreamHandler(t *testing.T) {
 	}
 }
 
+func TestMockUpstreamHandler_ConcurrentSetResponse(t *testing.T) {
+	mock := NewMockUpstreamHandler("concurrent-svc")
+	mock.SetResponse(http.StatusOK, "body-0")
+
+	pairs := []struct {
+		code int
+		body string
+	}{
+		{http.StatusOK, "body-ok"},
+		{http.StatusCreated, "body-created"},
+		{http.StatusBadRequest, "body-bad"},
+		{http.StatusNotFound, "body-nf"},
+		{http.StatusInternalServerError, "body-err"},
+	}
+
+	var wg sync.WaitGroup
+	numSetters := 5
+	numReaders := 10
+	iterations := 200
+	inconsistent := int64(0)
+
+	for s := 0; s < numSetters; s++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				p := pairs[(id+i)%len(pairs)]
+				mock.SetResponse(p.code, p.body)
+			}
+		}(s)
+	}
+
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				w := httptest.NewRecorder()
+				mock.ServeHTTP(w, req)
+
+				code := w.Code
+				body := w.Body.String()
+
+				matched := false
+				for _, p := range pairs {
+					if p.code == code && p.body == body {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					atomic.AddInt64(&inconsistent, 1)
+					t.Logf("inconsistent state: code=%d body=%q", code, body)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	count := atomic.LoadInt64(&inconsistent)
+	if count > 0 {
+		t.Errorf("found %d inconsistent status/body pairs (race condition)", count)
+	}
+
+	totalExpected := int64(numReaders * iterations)
+	if mock.RequestCount() != totalExpected {
+		t.Errorf("expected %d requests, got %d", totalExpected, mock.RequestCount())
+	}
+}
+
+func TestMockUpstreamHandler_ConcurrentHealthToggle(t *testing.T) {
+	mock := NewMockUpstreamHandler("health-test")
+	mock.SetHealthy(true)
+
+	var wg sync.WaitGroup
+	numTogglers := 4
+	numReaders := 8
+	iterations := 500
+	invalidStates := int64(0)
+
+	for s := 0; s < numTogglers; s++ {
+		wg.Add(1)
+		go func(start bool) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				mock.SetHealthy((i%2 == 0) == start)
+			}
+		}(s%2 == 0)
+	}
+
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				h := mock.HealthCheck()
+				if h != true && h != false {
+					atomic.AddInt64(&invalidStates, 1)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if atomic.LoadInt64(&invalidStates) > 0 {
+		t.Error("found invalid health states (race condition)")
+	}
+}
+
+func TestMockUpstreamHandler_ConcurrentSetLatency(t *testing.T) {
+	mock := NewMockUpstreamHandler("latency-test")
+
+	var wg sync.WaitGroup
+	durations := []time.Duration{0, 1 * time.Microsecond, 2 * time.Microsecond, 5 * time.Microsecond}
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				mock.SetLatency(durations[(id+j)%len(durations)])
+			}
+		}(i)
+	}
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				w := httptest.NewRecorder()
+				mock.ServeHTTP(w, req)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if mock.RequestCount() != 500 {
+		t.Errorf("expected 500 requests, got %d", mock.RequestCount())
+	}
+}
+
+func TestMockUpstreamHandler_ConcurrentCustomHandler(t *testing.T) {
+	mock := NewMockUpstreamHandler("custom-test")
+	counter := int64(0)
+
+	mock.SetCustomHandler(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&counter, 1)
+		w.WriteHeader(http.StatusTeapot)
+	})
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			localCounter := int64(0)
+			mock.SetCustomHandler(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt64(&localCounter, 1)
+				w.WriteHeader(http.StatusOK)
+			})
+			time.Sleep(time.Microsecond)
+		}
+	}()
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				w := httptest.NewRecorder()
+				mock.ServeHTTP(w, req)
+				if w.Code != http.StatusOK && w.Code != http.StatusTeapot {
+					t.Errorf("unexpected status code: %d", w.Code)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if mock.RequestCount() != 500 {
+		t.Errorf("expected 500 requests, got %d", mock.RequestCount())
+	}
+}
+
+func TestMockUpstreamHandler_ConcurrentResetCount(t *testing.T) {
+	mock := NewMockUpstreamHandler("reset-test")
+
+	var wg sync.WaitGroup
+	var resets int64
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				w := httptest.NewRecorder()
+				mock.ServeHTTP(w, req)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			mock.ResetCount()
+			atomic.AddInt64(&resets, 1)
+			time.Sleep(time.Microsecond * 50)
+		}
+	}()
+
+	wg.Wait()
+
+	count := mock.RequestCount()
+	if count < 0 {
+		t.Errorf("request count should not be negative, got %d", count)
+	}
+	t.Logf("final request count: %d (after %d resets)", count, atomic.LoadInt64(&resets))
+}
+
 func TestGateway_Integration(t *testing.T) {
 	store := NewMemoryTokenStore()
 	store.Add("token-good", &UserInfo{UserID: "alice", Roles: []string{"user"}})

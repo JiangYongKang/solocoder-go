@@ -97,14 +97,14 @@ func (kv *KVStore) getSegment(key string) *segment {
 }
 
 func (kv *KVStore) Put(key string, value string) {
+	kv.bloomMu.Lock()
+	kv.bloomFilter.Add(key)
+	kv.bloomMu.Unlock()
+
 	seg := kv.getSegment(key)
 	seg.mu.Lock()
 	seg.data[key] = value
 	seg.mu.Unlock()
-
-	kv.bloomMu.Lock()
-	kv.bloomFilter.Add(key)
-	kv.bloomMu.Unlock()
 }
 
 func (kv *KVStore) Get(key string) (string, bool) {
@@ -141,6 +141,12 @@ func (kv *KVStore) BatchPut(pairs map[string]string) error {
 		return ErrEmptyBatch
 	}
 
+	kv.bloomMu.Lock()
+	for key := range pairs {
+		kv.bloomFilter.Add(key)
+	}
+	kv.bloomMu.Unlock()
+
 	segmentKeys := make(map[int][]string)
 	for key := range pairs {
 		idx := kv.getSegmentIndex(key)
@@ -167,12 +173,6 @@ func (kv *KVStore) BatchPut(pairs map[string]string) error {
 		idx := kv.getSegmentIndex(key)
 		kv.segments[idx].data[key] = value
 	}
-
-	kv.bloomMu.Lock()
-	for key := range pairs {
-		kv.bloomFilter.Add(key)
-	}
-	kv.bloomMu.Unlock()
 
 	return nil
 }

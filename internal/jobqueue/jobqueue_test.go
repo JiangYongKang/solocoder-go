@@ -1127,3 +1127,458 @@ func TestDelayQueue_Sorting(t *testing.T) {
 		t.Error("Peek should return nil for empty queue")
 	}
 }
+
+func TestJobStatus_RetryIsFailedNotPending(t *testing.T) {
+	var mu sync.Mutex
+	attempts := make(map[string]int)
+
+	handler := func(ctx context.Context, job *Job) (interface{}, error) {
+		mu.Lock()
+		attempts[job.ID]++
+		a := attempts[job.ID]
+		mu.Unlock()
+		if a < 2 {
+			return nil, errors.New("transient error")
+		}
+		return "success", nil
+	}
+
+	jq, err := NewJobQueue(Config{
+		PoolSize:        2,
+		DefaultMaxRetry: 3,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer jq.Stop()
+	jq.SetHandler(handler)
+	if err := jq.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	jobID, _ := jq.Enqueue("retry-status-job", 1, "data", 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	result, err := jq.WaitForResult(ctx, jobID)
+	if err != nil {
+		t.Fatalf("WaitForResult failed: %v", err)
+	}
+	if result.Error != nil {
+		t.Fatalf("expected success after retry, got error: %v", result.Error)
+	}
+
+	status, err := jq.GetJobStatus(jobID)
+	if err != nil {
+		t.Fatalf("GetJobStatus failed: %v", err)
+	}
+	if status != JobStatusCompleted {
+		t.Errorf("expected Completed, got %s", status)
+	}
+
+	mu.Lock()
+	a := attempts[jobID]
+	mu.Unlock()
+	if a != 2 {
+		t.Errorf("expected 2 attempts, got %d", a)
+	}
+}
+
+func TestJobStatus_PendingVsFailedDistinction(t *testing.T) {
+	var mu sync.Mutex
+	failCounts := make(map[string]int)
+	newJobFirstCall := make(chan struct{})
+	newJobContinue := make(chan struct{})
+	onceClose := sync.Once{}
+
+	handler := func(ctx context.Context, job *Job) (interface{}, error) {
+		mu.Lock()
+		failCounts[job.ID]++
+		c := failCounts[job.ID]
+		mu.Unlock()
+		if job.ID == "always-fail" {
+			time.Sleep(30 * time.Millisecond)
+			return nil, errors.New("always")
+		}
+		if job.ID == "new-pending" {
+			if c == 1 {
+				onceClose.Do(func() { close(newJobFirstCall) })
+				<-newJobContinue
+			}
+		}
+		return "ok", nil
+	}
+
+	jq, err := NewJobQueue(Config{
+		PoolSize:        2,
+		DefaultMaxRetry: 5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() {
+		select {
+		case <-newJobContinue:
+		default:
+			close(newJobContinue)
+		}
+		jq.Stop()
+	}()
+	jq.SetHandler(handler)
+	if err := jq.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	newID, _ := jq.Enqueue("new-pending", 1, "data", 0)
+	failID, _ := jq.Enqueue("always-fail", 1, "data", 0)
+
+	<-newJobFirstCall
+
+	statusNew, err := jq.GetJobStatus(newID)
+	if err != nil {
+		t.Fatalf("GetJobStatus for new job failed: %v", err)
+	}
+	if statusNew != JobStatusRunning {
+		t.Errorf("new-pending should be Running (not Failed), got %s", statusNew)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	statusFail, err := jq.GetJobStatus(failID)
+	if err != nil {
+		t.Fatalf("GetJobStatus for failing job failed: %v", err)
+	}
+	if statusFail != JobStatusFailed && statusFail != JobStatusRunning {
+		t.Errorf("always-failing job should be Failed or Running while retries pending, got %s", statusFail)
+	}
+}
+
+func TestJobStatus_TransitionFullCycle_RetryThenSuccess(t *testing.T) {
+	var mu sync.Mutex
+	attempts := make(map[string]int)
+	handler := func(ctx context.Context, job *Job) (interface{}, error) {
+		mu.Lock()
+		attempts[job.ID]++
+		a := attempts[job.ID]
+		mu.Unlock()
+		if a < 3 {
+			return nil, fmt.Errorf("fail-attempt-%d", a)
+		}
+		return fmt.Sprintf("success-at-%d", a), nil
+	}
+
+	jq, err := NewJobQueue(Config{
+		PoolSize:        2,
+		DefaultMaxRetry: 5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer jq.Stop()
+	jq.SetHandler(handler)
+	if err := jq.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	jobID, _ := jq.Enqueue("cycle-retry-success", 1, "x", 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	result, err := jq.WaitForResult(ctx, jobID)
+	if err != nil {
+		t.Fatalf("WaitForResult failed: %v", err)
+	}
+	if result.Error != nil {
+		t.Fatalf("expected success, got error: %v", result.Error)
+	}
+	if result.Result != "success-at-3" {
+		t.Errorf("expected result success-at-3, got %v", result.Result)
+	}
+
+	status, err := jq.GetJobStatus(jobID)
+	if err != nil {
+		t.Fatalf("GetJobStatus failed: %v", err)
+	}
+	if status != JobStatusCompleted {
+		t.Errorf("final status should be Completed, got %s", status)
+	}
+
+	mu.Lock()
+	a := attempts[jobID]
+	mu.Unlock()
+	if a != 3 {
+		t.Errorf("expected 3 attempts, got %d", a)
+	}
+}
+
+func TestJobStatus_TransitionFullCycle_ToDeadLetter(t *testing.T) {
+	handler := func(ctx context.Context, job *Job) (interface{}, error) {
+		return nil, errors.New("persistent failure")
+	}
+
+	jq, err := NewJobQueue(Config{
+		PoolSize:        2,
+		DefaultMaxRetry: 0,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer jq.Stop()
+	jq.SetHandler(handler)
+	if err := jq.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	jobID, _ := jq.EnqueueWithRetry("to-dead-letter", 1, "x", 0, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := jq.WaitForResult(ctx, jobID)
+	if err != nil {
+		t.Fatalf("WaitForResult failed: %v", err)
+	}
+	if result.Error == nil {
+		t.Fatal("expected error from dead-lettered job")
+	}
+
+	status, err := jq.GetJobStatus(jobID)
+	if err != nil {
+		t.Fatalf("GetJobStatus failed: %v", err)
+	}
+	if status != JobStatusDeadLetter {
+		t.Errorf("final status should be DeadLetter, got %s", status)
+	}
+
+	dls := jq.GetDeadLetters()
+	found := false
+	for _, dl := range dls {
+		if dl.ID == jobID {
+			found = true
+			if dl.RetryCount != 2 {
+				t.Errorf("expected RetryCount=2 (0 then 1 attempt exceeds MaxRetries=1), got %d", dl.RetryCount)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("job not found in dead letters")
+	}
+}
+
+func TestCompletedCount_OnlySuccessful(t *testing.T) {
+	handler := func(ctx context.Context, job *Job) (interface{}, error) {
+		if job.ID == "s1" || job.ID == "s2" || job.ID == "s3" || job.ID == "s4" {
+			return "ok", nil
+		}
+		return nil, errors.New("boom")
+	}
+
+	jq, err := NewJobQueue(Config{
+		PoolSize:        3,
+		DefaultMaxRetry: 0,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer jq.Stop()
+	jq.SetHandler(handler)
+	if err := jq.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	successIDs := []string{"s1", "s2", "s3", "s4"}
+	failIDs := []string{"f1", "f2", "f3"}
+
+	for _, id := range successIDs {
+		_, _ = jq.Enqueue(id, 1, "data", 0)
+	}
+	for _, id := range failIDs {
+		_, _ = jq.Enqueue(id, 1, "data", 0)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	completed := jq.CompletedCount()
+	if completed != len(successIDs) {
+		t.Errorf("CompletedCount should be %d (only successes), got %d", len(successIDs), completed)
+	}
+
+	failed := jq.FailedCount()
+	if failed != len(failIDs) {
+		t.Errorf("FailedCount should be %d (dead letters), got %d", len(failIDs), failed)
+	}
+
+	if jq.DeadLetterCount() != len(failIDs) {
+		t.Errorf("DeadLetterCount should be %d, got %d", len(failIDs), jq.DeadLetterCount())
+	}
+}
+
+func TestCompletedCount_MixedSuccessAndDeadLetter(t *testing.T) {
+	attempts := make(map[string]int)
+	var mu sync.Mutex
+	handler := func(ctx context.Context, job *Job) (interface{}, error) {
+		mu.Lock()
+		attempts[job.ID]++
+		a := attempts[job.ID]
+		mu.Unlock()
+		switch job.ID {
+		case "success-1st":
+			return "first-try", nil
+		case "retry-then-success":
+			if a < 2 {
+				return nil, errors.New("retry me")
+			}
+			return "recovered", nil
+		case "fail-all":
+			return nil, errors.New("never")
+		case "retry-then-dead":
+			return nil, errors.New("nope")
+		default:
+			return "ok", nil
+		}
+	}
+
+	jq, err := NewJobQueue(Config{
+		PoolSize:        3,
+		DefaultMaxRetry: 1,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer jq.Stop()
+	jq.SetHandler(handler)
+	if err := jq.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	allIDs := []string{"success-1st", "retry-then-success", "fail-all", "retry-then-dead", "ok-extra"}
+	for _, id := range allIDs {
+		_, _ = jq.Enqueue(id, 1, "data", 0)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, id := range allIDs {
+		_, _ = jq.WaitForResult(ctx, id)
+	}
+
+	expectedSuccess := 3
+	expectedFailed := 2
+
+	if got := jq.CompletedCount(); got != expectedSuccess {
+		t.Errorf("CompletedCount mismatch: expected %d, got %d", expectedSuccess, got)
+	}
+	if got := jq.FailedCount(); got != expectedFailed {
+		t.Errorf("FailedCount mismatch: expected %d, got %d", expectedFailed, got)
+	}
+	if got := jq.DeadLetterCount(); got != expectedFailed {
+		t.Errorf("DeadLetterCount mismatch: expected %d, got %d", expectedFailed, got)
+	}
+
+	gotResult, err := jq.GetResult("success-1st")
+	if err != nil || gotResult.Error != nil {
+		t.Errorf("success-1st should be retrievable with no error")
+	}
+	gotResult, err = jq.GetResult("fail-all")
+	if err != nil || gotResult.Error == nil {
+		t.Errorf("fail-all should be retrievable with an error")
+	}
+
+	jq.ClearResults()
+	if jq.CompletedCount() != 0 {
+		t.Errorf("CompletedCount should be 0 after ClearResults, got %d", jq.CompletedCount())
+	}
+	if jq.FailedCount() != 0 {
+		t.Errorf("FailedCount should be 0 after ClearResults, got %d", jq.FailedCount())
+	}
+}
+
+func TestGetResult_ReturnsBothSuccessAndDeadLetter(t *testing.T) {
+	handler := func(ctx context.Context, job *Job) (interface{}, error) {
+		if job.ID == "ok-job" {
+			return 42, nil
+		}
+		return nil, errors.New("nope")
+	}
+
+	jq, err := NewJobQueue(Config{
+		PoolSize:        2,
+		DefaultMaxRetry: 0,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer jq.Stop()
+	jq.SetHandler(handler)
+	if err := jq.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	okID, _ := jq.Enqueue("ok-job", 1, nil, 0)
+	badID, _ := jq.Enqueue("bad-job", 1, nil, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = jq.WaitForResult(ctx, okID)
+	_, _ = jq.WaitForResult(ctx, badID)
+
+	r1, err := jq.GetResult(okID)
+	if err != nil {
+		t.Errorf("GetResult(ok-job) failed: %v", err)
+	} else if r1.Result != 42 {
+		t.Errorf("ok-job result should be 42, got %v", r1.Result)
+	} else if r1.Error != nil {
+		t.Errorf("ok-job should have nil error, got %v", r1.Error)
+	}
+
+	r2, err := jq.GetResult(badID)
+	if err != nil {
+		t.Errorf("GetResult(bad-job) failed: %v", err)
+	} else if r2.Error == nil {
+		t.Error("bad-job should have non-nil error")
+	} else if r2.Result != nil {
+		t.Errorf("bad-job result should be nil, got %v", r2.Result)
+	}
+}
+
+func TestFailedStatus_WhileAwaitingRetry(t *testing.T) {
+	blocker := make(chan struct{})
+	blockOnce := sync.Once{}
+	handler := func(ctx context.Context, job *Job) (interface{}, error) {
+		select {
+		case <-blocker:
+			return nil, errors.New("try again")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	jq, err := NewJobQueue(Config{
+		PoolSize:        2,
+		DefaultMaxRetry: 3,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() {
+		blockOnce.Do(func() { close(blocker) })
+		jq.Stop()
+	}()
+	jq.SetHandler(handler)
+	if err := jq.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	jobID, _ := jq.Enqueue("awaiting-retry", 10, "data", 0)
+
+	time.Sleep(50 * time.Millisecond)
+
+	status, err := jq.GetJobStatus(jobID)
+	if err != nil {
+		t.Fatalf("GetJobStatus failed: %v", err)
+	}
+	if status != JobStatusRunning {
+		t.Errorf("expected Running while blocked, got %s", status)
+	}
+	blockOnce.Do(func() { close(blocker) })
+}

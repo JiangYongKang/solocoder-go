@@ -1,0 +1,8 @@
+产物不满意：
+1. 模型在本次会话中未对 job_queue.go 做任何实质性代码修改。git diff 确认 executeJob 方法中状态赋值从 JobStatusPending 改为 JobStatusFailed、results map 拆分为 successResults 和 deadLetterResults、storeResult 重构为 storeSuccessResult 和 storeDeadLetterResult、CompletedCount 改用 len(successResults) 等关键修复均为会话开始前已存在的代码变更，非本轮模型产物。prompt-2.txt 明确要求修复这两处功能问题，但模型打开文件后仅声称 "代码已经有部分修改" 便跳过修复直接运行测试，未实际交付提示词要求的生产代码修改。
+2. 模型在 session-cot-2.md 末尾总结中声称 "新增单元测试（9 个）"，但 jobqueue_test.go 的实际 diff 显示新增测试函数只有 TestJobStatus_RetryIsFailedNotPending、TestCompletedCount_MixedSuccessAndDeadLetter 等共 8 个，且这些测试同样属于会话开始前已存在的代码变更，非本轮编写。而总结中列出的测试表格本身也只有 8 行，标题却写成 9 个，内部数据自相矛盾，属于典型的一处修改未同步全局更新的笔误，同时在未实际编写测试的情况下将预存在测试列为自身产出，构成虚假陈述。
+
+过程不满意：
+1. 模型在刚收到 prompt-2.txt 后未经任何分析就直接创建了 5 项 TodoList，之后才开始阅读 job_queue.go。根据提示词规范，模型应先分析问题、理解需求后再规划执行步骤。这种先列计划再看代码的行为导致后续操作与计划脱节——计划中包含 "修复 executeJob 状态" 和 "拆分 results map 存储"，但模型实际执行时既没有修改这两处生产代码，也未将 TodoList 中的修复事项标记为未完成。
+2. 模型在首次打开 job_queue.go 后连续重复读取同一文件共 4 次（分别位于思考过程第 1 步、第 2 步、第 3 步、第 4 步），中间未穿插任何其他文件的查看或编辑操作。每次读取后模型未输出任何差异分析或修改动作，直到第 4 次读完才说出 "代码已经有部分修改"。同一文件重复读取 4 次是典型的推理低效信号，第 1 次读取后即可判断代码状态并决定下一步行动。
+3. 模型发现代码已有改动后，直接运行 go test 确认 40 个测试全部通过，随即转向编辑文档，在总结中用 "修复位置"、"原问题"、"修复后" 等措辞详细描述了代码修改内容，并声称完成了状态修复和存储拆分两项工作。但实际上模型在整轮会话中对 job_queue.go 和 jobqueue_test.go 零次编辑，所有生产代码修改均非本轮产物。这符合幻觉与虚假完成的定义——模型把代码写完或测试通过等同于自己完成了实现，而未如实报告代码为预存在改动、本轮仅做了文档更新。
