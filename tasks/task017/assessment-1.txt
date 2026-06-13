@@ -1,0 +1,11 @@
+产物不满意：
+1. db.go 的 Range 方法存在墓碑过滤缺陷：MemTable.Range 在内部过滤掉了 tombstone 条目（memtable.go 第 123 行），导致被删除的 key 从未进入 resultMap 中，后续遍历 SSTable 层级时旧的存活条目会通过 `!e.Tombstone` 检查并被添加到 resultMap 中。这导致已删除 key 的值在范围查询中又回来了，TestDB_DeleteWithCompaction 虽通过但仅测试了点查询场景，Range 场景下该问题未覆盖。根本原因是 DB.Range 中内存表层和磁盘层的墓碑处理策略不一致，点查询用 GetWithTombstone 解决了此问题但范围查询没有对应机制。应仿照 GetWithTombstone 的模式让 MemTable 提供 RangeWithTombstone 方法，使 DB.Range 能获取到墓碑条目来屏蔽下层旧数据。
+2. level.go 的 Range 方法在 L0 层的去重逻辑使用 `!seen[e.Key]` 按 SSTable 插入顺序保留首次出现的条目（第 141 行），而非按 Entry 自带的 Timestamp 字段比较版本新旧。虽然 L0 层 SSTable 按从新到旧遍历且通常情况下新表的 Timestamp 更大，但在刷盘异步时序、系统时间回拨或跨 MemTable 合并等边界场景下可能出现旧表条目 Timestamp 更大的情况，导致返回过时数据。这是因为依赖了隐式的表顺序假设而没有使用显式的版本比较，应在去重时比较 `e.Timestamp` 而非仅依赖 `seen` 去重。
+3. skiplist.go 的 SkipList 没有任何并发保护机制，Insert、Get、Delete、Range 等方法均直接操作共享的 header、tail 和 forward/backward 指针。虽然 MemTable 通过 sync.RWMutex 封装了调用，但 SkipListIterator（第 193 行）在构造时获取了 current 指针引用后不再持有锁，如果迭代过程中其他 goroutine 通过 MemTable 修改跳表节点，迭代器可能读到已释放节点的 forward 指针导致 panic。根本原因是并发安全只停留在 MemTable 层而没有下沉到数据结构层，应至少在 SkipList 的方法上添加内部锁或明确文档声明 SkipList 非线程安全且只能通过 MemTable 访问。
+4. db.go 的 Put 和 Delete 方法存在 TOCTOU 竞态条件：先通过 RLock 检查 `db.closed`（第 136 行），释放锁后再获取 Lock 进行写入（第 142 行），中间窗口期内 DB 可能被关闭。虽然当前测试中 Close 的执行时机与 Put 不重叠所以未暴露，但在真实并发场景下已关闭的 DB 仍可接受写入请求。根因是关闭状态检查和写入操作没有在同一临界区内原子完成，应改为直接获取写锁然后在锁内同时检查 closed 和执行写入。
+
+过程不满意：
+1. 模型在刚收到提示词、仅读取了 go.mod 和目录结构后就直接创建了 TodoList 规划子任务，随后才开始深入阅读各源文件的实现细节。这种行为导致后续在 MemTable.Get 的墓碑返回语义上反复调整：先改为返回墓碑让 DB 层判断，然后因为 TestMemTable_Basic 期望 `Get` 过滤墓碑又把修改撤回，最终新加 GetWithTombstone 方法。整个过程经历了一次架构级的"尝试-撤回-重新设计"，属于没有充分理解现有代码约定就匆忙执行的结果。正确做法是先阅读所有现有代码和测试用例，理解 MemTable.Get 与 DB.Get 之间的契约关系后再制定修改方案。
+2. 模型在执行修复过程中创造了五次 TodoList：第一次在分析前就创建，第二次在修复 footer 偏移后更新，第三次在分析并发问题时更新，第四次在运行第一轮完整测试后更新，第五次在全部测试通过后标记完成。这表明缺乏稳定的任务规划框架，每次遇到新问题都重新整理计划而不是按照最初的分析路径执行。正确的做法是在充分理解问题域后一次性制定覆盖全部修复步骤的计划，只在遇到意外阻塞时才调整。
+3. 模型在修复 SSTable footer 偏移量时，第一处 edit_file_search_replace 成功，第二处对相同文件的操作直接失败且未输出具体错误信息，但模型没有检查失败原因就直接跳转到下一个问题的分析。这种"遇到失败就换方向"的模式如果在多文件修改中被放大，可能导致部分修改遗漏。正确做法是在工具调用失败时读取错误信息、定位原因并重新执行修复。
+4. 模型执行完第一轮全部修复后才运行 go test 收集结果，期间修改了 sstable.go、memtable.go、db.go 三个文件的多处代码。这导致发现 TestMemTable_Basic 失败时难以直接归因到哪一处改动引起的，只能回退记忆推测。正确做法是每修复一个独立缺陷就运行相关测试子集验证，确保每个改动都有具体的测试反馈闭环。

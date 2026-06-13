@@ -1,0 +1,9 @@
+产物不满意：
+1. processMessage 方法中使用 context.Background() 作为 handler 的上下文，没有将处理器生命周期与 handler 执行关联起来。当 handler 内部出现无限循环或长时间阻塞的网络调用时，processMessage 永远不会返回，导致 taskWg 无法递减，Stop 方法在调用 taskWg.Wait 时永久阻塞，优雅关闭机制彻底失效。TestStop_WaitsForNoRunningTasks 测试中 handler 通过 channel 手动 release 绕过了这一场景，未覆盖 handler 卡死导致停止超时的边界情况。根因是没有设计可取消的上下文传递机制，应在 Start 时创建可取消的 context 并传入 handler，Stop 时取消该 context 使 handler 能够主动感知关闭信号并退出。
+2. TestConcurrent_ProcessAndQuery 测试中启动了一个无退出条件的无限循环 goroutine，该 goroutine 在测试函数返回后仍持续运行，不断调用 PendingCount、PermanentlyFailedCount 和 GetAllMessages 方法与已停止的处理器交互，形成了 goroutine 泄漏。虽然当前不导致测试失败，但在持续集成环境中多次运行会累积大量僵尸 goroutine 消耗系统资源。根因是并发查询 goroutine 缺少取消机制，应在循环中通过 processor 的状态或独立的 stop channel 控制 goroutine 退出。
+
+过程不满意：
+1. 模型在刚收到提示词后未经分析就直接用 todo_write 创建了 5 项子任务计划，之后才开始阅读现有代码文件和运行测试。这违反了标注规范中"不能刚收到任务就直接创建 TodoList，应先分析问题再规划"的要求。从 session-cot 可以看到，模型先创建了 todos 然后才去查看 delaysched 和 jobqueue 的代码参考，导致计划的粒度划分与 deadletter 模块的实际需求边界可能不匹配。正确做法是先阅读提示词需求和项目骨架，理解模块职责后再制定执行计划。
+2. 模型在任务初期就将 delaysched/scheduler.go 和 jobqueue/job.go 作为参考代码进行阅读，这两个模块分别属于延迟任务调度器和内存任务队列，与 deadletter 死信队列处理器是不同的任务域。按照项目规范，每个任务的所有代码应集中在语义对应的单一包下，不同任务之间应保持包隔离。模型参考非本任务域代码的行为增加了不必要的上下文噪音，可能影响对 deadletter 模块独立设计的判断。
+3. 模型采用了先运行测试发现失败再修改代码的试错式调试路径。从 session-cot 可以看到，模型在阅读代码后直接执行 go test 发现了多个测试失败，然后针对三个具体问题（runLoop 等待时间计算、processMessage panic recover、并发测试设计）进行修改，第二轮运行测试后通过。虽然最终测试全部通过，但这种"跑测试-看报错-改代码-再跑测试"的模式属于试错式调试，缺乏对代码逻辑的系统性推理和正向设计。正确做法是先根据提示词需求系统性设计所有功能的正确实现，再通过测试验证。
+4. session-cot 中多个工具调用的 results 字段显示为 undefined，包括 view_files、edit_file_search_replace 和 Write 等关键操作的返回结果均未完整记录。虽然这可能是会话日志采集层面的问题而非模型行为问题，但导致标注人员无法评估模型在阅读文件后对代码的理解是否正确，也无法验证 edit_file_search_replace 和 Write 操作的具体变更内容是否符合预期。
