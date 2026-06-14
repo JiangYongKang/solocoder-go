@@ -1,0 +1,5 @@
+你实现的死信队列处理器模块存在一些问题，需要修复：
+1. processMessage 方法中使用 context.Background() 作为 handler 的上下文，当 handler 内部出现死循环或长时间阻塞时 processMessage 永不返回，导致 Stop 调用 taskWg.Wait 永久挂起，优雅关闭机制彻底失效。
+2. 测试中 TestConcurrent_ProcessAndQuery 启动了一个无退出条件的无限循环 goroutine，测试函数返回后该 goroutine 仍在运行，多次运行会累积僵尸 goroutine 造成资源泄漏。
+3. 修复完成后运行 go test ./internal/deadletter/ -v，需要让所有测试通过。
+4. 在 docs/deadletter.md 中更新模块需求文档，说明 handler 上下文传递机制和优雅关闭的保障策略。

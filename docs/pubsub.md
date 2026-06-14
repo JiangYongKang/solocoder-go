@@ -71,14 +71,41 @@ const (
 )
 ```
 
-**职责**：消息状态枚举，表示消息在处理流程中的不同阶段。
+**职责**：消息状态枚举，表示消息在处理流程中的不同阶段。MessageStatus 不仅用于标记状态，还深度参与控制流判断，构成完整的消息状态机。
 
 | 状态 | 说明 |
 |------|------|
-| `MessageStatusPending` | 待投递状态（持久化缓存中） |
-| `MessageStatusDelivered` | 已投递，等待消费者确认 |
-| `MessageStatusAcked` | 已确认，处理完成 |
-| `MessageStatusDead` | 已死亡，移入死信队列 |
+| `MessageStatusPending` | 待投递状态（持久化缓存中或背压缓冲区中），此时消息等待被重新投递 |
+| `MessageStatusDelivered` | 已投递至消费者，等待消费者显式确认（Ack/Nack），超时会触发自动重推 |
+| `MessageStatusAcked` | 已被消费者确认，消息生命周期正常结束，从 pending 列表中移除 |
+| `MessageStatusDead` | 重推次数超过上限，被移入死信队列，不再参与投递流程 |
+
+#### 状态机控制流
+
+MessageStatus 在以下关键路径中参与控制流判断：
+
+1. **Ack()**：仅处理状态为 `MessageStatusDelivered` 或 `MessageStatusPending` 的消息，其他状态返回 `ErrMessageNotFound`
+2. **Nack()**：仅处理状态为 `MessageStatusDelivered` 或 `MessageStatusPending` 的消息，防止对已确认/已死消息重复处理
+3. **ProcessTimeouts()**：仅对状态为 `MessageStatusDelivered` 且超过 AckTimeout 的消息触发重推
+4. **redeliverOrDeadLetter()**：入口处校验状态有效性，仅对 Delivered/Pending 状态执行重推或死信逻辑
+5. **DisconnectConsumer()**：将 `MessageStatusDelivered` 的消息转换为 `MessageStatusPending` 并存入持久化缓存
+6. **GetMessageStatus()**：对外提供消息状态查询 API，返回 Delivered/Pending/Dead 状态
+
+状态转移图：
+
+```
+                  投递成功
+   Pending ──────────────────────► Delivered
+      ▲                               │
+      │                               │ Ack 确认
+      │                    消费者离线  │  (正常结束，移出pending)
+      │                    Disconnect  ▼
+      │                        Acked (终态)
+      │                               │
+      │ Nack重推 / 超时重推            │ Nack 且重试次数 > MaxRetry
+      │                               ▼
+      └──────────────────── Dead (终态，死信队列)
+```
 
 ### 2.4 Consumer
 
@@ -148,6 +175,17 @@ type topicNode struct {
 | `wildcardOne` | 单层通配符 `*` 订阅者 |
 | `wildcardAny` | 多层通配符 `#` 订阅者 |
 
+#### 节点剪枝机制
+
+每个 topicNode 提供 `isEmpty()` 方法判断节点是否为空（无订阅者、无通配符订阅、无子节点）。当执行 `Unsubscribe()` 或 `RemoveConsumer()` 时，`removeFromTopicTree()` 方法会自底向上执行节点剪枝：
+
+1. 从主题树的叶子节点（订阅位置）开始，删除对应订阅者
+2. 检查当前节点是否为空，若为空则从父节点的 children 中移除
+3. 沿路径向上回溯，对经过的每个祖先节点执行同样的空检查与剪枝
+4. 遇到非空节点时停止剪枝（该节点仍被其他订阅共享）
+
+剪枝机制有效防止了长期运行时的空壳节点链内存泄漏，确保 Subscribe/Unsubscribe 多次循环不会导致主题树无限膨胀。
+
 ### 2.7 Broker
 
 ```go
@@ -162,17 +200,17 @@ type Broker struct {
     running       bool
     stopCh        chan struct{}
     wg            sync.WaitGroup
-    ackTimerCh    chan string
-    retryTimerCh  chan string
 }
 ```
 
 **职责**：消息代理核心结构体，负责管理所有消费者、订阅关系、主题路由、消息发布与投递、超时检测和死信队列。
 
+> 说明：Broker 不使用 channel 驱动的定时器机制，而是通过独立 goroutine 运行的 `timeoutLoop`，使用 `time.Ticker` (100ms 间隔) 周期性地调用 `ProcessTimeouts()` 来检测超时消息，实现简洁且易于维护。
+
 核心职责包括：
 - 管理消费者的创建、连接、断开和移除
 - 管理订阅关系的添加和删除
-- 维护主题树实现高效的通配符匹配
+- 维护主题树实现高效的通配符匹配（含节点剪枝）
 - 接收生产者发布的消息并路由到匹配的消费者
 - 检测消息确认超时并触发重推
 - 管理死信队列
@@ -440,6 +478,14 @@ subs1    subs2
    - 精确匹配子节点的订阅者
 3. 递归遍历子节点，直到主题段遍历完成
 
+**删除与剪枝流程**：
+1. `Unsubscribe(filter)` 或 `RemoveConsumer(id)` 触发订阅删除
+2. `removeFromTopicTree()` 沿主题段路径定位到目标节点，删除对应订阅记录
+3. 对叶子节点执行 `isEmpty()` 检查（subscribers、wildcardOne、wildcardAny、children 全部为空）
+4. 自底向上回溯路径，逐层删除空节点
+5. 遇到非空节点立即终止回溯（该节点仍被其他订阅路径共享）
+6. 根节点永不删除，即使其为空
+
 ### 4.3 消息 ID 生成算法
 
 ```go
@@ -685,7 +731,35 @@ b.ClearDeadLetters()
 fmt.Printf("清空后死信队列长度: %d\n", b.DeadLetterCount()) // 0
 ```
 
-### 5.7 多个消费者与订阅
+### 5.7 消息状态查询
+
+```go
+b := pubsub.NewBroker(pubsub.DefaultConfig())
+defer b.Stop()
+
+ch, _ := b.AddConsumer("consumer-1")
+b.SubscribeDurable("consumer-1", "test.topic", true)
+
+b.Publish("test.topic", "hello")
+msg := <-ch
+
+// 查询消息状态：Delivered（已投递，等待确认）
+status, err := b.GetMessageStatus("consumer-1", msg.ID)
+if err == nil && status == pubsub.MessageStatusDelivered {
+    fmt.Println("消息已投递，等待消费者确认")
+}
+
+// 模拟消费者离线
+b.DisconnectConsumer("consumer-1")
+
+// 查询消息状态：Pending（离线后转入待投递缓存）
+status, _ = b.GetMessageStatus("consumer-1", msg.ID)
+if status == pubsub.MessageStatusPending {
+    fmt.Println("消费者离线，消息待重投")
+}
+```
+
+### 5.8 多个消费者与订阅
 
 ```go
 b := pubsub.NewBroker(pubsub.DefaultConfig())

@@ -105,6 +105,13 @@ func newTopicNode() *topicNode {
 	}
 }
 
+func (n *topicNode) isEmpty() bool {
+	return len(n.children) == 0 &&
+		len(n.subscribers) == 0 &&
+		len(n.wildcardOne) == 0 &&
+		len(n.wildcardAny) == 0
+}
+
 type Broker struct {
 	nextMsgID     uint64
 	cfg           Config
@@ -116,8 +123,6 @@ type Broker struct {
 	running       bool
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
-	ackTimerCh    chan string
-	retryTimerCh  chan string
 }
 
 func NewBroker(cfg Config) *Broker {
@@ -142,8 +147,6 @@ func NewBroker(cfg Config) *Broker {
 		deadLetters:   make([]*Message, 0),
 		stopCh:        make(chan struct{}),
 		running:       true,
-		ackTimerCh:    make(chan string, 1024),
-		retryTimerCh:  make(chan string, 1024),
 	}
 }
 
@@ -260,8 +263,12 @@ func (b *Broker) removeFromTopicTree(sub *Subscription) {
 	filter := sub.TopicFilter
 	parts := strings.Split(filter, ".")
 	node := b.topicTree
-	path := make([]*topicNode, 0, len(parts))
-	path = append(path, node)
+
+	type pathEntry struct {
+		parent *topicNode
+		part   string
+	}
+	path := make([]pathEntry, 0, len(parts))
 
 	for i, p := range parts {
 		if i == len(parts)-1 {
@@ -273,14 +280,28 @@ func (b *Broker) removeFromTopicTree(sub *Subscription) {
 			default:
 				if child, ok := node.children[p]; ok {
 					delete(child.subscribers, sub.ConsumerID)
+					if child.isEmpty() {
+						delete(node.children, p)
+					}
 				}
 			}
 		} else {
 			if child, ok := node.children[p]; ok {
+				path = append(path, pathEntry{parent: node, part: p})
 				node = child
-				path = append(path, node)
 			} else {
 				return
+			}
+		}
+	}
+
+	for i := len(path) - 1; i >= 0; i-- {
+		entry := path[i]
+		if child, ok := entry.parent.children[entry.part]; ok {
+			if child.isEmpty() {
+				delete(entry.parent.children, entry.part)
+			} else {
+				break
 			}
 		}
 	}
@@ -595,6 +616,10 @@ func (b *Broker) Ack(consumerID, messageID string) error {
 		return ErrMessageNotFound
 	}
 
+	if pm.status != MessageStatusDelivered && pm.status != MessageStatusPending {
+		return ErrMessageNotFound
+	}
+
 	pm.status = MessageStatusAcked
 	c.pendingList.Remove(pm.element)
 	delete(c.pending, messageID)
@@ -656,11 +681,19 @@ func (b *Broker) Nack(consumerID, messageID string) error {
 		return ErrMessageNotFound
 	}
 
+	if pm.status != MessageStatusDelivered && pm.status != MessageStatusPending {
+		return ErrMessageNotFound
+	}
+
 	b.redeliverOrDeadLetter(c, pm)
 	return nil
 }
 
 func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
+	if pm.status != MessageStatusDelivered && pm.status != MessageStatusPending {
+		return
+	}
+
 	pm.msg.RetryCount++
 
 	c.pendingList.Remove(pm.element)
@@ -675,10 +708,12 @@ func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
 	}
 
 	if !c.connected {
+		pm.status = MessageStatusPending
 		return
 	}
 
 	if atomic.LoadInt64(&c.unackedCount) >= int64(c.maxUnacked) {
+		pm.status = MessageStatusPending
 		c.durableBuffer = append(c.durableBuffer, pm.msg)
 		return
 	}
@@ -697,6 +732,7 @@ func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
 		c.pending[msgCopy.ID] = newPM
 		atomic.AddInt64(&c.unackedCount, 1)
 	default:
+		pm.status = MessageStatusPending
 		c.durableBuffer = append(c.durableBuffer, pm.msg)
 		b.flushDurableBuffer(c)
 	}
@@ -724,15 +760,14 @@ func (b *Broker) DisconnectConsumer(id string) error {
 	if ok {
 		for _, sub := range subs {
 			if sub.Durable {
-				for e := c.pendingList.Front(); e != nil; {
-					next := e.Next()
+				for e := c.pendingList.Front(); e != nil; e = e.Next() {
 					pm := e.Value.(*pendingMessage)
-					pm.status = MessageStatusPending
-					c.durableBuffer = append(c.durableBuffer, pm.msg)
-					c.pendingList.Remove(e)
-					e = next
+					if pm.status == MessageStatusDelivered {
+						pm.status = MessageStatusPending
+						c.durableBuffer = append(c.durableBuffer, pm.msg)
+					}
 				}
-				c.pending = make(map[string]*pendingMessage)
+				c.pendingList.Init()
 				atomic.StoreInt64(&c.unackedCount, 0)
 				break
 			}
@@ -900,4 +935,27 @@ func (b *Broker) SubscriptionCount() int {
 		count += len(subs)
 	}
 	return count
+}
+
+func (b *Broker) GetMessageStatus(consumerID, messageID string) (MessageStatus, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	c, ok := b.consumers[consumerID]
+	if !ok {
+		return 0, ErrConsumerNotFound
+	}
+
+	pm, ok := c.pending[messageID]
+	if ok {
+		return pm.status, nil
+	}
+
+	for _, dl := range b.deadLetters {
+		if dl.ID == messageID {
+			return MessageStatusDead, nil
+		}
+	}
+
+	return 0, ErrMessageNotFound
 }

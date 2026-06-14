@@ -82,6 +82,8 @@ type Processor struct {
 	nextID       uint64
 	idMu         sync.Mutex
 	alertFired   bool
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 func NewProcessor(cfg Config) (*Processor, error) {
@@ -98,9 +100,12 @@ func NewProcessor(cfg Config) (*Processor, error) {
 		return nil, fmt.Errorf("%w: DelayStrategy.Max must be >= Base", ErrInvalidConfig)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Processor{
 		cfg:      cfg,
 		messages: make(map[string]*DeadLetterMessage),
+		ctx:      ctx,
+		cancel:   cancel,
 	}, nil
 }
 
@@ -130,6 +135,7 @@ func (p *Processor) Start() error {
 	p.running = true
 	p.stopCh = make(chan struct{})
 	p.wakeCh = make(chan struct{})
+	p.ctx, p.cancel = context.WithCancel(context.Background())
 	p.mu.Unlock()
 
 	p.wg.Add(1)
@@ -144,6 +150,7 @@ func (p *Processor) Stop() {
 		return
 	}
 	p.running = false
+	p.cancel()
 	close(p.stopCh)
 	p.wake()
 	p.mu.Unlock()
@@ -403,7 +410,10 @@ func (p *Processor) runLoop() {
 func (p *Processor) processMessage(msg *DeadLetterMessage, handler MessageHandler) {
 	defer p.taskWg.Done()
 
-	ctx := context.Background()
+	p.mu.Lock()
+	ctx := p.ctx
+	p.mu.Unlock()
+
 	err := func() (retErr error) {
 		defer func() {
 			if r := recover(); r != nil {

@@ -1,0 +1,6 @@
+你实现的 Pub/Sub 消息代理模块存在一些问题，需要修复：
+1. Broker 结构体中定义了 ackTimerCh 和 retryTimerCh 两个 channel 字段，分配了缓冲区但模块内没有任何 goroutine 向它们发送或接收数据，实际的超时重推完全依赖 timeoutLoop 的 ticker 轮询，这两个 channel 是无效代码残留。
+2. removeFromTopicTree 方法在删除订阅者后没有检查经过的主题树节点是否变为空节点，Subscribe 后 Unsubscribe 同一过滤器会在树中残留空壳节点链永不回收，长期运行导致内存泄漏。
+3. MessageStatus 枚举定义了四种状态但只有 MessageStatusDelivered 被 ProcessTimeouts 用作判断条件，其余状态在整个模块中不参与任何控制流分支，状态字段成了只写不读的装饰字段。
+4. 修复完成后运行 go test ./internal/pubsub/ -v，需要让所有测试通过。
+5. 在 docs/pubsub.md 中更新模块需求文档，说明修复后的状态管理策略和主题树剪枝机制。

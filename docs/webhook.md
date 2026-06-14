@@ -621,6 +621,7 @@ wg.Wait()
 | 错误 | 场景 |
 |------|------|
 | `ErrCallbackNotFound` | 操作不存在的回调 ID |
+| `ErrCallbackCancelled` | 触发已取消的回调（区分于不存在的回调） |
 | `ErrCallbackAlreadyExists` | 使用指定 ID 注册时 ID 已存在 |
 | `ErrSchedulerStopped` | 调度器未启动或已停止时调用注册/触发 |
 | `ErrInvalidURL` | 回调 URL 不合法（非 http/https 或缺少 host） |
@@ -633,6 +634,45 @@ wg.Wait()
 
 上下文取消/超时：
 - `WaitForResult(ctx, callbackID)` 在 ctx 被取消或超时时返回 `ctx.Err()`
+
+### 6.1 错误语义区分
+
+`ErrCallbackNotFound` 与 `ErrCallbackCancelled` 是两个不同的错误，调用方应正确区分：
+
+```go
+err := s.Trigger(callbackID)
+if err == ErrCallbackNotFound {
+    // 回调 ID 不存在，可能是输入错误或已被清理
+    log.Printf("回调 %s 不存在", callbackID)
+} else if err == ErrCallbackCancelled {
+    // 回调存在但已被取消，不应再触发
+    log.Printf("回调 %s 已被取消，跳过触发", callbackID)
+} else if err != nil {
+    // 其他错误
+    log.Printf("触发回调失败: %v", err)
+}
+```
+
+### 6.2 失败结果的错误汇总
+
+当重试耗尽最终失败时，`DeliveryResult.Error` 字段会包含汇总的错误信息，包含重试耗尽的上下文：
+
+```go
+result, _ := s.WaitForResult(ctx, callbackID)
+if result.Final && result.Error != nil {
+    // result.Error 包含汇总信息，如: "max retries exhausted: HTTP 500"
+    // result.Delivery.Error 包含最后一次具体错误，如: "HTTP 500"
+    log.Printf("最终失败: %v, 最后一次错误: %s",
+        result.Error, result.Delivery.Error)
+}
+```
+
+| 场景 | `result.Error` | `result.Delivery.Error` |
+|------|---------------|------------------------|
+| 重试耗尽最终失败 | `"max retries exhausted: HTTP 500"` | `"HTTP 500"` |
+| 单次请求成功 | `nil` | `""` |
+| 单次请求失败（MaxRetries=0） | `"max retries exhausted: send request: dial tcp"` | `"send request: dial tcp"` |
+| 回调被取消 | `nil` | `""` |
 
 ## 7. 线程安全说明
 

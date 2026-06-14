@@ -26,11 +26,14 @@ func TestNewTSEngine(t *testing.T) {
 
 func TestNewTSEngineWithConfig(t *testing.T) {
 	cfg := Config{
-		TTL:             2 * time.Hour,
-		CleanupInterval: time.Minute,
+		TTL:              2 * time.Hour,
+		CleanupInterval:  time.Minute,
 		CleanupBatchSize: 100,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
 	if e.GetTTL() != 2*time.Hour {
@@ -38,13 +41,69 @@ func TestNewTSEngineWithConfig(t *testing.T) {
 	}
 }
 
-func TestNewTSEngineWithConfig_Defaults(t *testing.T) {
-	cfg := Config{}
-	e := NewTSEngineWithConfig(cfg)
-	defer e.Close()
+func TestNewTSEngineWithConfig_InvalidTTL(t *testing.T) {
+	cfg := Config{
+		TTL:              0,
+		CleanupInterval:  time.Minute,
+		CleanupBatchSize: 100,
+	}
+	_, err := NewTSEngineWithConfig(cfg)
+	if err != ErrInvalidTTL {
+		t.Errorf("expected ErrInvalidTTL for TTL=0, got %v", err)
+	}
 
-	if e.GetTTL() != 24*time.Hour {
-		t.Errorf("expected default TTL 24h, got %v", e.GetTTL())
+	cfg2 := Config{
+		TTL:              -2,
+		CleanupInterval:  time.Minute,
+		CleanupBatchSize: 100,
+	}
+	_, err2 := NewTSEngineWithConfig(cfg2)
+	if err2 != ErrInvalidTTL {
+		t.Errorf("expected ErrInvalidTTL for TTL=-2, got %v", err2)
+	}
+}
+
+func TestNewTSEngineWithConfig_InvalidInterval(t *testing.T) {
+	cfg := Config{
+		TTL:              time.Hour,
+		CleanupInterval:  0,
+		CleanupBatchSize: 100,
+	}
+	_, err := NewTSEngineWithConfig(cfg)
+	if err != ErrInvalidInterval {
+		t.Errorf("expected ErrInvalidInterval, got %v", err)
+	}
+
+	cfg2 := Config{
+		TTL:              time.Hour,
+		CleanupInterval:  -time.Minute,
+		CleanupBatchSize: 100,
+	}
+	_, err2 := NewTSEngineWithConfig(cfg2)
+	if err2 != ErrInvalidInterval {
+		t.Errorf("expected ErrInvalidInterval for negative, got %v", err2)
+	}
+}
+
+func TestNewTSEngineWithConfig_InvalidBatchSize(t *testing.T) {
+	cfg := Config{
+		TTL:              time.Hour,
+		CleanupInterval:  time.Minute,
+		CleanupBatchSize: 0,
+	}
+	_, err := NewTSEngineWithConfig(cfg)
+	if err != ErrInvalidBatchSize {
+		t.Errorf("expected ErrInvalidBatchSize, got %v", err)
+	}
+
+	cfg2 := Config{
+		TTL:              time.Hour,
+		CleanupInterval:  time.Minute,
+		CleanupBatchSize: -100,
+	}
+	_, err2 := NewTSEngineWithConfig(cfg2)
+	if err2 != ErrInvalidBatchSize {
+		t.Errorf("expected ErrInvalidBatchSize for negative, got %v", err2)
 	}
 }
 
@@ -301,14 +360,15 @@ func TestDownsample_Avg(t *testing.T) {
 	e := NewTSEngine()
 	defer e.Close()
 
-	now := time.Now().UnixMilli()
 	window := time.Second
+	windowMs := window.Milliseconds()
+	baseTs := (time.Now().UnixMilli() / windowMs) * windowMs
 
 	points := []*DataPoint{
-		{Timestamp: now + 500, Value: 10.0, Tags: map[string]string{"m": "cpu"}},
-		{Timestamp: now + 1500, Value: 20.0, Tags: map[string]string{"m": "cpu"}},
-		{Timestamp: now + 2500, Value: 30.0, Tags: map[string]string{"m": "cpu"}},
-		{Timestamp: now + 3500, Value: 40.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 500, Value: 10.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 1500, Value: 20.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 2500, Value: 30.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 3500, Value: 40.0, Tags: map[string]string{"m": "cpu"}},
 	}
 
 	err := e.Write(points)
@@ -316,7 +376,7 @@ func TestDownsample_Avg(t *testing.T) {
 		t.Fatalf("Write failed: %v", err)
 	}
 
-	result, err := e.Downsample(0, now+10000, window, AggAvg, map[string]string{"m": "cpu"})
+	result, err := e.Downsample(0, baseTs+10000, window, AggAvg, map[string]string{"m": "cpu"})
 	if err != nil {
 		t.Fatalf("Downsample failed: %v", err)
 	}
@@ -372,19 +432,20 @@ func TestDownsample_MinMax(t *testing.T) {
 	e := NewTSEngine()
 	defer e.Close()
 
-	now := time.Now().UnixMilli()
 	window := time.Second
+	windowMs := window.Milliseconds()
+	baseTs := (time.Now().UnixMilli() / windowMs) * windowMs
 
 	points := []*DataPoint{
-		{Timestamp: now + 500, Value: 10.0, Tags: map[string]string{"m": "cpu"}},
-		{Timestamp: now + 700, Value: 5.0, Tags: map[string]string{"m": "cpu"}},
-		{Timestamp: now + 1500, Value: 30.0, Tags: map[string]string{"m": "cpu"}},
-		{Timestamp: now + 1800, Value: 20.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 500, Value: 10.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 700, Value: 5.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 1500, Value: 30.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 1800, Value: 20.0, Tags: map[string]string{"m": "cpu"}},
 	}
 
 	e.Write(points)
 
-	minResult, err := e.Downsample(0, now+10000, window, AggMin, map[string]string{"m": "cpu"})
+	minResult, err := e.Downsample(0, baseTs+10000, window, AggMin, map[string]string{"m": "cpu"})
 	if err != nil {
 		t.Fatalf("Downsample min failed: %v", err)
 	}
@@ -392,7 +453,7 @@ func TestDownsample_MinMax(t *testing.T) {
 		t.Errorf("expected min 5.0 in first window, got %v", minResult)
 	}
 
-	maxResult, err := e.Downsample(0, now+10000, window, AggMax, map[string]string{"m": "cpu"})
+	maxResult, err := e.Downsample(0, baseTs+10000, window, AggMax, map[string]string{"m": "cpu"})
 	if err != nil {
 		t.Fatalf("Downsample max failed: %v", err)
 	}
@@ -484,19 +545,20 @@ func TestDownsample_Sorted(t *testing.T) {
 	e := NewTSEngine()
 	defer e.Close()
 
-	now := time.Now().UnixMilli()
 	window := time.Second
+	windowMs := window.Milliseconds()
+	baseTs := (time.Now().UnixMilli() / windowMs) * windowMs
 
 	points := []*DataPoint{
-		{Timestamp: now + 5000, Value: 5.0, Tags: map[string]string{"m": "cpu"}},
-		{Timestamp: now + 1000, Value: 1.0, Tags: map[string]string{"m": "cpu"}},
-		{Timestamp: now + 3000, Value: 3.0, Tags: map[string]string{"m": "cpu"}},
-		{Timestamp: now + 2000, Value: 2.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 5000, Value: 5.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 1000, Value: 1.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 3000, Value: 3.0, Tags: map[string]string{"m": "cpu"}},
+		{Timestamp: baseTs + 2000, Value: 2.0, Tags: map[string]string{"m": "cpu"}},
 	}
 
 	e.Write(points)
 
-	result, err := e.Downsample(0, now+10000, window, AggAvg, map[string]string{"m": "cpu"})
+	result, err := e.Downsample(0, baseTs+10000, window, AggAvg, map[string]string{"m": "cpu"})
 	if err != nil {
 		t.Fatalf("Downsample failed: %v", err)
 	}
@@ -510,11 +572,14 @@ func TestDownsample_Sorted(t *testing.T) {
 
 func TestTTL_ExpiredDataCleanup(t *testing.T) {
 	cfg := Config{
-		TTL:             100 * time.Millisecond,
-		CleanupInterval: 10 * time.Millisecond,
+		TTL:              100 * time.Millisecond,
+		CleanupInterval:  10 * time.Millisecond,
 		CleanupBatchSize: 100,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
 	oldTime := time.Now().Add(-200 * time.Millisecond).UnixMilli()
@@ -522,7 +587,7 @@ func TestTTL_ExpiredDataCleanup(t *testing.T) {
 		{Timestamp: oldTime, Value: 1.0, Tags: map[string]string{"id": "old"}},
 	}
 
-	err := e.Write(points)
+	err = e.Write(points)
 	if err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
@@ -540,11 +605,14 @@ func TestTTL_ExpiredDataCleanup(t *testing.T) {
 
 func TestTTL_RecentDataNotCleaned(t *testing.T) {
 	cfg := Config{
-		TTL:             time.Hour,
-		CleanupInterval: time.Minute,
+		TTL:              time.Hour,
+		CleanupInterval:  time.Minute,
 		CleanupBatchSize: 100,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
 	now := time.Now().UnixMilli()
@@ -562,11 +630,14 @@ func TestTTL_RecentDataNotCleaned(t *testing.T) {
 
 func TestTTL_BatchCleanup(t *testing.T) {
 	cfg := Config{
-		TTL:             time.Millisecond,
-		CleanupInterval: time.Second,
+		TTL:              time.Millisecond,
+		CleanupInterval:  time.Second,
 		CleanupBatchSize: 5,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
 	oldTime := time.Now().Add(-100 * time.Millisecond).UnixMilli()
@@ -588,17 +659,20 @@ func TestTTL_BatchCleanup(t *testing.T) {
 	}
 }
 
-func TestTTL_NegativeTTL_Disabled(t *testing.T) {
+func TestTTL_TTLDisabled(t *testing.T) {
 	cfg := Config{
-		TTL:             -1,
-		CleanupInterval: time.Millisecond,
+		TTL:              TTLDisabled,
+		CleanupInterval:  time.Millisecond,
 		CleanupBatchSize: 100,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
-	if e.GetTTL() != -1 {
-		t.Errorf("expected TTL -1 (disabled), got %v", e.GetTTL())
+	if e.GetTTL() != TTLDisabled {
+		t.Errorf("expected TTLDisabled, got %v", e.GetTTL())
 	}
 
 	now := time.Now().UnixMilli()
@@ -610,7 +684,7 @@ func TestTTL_NegativeTTL_Disabled(t *testing.T) {
 	e.ForceCleanup()
 
 	if e.Count() != 1 {
-		t.Errorf("expected 1 point with TTL=-1 (disabled), got %d", e.Count())
+		t.Errorf("expected 1 point with TTLDisabled, got %d", e.Count())
 	}
 }
 
@@ -844,19 +918,20 @@ func TestDownsample_WithTagFilter(t *testing.T) {
 	e := NewTSEngine()
 	defer e.Close()
 
-	now := time.Now().UnixMilli()
 	window := time.Second
+	windowMs := window.Milliseconds()
+	baseTs := (time.Now().UnixMilli() / windowMs) * windowMs
 
 	points := []*DataPoint{
-		{Timestamp: now + 500, Value: 10.0, Tags: map[string]string{"host": "s1", "dc": "us"}},
-		{Timestamp: now + 1500, Value: 20.0, Tags: map[string]string{"host": "s1", "dc": "us"}},
-		{Timestamp: now + 500, Value: 30.0, Tags: map[string]string{"host": "s2", "dc": "eu"}},
-		{Timestamp: now + 1500, Value: 40.0, Tags: map[string]string{"host": "s2", "dc": "eu"}},
+		{Timestamp: baseTs + 500, Value: 10.0, Tags: map[string]string{"host": "s1", "dc": "us"}},
+		{Timestamp: baseTs + 1500, Value: 20.0, Tags: map[string]string{"host": "s1", "dc": "us"}},
+		{Timestamp: baseTs + 500, Value: 30.0, Tags: map[string]string{"host": "s2", "dc": "eu"}},
+		{Timestamp: baseTs + 1500, Value: 40.0, Tags: map[string]string{"host": "s2", "dc": "eu"}},
 	}
 
 	e.Write(points)
 
-	result, err := e.Downsample(0, now+10000, window, AggAvg, map[string]string{"host": "s1"})
+	result, err := e.Downsample(0, baseTs+10000, window, AggAvg, map[string]string{"host": "s1"})
 	if err != nil {
 		t.Fatalf("Downsample failed: %v", err)
 	}
@@ -878,6 +953,15 @@ func TestErrors_Values(t *testing.T) {
 	}
 	if ErrInvalidAggregator == nil {
 		t.Error("ErrInvalidAggregator should not be nil")
+	}
+	if ErrInvalidTTL == nil {
+		t.Error("ErrInvalidTTL should not be nil")
+	}
+	if ErrInvalidBatchSize == nil {
+		t.Error("ErrInvalidBatchSize should not be nil")
+	}
+	if ErrInvalidInterval == nil {
+		t.Error("ErrInvalidInterval should not be nil")
 	}
 	if ErrEmptyTags == nil {
 		t.Error("ErrEmptyTags should not be nil")
@@ -959,7 +1043,10 @@ func TestTTL_CleanupPreservesIndex(t *testing.T) {
 		CleanupInterval: time.Minute,
 		CleanupBatchSize: 100,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
 	oldTime := time.Now().Add(-200 * time.Millisecond).UnixMilli()
@@ -1502,7 +1589,10 @@ func TestTTL_CleanupRemovesOldKeepsNew(t *testing.T) {
 		CleanupInterval:  50 * time.Millisecond,
 		CleanupBatchSize: 10,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
 	oldTime := time.Now().Add(-1 * time.Second).UnixMilli()
@@ -1541,11 +1631,9 @@ func TestTTL_ZeroTTL(t *testing.T) {
 		CleanupInterval:  50 * time.Millisecond,
 		CleanupBatchSize: 100,
 	}
-	e := NewTSEngineWithConfig(cfg)
-	defer e.Close()
-
-	if e.GetTTL() != 24*time.Hour {
-		t.Errorf("expected default TTL 24h when zero provided, got %v", e.GetTTL())
+	_, err := NewTSEngineWithConfig(cfg)
+	if err != ErrInvalidTTL {
+		t.Errorf("expected ErrInvalidTTL for TTL=0, got %v", err)
 	}
 }
 
@@ -1555,7 +1643,10 @@ func TestTTL_CleanupBatchSizeRespected(t *testing.T) {
 		CleanupInterval:  time.Minute,
 		CleanupBatchSize: 3,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
 	oldTime := time.Now().Add(-100 * time.Millisecond).UnixMilli()
@@ -1582,7 +1673,10 @@ func TestTTL_CleanupOnEmptyEngine(t *testing.T) {
 		CleanupInterval:  time.Minute,
 		CleanupBatchSize: 100,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
 	e.ForceCleanup()
@@ -1769,7 +1863,10 @@ func TestConcurrentWriteAndCleanup(t *testing.T) {
 		CleanupInterval:  50 * time.Millisecond,
 		CleanupBatchSize: 50,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
 	var wg sync.WaitGroup
@@ -1835,11 +1932,9 @@ func TestNewTSEngineWithConfig_ZeroCleanupBatchSize(t *testing.T) {
 		CleanupInterval:  time.Minute,
 		CleanupBatchSize: 0,
 	}
-	e := NewTSEngineWithConfig(cfg)
-	defer e.Close()
-
-	if e.GetTTL() != time.Hour {
-		t.Errorf("expected TTL 1h, got %v", e.GetTTL())
+	_, err := NewTSEngineWithConfig(cfg)
+	if err != ErrInvalidBatchSize {
+		t.Errorf("expected ErrInvalidBatchSize for zero batch size, got %v", err)
 	}
 }
 
@@ -1849,11 +1944,9 @@ func TestNewTSEngineWithConfig_NegativeCleanupInterval(t *testing.T) {
 		CleanupInterval:  -1,
 		CleanupBatchSize: 100,
 	}
-	e := NewTSEngineWithConfig(cfg)
-	defer e.Close()
-
-	if e.GetTTL() != time.Hour {
-		t.Errorf("expected TTL 1h, got %v", e.GetTTL())
+	_, err := NewTSEngineWithConfig(cfg)
+	if err != ErrInvalidInterval {
+		t.Errorf("expected ErrInvalidInterval for negative interval, got %v", err)
 	}
 }
 
@@ -1895,7 +1988,10 @@ func TestTagIndex_AfterCleanupStillCorrect(t *testing.T) {
 		CleanupInterval:  time.Minute,
 		CleanupBatchSize: 10,
 	}
-	e := NewTSEngineWithConfig(cfg)
+	e, err := NewTSEngineWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTSEngineWithConfig failed: %v", err)
+	}
 	defer e.Close()
 
 	oldTime := time.Now().Add(-200 * time.Millisecond).UnixMilli()

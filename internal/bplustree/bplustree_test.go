@@ -1475,3 +1475,495 @@ func TestSplit_ManyDuplicatesWithSplit(t *testing.T) {
 		t.Errorf("expected a=val_9 (last update), got %s (ok=%v)", val, ok)
 	}
 }
+
+func TestUnderflow_LeafBorrowFromLeft(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	tree.Insert("a", "1")
+	tree.Insert("b", "2")
+	tree.Insert("c", "3")
+	tree.Insert("d", "4")
+	tree.Insert("e", "5")
+	tree.Insert("f", "6")
+	tree.Insert("g", "7")
+	tree.Insert("h", "8")
+	tree.Insert("i", "9")
+
+	if tree.Count() != 9 {
+		t.Fatalf("expected 9 keys, got %d", tree.Count())
+	}
+
+	for i := 7; i >= 4; i-- {
+		key := fmt.Sprintf("%c", 'a'+i)
+		tree.Delete(key)
+	}
+
+	if tree.Count() != 5 {
+		t.Errorf("expected 5 keys after deletions, got %d", tree.Count())
+	}
+
+	remaining := []string{"a", "b", "c", "d", "i"}
+	for _, k := range remaining {
+		_, ok := tree.Search(k)
+		if !ok {
+			t.Errorf("key %s should exist after borrow", k)
+		}
+	}
+
+	deleted := []string{"e", "f", "g", "h"}
+	for _, k := range deleted {
+		_, ok := tree.Search(k)
+		if ok {
+			t.Errorf("key %s should be deleted", k)
+		}
+	}
+}
+
+func TestUnderflow_LeafBorrowFromRight(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	tree.Insert("a", "1")
+	tree.Insert("b", "2")
+	tree.Insert("c", "3")
+	tree.Insert("d", "4")
+	tree.Insert("e", "5")
+	tree.Insert("f", "6")
+	tree.Insert("g", "7")
+	tree.Insert("h", "8")
+	tree.Insert("i", "9")
+
+	tree.Delete("a")
+	tree.Delete("b")
+	tree.Delete("c")
+	tree.Delete("d")
+
+	if tree.Count() != 5 {
+		t.Errorf("expected 5 keys, got %d", tree.Count())
+	}
+
+	remaining := []string{"e", "f", "g", "h", "i"}
+	for _, k := range remaining {
+		_, ok := tree.Search(k)
+		if !ok {
+			t.Errorf("key %s should exist after borrow from right", k)
+		}
+	}
+
+	result, err := tree.RangeScan("a", "z")
+	if err != nil {
+		t.Fatalf("RangeScan failed: %v", err)
+	}
+	if len(result) != 5 {
+		t.Errorf("expected 5 items in range, got %d", len(result))
+	}
+	for i, k := range remaining {
+		if result[i].Key != k {
+			t.Errorf("position %d: expected %s, got %s", i, k, result[i].Key)
+		}
+	}
+}
+
+func TestUnderflow_LeafMergeWithLeft(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	n := 6
+	for i := 0; i < n; i++ {
+		tree.Insert(fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+	}
+
+	tree.Delete("k4")
+	tree.Delete("k5")
+
+	if tree.Count() != 4 {
+		t.Errorf("expected 4 keys after merge-triggering deletions, got %d", tree.Count())
+	}
+
+	for i := 0; i < 4; i++ {
+		key := fmt.Sprintf("k%d", i)
+		_, ok := tree.Search(key)
+		if !ok {
+			t.Errorf("key %s should exist after merge", key)
+		}
+	}
+}
+
+func TestUnderflow_LeafMergeWithRight(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	n := 6
+	for i := 0; i < n; i++ {
+		tree.Insert(fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+	}
+
+	tree.Delete("k0")
+	tree.Delete("k1")
+
+	if tree.Count() != 4 {
+		t.Errorf("expected 4 keys, got %d", tree.Count())
+	}
+
+	for i := 2; i < 6; i++ {
+		key := fmt.Sprintf("k%d", i)
+		_, ok := tree.Search(key)
+		if !ok {
+			t.Errorf("key %s should exist after merge with right", key)
+		}
+	}
+}
+
+func TestUnderflow_InternalNodeBorrow(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	n := 30
+	for i := 0; i < n; i++ {
+		tree.Insert(fmt.Sprintf("k%03d", i), fmt.Sprintf("v%03d", i))
+	}
+
+	for i := 0; i < 5; i++ {
+		tree.Delete(fmt.Sprintf("k%03d", i))
+	}
+
+	if tree.Count() != 25 {
+		t.Errorf("expected 25 keys, got %d", tree.Count())
+	}
+
+	for i := 5; i < n; i++ {
+		key := fmt.Sprintf("k%03d", i)
+		_, ok := tree.Search(key)
+		if !ok {
+			t.Errorf("key %s should exist after internal borrow", key)
+		}
+	}
+
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("k%03d", i)
+		_, ok := tree.Search(key)
+		if ok {
+			t.Errorf("key %s should not exist", key)
+		}
+	}
+}
+
+func TestUnderflow_InternalNodeMerge(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	n := 20
+	for i := 0; i < n; i++ {
+		tree.Insert(fmt.Sprintf("k%03d", i), fmt.Sprintf("v%03d", i))
+	}
+
+	for i := 0; i < 8; i++ {
+		tree.Delete(fmt.Sprintf("k%03d", i))
+	}
+
+	if tree.Count() != 12 {
+		t.Errorf("expected 12 keys, got %d", tree.Count())
+	}
+
+	for i := 8; i < n; i++ {
+		key := fmt.Sprintf("k%03d", i)
+		_, ok := tree.Search(key)
+		if !ok {
+			t.Errorf("key %s should exist after internal merge", key)
+		}
+	}
+
+	result, err := tree.RangeScan("k000", "k999")
+	if err != nil {
+		t.Fatalf("RangeScan failed: %v", err)
+	}
+	if len(result) != 12 {
+		t.Errorf("expected 12 items in range, got %d", len(result))
+	}
+}
+
+func TestUnderflow_RootShrinks(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	for i := 0; i < 6; i++ {
+		tree.Insert(fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+	}
+
+	if tree.root.isLeaf {
+		t.Error("root should be internal node after 6 inserts with maxKeys=4")
+	}
+
+	tree.Delete("k0")
+	tree.Delete("k1")
+	tree.Delete("k2")
+	tree.Delete("k3")
+
+	if !tree.root.isLeaf {
+		t.Error("root should have shrunk back to leaf after sufficient deletions")
+	}
+
+	if tree.Count() != 2 {
+		t.Errorf("expected 2 keys, got %d", tree.Count())
+	}
+
+	for i := 4; i < 6; i++ {
+		key := fmt.Sprintf("k%d", i)
+		_, ok := tree.Search(key)
+		if !ok {
+			t.Errorf("key %s should exist after root shrink", key)
+		}
+	}
+}
+
+func TestUnderflow_MultipleCascadeMerges(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	n := 50
+	for i := 0; i < n; i++ {
+		tree.Insert(fmt.Sprintf("k%03d", i), fmt.Sprintf("v%03d", i))
+	}
+
+	for i := 0; i < 35; i++ {
+		key := fmt.Sprintf("k%03d", i)
+		tree.Delete(key)
+	}
+
+	if tree.Count() != 15 {
+		t.Errorf("expected 15 keys after cascade deletions, got %d", tree.Count())
+	}
+
+	for i := 35; i < n; i++ {
+		key := fmt.Sprintf("k%03d", i)
+		val, ok := tree.Search(key)
+		if !ok {
+			t.Errorf("key %s should exist after cascade merges", key)
+			continue
+		}
+		expected := fmt.Sprintf("v%03d", i)
+		if val != expected {
+			t.Errorf("expected %s for key %s, got %s", expected, key, val)
+		}
+	}
+
+	for i := 0; i < 35; i++ {
+		key := fmt.Sprintf("k%03d", i)
+		_, ok := tree.Search(key)
+		if ok {
+			t.Errorf("key %s should be deleted", key)
+		}
+	}
+
+	result, err := tree.RangeScan("k000", "k999")
+	if err != nil {
+		t.Fatalf("RangeScan failed: %v", err)
+	}
+	if len(result) != 15 {
+		t.Errorf("expected 15 items in range, got %d", len(result))
+	}
+	for idx, item := range result {
+		expected := fmt.Sprintf("k%03d", idx+35)
+		if item.Key != expected {
+			t.Errorf("position %d: expected %s, got %s", idx, expected, item.Key)
+		}
+	}
+}
+
+func TestUnderflow_DeleteFromRightSide(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	n := 30
+	for i := 0; i < n; i++ {
+		tree.Insert(fmt.Sprintf("k%03d", i), fmt.Sprintf("v%03d", i))
+	}
+
+	for i := n - 1; i >= 10; i-- {
+		tree.Delete(fmt.Sprintf("k%03d", i))
+	}
+
+	if tree.Count() != 10 {
+		t.Errorf("expected 10 keys, got %d", tree.Count())
+	}
+
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("k%03d", i)
+		_, ok := tree.Search(key)
+		if !ok {
+			t.Errorf("key %s should exist", key)
+		}
+	}
+}
+
+func TestUnderflow_IteratorDeleteWithMerges(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	n := 20
+	for i := 0; i < n; i++ {
+		tree.Insert(fmt.Sprintf("k%03d", i), fmt.Sprintf("v%03d", i))
+	}
+
+	it := tree.NewIterator()
+	count := 0
+	var remaining []string
+	for it.Valid() {
+		key, _ := it.Key()
+		if count%2 == 0 {
+			it.Delete()
+		} else {
+			remaining = append(remaining, key)
+			it.Next()
+		}
+		count++
+	}
+
+	if tree.Count() != 10 {
+		t.Errorf("expected 10 keys after deleting every other, got %d", tree.Count())
+	}
+
+	if len(remaining) != 10 {
+		t.Errorf("expected 10 remaining keys from iteration, got %d", len(remaining))
+	}
+
+	for _, k := range remaining {
+		_, ok := tree.Search(k)
+		if !ok {
+			t.Errorf("key %s should exist", k)
+		}
+	}
+
+	expectedCount := 0
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("k%03d", i)
+		_, ok := tree.Search(key)
+		if ok {
+			expectedCount++
+		}
+	}
+	if expectedCount != 10 {
+		t.Errorf("expected 10 existing keys in tree, found %d", expectedCount)
+	}
+}
+
+func TestUnderflow_LeafLinkedListAfterMerge(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	for i := 0; i < 10; i++ {
+		tree.Insert(fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+	}
+
+	tree.Delete("k0")
+	tree.Delete("k1")
+	tree.Delete("k2")
+	tree.Delete("k3")
+	tree.Delete("k4")
+
+	current := tree.root
+	for !current.isLeaf {
+		current = current.children[0]
+	}
+
+	var collected []string
+	for current != nil {
+		collected = append(collected, current.keys...)
+		current = current.next
+	}
+
+	expected := []string{"k5", "k6", "k7", "k8", "k9"}
+	if len(collected) != len(expected) {
+		t.Fatalf("expected %d keys in leaf chain, got %d", len(expected), len(collected))
+	}
+	for i, k := range expected {
+		if collected[i] != k {
+			t.Errorf("position %d: expected %s, got %s", i, k, collected[i])
+		}
+	}
+
+	current = tree.root
+	for !current.isLeaf {
+		current = current.children[len(current.children)-1]
+	}
+	var backward []string
+	for current != nil {
+		for i := len(current.keys) - 1; i >= 0; i-- {
+			backward = append(backward, current.keys[i])
+		}
+		current = current.prev
+	}
+
+	if len(backward) != len(expected) {
+		t.Fatalf("expected %d keys in backward traversal, got %d", len(expected), len(backward))
+	}
+	for i := range expected {
+		if backward[i] != expected[len(expected)-1-i] {
+			t.Errorf("backward position %d: expected %s, got %s", i, expected[len(expected)-1-i], backward[i])
+		}
+	}
+}
+
+func TestIteratorDelete_ReturnsErrKeyNotFound(t *testing.T) {
+	tree := NewBPlusTree()
+	tree.Insert("a", "1")
+
+	it := tree.NewIterator()
+	it.Next()
+	if it.Valid() {
+		t.Error("iterator should be invalid after Next past last element")
+	}
+
+	err := it.Delete()
+	if err != ErrIteratorInvalid {
+		t.Errorf("expected ErrIteratorInvalid on invalid iterator, got %v", err)
+	}
+}
+
+func TestUnderflow_MinKeysCalculation(t *testing.T) {
+	cases := []struct {
+		maxKeys int
+		minKeys int
+	}{
+		{4, 2},
+		{6, 3},
+		{8, 4},
+		{32, 16},
+		{2, 1},
+	}
+
+	for _, c := range cases {
+		tree := NewBPlusTreeWithConfig(Config{MaxKeys: c.maxKeys})
+		if tree.minKeys() != c.minKeys {
+			t.Errorf("maxKeys=%d: expected minKeys=%d, got %d", c.maxKeys, c.minKeys, tree.minKeys())
+		}
+	}
+}
+
+func TestUnderflow_AlternatingInsertDelete(t *testing.T) {
+	tree := NewBPlusTreeWithConfig(Config{MaxKeys: 4})
+
+	for phase := 0; phase < 5; phase++ {
+		base := phase * 10
+		for i := 0; i < 10; i++ {
+			tree.Insert(fmt.Sprintf("k%03d", base+i), fmt.Sprintf("v%03d", base+i))
+		}
+
+		for i := 0; i < 5; i++ {
+			tree.Delete(fmt.Sprintf("k%03d", base+i))
+		}
+
+		if tree.Count() != (phase+1)*5 {
+			t.Errorf("phase %d: expected %d keys, got %d", phase, (phase+1)*5, tree.Count())
+		}
+	}
+
+	result, err := tree.RangeScan("k000", "k999")
+	if err != nil {
+		t.Fatalf("RangeScan failed: %v", err)
+	}
+	if len(result) != 25 {
+		t.Errorf("expected 25 items in total, got %d", len(result))
+	}
+
+	for _, item := range result {
+		val, ok := tree.Search(item.Key)
+		if !ok {
+			t.Errorf("key %s from RangeScan should exist in tree", item.Key)
+			continue
+		}
+		if val != item.Value {
+			t.Errorf("value mismatch for key %s: expected %s, got %s", item.Key, item.Value, val)
+		}
+	}
+}

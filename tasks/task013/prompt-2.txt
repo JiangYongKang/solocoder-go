@@ -1,0 +1,6 @@
+你实现的事件总线路由器模块存在一些问题，需要修复：
+1. PublishAsync 方法虽然获取了按优先级排序的订阅者列表，但随后为每个订阅者并发启动了 goroutine，排序后的顺序在并发执行中完全丢失，高优先级订阅者可能晚于低优先级执行，同时 ErrInterrupt 中断机制在异步模式下完全失效，低优先级订阅者不会因高优先级返回中断而停止。
+2. TestUnsubscribeRemovesEmptyEventType 测试直接访问了 bus.mu 和 bus.subscribers 这两个未导出字段来验证内部状态，测试代码与内部实现紧密耦合，一旦存储结构改变即使外部行为正确测试也会失败。
+3. TestRangeFilter 测试中 "non-numeric value" 分支将 filter.Key 重置为已经初始化的 "age"，属于无效死代码，降低了可读性。
+4. 修复完成后运行 go test ./internal/eventbus/ -v，需要让所有测试通过。
+5. 在 docs/eventbus.md 中更新模块需求文档，说明异步分发模式下优先级和中断机制的具体实现策略。

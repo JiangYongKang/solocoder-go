@@ -1,0 +1,6 @@
+你实现的 WAL 存储引擎模块存在一些问题，需要修复：
+1. rotateSegment 方法在将当前活跃段切换为非活跃段时没有关闭旧段的文件句柄，旧段继续持有 O_RDWR|O_APPEND 权限，多次段切分后文件描述符不断累积超出系统限制，导致后续段文件创建失败。
+2. readSegmentEntries 和 recoverSegment 方法通过 Seek 加 ReadAll 读取段文件，但 os.File 的读取位置是多 goroutine 共享的，两个 reader 同时持有读锁调用时第一个 reader 会将文件位置消耗到末尾，第二个 reader 读到空数据或截断数据。
+3. scanSegmentOffsets、readSegmentEntries 和 recoverSegment 三个方法均用 io.ReadAll 将整个段文件（默认 64MB）一次性全部读入内存再处理，导致不必要的内存分配，扫描偏移量只需固定大小头部信息却加载了全部数据。
+4. 修复完成后运行 go test ./internal/wal/ -v，需要让所有测试通过。
+5. 在 docs/wal.md 中更新模块需求文档，说明段切分时的文件句柄管理策略和并发读取的安全保证。

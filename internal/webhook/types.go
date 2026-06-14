@@ -16,7 +16,8 @@ var (
 	ErrInvalidMaxRetries    = errors.New("webhook: max retries must be >= 0")
 	ErrInvalidInterval      = errors.New("webhook: retry interval must be positive")
 	ErrInvalidTimeout       = errors.New("webhook: timeout must be positive")
-	ErrDeliveryNotFound     = errors.New("webhook: delivery not found")
+	ErrDeliveryNotFound  = errors.New("webhook: delivery not found")
+	ErrCallbackCancelled = errors.New("webhook: callback is cancelled")
 )
 
 type BackoffType int
@@ -115,6 +116,7 @@ type Delivery struct {
 type DeliveryResult struct {
 	Delivery *Delivery
 	Final    bool
+	Error    error
 }
 
 type CallbackOption func(*Callback)

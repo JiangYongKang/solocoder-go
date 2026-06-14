@@ -94,17 +94,18 @@ type Config struct {
 type segment struct {
     id          int        // 段 ID，从 1 开始递增
     path        string     // 段文件的完整路径
-    file        *os.File   // 打开的文件句柄
+    file        *os.File   // 打开的文件句柄（仅活跃段非 nil）
     size        int64      // 当前段的已写入字节数
     startOffset int64      // 本段第一条记录的偏移量（-1 表示空段）
     endOffset   int64      // 本段最后一条记录的偏移量（-1 表示空段）
 }
 ```
 
-**职责**：持有单个日志段文件的状态。段文件命名格式为 `wal_%08d.log`，例如 `wal_00000001.log`、`wal_00000002.log`。
+**职责**：持有单个日志段文件的元数据状态。段文件命名格式为 `wal_%08d.log`，例如 `wal_00000001.log`、`wal_00000002.log`。
 
-- `startOffset` 和 `endOffset` 通过段加载时的全量扫描建立，用于快速定位某个偏移量所在的段。
-- 活跃段（active segment）以 `O_RDWR|O_APPEND` 模式打开，非活跃旧段以 `O_RDWR` 模式打开，支持读取和按需重写。
+- `startOffset` 和 `endOffset` 通过段加载时的流式扫描建立，用于快速定位某个偏移量所在的段。
+- **文件句柄管理策略**：只有当前活跃段（`activeSeg`）以 `O_RDWR|O_APPEND` 模式持久持有 `*os.File` 句柄。所有非活跃旧段的 `file` 字段为 `nil`，不长期占用文件描述符。
+- 读取非活跃段（或活跃段）时，每次调用 `ReadFrom` / `RecoverFrom` 都会临时以 `O_RDONLY` 打开独立句柄，读取完成后立即关闭，避免 FD 累积和多 reader 位置竞争。
 
 ---
 

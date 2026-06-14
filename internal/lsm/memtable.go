@@ -127,6 +127,12 @@ func (mt *MemTable) Range(start, end string) []*Entry {
 	return result
 }
 
+func (mt *MemTable) RangeWithTombstone(start, end string) []*Entry {
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
+	return mt.data.Range(start, end)
+}
+
 func (mt *MemTable) AllEntries() []*Entry {
 	mt.mu.RLock()
 	defer mt.mu.RUnlock()

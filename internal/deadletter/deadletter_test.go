@@ -1302,16 +1302,24 @@ func TestConcurrent_ProcessAndQuery(t *testing.T) {
 		}(i)
 	}
 
+	done := make(chan struct{})
 	go func() {
 		for {
-			_ = p.PendingCount()
-			_ = p.PermanentlyFailedCount()
-			_ = p.GetAllMessages()
+			select {
+			case <-done:
+				return
+			default:
+				_ = p.PendingCount()
+				_ = p.PermanentlyFailedCount()
+				_ = p.GetAllMessages()
+				time.Sleep(10 * time.Millisecond)
+			}
 		}
 	}()
 
 	wg.Wait()
 	time.Sleep(300 * time.Millisecond)
+	close(done)
 
 	if p.PendingCount() != 0 {
 		t.Errorf("expected 0 pending after processing, got %d", p.PendingCount())

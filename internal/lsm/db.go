@@ -132,14 +132,13 @@ func (db *DB) Put(key, value string) error {
 		return ErrEmptyKey
 	}
 
-	db.mu.RLock()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	if db.closed {
-		db.mu.RUnlock()
 		return ErrDBClosed
 	}
-	db.mu.RUnlock()
 
-	db.mu.Lock()
 	db.memTable.Put(key, value)
 	needsFlush := db.memTable.ShouldFlush()
 
@@ -153,7 +152,6 @@ func (db *DB) Put(key, value string) error {
 		default:
 		}
 	}
-	db.mu.Unlock()
 
 	return nil
 }
@@ -163,14 +161,13 @@ func (db *DB) Delete(key string) error {
 		return ErrEmptyKey
 	}
 
-	db.mu.RLock()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	if db.closed {
-		db.mu.RUnlock()
 		return ErrDBClosed
 	}
-	db.mu.RUnlock()
 
-	db.mu.Lock()
 	db.memTable.Delete(key)
 	needsFlush := db.memTable.ShouldFlush()
 
@@ -184,7 +181,6 @@ func (db *DB) Delete(key string) error {
 		default:
 		}
 	}
-	db.mu.Unlock()
 
 	return nil
 }
@@ -199,9 +195,7 @@ func (db *DB) Get(key string) (string, error) {
 		db.mu.RUnlock()
 		return "", ErrDBClosed
 	}
-	db.mu.RUnlock()
 
-	db.mu.RLock()
 	entry, found := db.memTable.GetWithTombstone(key)
 	if found {
 		if entry.Tombstone {
@@ -238,6 +232,13 @@ func (db *DB) Get(key string) (string, error) {
 	db.mu.RUnlock()
 
 	for level := 0; level < db.config.MaxLevel; level++ {
+		db.mu.RLock()
+		if db.closed {
+			db.mu.RUnlock()
+			return "", ErrDBClosed
+		}
+		db.mu.RUnlock()
+
 		entry, found, err := db.levels[level].Get(key)
 		if err != nil {
 			return "", err
@@ -258,17 +259,15 @@ func (db *DB) Range(start, end string) ([]*Entry, error) {
 		return nil, ErrInvalidRange
 	}
 
+	resultMap := make(map[string]*Entry)
+
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
 		return nil, ErrDBClosed
 	}
-	db.mu.RUnlock()
 
-	resultMap := make(map[string]*Entry)
-
-	db.mu.RLock()
-	memEntries := db.memTable.Range(start, end)
+	memEntries := db.memTable.RangeWithTombstone(start, end)
 	for _, e := range memEntries {
 		if existing, ok := resultMap[e.Key]; !ok || e.Timestamp > existing.Timestamp {
 			resultMap[e.Key] = e
@@ -276,7 +275,7 @@ func (db *DB) Range(start, end string) ([]*Entry, error) {
 	}
 
 	for i := len(db.immutable) - 1; i >= 0; i-- {
-		immEntries := db.immutable[i].Range(start, end)
+		immEntries := db.immutable[i].RangeWithTombstone(start, end)
 		for _, e := range immEntries {
 			if existing, ok := resultMap[e.Key]; !ok || e.Timestamp > existing.Timestamp {
 				resultMap[e.Key] = e
@@ -285,7 +284,7 @@ func (db *DB) Range(start, end string) ([]*Entry, error) {
 	}
 
 	if db.flushing != nil {
-		flushEntries := db.flushing.Range(start, end)
+		flushEntries := db.flushing.RangeWithTombstone(start, end)
 		for _, e := range flushEntries {
 			if existing, ok := resultMap[e.Key]; !ok || e.Timestamp > existing.Timestamp {
 				resultMap[e.Key] = e
@@ -295,15 +294,20 @@ func (db *DB) Range(start, end string) ([]*Entry, error) {
 	db.mu.RUnlock()
 
 	for level := 0; level < db.config.MaxLevel; level++ {
-		levelEntries, err := db.levels[level].Range(start, end)
+		db.mu.RLock()
+		if db.closed {
+			db.mu.RUnlock()
+			return nil, ErrDBClosed
+		}
+		db.mu.RUnlock()
+
+		levelEntries, err := db.levels[level].RangeWithTombstone(start, end)
 		if err != nil {
 			return nil, err
 		}
 		for _, e := range levelEntries {
-			if !e.Tombstone {
-				if existing, ok := resultMap[e.Key]; !ok || e.Timestamp > existing.Timestamp {
-					resultMap[e.Key] = e
-				}
+			if existing, ok := resultMap[e.Key]; !ok || e.Timestamp > existing.Timestamp {
+				resultMap[e.Key] = e
 			}
 		}
 	}

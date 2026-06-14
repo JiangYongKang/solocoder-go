@@ -19,6 +19,7 @@ type Deduplicator struct {
 	idMap    map[string]*list.Element
 	idList   *list.List
 	running  bool
+	stopped  bool
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 }
@@ -41,14 +42,25 @@ func DefaultConfig() Config {
 }
 
 func NewDeduplicator() *Deduplicator {
-	return NewDeduplicatorWithConfig(DefaultConfig())
+	d, err := NewDeduplicatorWithConfig(DefaultConfig())
+	if err != nil {
+		panic("dedup: DefaultConfig is invalid: " + err.Error())
+	}
+	return d
 }
 
-func NewDeduplicatorWithConfig(cfg Config) *Deduplicator {
-	if cfg.WindowSize <= 0 {
+func NewDeduplicatorWithConfig(cfg Config) (*Deduplicator, error) {
+	if cfg.WindowSize < 0 {
+		return nil, ErrInvalidConfig
+	}
+	if cfg.CleanInterval < 0 {
+		return nil, ErrInvalidConfig
+	}
+
+	if cfg.WindowSize == 0 {
 		cfg.WindowSize = 5 * time.Minute
 	}
-	if cfg.CleanInterval <= 0 {
+	if cfg.CleanInterval == 0 {
 		cfg.CleanInterval = cfg.WindowSize / 5
 		if cfg.CleanInterval <= 0 {
 			cfg.CleanInterval = time.Second
@@ -61,11 +73,15 @@ func NewDeduplicatorWithConfig(cfg Config) *Deduplicator {
 		idList: list.New(),
 		stopCh: make(chan struct{}),
 	}
-	return d
+	return d, nil
 }
 
 func (d *Deduplicator) Start() {
 	d.mu.Lock()
+	if d.stopped {
+		d.mu.Unlock()
+		return
+	}
 	if d.running {
 		d.mu.Unlock()
 		return
@@ -80,12 +96,15 @@ func (d *Deduplicator) Start() {
 
 func (d *Deduplicator) Stop() {
 	d.mu.Lock()
-	if !d.running {
+	if d.stopped {
 		d.mu.Unlock()
 		return
 	}
-	d.running = false
-	close(d.stopCh)
+	d.stopped = true
+	if d.running {
+		d.running = false
+		close(d.stopCh)
+	}
 	d.mu.Unlock()
 
 	d.wg.Wait()
@@ -98,6 +117,10 @@ func (d *Deduplicator) CheckAndMark(msgID string) (bool, error) {
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	if d.stopped {
+		return false, ErrDeduplicatorStop
+	}
 
 	now := time.Now()
 	cutoff := now.Add(-d.cfg.WindowSize)
@@ -123,41 +146,72 @@ func (d *Deduplicator) CheckAndMark(msgID string) (bool, error) {
 	return true, nil
 }
 
-func (d *Deduplicator) Contains(msgID string) bool {
+func (d *Deduplicator) Contains(msgID string) (bool, error) {
 	if msgID == "" {
-		return false
+		return false, ErrEmptyMessageID
 	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.stopped {
+		return false, ErrDeduplicatorStop
+	}
+
 	elem, exists := d.idMap[msgID]
 	if !exists {
-		return false
+		return false, nil
 	}
 
 	entry := elem.Value.(*idEntry)
 	cutoff := time.Now().Add(-d.cfg.WindowSize)
-	return entry.createdAt.After(cutoff)
+	return entry.createdAt.After(cutoff), nil
 }
 
-func (d *Deduplicator) Count() int {
+func (d *Deduplicator) Count() (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return len(d.idMap)
+
+	if d.stopped {
+		return 0, ErrDeduplicatorStop
+	}
+
+	cutoff := time.Now().Add(-d.cfg.WindowSize)
+	expiredCount := 0
+
+	for elem := d.idList.Front(); elem != nil; elem = elem.Next() {
+		entry := elem.Value.(*idEntry)
+		if entry.createdAt.After(cutoff) {
+			break
+		}
+		expiredCount++
+	}
+
+	return d.idList.Len() - expiredCount, nil
 }
 
-func (d *Deduplicator) Clear() {
+func (d *Deduplicator) Clear() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	if d.stopped {
+		return ErrDeduplicatorStop
+	}
+
 	d.idMap = make(map[string]*list.Element)
 	d.idList.Init()
+	return nil
 }
 
-func (d *Deduplicator) CleanExpired() int {
+func (d *Deduplicator) CleanExpired() (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.cleanExpiredLocked()
+
+	if d.stopped {
+		return 0, ErrDeduplicatorStop
+	}
+
+	return d.cleanExpiredLocked(), nil
 }
 
 func (d *Deduplicator) cleanExpiredLocked() int {
@@ -192,7 +246,7 @@ func (d *Deduplicator) cleanLoop() {
 		case <-d.stopCh:
 			return
 		case <-ticker.C:
-			d.CleanExpired()
+			_, _ = d.CleanExpired()
 		}
 	}
 }

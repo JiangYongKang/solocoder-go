@@ -123,10 +123,36 @@ func (ii *InvertedIndex) HasTerm(term string) bool {
 	return exists
 }
 
+func (ii *InvertedIndex) RemoveDocument(docID string, terms map[string]struct{}) {
+	ii.mu.Lock()
+	defer ii.mu.Unlock()
+
+	for term := range terms {
+		postingList, exists := ii.index[term]
+		if !exists {
+			continue
+		}
+
+		newPostings := postingList.Postings[:0]
+		for _, posting := range postingList.Postings {
+			if posting.DocID != docID {
+				newPostings = append(newPostings, posting)
+			}
+		}
+
+		if len(newPostings) == 0 {
+			delete(ii.index, term)
+		} else {
+			postingList.Postings = newPostings
+		}
+	}
+}
+
 type Document struct {
 	ID      string
 	Content string
 	Length  int
+	Terms   map[string]struct{}
 }
 
 type SearchResult struct {
@@ -225,26 +251,29 @@ func (e *Engine) AddDocumentWithLanguage(docID string, content string, language 
 		return ErrEmptyDocument
 	}
 
-	e.mu.Lock()
-	if _, exists := e.docs[docID]; exists {
-		e.mu.Unlock()
-		return ErrDuplicateDocID
+	terms := make(map[string]struct{}, len(tokens))
+	for _, token := range tokens {
+		terms[token] = struct{}{}
 	}
-	e.mu.Unlock()
 
 	doc := &Document{
 		ID:      docID,
 		Content: content,
 		Length:  len(tokens),
+		Terms:   terms,
 	}
+
+	e.mu.Lock()
+	if _, exists := e.docs[docID]; exists {
+		e.mu.Unlock()
+		return ErrDuplicateDocID
+	}
+	e.docs[docID] = doc
+	e.mu.Unlock()
 
 	for pos, token := range tokens {
 		e.invertedIndex.AddTerm(token, docID, pos)
 	}
-
-	e.mu.Lock()
-	e.docs[docID] = doc
-	e.mu.Unlock()
 
 	return nil
 }
@@ -255,13 +284,15 @@ func (e *Engine) DeleteDocument(docID string) error {
 	}
 
 	e.mu.Lock()
-	_, exists := e.docs[docID]
+	doc, exists := e.docs[docID]
 	if !exists {
 		e.mu.Unlock()
 		return ErrDocNotFound
 	}
 	delete(e.docs, docID)
 	e.mu.Unlock()
+
+	e.invertedIndex.RemoveDocument(docID, doc.Terms)
 
 	return nil
 }
@@ -303,7 +334,6 @@ func (e *Engine) SearchWithLanguage(query string, language string) ([]*SearchRes
 	}
 
 	docScores := make(map[string]float64)
-	docMatchCount := make(map[string]int)
 
 	for _, term := range queryTokens {
 		postingList, exists := e.invertedIndex.GetPostingList(term)
@@ -327,7 +357,6 @@ func (e *Engine) SearchWithLanguage(query string, language string) ([]*SearchRes
 			tfidf := tf * idf
 
 			docScores[posting.DocID] += tfidf
-			docMatchCount[posting.DocID]++
 		}
 	}
 
@@ -379,16 +408,20 @@ func (e *Engine) SearchPhraseWithLanguage(phrase string, language string) ([]*Se
 		postingLists = append(postingLists, pl)
 	}
 
-	candidateDocs := make(map[string][]*TermPosting)
+	candidateDocs := make(map[string][][]int)
 	for _, posting := range postingLists[0].Postings {
-		candidateDocs[posting.DocID] = []*TermPosting{posting}
+		posCopy := make([]int, len(posting.Positions))
+		copy(posCopy, posting.Positions)
+		candidateDocs[posting.DocID] = [][]int{posCopy}
 	}
 
 	for i := 1; i < len(postingLists); i++ {
-		nextCandidates := make(map[string][]*TermPosting)
+		nextCandidates := make(map[string][][]int)
 		for _, posting := range postingLists[i].Postings {
-			if prevPostings, exists := candidateDocs[posting.DocID]; exists {
-				nextCandidates[posting.DocID] = append(prevPostings, posting)
+			if prevPositions, exists := candidateDocs[posting.DocID]; exists {
+				posCopy := make([]int, len(posting.Positions))
+				copy(posCopy, posting.Positions)
+				nextCandidates[posting.DocID] = append(prevPositions, posCopy)
 			}
 		}
 		candidateDocs = nextCandidates
@@ -398,11 +431,11 @@ func (e *Engine) SearchPhraseWithLanguage(phrase string, language string) ([]*Se
 	}
 
 	matchedDocs := make(map[string]bool)
-	for docID, postings := range candidateDocs {
-		if len(postings) != len(terms) {
+	for docID, positionsList := range candidateDocs {
+		if len(positionsList) != len(terms) {
 			continue
 		}
-		if e.checkPhraseMatch(postings) {
+		if checkPhraseMatch(positionsList) {
 			matchedDocs[docID] = true
 		}
 	}
@@ -436,18 +469,18 @@ func (e *Engine) SearchPhraseWithLanguage(phrase string, language string) ([]*Se
 	return results, nil
 }
 
-func (e *Engine) checkPhraseMatch(postings []*TermPosting) bool {
-	if len(postings) < 2 {
+func checkPhraseMatch(positionsList [][]int) bool {
+	if len(positionsList) < 2 {
 		return false
 	}
 
-	firstPositions := postings[0].Positions
+	firstPositions := positionsList[0]
 	for _, startPos := range firstPositions {
 		matched := true
-		for i := 1; i < len(postings); i++ {
+		for i := 1; i < len(positionsList); i++ {
 			expectedPos := startPos + i
 			found := false
-			for _, pos := range postings[i].Positions {
+			for _, pos := range positionsList[i] {
 				if pos == expectedPos {
 					found = true
 					break

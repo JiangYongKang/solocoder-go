@@ -127,8 +127,7 @@ func (l *Level) Range(start, end string) ([]*Entry, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	var result []*Entry
-	seen := make(map[string]bool)
+	resultMap := make(map[string]*Entry)
 
 	if l.level == 0 {
 		for i := len(l.tables) - 1; i >= 0; i-- {
@@ -138,9 +137,9 @@ func (l *Level) Range(start, end string) ([]*Entry, error) {
 				return nil, err
 			}
 			for _, e := range entries {
-				if !seen[e.Key] {
-					seen[e.Key] = true
-					result = append(result, e)
+				existing, ok := resultMap[e.Key]
+				if !ok || e.Timestamp > existing.Timestamp {
+					resultMap[e.Key] = e
 				}
 			}
 		}
@@ -154,12 +153,66 @@ func (l *Level) Range(start, end string) ([]*Entry, error) {
 				return nil, err
 			}
 			for _, e := range entries {
-				if !seen[e.Key] {
-					seen[e.Key] = true
-					result = append(result, e)
+				existing, ok := resultMap[e.Key]
+				if !ok || e.Timestamp > existing.Timestamp {
+					resultMap[e.Key] = e
 				}
 			}
 		}
+	}
+
+	result := make([]*Entry, 0, len(resultMap))
+	for _, e := range resultMap {
+		result = append(result, e)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Key < result[j].Key
+	})
+	return result, nil
+}
+
+func (l *Level) RangeWithTombstone(start, end string) ([]*Entry, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	resultMap := make(map[string]*Entry)
+
+	if l.level == 0 {
+		for i := len(l.tables) - 1; i >= 0; i-- {
+			sst := l.tables[i]
+			entries, err := sst.RangeWithTombstone(start, end)
+			if err != nil {
+				return nil, err
+			}
+			for _, e := range entries {
+				existing, ok := resultMap[e.Key]
+				if !ok || e.Timestamp > existing.Timestamp {
+					resultMap[e.Key] = e
+				}
+			}
+		}
+	} else {
+		for _, sst := range l.tables {
+			if sst.MaxKey() < start || sst.MinKey() > end {
+				continue
+			}
+			entries, err := sst.RangeWithTombstone(start, end)
+			if err != nil {
+				return nil, err
+			}
+			for _, e := range entries {
+				existing, ok := resultMap[e.Key]
+				if !ok || e.Timestamp > existing.Timestamp {
+					resultMap[e.Key] = e
+				}
+			}
+		}
+	}
+
+	result := make([]*Entry, 0, len(resultMap))
+	for _, e := range resultMap {
+		result = append(result, e)
 	}
 
 	sort.Slice(result, func(i, j int) bool {

@@ -273,16 +273,16 @@ func (bus *EventBus) PublishAsync(event Event) {
 		return
 	}
 
-	for _, sub := range matched {
-		bus.asyncWg.Add(1)
-		go func(s *subscriber, e Event) {
-			defer bus.asyncWg.Done()
-			defer func() {
-				recover()
-			}()
-			s.Handler(e)
-		}(sub, event)
-	}
+	bus.asyncWg.Add(1)
+	go func(subs []*subscriber, e Event) {
+		defer bus.asyncWg.Done()
+		for _, sub := range subs {
+			err := callHandler(sub.Handler, e)
+			if err != nil && errors.Is(err, ErrInterrupt) {
+				return
+			}
+		}
+	}(matched, event)
 }
 
 func (bus *EventBus) Wait() {

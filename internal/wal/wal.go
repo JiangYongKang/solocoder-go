@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -211,9 +212,6 @@ func New(config *Config) (*WAL, error) {
 		}
 	} else {
 		lastSeg := wal.segments[len(wal.segments)-1]
-		if err := lastSeg.file.Close(); err != nil {
-			return nil, fmt.Errorf("close last segment failed: %w", err)
-		}
 		f, err := os.OpenFile(lastSeg.path, os.O_RDWR|os.O_APPEND, 0644)
 		if err != nil {
 			return nil, fmt.Errorf("reopen last segment with append failed: %w", err)
@@ -263,29 +261,28 @@ func (w *WAL) loadExistingSegments() error {
 
 func (w *WAL) openSegment(id int) (*segment, error) {
 	path := filepath.Join(w.config.Dir, segmentFileName(id))
-	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open segment %d failed: %w", id, err)
 	}
+	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
 		return nil, fmt.Errorf("stat segment %d failed: %w", id, err)
 	}
 
 	seg := &segment{
 		id:          id,
 		path:        path,
-		file:        f,
+		file:        nil,
 		size:        info.Size(),
 		startOffset: -1,
 		endOffset:   -1,
 	}
 
 	if seg.size > 0 {
-		if err := w.scanSegmentOffsets(seg); err != nil {
-			f.Close()
+		if err := scanSegmentOffsets(f, seg); err != nil {
 			return nil, err
 		}
 	}
@@ -293,58 +290,69 @@ func (w *WAL) openSegment(id int) (*segment, error) {
 	return seg, nil
 }
 
-func (w *WAL) scanSegmentOffsets(seg *segment) error {
-	_, err := seg.file.Seek(0, io.SeekStart)
-	if err != nil {
-		return err
-	}
-
-	rawData, err := io.ReadAll(seg.file)
-	if err != nil {
-		return err
-	}
+func scanSegmentOffsets(f *os.File, seg *segment) error {
+	br := bufio.NewReaderSize(f, 64*1024)
+	headerBuf := make([]byte, entryHeaderSize)
 
 	firstOffset := int64(-1)
 	lastOffset := int64(-1)
-	pos := 0
+	filePos := int64(0)
 
-	for pos < len(rawData) {
-		remaining := rawData[pos:]
-		if len(remaining) < entryHeaderSize {
+	for {
+		n, err := io.ReadFull(br, headerBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
 		}
+		if err != nil {
+			return err
+		}
 
-		magic := binary.BigEndian.Uint16(remaining[0:2])
+		magic := binary.BigEndian.Uint16(headerBuf[0:2])
 		if magic != magicNumber {
-			pos++
+			_, err = br.Discard(1)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			filePos += 1
 			continue
 		}
 
-		dataLen := binary.BigEndian.Uint32(remaining[15:19])
+		dataLen := binary.BigEndian.Uint32(headerBuf[15:19])
 		totalLen := entryHeaderSize + int(dataLen)
-		if len(remaining) < totalLen {
+
+		dataBuf := make([]byte, dataLen)
+		_, err = io.ReadFull(br, dataBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
 		}
+		if err != nil {
+			return err
+		}
 
-		checksum := binary.BigEndian.Uint32(remaining[2:6])
+		checksum := binary.BigEndian.Uint32(headerBuf[2:6])
 		checksumPayload := make([]byte, 13+int(dataLen))
-		copy(checksumPayload[0:8], remaining[6:14])
-		checksumPayload[8] = remaining[14]
-		copy(checksumPayload[9:13], remaining[15:19])
-		copy(checksumPayload[13:], remaining[19:totalLen])
+		copy(checksumPayload[0:8], headerBuf[6:14])
+		checksumPayload[8] = headerBuf[14]
+		copy(checksumPayload[9:13], headerBuf[15:19])
+		copy(checksumPayload[13:], dataBuf)
 		actualChecksum := crc32.ChecksumIEEE(checksumPayload)
 
 		if actualChecksum != checksum {
-			pos++
+			_, err = br.Discard(1)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			filePos += 1
 			continue
 		}
 
-		offset := int64(binary.BigEndian.Uint64(remaining[6:14]))
+		offset := int64(binary.BigEndian.Uint64(headerBuf[6:14]))
 		if firstOffset == -1 {
 			firstOffset = offset
 		}
 		lastOffset = offset
-		pos += totalLen
+		filePos += int64(totalLen)
+		_ = n
 	}
 
 	seg.startOffset = firstOffset
@@ -428,6 +436,10 @@ func (w *WAL) rotateSegment() error {
 	if err := w.activeSeg.file.Sync(); err != nil {
 		return fmt.Errorf("sync active segment failed: %w", err)
 	}
+	if err := w.activeSeg.file.Close(); err != nil {
+		return fmt.Errorf("close old active segment failed: %w", err)
+	}
+	w.activeSeg.file = nil
 
 	newID := w.activeSeg.id + 1
 	return w.createSegment(newID)
@@ -486,28 +498,63 @@ func (w *WAL) ReadFrom(startOffset int64) ([]*Entry, error) {
 }
 
 func (w *WAL) readSegmentEntries(seg *segment, minOffset int64) ([]*Entry, error) {
-	_, err := seg.file.Seek(0, io.SeekStart)
+	f, err := os.Open(seg.path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open segment %d for read failed: %w", seg.id, err)
 	}
+	defer f.Close()
 
+	return readSegmentEntriesStream(f, seg.id, minOffset)
+}
+
+func readSegmentEntriesStream(f *os.File, segID int, minOffset int64) ([]*Entry, error) {
+	br := bufio.NewReaderSize(f, 64*1024)
+	headerBuf := make([]byte, entryHeaderSize)
 	var entries []*Entry
-	rawData, err := io.ReadAll(seg.file)
-	if err != nil {
-		return nil, err
-	}
 
-	pos := 0
-	for pos < len(rawData) {
-		entry, consumed, err := decodeEntry(rawData[pos:])
+	for {
+		_, err := io.ReadFull(br, headerBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
 		if err != nil {
-			pos++
+			return nil, err
+		}
+
+		magic := binary.BigEndian.Uint16(headerBuf[0:2])
+		if magic != magicNumber {
+			_, err = br.Discard(1)
+			if err != nil && err != io.EOF {
+				return nil, err
+			}
+			continue
+		}
+
+		dataLen := binary.BigEndian.Uint32(headerBuf[15:19])
+		dataBuf := make([]byte, dataLen)
+		_, err = io.ReadFull(br, dataBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		fullBuf := make([]byte, entryHeaderSize+int(dataLen))
+		copy(fullBuf[0:entryHeaderSize], headerBuf)
+		copy(fullBuf[entryHeaderSize:], dataBuf)
+
+		entry, _, err := decodeEntry(fullBuf)
+		if err != nil {
+			_, err = br.Discard(1)
+			if err != nil && err != io.EOF {
+				return nil, err
+			}
 			continue
 		}
 		if entry.Offset >= minOffset {
 			entries = append(entries, entry)
 		}
-		pos += consumed
 	}
 
 	return entries, nil
@@ -573,27 +620,76 @@ func (w *WAL) RecoverFrom(startOffset int64, cb RecoverCallback) ([]*CorruptedEn
 }
 
 func (w *WAL) recoverSegment(seg *segment, minOffset int64, cb RecoverCallback) ([]*CorruptedEntryWarning, error) {
-	_, err := seg.file.Seek(0, io.SeekStart)
+	f, err := os.Open(seg.path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open segment %d for recovery failed: %w", seg.id, err)
 	}
+	defer f.Close()
 
+	return recoverSegmentStream(f, seg.id, minOffset, cb)
+}
+
+func recoverSegmentStream(f *os.File, segID int, minOffset int64, cb RecoverCallback) ([]*CorruptedEntryWarning, error) {
+	br := bufio.NewReaderSize(f, 64*1024)
+	headerBuf := make([]byte, entryHeaderSize)
 	var warnings []*CorruptedEntryWarning
-	rawData, err := io.ReadAll(seg.file)
-	if err != nil {
-		return nil, err
-	}
+	filePos := int64(0)
 
-	pos := 0
-	for pos < len(rawData) {
-		entry, consumed, err := decodeEntry(rawData[pos:])
+	for {
+		_, err := io.ReadFull(br, headerBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			return warnings, err
+		}
+
+		magic := binary.BigEndian.Uint16(headerBuf[0:2])
+		if magic != magicNumber {
+			warnings = append(warnings, &CorruptedEntryWarning{
+				SegmentID: segID,
+				Position:  filePos,
+				Reason:    fmt.Sprintf("invalid magic number: 0x%x", magic),
+			})
+			_, err = br.Discard(1)
+			if err != nil && err != io.EOF {
+				return warnings, err
+			}
+			filePos += 1
+			continue
+		}
+
+		dataLen := binary.BigEndian.Uint32(headerBuf[15:19])
+		dataBuf := make([]byte, dataLen)
+		_, err = io.ReadFull(br, dataBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			warnings = append(warnings, &CorruptedEntryWarning{
+				SegmentID: segID,
+				Position:  filePos,
+				Reason:    "truncated entry data",
+			})
+			break
+		}
+		if err != nil {
+			return warnings, err
+		}
+
+		fullBuf := make([]byte, entryHeaderSize+int(dataLen))
+		copy(fullBuf[0:entryHeaderSize], headerBuf)
+		copy(fullBuf[entryHeaderSize:], dataBuf)
+
+		entry, consumed, err := decodeEntry(fullBuf)
 		if err != nil {
 			warnings = append(warnings, &CorruptedEntryWarning{
-				SegmentID: seg.id,
-				Position:  int64(pos),
+				SegmentID: segID,
+				Position:  filePos,
 				Reason:    err.Error(),
 			})
-			pos++
+			_, err = br.Discard(1)
+			if err != nil && err != io.EOF {
+				return warnings, err
+			}
+			filePos += 1
 			continue
 		}
 		if entry.Offset >= minOffset {
@@ -601,7 +697,7 @@ func (w *WAL) recoverSegment(seg *segment, minOffset int64, cb RecoverCallback) 
 				return warnings, err
 			}
 		}
-		pos += consumed
+		filePos += int64(consumed)
 	}
 
 	return warnings, nil
@@ -615,7 +711,7 @@ func (w *WAL) Sync() error {
 		return nil
 	}
 
-	if w.activeSeg != nil {
+	if w.activeSeg != nil && w.activeSeg.file != nil {
 		return w.activeSeg.file.Sync()
 	}
 	return nil
@@ -632,8 +728,11 @@ func (w *WAL) Close() error {
 
 	var firstErr error
 	for _, seg := range w.segments {
-		if err := seg.file.Close(); err != nil && firstErr == nil {
-			firstErr = err
+		if seg.file != nil {
+			if err := seg.file.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			seg.file = nil
 		}
 	}
 

@@ -2,6 +2,7 @@ package lsm
 
 import (
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -15,6 +16,7 @@ type SkipListNode struct {
 }
 
 type SkipList struct {
+	mu     sync.RWMutex
 	header *SkipListNode
 	tail   *SkipListNode
 	level  int
@@ -46,6 +48,9 @@ func (sl *SkipList) randomLevel() int {
 }
 
 func (sl *SkipList) Insert(entry *Entry) {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+
 	update := make([]*SkipListNode, maxLevel)
 	x := sl.header
 
@@ -93,6 +98,9 @@ func (sl *SkipList) Insert(entry *Entry) {
 }
 
 func (sl *SkipList) Get(key string) (*Entry, bool) {
+	sl.mu.RLock()
+	defer sl.mu.RUnlock()
+
 	x := sl.header
 	for i := sl.level - 1; i >= 0; i-- {
 		for x.forward[i] != nil && x.forward[i].entry.Key < key {
@@ -107,6 +115,9 @@ func (sl *SkipList) Get(key string) (*Entry, bool) {
 }
 
 func (sl *SkipList) Delete(key string) (*Entry, bool) {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+
 	update := make([]*SkipListNode, maxLevel)
 	x := sl.header
 
@@ -146,23 +157,30 @@ func (sl *SkipList) Delete(key string) (*Entry, bool) {
 }
 
 func (sl *SkipList) Len() int {
+	sl.mu.RLock()
+	defer sl.mu.RUnlock()
 	return sl.length
 }
 
 func (sl *SkipList) Size() int {
+	sl.mu.RLock()
+	defer sl.mu.RUnlock()
 	return sl.size
 }
 
 func (sl *SkipList) Iterator() *SkipListIterator {
+	sl.mu.RLock()
 	return &SkipListIterator{
 		sl:      sl,
 		current: sl.header.forward[0],
+		locked:  true,
 	}
 }
 
 func (sl *SkipList) Range(start, end string) []*Entry {
 	var result []*Entry
 	iter := sl.Iterator()
+	defer iter.Close()
 	for iter.Next() {
 		key := iter.Entry().Key
 		if key > end {
@@ -178,6 +196,7 @@ func (sl *SkipList) Range(start, end string) []*Entry {
 func (sl *SkipList) AllEntries() []*Entry {
 	result := make([]*Entry, 0, sl.length)
 	iter := sl.Iterator()
+	defer iter.Close()
 	for iter.Next() {
 		result = append(result, iter.Entry())
 	}
@@ -188,6 +207,7 @@ type SkipListIterator struct {
 	sl      *SkipList
 	current *SkipListNode
 	started bool
+	locked  bool
 }
 
 func (it *SkipListIterator) Next() bool {
@@ -225,4 +245,11 @@ func (it *SkipListIterator) Seek(key string) {
 	}
 	it.current = x.forward[0]
 	it.started = false
+}
+
+func (it *SkipListIterator) Close() {
+	if it.locked {
+		it.sl.mu.RUnlock()
+		it.locked = false
+	}
 }

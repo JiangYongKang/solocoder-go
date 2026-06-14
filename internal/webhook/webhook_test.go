@@ -1242,3 +1242,336 @@ func TestDeliveryHeap(t *testing.T) {
 		t.Errorf("third pop = %s, want cb1", third.callback.ID)
 	}
 }
+
+func TestTrigger_CancelledVsNotFound(t *testing.T) {
+	mc := newMockHTTPClient()
+	s := NewScheduler(SchedulerConfig{WorkerCount: 2, HTTPClient: mc})
+	s.Start()
+	defer s.Stop()
+
+	id, _ := s.Register("https://example.com/cancel-test", "POST")
+
+	t.Run("trigger cancelled callback returns ErrCallbackCancelled", func(t *testing.T) {
+		s.Cancel(id)
+		err := s.Trigger(id)
+		if err != ErrCallbackCancelled {
+			t.Errorf("Trigger() error = %v, want ErrCallbackCancelled", err)
+		}
+	})
+
+	t.Run("trigger nonexistent callback returns ErrCallbackNotFound", func(t *testing.T) {
+		err := s.Trigger("nonexistent-id")
+		if err != ErrCallbackNotFound {
+			t.Errorf("Trigger() error = %v, want ErrCallbackNotFound", err)
+		}
+	})
+}
+
+func TestContentType_NotOverridden(t *testing.T) {
+	mc := newMockHTTPClient()
+	url1 := "https://example.com/content-type"
+	url2 := "https://example.com/default-ct"
+	var capturedContentType string
+	var mu sync.Mutex
+
+	handler := func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		capturedContentType = req.Header.Get("Content-Type")
+		mu.Unlock()
+		return okResponse()
+	}
+	mc.transport.handlers[url1] = handler
+	mc.transport.handlers[url2] = handler
+
+	s := NewScheduler(SchedulerConfig{WorkerCount: 2, HTTPClient: mc})
+	s.Start()
+	defer s.Stop()
+
+	t.Run("custom content type is preserved", func(t *testing.T) {
+		id, _ := s.Register(url1, "POST",
+			WithHeaders(map[string]string{"Content-Type": "application/xml"}),
+			WithBodyTemplate(`<xml><data>test</data></xml>`),
+		)
+		s.Trigger(id)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.WaitForResult(ctx, id)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if capturedContentType != "application/xml" {
+			t.Errorf("Content-Type = %q, want application/xml", capturedContentType)
+		}
+	})
+
+	t.Run("default content type when not specified", func(t *testing.T) {
+		mu.Lock()
+		capturedContentType = ""
+		mu.Unlock()
+		id2, _ := s.Register(url2, "POST",
+			WithBodyTemplate(`{"key":"value"}`),
+		)
+		s.Trigger(id2)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.WaitForResult(ctx, id2)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if capturedContentType != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", capturedContentType)
+		}
+	})
+}
+
+func TestDeliveryResult_ErrorOnRetryExhausted(t *testing.T) {
+	mc := newMockHTTPClient()
+	url := "https://example.com/retry-exhausted-err"
+	var mu sync.Mutex
+	attempts := 0
+
+	mc.transport.handlers[url] = func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		attempts++
+		mu.Unlock()
+		return error500Response()
+	}
+
+	s := NewScheduler(SchedulerConfig{WorkerCount: 2, HTTPClient: mc})
+	s.Start()
+	defer s.Stop()
+
+	policy := RetryPolicy{
+		MaxRetries:  2,
+		Interval:    10 * time.Millisecond,
+		BackoffType: BackoffFixed,
+	}
+	id, _ := s.Register(url, "POST", WithRetryPolicy(policy))
+	s.Trigger(id)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := s.WaitForResult(ctx, id)
+	if err != nil {
+		t.Fatalf("WaitForResult() error = %v", err)
+	}
+
+	if result.Error == nil {
+		t.Fatal("result.Error should not be nil when retry exhausted")
+	}
+	if !strings.Contains(result.Error.Error(), "max retries exhausted") {
+		t.Errorf("result.Error = %v, want to contain 'max retries exhausted'", result.Error)
+	}
+	if !strings.Contains(result.Error.Error(), "HTTP 500") {
+		t.Errorf("result.Error = %v, want to contain 'HTTP 500'", result.Error)
+	}
+	if !result.Final {
+		t.Error("result.Final should be true")
+	}
+}
+
+func TestTemplateRendering(t *testing.T) {
+	mc := newMockHTTPClient()
+	url := "https://example.com/template"
+	var capturedBody string
+	var mu sync.Mutex
+
+	mc.transport.handlers[url] = func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		body, _ := io.ReadAll(req.Body)
+		capturedBody = string(body)
+		mu.Unlock()
+		return okResponse()
+	}
+
+	s := NewScheduler(SchedulerConfig{WorkerCount: 2, HTTPClient: mc})
+	s.Start()
+	defer s.Stop()
+
+	t.Run("template with data is rendered correctly", func(t *testing.T) {
+		capturedBody = ""
+		id, _ := s.Register(url, "POST",
+			WithBodyTemplate(`{"event":"{{.Event}}","id":{{.ID}},"name":"{{.Name}}"}`),
+		)
+
+		data := map[string]interface{}{
+			"Event": "order_created",
+			"ID":    12345,
+			"Name":  "Test Order",
+		}
+		err := s.TriggerWithData(id, data)
+		if err != nil {
+			t.Fatalf("TriggerWithData() error = %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.WaitForResult(ctx, id)
+
+		mu.Lock()
+		defer mu.Unlock()
+		expected := `{"event":"order_created","id":12345,"name":"Test Order"}`
+		if capturedBody != expected {
+			t.Errorf("body = %q, want %q", capturedBody, expected)
+		}
+	})
+
+	t.Run("nil data uses raw template", func(t *testing.T) {
+		capturedBody = ""
+		id, _ := s.Register(url, "POST",
+			WithBodyTemplate(`{"event":"{{.Event}}"}`),
+		)
+		s.Trigger(id)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.WaitForResult(ctx, id)
+
+		mu.Lock()
+		defer mu.Unlock()
+		expected := `{"event":"{{.Event}}"}`
+		if capturedBody != expected {
+			t.Errorf("body = %q, want %q", capturedBody, expected)
+		}
+	})
+
+	t.Run("struct data is rendered correctly", func(t *testing.T) {
+		capturedBody = ""
+		type EventData struct {
+			EventType string
+			Amount    float64
+		}
+		id, _ := s.Register(url, "POST",
+			WithBodyTemplate(`{"type":"{{.EventType}}","amount":{{.Amount}}}`),
+		)
+
+		data := EventData{EventType: "payment", Amount: 99.99}
+		s.TriggerWithData(id, data)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.WaitForResult(ctx, id)
+
+		mu.Lock()
+		defer mu.Unlock()
+		expected := `{"type":"payment","amount":99.99}`
+		if capturedBody != expected {
+			t.Errorf("body = %q, want %q", capturedBody, expected)
+		}
+	})
+
+	t.Run("invalid template returns error", func(t *testing.T) {
+		id, _ := s.Register(url, "POST",
+			WithBodyTemplate(`{"event":"{{.Event"}`),
+			WithRetryPolicy(RetryPolicy{
+				MaxRetries:  0,
+				Interval:    10 * time.Millisecond,
+				BackoffType: BackoffFixed,
+			}),
+		)
+
+		data := map[string]interface{}{"Event": "test"}
+		err := s.TriggerWithData(id, data)
+		if err != nil {
+			t.Fatalf("TriggerWithData() error = %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		result, waitErr := s.WaitForResult(ctx, id)
+		if waitErr != nil {
+			t.Fatalf("WaitForResult() error = %v", waitErr)
+		}
+		if result == nil || result.Delivery == nil {
+			t.Fatal("result or result.Delivery is nil")
+		}
+		if result.Delivery.Status != DeliveryStatusFailed {
+			t.Errorf("status = %v, want DeliveryStatusFailed", result.Delivery.Status)
+		}
+		if !strings.Contains(result.Delivery.Error, "render template") {
+			t.Errorf("error = %q, want to contain 'render template'", result.Delivery.Error)
+		}
+	})
+
+	t.Run("template with retry preserves data", func(t *testing.T) {
+		capturedBody = ""
+		attempts := 0
+		mc.transport.handlers[url] = func(req *http.Request) (*http.Response, error) {
+			mu.Lock()
+			attempts++
+			body, _ := io.ReadAll(req.Body)
+			capturedBody = string(body)
+			mu.Unlock()
+			if attempts < 2 {
+				return error500Response()
+			}
+			return okResponse()
+		}
+
+		id, _ := s.Register(url, "POST",
+			WithBodyTemplate(`{"value":{{.Value}}}`),
+			WithRetryPolicy(RetryPolicy{
+				MaxRetries:  3,
+				Interval:    10 * time.Millisecond,
+				BackoffType: BackoffFixed,
+			}),
+		)
+
+		s.TriggerWithData(id, map[string]interface{}{"Value": 42})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		result, _ := s.WaitForResult(ctx, id)
+
+		if result.Delivery.Status != DeliveryStatusSucceeded {
+			t.Errorf("status = %v, want DeliveryStatusSucceeded", result.Delivery.Status)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		expected := `{"value":42}`
+		if capturedBody != expected {
+			t.Errorf("body = %q, want %q", capturedBody, expected)
+		}
+	})
+}
+
+func TestRenderTemplate(t *testing.T) {
+	t.Run("empty template returns empty bytes", func(t *testing.T) {
+		b, err := renderTemplate("", map[string]interface{}{"key": "value"})
+		if err != nil {
+			t.Fatalf("error = %v", err)
+		}
+		if string(b) != "" {
+			t.Errorf("body = %q, want empty", string(b))
+		}
+	})
+
+	t.Run("nil data returns raw template", func(t *testing.T) {
+		b, err := renderTemplate("Hello {{.Name}}", nil)
+		if err != nil {
+			t.Fatalf("error = %v", err)
+		}
+		if string(b) != "Hello {{.Name}}" {
+			t.Errorf("body = %q, want 'Hello {{.Name}}'", string(b))
+		}
+	})
+
+	t.Run("invalid template syntax returns error", func(t *testing.T) {
+		_, err := renderTemplate("Hello {{.Name", map[string]interface{}{"Name": "test"})
+		if err == nil {
+			t.Error("expected error for invalid template")
+		}
+	})
+
+	t.Run("valid template with data renders correctly", func(t *testing.T) {
+		b, err := renderTemplate("Hello {{.Name}}", map[string]interface{}{"Name": "World"})
+		if err != nil {
+			t.Fatalf("error = %v", err)
+		}
+		if string(b) != "Hello World" {
+			t.Errorf("body = %q, want 'Hello World'", string(b))
+		}
+	})
+}

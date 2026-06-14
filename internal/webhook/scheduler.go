@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"text/template"
 	"time"
 )
 
@@ -22,9 +23,10 @@ const (
 )
 
 type pendingDelivery struct {
-	callback   *Callback
-	attempt    int
+	callback    *Callback
+	attempt     int
 	scheduledAt time.Time
+	data        interface{}
 }
 
 type deliveryHeap []*pendingDelivery
@@ -283,6 +285,10 @@ func (s *Scheduler) RegisterWithID(id string, rawURL string, method string, opts
 }
 
 func (s *Scheduler) Trigger(callbackID string) error {
+	return s.TriggerWithData(callbackID, nil)
+}
+
+func (s *Scheduler) TriggerWithData(callbackID string, data interface{}) error {
 	s.mu.Lock()
 	cb, exists := s.callbacks[callbackID]
 	if !exists {
@@ -295,13 +301,14 @@ func (s *Scheduler) Trigger(callbackID string) error {
 	}
 	if cb.Status == CallbackStatusCancelled {
 		s.mu.Unlock()
-		return ErrCallbackNotFound
+		return ErrCallbackCancelled
 	}
 
 	pd := &pendingDelivery{
 		callback:    cb,
 		attempt:     0,
 		scheduledAt: time.Now(),
+		data:        data,
 	}
 	heap.Push(s.pending, pd)
 	s.wake()
@@ -520,9 +527,10 @@ func (s *Scheduler) executeDelivery(pd *pendingDelivery) {
 		return
 	}
 	attempt := pd.attempt + 1
+	data := pd.data
 	s.mu.Unlock()
 
-	delivery := s.sendRequest(cb, attempt)
+	delivery := s.sendRequest(cb, attempt, data)
 
 	s.mu.Lock()
 	s.deliveries[cb.ID] = append(s.deliveries[cb.ID], delivery)
@@ -557,13 +565,14 @@ func (s *Scheduler) executeDelivery(pd *pendingDelivery) {
 		callback:    cb,
 		attempt:     attempt,
 		scheduledAt: time.Now().Add(delay),
+		data:        data,
 	}
 	heap.Push(s.pending, next)
 	s.wake()
 	s.mu.Unlock()
 }
 
-func (s *Scheduler) sendRequest(cb *Callback, attempt int) *Delivery {
+func (s *Scheduler) sendRequest(cb *Callback, attempt int, data interface{}) *Delivery {
 	delivery := &Delivery{
 		ID:         s.generateID("dlv"),
 		CallbackID: cb.ID,
@@ -572,7 +581,14 @@ func (s *Scheduler) sendRequest(cb *Callback, attempt int) *Delivery {
 		StartedAt:  time.Now(),
 	}
 
-	body := []byte(cb.BodyTemplate)
+	body, err := renderTemplate(cb.BodyTemplate, data)
+	if err != nil {
+		delivery.FinishedAt = time.Now()
+		delivery.Duration = delivery.FinishedAt.Sub(delivery.StartedAt)
+		delivery.Status = DeliveryStatusFailed
+		delivery.Error = fmt.Sprintf("render template: %v", err)
+		return delivery
+	}
 
 	req, err := http.NewRequest(cb.Method, cb.URL, bytes.NewReader(body))
 	if err != nil {
@@ -593,7 +609,9 @@ func (s *Scheduler) sendRequest(cb *Callback, attempt int) *Delivery {
 		req.Header.Set(SignatureHeader, sig)
 		req.Header.Set(TimestampHeader, timestamp)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cb.Timeout)
 	defer cancel()
@@ -635,6 +653,7 @@ func (s *Scheduler) markFinalResult(callbackID string, delivery *Delivery, final
 	s.deliveryResults[callbackID] = &DeliveryResult{
 		Delivery: delivery,
 		Final:    final,
+		Error:    err,
 	}
 	s.mu.Unlock()
 
@@ -644,4 +663,22 @@ func (s *Scheduler) markFinalResult(callbackID string, delivery *Delivery, final
 		delete(s.notifyChan, callbackID)
 	}
 	s.notifyMu.Unlock()
+}
+
+func renderTemplate(tpl string, data interface{}) ([]byte, error) {
+	if tpl == "" {
+		return []byte{}, nil
+	}
+	if data == nil {
+		return []byte(tpl), nil
+	}
+	t, err := template.New("webhook").Parse(tpl)
+	if err != nil {
+		return nil, fmt.Errorf("parse template: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, data); err != nil {
+		return nil, fmt.Errorf("execute template: %w", err)
+	}
+	return buf.Bytes(), nil
 }

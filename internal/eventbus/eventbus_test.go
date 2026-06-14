@@ -99,13 +99,26 @@ func TestUnsubscribeRemovesEmptyEventType(t *testing.T) {
 
 	handler := func(event Event) error { return nil }
 	id, _ := bus.Subscribe("user.created", handler, SubscribeConfig{})
+
+	if bus.SubscriberCount("user.created") != 1 {
+		t.Fatalf("expected 1 subscriber after subscribe, got %d", bus.SubscriberCount("user.created"))
+	}
+
 	bus.Unsubscribe("user.created", id)
 
-	bus.mu.RLock()
-	_, exists := bus.subscribers["user.created"]
-	bus.mu.RUnlock()
-	if exists {
-		t.Error("expected eventType key to be removed after last subscriber unsubscribed")
+	if bus.SubscriberCount("user.created") != 0 {
+		t.Errorf("expected 0 subscribers after unsubscribe, got %d", bus.SubscriberCount("user.created"))
+	}
+
+	found := false
+	for _, et := range bus.EventTypes() {
+		if et == "user.created" {
+			found = true
+			break
+		}
+	}
+	if found {
+		t.Error("expected eventType to be removed from EventTypes after last subscriber unsubscribed")
 	}
 }
 
@@ -283,6 +296,77 @@ func TestPublishAsyncWait(t *testing.T) {
 
 	if atomic.LoadInt32(&callCount) != 2 {
 		t.Errorf("expected 2 handler calls after Wait, got %d", callCount)
+	}
+}
+
+func TestPublishAsyncPriorityOrder(t *testing.T) {
+	bus := NewEventBus()
+
+	var order []int
+	var mu sync.Mutex
+
+	addOrder := func(n int) {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, n)
+	}
+
+	bus.Subscribe("test", func(event Event) error {
+		addOrder(10)
+		return nil
+	}, SubscribeConfig{Priority: 10})
+
+	bus.Subscribe("test", func(event Event) error {
+		addOrder(100)
+		return nil
+	}, SubscribeConfig{Priority: 100})
+
+	bus.Subscribe("test", func(event Event) error {
+		addOrder(50)
+		return nil
+	}, SubscribeConfig{Priority: 50})
+
+	bus.PublishAsync(Event{Type: "test"})
+	bus.Wait()
+
+	expected := []int{100, 50, 10}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != len(expected) {
+		t.Fatalf("expected %d calls, got %d: %v", len(expected), len(order), order)
+	}
+	for i, v := range expected {
+		if order[i] != v {
+			t.Errorf("expected order[%d] = %d, got %d. Full order: %v", i, v, order[i], order)
+		}
+	}
+}
+
+func TestPublishAsyncInterrupt(t *testing.T) {
+	bus := NewEventBus()
+
+	var callCount int32
+
+	bus.Subscribe("test.event", func(event Event) error {
+		atomic.AddInt32(&callCount, 1)
+		return ErrInterrupt
+	}, SubscribeConfig{Priority: 100})
+
+	bus.Subscribe("test.event", func(event Event) error {
+		atomic.AddInt32(&callCount, 1)
+		return nil
+	}, SubscribeConfig{Priority: 50})
+
+	bus.Subscribe("test.event", func(event Event) error {
+		atomic.AddInt32(&callCount, 1)
+		return nil
+	}, SubscribeConfig{Priority: 10})
+
+	bus.PublishAsync(Event{Type: "test.event"})
+	bus.Wait()
+
+	if atomic.LoadInt32(&callCount) != 1 {
+		t.Errorf("expected only 1 handler call due to interrupt in async mode, got %d", callCount)
 	}
 }
 
@@ -542,9 +626,6 @@ func TestRangeFilter(t *testing.T) {
 			}
 			if tt.name == "within range float" {
 				filter.Key = "score"
-			}
-			if tt.name == "non-numeric value" {
-				filter.Key = "age"
 			}
 			event := Event{Attributes: tt.attributes}
 			result := filter.Match(event)

@@ -1,0 +1,11 @@
+产物不满意：
+1. engine.go 的 AddDocumentWithLanguage 将 docID 重复检查和 docs 写入合并到同一持锁范围内消除了 TOCTOU 窗口，但 engine_test.go 完全没有新增对应并发测试。现有 TestConcurrent_AddDocument 每个 goroutine 都使用互不重复的唯一 docID，无法验证同一 docID 被多 goroutine 并发插入时是否只有一个成功另一个返回 ErrDuplicateDocID。提示词明确指出原实现"在两次持锁之间的窗口期内另一个并发 goroutine 可以插入相同 docID"，但修复后的测试覆盖仍遗漏这一并发去重场景，若锁实现有细微问题将无法被现有测试捕获。应新增测试用 WaitGroup 同步至少两个 goroutine 同时调用 AddDocument 传入相同 docID 并断言仅一个返回 nil 另一个返回 ErrDuplicateDocID。
+
+2. engine_test.go 中 TestDeleteDocument_SearchAfterDelete 仅验证删除后搜索不含已删文档，完全不检查倒排索引的内部状态。InvertedIndex.RemoveDocument 有两个核心行为需要直接验证:文档独有词项的 index map 条目应被 delete 彻底移除、共享词项的 PostingList 长度应减少 1 且列表中不再包含被删 docID。当前测试通过搜索结果间接推断索引已清理，但如果 RemoveDocument 实现有遗漏(例如遍历词项集合时跳过某个 term 或 PostingList 过滤逻辑错误)，搜索结果也会巧合地不包含已删文档(因为 docs map 已先删除导致 Search 的 docExists 检查返回 false 跳过该文档)从而掩盖索引泄露。应在 DeleteDocument 后直接调用 ii.GetPostingList 检查被删词项是否仍在索引中存在。
+
+3. engine.go 的 DeleteDocument 操作顺序存在短暂 IDF 不准确窗口:deldoc 先从 docs map 中删除导致 totalDocs 减小，再调用 RemoveDocument 清理倒排索引，在两步之间并发执行的 Search 会用已排除 deldoc 的新 totalDocs 计算 IDF 但受影响词项的 docsWithTerm 仍包含 deldoc 的 Posting，使得 IDF = ln(1+N/(df+1)) 中分母偏大、评分偏低。模型在 fulltext.md 第 12 节中明确声称"删除期间的评分一致性"被保证，但窗口期内 IDF 确实不准确与声明矛盾。应调整为在持锁内先收集 deldoc 的全部词项信息然后原子地同时删除 docs 记录和清理索引，或在文档中如实说明该短暂窗口的存在而非承诺一致。
+
+过程不满意：
+1. 模型收到提示词后未进行任何分析就直接调用 todo_write 创建了 6 项子任务计划，然后才开始阅读 engine.go 代码。违反了标注规范中"不能刚收到任务时就直接创建 TodoList 应先分析问题再规划"的要求。虽然最终修复了 4 个问题并通过了现有测试，但跳过前置分析导致模型未能识别出提示词隐含的衍生要求:为 TOCTOU 修复编写并发竞态测试、为倒排索引清理编写索引级断言、为位置切片副本编写独立性验证。这些缺失的测试本应作为修复验证的证据但被完全遗漏了。
+
+2. 模型在最后总结中声称"69 个测试用例全部通过"，但实际测试文件包含 73 个测试函数且 go test 的输出确认 73 个全部通过。计数值偏差 4 个说明模型并未仔细核对测试输出统计数据而是凭印象填入总结，属于总结阶段的不准确汇报。若测试数量偏差出现在标注流程中会直接影响标注人员对修复质量的判断，正确做法是阅读 go test 输出的"ok"行或者逐条计数后准确写入最终报告。

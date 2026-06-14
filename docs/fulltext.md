@@ -49,6 +49,7 @@ type Document struct {
     ID      string
     Content string
     Length  int
+    Terms   map[string]struct{}
 }
 ```
 
@@ -56,6 +57,7 @@ type Document struct {
 - `ID`: 文档唯一标识符，用于索引和检索
 - `Content`: 文档原始文本内容
 - `Length`: 文档分词后的词项总数，用于 TF 计算
+- `Terms`: 文档包含的去重词项集合，用于删除文档时快速清理倒排索引
 
 ### 3.3 InvertedIndex
 
@@ -74,6 +76,7 @@ type InvertedIndex struct {
 - `GetPostingList(term)`: 获取词项的所有文档出现信息
 - `HasTerm(term)`: 快速判断词项是否存在
 - `GetTermCount()`: 获取索引中的词项总数
+- `RemoveDocument(docID, terms)`: 从倒排索引中移除指定文档的所有词项记录，当词项不再被任何文档引用时清理该词项条目
 - 通过独立的 `sync.RWMutex` 保护索引并发访问
 
 ### 3.4 PostingList
@@ -158,8 +161,7 @@ AddDocument(docID, content)
   参数校验
   ├─ docID 非空? ──否──► ErrEmptyDocID
   ├─ content TrimSpace 非空? ──否──► ErrEmptyDocument
-  ├─ 分词后 tokens 非空? ──否──► ErrEmptyDocument
-  └─ docID 未重复? ──否──► ErrDuplicateDocID
+  └─ 分词后 tokens 非空? ──否──► ErrEmptyDocument
        │
        ▼
   选择分词器
@@ -168,6 +170,14 @@ AddDocument(docID, content)
        │
        ▼
   调用 Tokenize(content) 获取 tokens
+  构建去重词项集合 Terms
+       │
+       ▼
+  获取 Engine.mu 写锁
+  ├─ docID 未重复? ──否──► 释放锁，返回 ErrDuplicateDocID
+  └─ docs[docID] = &Document{ID, Content, Length, Terms}
+  释放 Engine.mu 写锁
+  （说明：重复检查与文档写入在同一持锁范围内，防止 TOCTOU 竞态）
        │
        ▼
   构建倒排索引
@@ -176,10 +186,6 @@ AddDocument(docID, content)
         ├─ 词项首次出现 → 创建新 PostingList
         ├─ 文档首次出现该词项 → 添加新 TermPosting(Frequency=1, Positions=[pos])
         └─ 文档已含该词项 → Frequency++，追加 pos 到 Positions
-       │
-       ▼
-  存储文档
-  └─ docs[docID] = &Document{ID, Content, Length=len(tokens)}
        │
        ▼
      返回 nil (成功)
@@ -281,6 +287,33 @@ SearchPhrase(phrase)
   返回短语匹配结果
 ```
 
+### 4.4 文档删除与倒排索引清理流程
+
+```
+DeleteDocument(docID)
+       │
+       ▼
+  参数校验
+  └─ docID 非空? ──否──► ErrEmptyDocID
+       │
+       ▼
+  获取 Engine.mu 写锁
+  ├─ docID 存在? ──否──► 释放锁，返回 ErrDocNotFound
+  ├─ 读取 doc.Terms（去重词项集合）
+  ├─ 从 docs map 中删除 docID
+  └─ 释放 Engine.mu 写锁
+       │
+       ▼
+  清理倒排索引
+  └─ invertedIndex.RemoveDocument(docID, doc.Terms)
+     └─ 遍历文档中的每个词项 term:
+        ├─ 从该 term 的 PostingList 中移除 docID 对应的 TermPosting
+        └─ 若移除后 PostingList 为空，则从倒排索引中删除该 term 条目
+       │
+       ▼
+     返回 nil (成功)
+```
+
 ## 5. TF-IDF 算法详解
 
 ### 5.1 TF (Term Frequency，词频)
@@ -327,6 +360,18 @@ TF-IDF(t, d) = TF(t, d) × IDF(t)
 Score(d, Q) = Σ TF-IDF(term_i, d)  for term_i in query Q
 ```
 
+### 5.4 多词项查询排序规则
+
+多词项查询的排序遵循以下规则：
+
+1. **累加评分模型**: 文档最终得分为所有匹配查询词项的 TF-IDF 分值累加和
+2. **匹配任一即参与排序**: 文档只需匹配查询中的任意一个词项即可出现在结果中，匹配的词项越多通常得分越高（因为有更多分值累加）
+3. **降序排列**: 所有结果按 Score 从高到低排序，高分文档排在前面
+4. **稀有词项权重更高**: 稀有词项（在少数文档中出现）的 IDF 值更高，因此匹配稀有词项的文档排名会更靠前
+5. **词频正相关**: 在同一文档中，词项出现频率越高，该词项对总分的贡献越大
+6. **文档长度归一化**: TF 计算使用归一化词频（frequency / docLength），避免长文档因词项绝对数量多而获得不公平优势
+7. **同分排序**: 当两个文档 Score 完全相同时，排序顺序不做保证，取决于 Go `sort.Slice` 的稳定性
+
 ## 6. 短语查询匹配算法
 
 ### 6.1 位置连续性原理
@@ -351,6 +396,11 @@ Score(d, Q) = Σ TF-IDF(term_i, d)  for term_i in query Q
    - ...
    - 检查 tn 是否出现在 `start + (n-1)`
 3. 任一 `start` 满足所有条件 → 文档匹配
+
+**数据隔离保证**:
+- 短语匹配不直接使用倒排索引中的 `*TermPosting` 指针，而是为每个词项创建独立的位置切片副本（`[][]int`）
+- 即使短语包含重复词项（如 "go go go"），每个位置列表也是独立拷贝，避免因隐式共享底层数组导致的意外副作用
+- `checkPhraseMatch` 函数接收纯位置数据（`[][]int`），与倒排索引内部结构完全解耦，便于扩展匹配策略
 
 **时间复杂度**: O(k × m × n)，其中 k 为 t1 出现次数，m 为平均位置列表长度，n 为短语词项数。实际应用中由于倒排索引提前筛选了候选文档，性能通常可接受。
 
@@ -407,11 +457,34 @@ type Tokenizer interface {
   - 获取对应写锁确保独占访问
   - 写操作与其他读/写操作互斥
 
-### 8.3 死锁避免
+### 8.3 TOCTOU 竞态防护
+
+本模块针对检查时使用（Time-of-Check to Time-of-Use）竞态漏洞采取了专门防护：
+
+**文档添加的原子性保证**:
+- `AddDocumentWithLanguage` 中，docID 重复检查和 docs map 写入操作在**同一个持锁范围内**原子执行
+- 避免了原实现中「检查重复 → 释放锁 → 重新获取锁 → 写入」的时间窗口
+- 该窗口期曾允许并发 goroutine 插入相同 docID 的文档，导致重复文档检测失效
+
+**防护原理**:
+```
+错误模式（TOCTOU 漏洞）:
+  goroutine A: Lock → 检查 docID 不存在 → Unlock → [窗口] → Lock → 写入
+  goroutine B:                          Lock → 检查 docID 不存在 → 写入 → Unlock
+  → 两个 goroutine 都认为自己成功，造成数据竞争
+
+正确模式（本实现）:
+  goroutine A: Lock → 检查 docID 不存在 → 写入 → Unlock
+  goroutine B:           [等待锁] → Lock → 检查 docID 已存在 → 返回错误 → Unlock
+  → 保证同一 docID 只有一个 goroutine 能成功写入
+```
+
+### 8.4 死锁避免
 
 - 固定锁获取顺序：Engine 锁 → InvertedIndex 锁（如需要）
 - 避免嵌套获取同一把锁
 - 写操作完成后立即释放锁，减少持有时间
+- 短语匹配使用独立的位置切片副本，避免对倒排索引内部数据结构的共享修改
 
 ## 9. 使用示例
 
@@ -549,7 +622,7 @@ wg.Wait()
 | AddDocument | O(L) | L 为文档词项数，每个词项倒排索引插入 O(1) |
 | Search | O(Q × P) | Q 为查询词项数，P 为词项平均倒排列表长度 |
 | SearchPhrase | O(Q × P × K) | K 为词项平均出现次数（位置匹配） |
-| DeleteDocument | O(1) | 仅从 docs map 删除，倒排索引保留（可接受的权衡） |
+| DeleteDocument | O(U × P) | U 为文档去重词项数，P 为词项平均倒排列表长度；需遍历每个词项的 PostingList 并移除该文档条目，当词项无文档引用时清理词项 |
 | GetDocument | O(1) | map 查找 |
 
 ### 11.2 空间复杂度
@@ -561,8 +634,13 @@ wg.Wait()
 ## 12. 注意事项与限制
 
 1. **纯内存存储**: 数据仅存在于内存中，进程退出即丢失
-2. **删除策略**: DeleteDocument 仅删除 docs 记录，倒排索引保留旧数据（搜索时会跳过已删除文档）
+2. **删除策略**: DeleteDocument 同步清理倒排索引中的对应条目
+   - 删除文档时遍历文档的去重词项集合，从每个词项的 PostingList 中移除该文档
+   - 当词项不再被任何文档引用时，自动从倒排索引中删除该词项条目以回收空间
+   - IDF 计算基于实时文档数，删除文档后会立即反映到后续的 TF-IDF 评分中
 3. **大小写不敏感**: 默认分词器将所有词项转为小写，搜索自动大小写不敏感
 4. **短语查询限制**: 短语查询要求分词后至少 2 个词项，单词项请使用普通 Search
 5. **并发度**: 读写锁设计允许多读者并发，写操作串行，适合读多写少场景
 6. **TF-IDF 变体**: 本实现使用 `ln(1 + N/(df+1))` 确保分数非负，与经典公式略有差异
+7. **短语匹配数据隔离**: 短语查询过程中使用位置切片的独立副本进行匹配判定，避免与倒排索引内部数据结构发生隐式共享，确保扩展匹配策略时的安全性
+8. **删除期间的评分一致性**: 文档删除操作先从 docs map 移除记录再清理倒排索引，期间进行的搜索会因文档已从 docs 中移除而正确跳过该文档，保证评分一致性

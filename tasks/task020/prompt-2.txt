@@ -1,0 +1,7 @@
+你实现的全文检索引擎模块存在一些问题，需要修复：
+1. AddDocumentWithLanguage 方法检查重复 docID 后释放锁再重新获取锁才写入 docs map，在两次持锁之间的窗口期内另一个并发 goroutine 可以插入相同 docID 的文档，导致重复文档检测存在 TOCTOU 竞态失效。
+2. DeleteDocument 方法仅从 docs map 中删除文档记录，完全没有清理倒排索引中该文档相关的条目，导致索引空间不可回收且 IDF 计算仍然统计了已删除文档的词项，使得其余文档的 TF-IDF 评分失真。
+3. SearchWithLanguage 方法中维护了 docMatchCount 记录每个文档匹配的查询词项数量，但后续逻辑从未读取该变量，属于无效死代码。
+4. checkPhraseMatch 方法在处理重复词项的短语时，同一文档的两个 TermPosting 实际上是同一个指针对象共享同一个 Positions 切片，修改任一 Posting 会影响另一个，这种隐式共享在扩展短语匹配策略时是脆弱的。
+5. 修复完成后运行 go test ./internal/fulltext/ -v，需要让所有测试通过。
+6. 在 docs/fulltext.md 中更新模块需求文档，说明并发安全保证、文档删除时倒排索引的清理策略以及多词项查询的排序规则。

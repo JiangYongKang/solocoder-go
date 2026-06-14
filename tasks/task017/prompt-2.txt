@@ -1,0 +1,7 @@
+你实现的 LSM-Tree 存储引擎模块存在一些问题，需要修复：
+1. DB.Range 方法存在墓碑过滤缺陷，MemTable.Range 在内部过滤掉了 tombstone 条目，导致被删除的 key 从未进入结果集，后续遍历 SSTable 层级时下层旧的存活条目会被错误地加入结果中，已删除的 key 在范围查询中又回来了。
+2. Level.Range 方法在 L0 层的去重使用 seen 按 SSTable 插入顺序保留首次出现的条目，而非按 Entry 自带的 Timestamp 字段比较版本新旧，在刷盘异步时序或系统时间回拨等边界场景下可能返回过时数据。
+3. SkipList 没有任何并发保护机制，SkipListIterator 在构造时获取了 current 指针后不再持有锁，如果迭代过程中其他 goroutine 通过 MemTable 修改跳表节点，迭代器可能读到已修改节点的 forward 指针导致 panic。
+4. DB.Put 和 Delete 方法存在 TOCTOU 竞态条件，先通过读锁检查 db.closed 释放锁后再获取写锁写入，中间窗口期内 DB 可能被关闭，已关闭的 DB 仍可接受写入请求。
+5. 修复完成后运行 go test ./internal/lsm/ -v，需要让所有测试通过。
+6. 在 docs/lsm.md 中更新模块需求文档，说明墓碑在范围查询中的处理策略、L0 去重的版本比较机制、并发安全保证以及关闭状态检查的原子性。

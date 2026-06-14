@@ -1,0 +1,7 @@
+你实现的 Webhook 调度器模块存在一些问题，需要修复：
+1. Trigger 方法在回调已被取消时返回 ErrCallbackNotFound，没有区分"回调不存在"和"回调已取消"两种不同语义，调用方无法正确处理已取消回调的触发请求。
+2. sendRequest 方法无条件覆盖 Content-Type 为 application/json，当用户通过 WithHeaders 指定了其他 Content-Type 时自定义值被静默丢弃。
+3. markFinalResult 函数接收了 err 参数但完全未使用，重试耗尽时构造的错误上下文被直接丢弃，调用方只能看到最后一次投递的具体错误而无法得知是因为重试耗尽导致的最终失败。
+4. BodyTemplate 字段支持模板占位符语法但 sendRequest 中直接将其作为原始字符串发送，不做模板渲染，接收方会收到未展开的模板文本而非预期的事件数据。
+5. 修复完成后运行 go test ./internal/webhook/ -v，需要让所有测试通过。
+6. 在 docs/webhook.md 中更新模块需求文档，说明错误返回类型的语义区分、模板渲染机制以及失败结果的错误汇总方式。

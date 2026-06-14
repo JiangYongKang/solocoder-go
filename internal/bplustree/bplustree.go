@@ -74,6 +74,10 @@ func (t *BPlusTree) Count() int {
 	return t.count
 }
 
+func (t *BPlusTree) minKeys() int {
+	return (t.maxKeys + 1) / 2
+}
+
 func (t *BPlusTree) Insert(key string, value string) {
 	leaf := t.findLeaf(key)
 
@@ -223,6 +227,18 @@ func (t *BPlusTree) Search(key string) (string, bool) {
 	return "", false
 }
 
+func (t *BPlusTree) findNodeIndex(child *node) int {
+	if child.parent == nil {
+		return -1
+	}
+	for i, c := range child.parent.children {
+		if c == child {
+			return i
+		}
+	}
+	return -1
+}
+
 func (t *BPlusTree) Delete(key string) bool {
 	if t.count == 0 {
 		return false
@@ -242,6 +258,12 @@ func (t *BPlusTree) Delete(key string) bool {
 		return false
 	}
 
+	t.deleteFromLeaf(leaf, idx)
+	t.count--
+	return true
+}
+
+func (t *BPlusTree) deleteFromLeaf(leaf *node, idx int) {
 	for i := idx; i < len(leaf.keys)-1; i++ {
 		leaf.keys[i] = leaf.keys[i+1]
 		leaf.values[i] = leaf.values[i+1]
@@ -249,9 +271,252 @@ func (t *BPlusTree) Delete(key string) bool {
 	leaf.keys = leaf.keys[:len(leaf.keys)-1]
 	leaf.values = leaf.values[:len(leaf.values)-1]
 
-	t.count--
+	if leaf == t.root {
+		return
+	}
 
-	return true
+	t.updateParentSeparatorAfterLeafDelete(leaf)
+
+	if len(leaf.keys) < t.minKeys() {
+		t.rebalanceLeaf(leaf)
+	}
+}
+
+func (t *BPlusTree) updateParentSeparatorAfterLeafDelete(leaf *node) {
+	if leaf.parent == nil {
+		return
+	}
+
+	nodeIdx := t.findNodeIndex(leaf)
+	if nodeIdx == -1 {
+		return
+	}
+
+	if nodeIdx > 0 && len(leaf.keys) > 0 {
+		leaf.parent.keys[nodeIdx-1] = leaf.keys[0]
+	}
+}
+
+func (t *BPlusTree) rebalanceLeaf(leaf *node) {
+	nodeIdx := t.findNodeIndex(leaf)
+	if nodeIdx == -1 {
+		return
+	}
+	parent := leaf.parent
+
+	leftSibling := leaf.prev
+	rightSibling := leaf.next
+
+	if leftSibling != nil && leftSibling.parent == parent && len(leftSibling.keys) > t.minKeys() {
+		t.borrowFromLeftLeaf(leaf, leftSibling, nodeIdx)
+		return
+	}
+
+	if rightSibling != nil && rightSibling.parent == parent && len(rightSibling.keys) > t.minKeys() {
+		t.borrowFromRightLeaf(leaf, rightSibling, nodeIdx)
+		return
+	}
+
+	if leftSibling != nil && leftSibling.parent == parent {
+		t.mergeWithLeftLeaf(leaf, leftSibling, nodeIdx)
+		return
+	}
+
+	if rightSibling != nil && rightSibling.parent == parent {
+		t.mergeWithRightLeaf(leaf, rightSibling, nodeIdx)
+		return
+	}
+}
+
+func (t *BPlusTree) borrowFromLeftLeaf(leaf *node, leftSibling *node, nodeIdx int) {
+	borrowedKey := leftSibling.keys[len(leftSibling.keys)-1]
+	borrowedValue := leftSibling.values[len(leftSibling.values)-1]
+
+	leftSibling.keys = leftSibling.keys[:len(leftSibling.keys)-1]
+	leftSibling.values = leftSibling.values[:len(leftSibling.values)-1]
+
+	leaf.keys = append([]string{borrowedKey}, leaf.keys...)
+	leaf.values = append([]string{borrowedValue}, leaf.values...)
+
+	if leaf.parent != nil && nodeIdx > 0 {
+		leaf.parent.keys[nodeIdx-1] = leaf.keys[0]
+	}
+}
+
+func (t *BPlusTree) borrowFromRightLeaf(leaf *node, rightSibling *node, nodeIdx int) {
+	borrowedKey := rightSibling.keys[0]
+	borrowedValue := rightSibling.values[0]
+
+	for i := 0; i < len(rightSibling.keys)-1; i++ {
+		rightSibling.keys[i] = rightSibling.keys[i+1]
+		rightSibling.values[i] = rightSibling.values[i+1]
+	}
+	rightSibling.keys = rightSibling.keys[:len(rightSibling.keys)-1]
+	rightSibling.values = rightSibling.values[:len(rightSibling.values)-1]
+
+	leaf.keys = append(leaf.keys, borrowedKey)
+	leaf.values = append(leaf.values, borrowedValue)
+
+	if leaf.parent != nil && nodeIdx < len(leaf.parent.keys) {
+		leaf.parent.keys[nodeIdx] = rightSibling.keys[0]
+	}
+}
+
+func (t *BPlusTree) mergeWithLeftLeaf(leaf *node, leftSibling *node, nodeIdx int) {
+	leftSibling.keys = append(leftSibling.keys, leaf.keys...)
+	leftSibling.values = append(leftSibling.values, leaf.values...)
+
+	leftSibling.next = leaf.next
+	if leaf.next != nil {
+		leaf.next.prev = leftSibling
+	}
+
+	parent := leaf.parent
+	t.removeChildFromInternal(parent, nodeIdx-1, nodeIdx)
+}
+
+func (t *BPlusTree) mergeWithRightLeaf(leaf *node, rightSibling *node, nodeIdx int) {
+	leaf.keys = append(leaf.keys, rightSibling.keys...)
+	leaf.values = append(leaf.values, rightSibling.values...)
+
+	leaf.next = rightSibling.next
+	if rightSibling.next != nil {
+		rightSibling.next.prev = leaf
+	}
+
+	parent := leaf.parent
+	t.removeChildFromInternal(parent, nodeIdx, nodeIdx+1)
+}
+
+func (t *BPlusTree) removeChildFromInternal(parent *node, keyIdx int, childIdx int) {
+	for i := keyIdx; i < len(parent.keys)-1; i++ {
+		parent.keys[i] = parent.keys[i+1]
+	}
+	parent.keys = parent.keys[:len(parent.keys)-1]
+
+	for i := childIdx; i < len(parent.children)-1; i++ {
+		parent.children[i] = parent.children[i+1]
+	}
+	parent.children = parent.children[:len(parent.children)-1]
+
+	if parent == t.root {
+		if len(parent.keys) == 0 && len(parent.children) == 1 {
+			t.root = parent.children[0]
+			t.root.parent = nil
+		}
+		return
+	}
+
+	if len(parent.keys) < t.minKeys() {
+		t.rebalanceInternal(parent)
+	}
+}
+
+func (t *BPlusTree) rebalanceInternal(internal *node) {
+	nodeIdx := t.findNodeIndex(internal)
+	if nodeIdx == -1 {
+		return
+	}
+	parent := internal.parent
+
+	var leftSibling, rightSibling *node
+	if nodeIdx > 0 {
+		leftSibling = parent.children[nodeIdx-1]
+	}
+	if nodeIdx < len(parent.children)-1 {
+		rightSibling = parent.children[nodeIdx+1]
+	}
+
+	if leftSibling != nil && len(leftSibling.keys) > t.minKeys() {
+		t.borrowFromLeftInternal(internal, leftSibling, nodeIdx)
+		return
+	}
+
+	if rightSibling != nil && len(rightSibling.keys) > t.minKeys() {
+		t.borrowFromRightInternal(internal, rightSibling, nodeIdx)
+		return
+	}
+
+	if leftSibling != nil {
+		t.mergeWithLeftInternal(internal, leftSibling, nodeIdx)
+		return
+	}
+
+	if rightSibling != nil {
+		t.mergeWithRightInternal(internal, rightSibling, nodeIdx)
+		return
+	}
+}
+
+func (t *BPlusTree) borrowFromLeftInternal(internal *node, leftSibling *node, nodeIdx int) {
+	parent := internal.parent
+
+	separatorKey := parent.keys[nodeIdx-1]
+
+	movedKey := leftSibling.keys[len(leftSibling.keys)-1]
+	movedChild := leftSibling.children[len(leftSibling.children)-1]
+
+	leftSibling.keys = leftSibling.keys[:len(leftSibling.keys)-1]
+	leftSibling.children = leftSibling.children[:len(leftSibling.children)-1]
+
+	internal.keys = append([]string{separatorKey}, internal.keys...)
+	internal.children = append([]*node{movedChild}, internal.children...)
+	movedChild.parent = internal
+
+	parent.keys[nodeIdx-1] = movedKey
+}
+
+func (t *BPlusTree) borrowFromRightInternal(internal *node, rightSibling *node, nodeIdx int) {
+	parent := internal.parent
+
+	separatorKey := parent.keys[nodeIdx]
+
+	movedKey := rightSibling.keys[0]
+	movedChild := rightSibling.children[0]
+
+	for i := 0; i < len(rightSibling.keys)-1; i++ {
+		rightSibling.keys[i] = rightSibling.keys[i+1]
+	}
+	rightSibling.keys = rightSibling.keys[:len(rightSibling.keys)-1]
+
+	for i := 0; i < len(rightSibling.children)-1; i++ {
+		rightSibling.children[i] = rightSibling.children[i+1]
+	}
+	rightSibling.children = rightSibling.children[:len(rightSibling.children)-1]
+
+	internal.keys = append(internal.keys, separatorKey)
+	internal.children = append(internal.children, movedChild)
+	movedChild.parent = internal
+
+	parent.keys[nodeIdx] = movedKey
+}
+
+func (t *BPlusTree) mergeWithLeftInternal(internal *node, leftSibling *node, nodeIdx int) {
+	parent := internal.parent
+	separatorKey := parent.keys[nodeIdx-1]
+
+	leftSibling.keys = append(leftSibling.keys, separatorKey)
+	leftSibling.keys = append(leftSibling.keys, internal.keys...)
+	leftSibling.children = append(leftSibling.children, internal.children...)
+	for _, child := range internal.children {
+		child.parent = leftSibling
+	}
+
+	t.removeChildFromInternal(parent, nodeIdx-1, nodeIdx)
+}
+
+func (t *BPlusTree) mergeWithRightInternal(internal *node, rightSibling *node, nodeIdx int) {
+	parent := internal.parent
+	separatorKey := parent.keys[nodeIdx]
+
+	internal.keys = append(internal.keys, separatorKey)
+	internal.keys = append(internal.keys, rightSibling.keys...)
+	internal.children = append(internal.children, rightSibling.children...)
+	for _, child := range rightSibling.children {
+		child.parent = internal
+	}
+
+	t.removeChildFromInternal(parent, nodeIdx, nodeIdx+1)
 }
 
 func (t *BPlusTree) RangeScan(start, end string) ([]KVItem, error) {
@@ -419,54 +684,71 @@ func (it *Iterator) Delete() error {
 		return ErrIteratorInvalid
 	}
 
-	key := it.node.keys[it.index]
+	currentNode := it.node
+	currentIdx := it.index
 
-	leaf := it.node
-	idx := it.index
-
-	hasNext := it.index < len(leaf.keys)-1
-	hasPrevNode := leaf.prev != nil && len(leaf.prev.keys) > 0
-
-	for i := idx; i < len(leaf.keys)-1; i++ {
-		leaf.keys[i] = leaf.keys[i+1]
-		leaf.values[i] = leaf.values[i+1]
+	hasNext := currentIdx < len(currentNode.keys)-1
+	nextNode := currentNode.next
+	prevNode := currentNode.prev
+	lenPrev := 0
+	if prevNode != nil {
+		lenPrev = len(prevNode.keys)
 	}
-	leaf.keys = leaf.keys[:len(leaf.keys)-1]
-	leaf.values = leaf.values[:len(leaf.values)-1]
-
-	it.tree.count--
-
-	if len(leaf.keys) == 0 {
-		if leaf.next != nil {
-			leaf.next.prev = leaf.prev
-		}
-		if leaf.prev != nil {
-			leaf.prev.next = leaf.next
-		}
-
-		if hasNext {
-			it.index = idx
-		} else if leaf.next != nil && len(leaf.next.keys) > 0 {
-			it.node = leaf.next
-			it.index = 0
-		} else if hasPrevNode {
-			it.node = leaf.prev
-			it.index = len(leaf.prev.keys) - 1
-		} else {
-			it.valid = false
-		}
-	} else {
-		if hasNext {
-			it.index = idx
-		} else if leaf.next != nil && len(leaf.next.keys) > 0 {
-			it.node = leaf.next
-			it.index = 0
-		} else {
-			it.valid = false
-		}
+	nextKeyExists := false
+	var nextKey string
+	if hasNext {
+		nextKey = currentNode.keys[currentIdx+1]
+		nextKeyExists = true
+	} else if nextNode != nil && len(nextNode.keys) > 0 {
+		nextKey = nextNode.keys[0]
+		nextKeyExists = true
 	}
 
-	_ = key
+	deleted := it.tree.Delete(currentNode.keys[currentIdx])
+	if !deleted {
+		return ErrKeyNotFound
+	}
+
+	if !it.tree.root.isLeaf || len(it.tree.root.keys) > 0 {
+		if nextKeyExists {
+			leaf := it.tree.findLeaf(nextKey)
+			foundIdx := -1
+			for i := 0; i < len(leaf.keys); i++ {
+				if leaf.keys[i] == nextKey {
+					foundIdx = i
+					break
+				}
+			}
+			if foundIdx >= 0 {
+				it.node = leaf
+				it.index = foundIdx
+				it.valid = true
+				return nil
+			}
+		}
+
+		if lenPrev > 0 && prevNode != nil {
+			if len(prevNode.keys) >= lenPrev {
+				it.node = prevNode
+				it.index = len(prevNode.keys) - 1
+				it.valid = true
+				return nil
+			}
+		}
+
+		current := it.tree.root
+		for !current.isLeaf {
+			current = current.children[len(current.children)-1]
+		}
+		if len(current.keys) > 0 {
+			it.node = current
+			it.index = len(current.keys) - 1
+			it.valid = true
+			return nil
+		}
+	}
+
+	it.valid = false
 	return nil
 }
 

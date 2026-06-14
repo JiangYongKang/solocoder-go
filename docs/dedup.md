@@ -13,12 +13,13 @@
 | F1 | 幂等检查与标记 (CheckAndMark) | 检查消息 ID 是否已处理，未处理则标记为已处理并通过，已处理则直接拒绝 |
 | F2 | 去重窗口滑动 | 只维护最近一段时间窗口内的消息 ID，超出窗口的记录自动失效 |
 | F3 | 访问时间刷新 (Touch on Access) | 重复消息在窗口内被再次访问时，刷新其时间戳并移动到窗口末尾，延长有效期 |
-| F4 | 手动过期清理 (CleanExpired) | 主动扫描并清理超过窗口时间的过期记录，返回清理数量 |
+| F4 | 手动过期清理 (CleanExpired) | 主动扫描并清理超过窗口时间的过期记录，返回清理数量和潜在错误 |
 | F5 | 后台定时清理 | 启动后台协程按配置间隔自动执行过期清理，无需调用方手动触发 |
 | F6 | 存在性查询 (Contains) | 查询消息 ID 是否在有效窗口内，不改变其状态 |
 | F7 | 全量清空 (Clear) | 清空所有去重记录，重置去重器状态 |
-| F8 | 数量统计 (Count) | 查询当前有效窗口内的记录总数 |
-| F9 | 生命周期管理 (Start/Stop) | 启动和停止后台清理协程，支持幂等调用 |
+| F8 | 数量统计 (Count) | 查询当前有效窗口内的记录总数（排除已过期但尚未清理的记录） |
+| F9 | 生命周期管理 (Start/Stop) | 启动和停止后台清理协程，支持幂等调用；Stop 后所有操作永久拒绝 |
+| F10 | 生命周期状态感知 | 所有公共方法在 Stop 后返回 `ErrDeduplicatorStop`，调用方可据此判断去重器状态 |
 
 ## 3. 核心结构体与职责
 
@@ -32,8 +33,8 @@ type Config struct {
 ```
 
 **配置约束与默认值：**
-- `WindowSize`：必须大于 0，默认为 5 分钟。设置为 0 或负数时自动使用默认值
-- `CleanInterval`：必须大于 0，默认为 `WindowSize / 5`（最少 1 秒）。设置为 0 或负数时自动根据窗口大小推导
+- `WindowSize`：必须 >= 0。设置为 **负数** 时返回 `ErrInvalidConfig`；设置为 **0** 时自动使用默认值 5 分钟
+- `CleanInterval`：必须 >= 0。设置为 **负数** 时返回 `ErrInvalidConfig`；设置为 **0** 时自动根据 `WindowSize / 5` 推导（最少 1 秒）
 - `CleanInterval` 不宜大于 `WindowSize`，否则过期记录可能长时间驻留内存
 - 推荐配置：`CleanInterval` 为 `WindowSize` 的 1/5 ~ 1/2，在清理频率和 CPU 开销间取得平衡
 
@@ -46,6 +47,7 @@ type Deduplicator struct {
     idMap    map[string]*list.Element // 消息ID → 链表节点的快速查找索引
     idList   *list.List          // 按插入/访问顺序排列的双向链表（FIFO 队列）
     running  bool                // 后台清理协程是否运行中
+    stopped  bool                // 是否已永久停止（Stop 调用后置为 true，不可逆）
     stopCh   chan struct{}       // 后台协程停止信号通道
     wg       sync.WaitGroup      // 后台协程同步等待组
 }
@@ -55,6 +57,7 @@ type Deduplicator struct {
 - 维护消息 ID 的去重状态，通过 `idMap` 提供 O(1) 的存在性查询
 - 通过 `idList` 双向链表维护 FIFO 顺序，支持高效的批量过期清理（只需从链表头部扫描）
 - 驱动后台定时清理协程，自动回收过期记录
+- 维护 `stopped` 生命周期标记，`Stop()` 后永久拒绝所有操作
 - 保证线程安全，通过互斥锁保护所有内部状态访问
 
 ### 3.3 idEntry - 消息记录节点
@@ -74,9 +77,9 @@ type idEntry struct {
 
 | 错误变量 | 含义 | 触发场景 |
 |----------|------|----------|
-| `ErrEmptyMessageID` | 消息 ID 为空 | 调用 `CheckAndMark("")` 传入空字符串 |
-| `ErrDeduplicatorStop` | 去重器已停止 | 保留错误，用于未来扩展 |
-| `ErrInvalidConfig` | 配置无效 | 保留错误，用于未来扩展 |
+| `ErrEmptyMessageID` | 消息 ID 为空 | 调用 `CheckAndMark("")` 或 `Contains("")` 传入空字符串 |
+| `ErrDeduplicatorStop` | 去重器已永久停止 | 调用 `Stop()` 后，任何公共方法（`CheckAndMark`、`Contains`、`Count`、`CleanExpired`、`Clear`）都会返回此错误。`Stop()` 一旦调用不可逆。 |
+| `ErrInvalidConfig` | 配置无效 | `NewDeduplicatorWithConfig()` 传入的 `WindowSize` 或 `CleanInterval` 为负数时返回此错误。
 
 ## 4. 核心机制详解
 
@@ -88,6 +91,8 @@ CheckAndMark(msgID)
    ├─ msgID == "" → 返回 (false, ErrEmptyMessageID)
    │
    ├─ mu.Lock()
+   │
+   ├─ stopped == true → mu.Unlock()，返回 (false, ErrDeduplicatorStop)
    │
    ├─ 计算 cutoff = now - WindowSize
    │
@@ -114,6 +119,35 @@ CheckAndMark(msgID)
 - 当重复消息在窗口内被再次访问时，虽然被拒绝消费（返回 `false`），但其 `createdAt` 时间戳会被刷新为当前时间，并在链表中移动到尾部
 - 这种机制确保"热点"重复消息（持续被重发的消息）只要在窗口间隔内不断被访问，就不会被清理，避免了在消息重试场景下因窗口过期导致的误接受
 - 同时该行为也保证了链表节点顺序与"最后访问时间"一致，使 FIFO 清理策略天然正确
+
+### 4.1.1 Count 统计语义
+
+`Count()` 方法的返回值严格对应 **当前有效窗口内的记录数**，不包括已过期但尚未被 `CleanExpired()` 清理的记录：
+
+```
+  idMap（物理存储，包含过期和有效记录）  idList（按时间排序）
+  ┌───────────────────────────────┐      ┌─────┬─────┬─────┬─────┐
+  │ msg1(过期)  msg2(过期)        │─────▶│ msg1│ msg2│ msg3│ msg4│
+  │ msg3(有效)  msg4(有效)        │      └─────┴─────┴─────┴─────┘
+  └───────────────────────────────┘        ▲             ▲
+                                           │             │
+                                       cutoff     有效窗口边界
+                                    (now-WindowSize)
+
+  len(idMap) = 4   Count() = 2  (只统计 msg3, msg4)
+```
+
+**统计逻辑：**
+1. 从 `idList` 头部（最早的记录）开始遍历
+2. 跳过所有 `createdAt <= cutoff` 的过期记录，统计过期数量 `expiredCount`
+3. 遇到第一个未过期记录即停止（链表有序性保证后续均有效）
+4. 返回 `idList.Len() - expiredCount`
+
+**设计考量：**
+- `Count()` 是 **纯查询操作**，不修改任何内部状态，不会触发清理
+- 时间复杂度为 O(k)，k 为过期记录数，而非总记录数（得益于链表有序性可提前终止）
+- 监控场景下 `Count()` 返回的值真实反映了当前窗口利用率，不会因为清理间隔较长而给出虚高数据
+- 如需获取物理存储占用（包括过期记录），可直接访问 `len(d.idMap)`（仅测试和内部调试使用）
 
 ### 4.2 滑动窗口机制
 
@@ -178,6 +212,7 @@ CleanExpired()
 Start()
    │
    ├─ mu.Lock()
+   ├─ stopped == true → Unlock 直接返回（已停止，无法重启）
    ├─ 已运行 → Unlock 直接返回
    ├─ running = true
    ├─ stopCh = make(chan struct{})
@@ -194,16 +229,18 @@ cleanLoop（后台协程）
          │
          ├─ select
          │     ├─ stopCh 关闭 → ticker.Stop()，wg.Done()，退出
-         │     └─ ticker.C 触发 → 调用 CleanExpired()
+         │     └─ ticker.C 触发 → 调用 CleanExpired()（忽略返回值）
          │
          └─ 继续循环
 
 Stop()
    │
    ├─ mu.Lock()
-   ├─ 未运行 → Unlock 直接返回
-   ├─ running = false
-   ├─ close(stopCh)
+   ├─ stopped == true → Unlock 直接返回
+   ├─ stopped = true  ← 永久标记，不可逆
+   ├─ 若 running：
+   │     ├─ running = false
+   │     ├─ close(stopCh)
    ├─ mu.Unlock()
    │
    └─ wg.Wait()（等待清理协程退出）
@@ -213,15 +250,61 @@ Stop()
 
 **典型生命周期：**
 ```
-NewDeduplicator() → Start() → [CheckAndMark() 反复调用] → Stop()
+NewDeduplicator() → Start() → [CheckAndMark() 反复调用] → Stop() → 所有后续操作返回 ErrDeduplicatorStop
                     │
                     └─ 可选：不调用 Start()，仅手动调用 CleanExpired()
 ```
+
+**生命周期状态说明：**
+
+| 状态 | `stopped` | `running` | 行为 |
+|------|-----------|-----------|------|
+| **初始态** | `false` | `false` | 所有公共方法正常工作，无后台清理。需手动调用 `CleanExpired()` |
+| **运行态** | `false` | `true` | 所有公共方法正常工作，后台协程按 `CleanInterval` 自动清理 |
+| **已停止** | `true` | `false` | 所有公共方法（`CheckAndMark`、`Contains`、`Count`、`CleanExpired`、`Clear`）均返回 `ErrDeduplicatorStop`。`Start()` 无效。`Stop()` 幂等。 |
+
+**不可逆停止约定：**
+- `Stop()` 一旦调用，`stopped` 标记永久设置为 `true`，去重器进入"已停止"状态，**不可逆转**
+- 调用方可以通过检查 `errors.Is(err, ErrDeduplicatorStop)` 来判断去重器是否已停止
+- 如需重新使用，必须创建新的 `Deduplicator` 实例
+- `Start()` 在已停止状态下调用会被静默忽略，不会重启去重器
 
 **资源安全：**
 - `Start()` 和 `Stop()` 均支持幂等调用，重复调用不会产生副作用
 - `Stop()` 会阻塞直到后台清理协程完全退出，确保协程泄漏防护
 - 不调用 `Start()` 也可正常使用去重功能（仅缺失自动清理，需手动调用 `CleanExpired()`）
+- `Stop()` 即使在未调用 `Start()` 的情况下也可安全调用，调用后去重器同样进入永久停止状态
+
+### 4.6 公共方法签名与错误返回约定
+
+所有可能失败的公共方法均返回 `error`，统一错误处理模式：
+
+| 方法 | 签名 | 错误返回说明 |
+|------|------|-------------|
+| `NewDeduplicatorWithConfig` | `(*Deduplicator, error)` | 配置负数值时返回 `ErrInvalidConfig` |
+| `CheckAndMark` | `(bool, error)` | 空 ID 返回 `ErrEmptyMessageID`；已停止返回 `ErrDeduplicatorStop` |
+| `Contains` | `(bool, error)` | 空 ID 返回 `ErrEmptyMessageID`；已停止返回 `ErrDeduplicatorStop` |
+| `Count` | `(int, error)` | 已停止返回 `ErrDeduplicatorStop` |
+| `CleanExpired` | `(int, error)` | 已停止返回 `ErrDeduplicatorStop` |
+| `Clear` | `error` | 已停止返回 `ErrDeduplicatorStop` |
+
+**错误检查模式：**
+```go
+ok, err := d.CheckAndMark(msgID)
+if errors.Is(err, dedup.ErrDeduplicatorStop) {
+    // 去重器已停止，需重建或采取降级策略
+    return err
+}
+if err != nil {
+    // 处理其他错误
+    return err
+}
+if !ok {
+    // 重复消息，丢弃
+    return nil
+}
+// 新消息，继续处理
+```
 
 ## 5. 线程安全设计
 
@@ -238,7 +321,9 @@ NewDeduplicator() → Start() → [CheckAndMark() 反复调用] → Stop()
 package main
 
 import (
+    "errors"
     "fmt"
+    "log"
     "time"
     "solocoder-go/internal/dedup"
 )
@@ -253,12 +338,18 @@ func main() {
         WindowSize:    10 * time.Minute,  // 10 分钟窗口
         CleanInterval: 2 * time.Minute,   // 每 2 分钟清理一次
     }
-    d := dedup.NewDeduplicatorWithConfig(cfg)
+    d, err := dedup.NewDeduplicatorWithConfig(cfg)
+    if err != nil {
+        log.Fatalf("创建去重器失败: %v", err)
+    }
     d.Start()
     defer d.Stop()
 
     processMessage := func(msg Message) error {
         ok, err := d.CheckAndMark(msg.ID)
+        if errors.Is(err, dedup.ErrDeduplicatorStop) {
+            return fmt.Errorf("去重器已停止，消息 %s 无法处理", msg.ID)
+        }
         if err != nil {
             return fmt.Errorf("dedup check failed: %w", err)
         }
@@ -278,7 +369,9 @@ func main() {
     }
 
     for _, m := range msgs {
-        _ = processMessage(m)
+        if err := processMessage(m); err != nil {
+            log.Printf("处理消息失败: %v", err)
+        }
     }
     // 输出:
     // 处理消息: m1 -> order-1
@@ -291,21 +384,34 @@ func main() {
 ### 6.2 手动清理模式（不启动后台协程）
 
 ```go
-d := dedup.NewDeduplicatorWithConfig(dedup.Config{
+d, err := dedup.NewDeduplicatorWithConfig(dedup.Config{
     WindowSize: 5 * time.Minute,
 })
+if err != nil {
+    log.Fatal(err)
+}
 // 注意：不调用 d.Start()，无后台协程
 
 for {
     batch := receiveBatch()
     for _, msg := range batch {
-        ok, _ := d.CheckAndMark(msg.ID)
+        ok, err := d.CheckAndMark(msg.ID)
+        if errors.Is(err, dedup.ErrDeduplicatorStop) {
+            log.Fatal("去重器已停止")
+        }
+        if err != nil {
+            log.Printf("检查失败: %v", err)
+            continue
+        }
         if ok {
             handle(msg)
         }
     }
     // 每批处理完后手动清理过期记录
-    cleaned := d.CleanExpired()
+    cleaned, err := d.CleanExpired()
+    if err != nil {
+        log.Printf("清理失败: %v", err)
+    }
     if cleaned > 0 {
         log.Printf("清理了 %d 条过期去重记录", cleaned)
     }
@@ -319,7 +425,15 @@ go func() {
     ticker := time.NewTicker(30 * time.Second)
     defer ticker.Stop()
     for range ticker.C {
-        count := d.Count()
+        count, err := d.Count()
+        if errors.Is(err, dedup.ErrDeduplicatorStop) {
+            log.Printf("Dedup: 已停止")
+            return
+        }
+        if err != nil {
+            log.Printf("Dedup: 获取数量失败: %v", err)
+            continue
+        }
         log.Printf("Dedup: 窗口内记录数 = %d", count)
     }
 }()
@@ -329,23 +443,27 @@ go func() {
 
 ```go
 func TestMessageDedupScenario(t *testing.T) {
-    d := dedup.NewDeduplicatorWithConfig(dedup.Config{
+    d, err := dedup.NewDeduplicatorWithConfig(dedup.Config{
         WindowSize: 100 * time.Millisecond,
     })
+    require.NoError(t, err)
 
     // 第一轮：全部通过
     for i := 0; i < 10; i++ {
         id := fmt.Sprintf("msg-%d", i)
         ok, err := d.CheckAndMark(id)
-        assert.True(t, ok)
         assert.NoError(t, err)
+        assert.True(t, ok)
     }
-    assert.Equal(t, 10, d.Count())
+    count, err := d.Count()
+    assert.NoError(t, err)
+    assert.Equal(t, 10, count)
 
     // 第二轮：重复消息全部被拒
     for i := 0; i < 10; i++ {
         id := fmt.Sprintf("msg-%d", i)
-        ok, _ := d.CheckAndMark(id)
+        ok, err := d.CheckAndMark(id)
+        assert.NoError(t, err)
         assert.False(t, ok)
     }
 
@@ -353,8 +471,40 @@ func TestMessageDedupScenario(t *testing.T) {
     time.Sleep(150 * time.Millisecond)
 
     // 第三轮：过期后重新接受
-    ok, _ := d.CheckAndMark("msg-0")
+    ok, err := d.CheckAndMark("msg-0")
+    assert.NoError(t, err)
     assert.True(t, ok)
+}
+```
+
+### 6.5 检测去重器停止状态
+
+```go
+// 优雅关闭示例
+stopCh := make(chan os.Signal, 1)
+signal.Notify(stopCh, os.Interrupt, syscall.SIGTERM)
+
+go func() {
+    <-stopCh
+    log.Println("收到关闭信号，停止去重器...")
+    d.Stop()
+}()
+
+for {
+    msg := receiveMessage()
+    ok, err := d.CheckAndMark(msg.ID)
+    if errors.Is(err, dedup.ErrDeduplicatorStop) {
+        log.Println("去重器已停止，退出消费循环")
+        break
+    }
+    if err != nil {
+        log.Printf("错误: %v", err)
+        continue
+    }
+    if !ok {
+        continue
+    }
+    process(msg)
 }
 ```
 
@@ -375,12 +525,14 @@ docs/
 
 | 测试类别 | 代表性测试用例 | 覆盖目标 |
 |----------|---------------|----------|
-| **基础创建** | `TestNewDeduplicator`、`TestDefaultConfig`、`TestNewDeduplicatorWithConfig_*` | 构造函数、默认值、配置推导 |
+| **基础创建** | `TestNewDeduplicator`、`TestDefaultConfig`、`TestNewDeduplicatorWithConfig_*` | 构造函数、默认值、配置推导、无效配置校验 |
 | **去重判断** | `TestCheckAndMark_NewMessage`、`TestCheckAndMark_DuplicateMessage`、`TestCheckAndMark_MultipleMessages` | 新消息通过、重复消息拒绝、批量验证 |
 | **边界条件** | `TestCheckAndMark_EmptyMessageID`、`TestContains` | 空ID处理、存在性查询 |
+| **Count 语义** | `TestCount_ExcludesExpired`、`TestCount_AccuracyWithMixedExpiry` | Count 只统计窗口内有效记录、与 len(idMap) 的差异 |
 | **窗口滑动** | `TestCheckAndMark_ExpiredThenReaccept`、`TestCheckAndMark_TouchOnAccess` | 过期后重新接受、访问续期 |
 | **过期清理** | `TestCleanExpired_NoExpired`、`TestCleanExpired_AllExpired`、`TestCleanExpired_PartialExpired`、`TestCleanExpired_FIFOOrder` | 无过期/全过期/部分过期、FIFO顺序 |
 | **生命周期** | `TestStartStop_Idempotent`、`TestStartStop_BackgroundCleanup` | 幂等启停、后台自动清理 |
+| **停止状态** | `TestStop_RejectsAllOperations`、`TestStop_WithoutStart`、`TestStart_AfterStop` | Stop 后所有操作返回 ErrDeduplicatorStop、不可逆 |
 | **并发安全** | `TestConcurrent_CheckAndMark`、`TestConcurrent_Duplicates`、`TestConcurrent_CleanAndCheck` | 并发写入、并发去重、清理与读写竞态 |
 | **内存泄漏** | `TestMemoryLeak_AfterCleanup` | 长期运行后内存占用受控 |
 | **内部机制** | `TestCheckAndMark_OrderPreservedInList`、`TestCheckAndMark_TouchMovesToBack` | 链表顺序正确性、Touch 行为 |

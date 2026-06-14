@@ -299,13 +299,23 @@ func main() {
     }
     defer dlq.Stop()
 
-    // 2. 设置消息处理函数
+    // 2. 设置消息处理函数（注意：必须监听 ctx.Done() 以响应优雅关闭信号
     dlq.SetHandler(func(ctx context.Context, msg *deadletter.DeadLetterMessage) error {
         payload := msg.Payload.(string)
         fmt.Printf("重试处理消息: topic=%s, payload=%s\n",
             msg.OriginalTopic, payload)
-        // 返回 nil 表示处理成功
-        return nil
+
+        // 最佳实践：在所有可能阻塞的操作中监听 ctx.Done()
+        // 确保处理器优雅关闭时 Handler 能够及时退出
+        select {
+        case <-ctx.Done():
+            return fmt.Errorf("handler cancelled: %w", ctx.Err())
+        case result := <-processOrderAsync(payload):
+            if result.err != nil {
+                return result.err
+            }
+            return nil
+        }
     })
 
     // 3. 启动处理器
@@ -399,23 +409,168 @@ dlq.MoveToDeadLetter("retryable-topic", payload, "temporary error", 5)
 | `ErrAlreadyStarted | 重复调用 `Start()` |
 | `ErrHandlerNotSet | 调用 `Start()` 前未通过 `SetHandler()` |
 
-## 6. 线程安全说明
+## 6. Handler 上下文传递机制
 
-DeadLetter Processor 所有公共方法均为**并发安全，可在多个 goroutine 同时调用：
+### 6.1 上下文生命周期
+
+处理器在内部维护一个可取消的 `context.Context`，其生命周期与处理器的运行状态严格绑定：
+
+- **创建时**：`NewProcessor()` 初始化一个根 context
+- **启动时**：`Start()` 重新创建一个全新的可取消 context，确保支持多次启停
+- **停止时**：`Stop()` 首先调用 `cancel()` 取消 context，然后才等待任务完成
+
+### 6.2 上下文传递路径
+
+```
+Stop() 被调用
+    │
+    ▼
+p.cancel()  ──►  ctx.Done() 被触发
+    │                     │
+    │                     ▼
+    │         所有正在执行的 Handler 收到取消信号
+    │                     │
+    │                     ▼
+    │         Handler 检查 ctx.Done() 并及时返回
+    │                     │
+    ▼                     ▼
+p.taskWg.Wait() ◄───  processMessage 返回
+    │
+    ▼
+Stop() 正常返回
+```
+
+### 6.3 Handler 编写最佳实践
+
+**MessageHandler** 的签名为 `func(ctx context.Context, msg *DeadLetterMessage) error`，其中 `ctx` 参数由处理器在调用时自动注入，开发者必须遵循以下最佳实践：
+
+1. **必须监听 ctx.Done()**：在所有可能长时间阻塞的操作（如网络调用、数据库查询、循环处理）中，必须通过 `select` 监听 `ctx.Done()` 通道，确保优雅关闭时能够及时退出。
+
+   **正确示例**：
+   ```go
+   dlq.SetHandler(func(ctx context.Context, msg *deadletter.DeadLetterMessage) error {
+       // 错误示例：死循环不检查 ctx，会导致 Stop() 永久挂起
+       // for {
+       //     time.Sleep(time.Second)
+       // }
+
+       // 正确示例：循环中检查 ctx.Done()
+       for {
+           select {
+           case <-ctx.Done():
+               return ctx.Err()
+           case <-time.After(time.Second):
+               // 执行业务逻辑
+           }
+       }
+   })
+   ```
+
+2. **传递 ctx 给下游操作**：将 ctx 传递给所有支持 context 的下游函数（如 HTTP 请求、数据库查询、Redis 操作等），确保取消信号能够完整传递。
+
+   ```go
+   dlq.SetHandler(func(ctx context.Context, msg *deadletter.DeadLetterMessage) error {
+       // 将 ctx 传递给 HTTP Client
+       req, _ := http.NewRequestWithContext(ctx, "POST", url, body)
+       resp, err := http.DefaultClient.Do(req)
+       // ...
+   })
+   ```
+
+3. **不要忽略 ctx**：即使业务逻辑非常简单，也应该在合适的位置检查 ctx 是否已取消，避免小概率的长时间阻塞场景。
+
+### 6.4 取消后的消息处理
+
+当 Handler 因 ctx 被取消而返回错误时：
+- 消息不会被标记为 `StatusProcessed`
+- 消息会按照正常重试流程，根据 `RetryCount` 判断是否继续重试或标记为永久失败
+- 这确保了在关闭过程中未完成处理的消息不会丢失，下次启动时可以继续处理
+
+## 7. 优雅关闭保障策略
+
+### 7.1 关闭流程详解
+
+`Stop()` 方法采用三级保障机制，确保在各种情况下都能尽可能优雅地关闭：
+
+```
+调用 Stop()
+    │
+    ├─►  第一级：状态标记
+    │       p.running = false
+    │       禁止新的 MoveToDeadLetter() 调用
+    │
+    ├─►  第二级：取消信号广播
+    │       p.cancel()  ──►  所有运行中 Handler 的 ctx.Done() 触发
+    │       close(p.stopCh) ──► runLoop 退出调度循环
+    │       p.wake() ──► 唤醒 runLoop，立即响应停止
+    │
+    └─►  第三级：等待任务完成
+            p.wg.Wait() ──► 等待 runLoop 协程退出
+            p.taskWg.Wait() ──► 等待所有 Handler 协程返回
+                               （依赖 Handler 正确响应 ctx 取消）
+            │
+            ▼
+          Stop() 返回
+```
+
+### 7.2 各级保障的作用
+
+| 保障级别 | 机制 | 作用 | 失败后果 |
+|----------|------|------|----------|
+| 第一级 | `p.running = false` | 阻止新消息进入，防止关闭过程中任务堆积 | 新消息仍可入队，关闭时间延长 |
+| 第二级 | `p.cancel()` | 向所有运行中 Handler 广播取消信号 | 核心保障，缺失会导致 Stop() 永久阻塞 |
+| 第三级 | `taskWg.Wait()` | 确保所有 Handler 真正完成后才返回 | 提前返回可能导致资源泄漏 |
+
+### 7.3 防止死循环阻塞的保障
+
+为了防止 Handler 内部死循环或忽略 ctx 导致 `Stop()` 永久挂起，系统提供以下机制：
+
+1. **Context 取消是强制性信号**：`Stop()` 调用时必然会调用 `p.cancel()`，这是不可绕过的机制
+2. **开发者责任**：Handler 必须遵循最佳实践监听 `ctx.Done()`，这是保障优雅关闭的前提
+3. **设计原则**：处理器不强制 kill Handler goroutine（Go 不支持强制停止 goroutine），而是通过 context 取消信号进行协作式取消
+
+### 7.4 优雅关闭的最佳实践
+
+1. **设置合理的超时**：如果担心某些 Handler 可能忽略 ctx，可以在 `Stop()` 外层设置超时保护：
+
+   ```go
+   stopped := make(chan struct{})
+   go func() {
+       dlq.Stop()
+       close(stopped)
+   }()
+
+   select {
+   case <-stopped:
+       fmt.Println("优雅关闭完成")
+   case <-time.After(30 * time.Second):
+       fmt.Println("警告：部分 Handler 未及时响应关闭，强制继续")
+   }
+   ```
+
+2. **分阶段关闭**：在关闭前先通过 `PendingCount()` 观察队列状态，必要时先手动处理关键消息。
+
+3. **监控关闭耗时**：正常情况下 `Stop()` 应该在毫秒级返回，如果耗时超过预期，说明存在 Handler 未正确响应 ctx 取消，需要检查 Handler 实现。
+
+## 8. 线程安全说明
+
+DeadLetter Processor 所有公共方法均为**并发安全**，可在多个 goroutine 中同时调用：
 
 - 处理器内部通过 `sync.Mutex` 保护共享数据结构
 - 后台调度循环 (`runLoop`) 单协程运行，避免竞争条件
 - Handler panic 自动捕获并转化为错误，不会导致整个处理器崩溃
 - `Stop()` 方法会等待所有正在执行的处理任务完成后再返回
 
-## 7. 资源与生命周期
+## 9. 资源与生命周期
 
-- **创建**：`NewProcessor(cfg)` 创建实例，验证配置参数
+- **创建**：`NewProcessor(cfg)` 创建实例，验证配置参数，初始化根 context
 - **设置 Handler**：`SetHandler(handler)` 设置消息处理函数
-- **启动**：`Start()` 启动后台调度循环
+- **启动**：`Start()` 启动后台调度循环，重新创建可取消 context
 - **运行**：转移消息、查询状态、手动重试、移除消息等
 - **停止**：`Stop()` 优雅关闭：
-  - 停止接收新消息
-  - 等待所有正在执行的处理任务完成
+  - 标记 `running = false`，停止接收新消息
+  - 调用 `cancel()` 广播取消信号给所有运行中的 Handler
+  - 等待 `runLoop` 协程退出
+  - 等待所有正在执行的 Handler 协程返回（依赖 Handler 正确响应 ctx）
   - 返回后所有 goroutine 全部退出
-- **幂等性**：`Start()`、`Stop()` 均为幂等操作
+- **幂等性**：`Start()`、`Stop()` 均为幂等操作，支持多次启停

@@ -1994,3 +1994,290 @@ func TestReconnectAfterRemove(t *testing.T) {
 		t.Errorf("expected ErrConsumerNotFound after RemoveConsumer, got %v", err)
 	}
 }
+
+func countTopicNodes(node *topicNode) int {
+	if node == nil {
+		return 0
+	}
+	count := 1
+	for _, child := range node.children {
+		count += countTopicNodes(child)
+	}
+	return count
+}
+
+func TestTopicTreePruningOnUnsubscribe(t *testing.T) {
+	b := NewBroker(DefaultConfig())
+	defer b.Stop()
+
+	b.AddConsumer("c1")
+
+	initialNodes := countTopicNodes(b.topicTree)
+	if initialNodes != 1 {
+		t.Fatalf("expected 1 node (root only) initially, got %d", initialNodes)
+	}
+
+	b.Subscribe("c1", "a.b.c.d.e")
+
+	nodesAfterSubscribe := countTopicNodes(b.topicTree)
+	if nodesAfterSubscribe <= initialNodes {
+		t.Errorf("expected more nodes after subscribe, got %d", nodesAfterSubscribe)
+	}
+
+	b.Unsubscribe("c1", "a.b.c.d.e")
+
+	nodesAfterUnsubscribe := countTopicNodes(b.topicTree)
+	if nodesAfterUnsubscribe != 1 {
+		t.Errorf("expected 1 node (root only) after unsubscribe (pruning), got %d", nodesAfterUnsubscribe)
+	}
+}
+
+func TestTopicTreePruningMultipleSubs(t *testing.T) {
+	b := NewBroker(DefaultConfig())
+	defer b.Stop()
+
+	b.AddConsumer("c1")
+	b.AddConsumer("c2")
+
+	b.Subscribe("c1", "a.b.c")
+	b.Subscribe("c2", "a.b.c")
+
+	nodesAfterTwoSubs := countTopicNodes(b.topicTree)
+
+	b.Unsubscribe("c1", "a.b.c")
+
+	nodesAfterOneUnsub := countTopicNodes(b.topicTree)
+	if nodesAfterOneUnsub != nodesAfterTwoSubs {
+		t.Errorf("node count should not change when one of two subs removed, got %d before, %d after", nodesAfterTwoSubs, nodesAfterOneUnsub)
+	}
+
+	b.Unsubscribe("c2", "a.b.c")
+
+	nodesAfterBothUnsub := countTopicNodes(b.topicTree)
+	if nodesAfterBothUnsub != 1 {
+		t.Errorf("expected 1 node after both unsubs, got %d", nodesAfterBothUnsub)
+	}
+}
+
+func TestTopicTreePruningSharedPrefix(t *testing.T) {
+	b := NewBroker(DefaultConfig())
+	defer b.Stop()
+
+	b.AddConsumer("c1")
+	b.AddConsumer("c2")
+
+	b.Subscribe("c1", "a.b.c.d")
+	b.Subscribe("c2", "a.b.x.y")
+
+	b.Unsubscribe("c1", "a.b.c.d")
+
+	nodesAfterOneUnsub := countTopicNodes(b.topicTree)
+	if nodesAfterOneUnsub == 1 {
+		t.Error("should not prune all nodes since a.b.x.y still exists")
+	}
+
+	b.Subscribe("c1", "a.b.c.d")
+	b.Unsubscribe("c1", "a.b.c.d")
+	b.Unsubscribe("c2", "a.b.x.y")
+
+	finalNodes := countTopicNodes(b.topicTree)
+	if finalNodes != 1 {
+		t.Errorf("expected 1 node after all unsubs, got %d", finalNodes)
+	}
+}
+
+func TestTopicTreePruningWildcardOne(t *testing.T) {
+	b := NewBroker(DefaultConfig())
+	defer b.Stop()
+
+	b.AddConsumer("c1")
+	b.Subscribe("c1", "a.*.c")
+
+	afterSub := countTopicNodes(b.topicTree)
+
+	b.Unsubscribe("c1", "a.*.c")
+
+	afterUnsub := countTopicNodes(b.topicTree)
+	if afterUnsub != 1 {
+		t.Errorf("expected 1 node after unsub wildcardOne, got %d (before: %d)", afterUnsub, afterSub)
+	}
+}
+
+func TestTopicTreePruningWildcardAny(t *testing.T) {
+	b := NewBroker(DefaultConfig())
+	defer b.Stop()
+
+	b.AddConsumer("c1")
+	b.Subscribe("c1", "a.b.#")
+
+	afterSub := countTopicNodes(b.topicTree)
+
+	b.Unsubscribe("c1", "a.b.#")
+
+	afterUnsub := countTopicNodes(b.topicTree)
+	if afterUnsub != 1 {
+		t.Errorf("expected 1 node after unsub wildcardAny, got %d (before: %d)", afterUnsub, afterSub)
+	}
+}
+
+func TestTopicTreePruningOnRemoveConsumer(t *testing.T) {
+	b := NewBroker(DefaultConfig())
+	defer b.Stop()
+
+	b.AddConsumer("c1")
+	b.Subscribe("c1", "deep.nested.topic.path.here")
+
+	afterSub := countTopicNodes(b.topicTree)
+
+	b.RemoveConsumer("c1")
+
+	afterRemove := countTopicNodes(b.topicTree)
+	if afterRemove != 1 {
+		t.Errorf("expected 1 node after RemoveConsumer, got %d (before: %d)", afterRemove, afterSub)
+	}
+}
+
+func TestTopicNodeIsEmpty(t *testing.T) {
+	node := newTopicNode()
+	if !node.isEmpty() {
+		t.Error("new node should be empty")
+	}
+
+	node.subscribers["c1"] = &Subscription{}
+	if node.isEmpty() {
+		t.Error("node with subscriber should not be empty")
+	}
+	delete(node.subscribers, "c1")
+
+	node.wildcardOne["c1"] = &Subscription{}
+	if node.isEmpty() {
+		t.Error("node with wildcardOne should not be empty")
+	}
+	delete(node.wildcardOne, "c1")
+
+	node.wildcardAny["c1"] = &Subscription{}
+	if node.isEmpty() {
+		t.Error("node with wildcardAny should not be empty")
+	}
+	delete(node.wildcardAny, "c1")
+
+	node.children["x"] = newTopicNode()
+	if node.isEmpty() {
+		t.Error("node with children should not be empty")
+	}
+}
+
+func TestGetMessageStatus(t *testing.T) {
+	b := NewBroker(DefaultConfig())
+	defer b.Stop()
+
+	_, err := b.GetMessageStatus("nonexistent", "msg")
+	if err != ErrConsumerNotFound {
+		t.Errorf("expected ErrConsumerNotFound, got %v", err)
+	}
+
+	ch, _ := b.AddConsumer("c1")
+	b.Subscribe("c1", "test.topic")
+
+	_, err = b.GetMessageStatus("c1", "nonexistent")
+	if err != ErrMessageNotFound {
+		t.Errorf("expected ErrMessageNotFound, got %v", err)
+	}
+
+	b.Publish("test.topic", "data")
+	msg := <-ch
+
+	status, err := b.GetMessageStatus("c1", msg.ID)
+	if err != nil {
+		t.Fatalf("GetMessageStatus failed: %v", err)
+	}
+	if status != MessageStatusDelivered {
+		t.Errorf("expected MessageStatusDelivered, got %d", status)
+	}
+
+	b.Ack("c1", msg.ID)
+
+	_, err = b.GetMessageStatus("c1", msg.ID)
+	if err != ErrMessageNotFound {
+		t.Errorf("expected ErrMessageNotFound after ack, got %v", err)
+	}
+}
+
+func TestGetMessageStatusDeadLetter(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxRetry = 0
+	b := NewBroker(cfg)
+	defer b.Stop()
+
+	ch, _ := b.AddConsumer("c1")
+	b.Subscribe("c1", "test.topic")
+
+	b.Publish("test.topic", "dead")
+	msg := <-ch
+	b.Nack("c1", msg.ID)
+
+	status, err := b.GetMessageStatus("c1", msg.ID)
+	if err != nil {
+		t.Fatalf("GetMessageStatus failed for dead letter: %v", err)
+	}
+	if status != MessageStatusDead {
+		t.Errorf("expected MessageStatusDead, got %d", status)
+	}
+}
+
+func TestGetMessageStatusPending(t *testing.T) {
+	b := NewBroker(DefaultConfig())
+	defer b.Stop()
+
+	ch, _ := b.AddConsumer("c1")
+	b.SubscribeDurable("c1", "test.topic", true)
+
+	b.Publish("test.topic", "data")
+	msg := <-ch
+	_ = msg
+
+	b.DisconnectConsumer("c1")
+
+	status, err := b.GetMessageStatus("c1", msg.ID)
+	if err != nil {
+		t.Fatalf("GetMessageStatus failed: %v", err)
+	}
+	if status != MessageStatusPending {
+		t.Errorf("expected MessageStatusPending after disconnect, got %d", status)
+	}
+
+	_ = ch
+}
+
+func TestMessageStateMachineTransitions(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxRetry = 1
+	b := NewBroker(cfg)
+	defer b.Stop()
+
+	ch, _ := b.AddConsumer("c1")
+	b.Subscribe("c1", "test.topic")
+
+	b.Publish("test.topic", "data")
+	msg := <-ch
+
+	status, _ := b.GetMessageStatus("c1", msg.ID)
+	if status != MessageStatusDelivered {
+		t.Fatalf("expected Delivered, got %d", status)
+	}
+
+	b.Nack("c1", msg.ID)
+
+	msg2 := <-ch
+	status, _ = b.GetMessageStatus("c1", msg2.ID)
+	if status != MessageStatusDelivered {
+		t.Fatalf("expected Delivered after redelivery, got %d", status)
+	}
+
+	b.Nack("c1", msg2.ID)
+
+	status, _ = b.GetMessageStatus("c1", msg2.ID)
+	if status != MessageStatusDead {
+		t.Fatalf("expected Dead after exceeding MaxRetry, got %d", status)
+	}
+}

@@ -1,0 +1,6 @@
+你实现的时序数据库引擎模块存在一些问题，需要修复：
+1. TestDownsample_MinMax 测试使用 time.Now().UnixMilli() 生成时间戳搭配固定窗口做降采样，但没有将时间对齐到窗口边界，当当前时间的毫秒偏移量导致两个数据点落入不同窗口时测试非确定性失败，运行 go test 间歇性报 expected min 不等于实际值。
+2. 定义了 ErrInvalidTTL、ErrInvalidBatchSize、ErrInvalidInterval 三个错误变量，但在 NewTSEngineWithConfig 中参数不合法时直接静默替换为默认值而不返回错误，调用方无法感知配置被修正了。
+3. cleanupExpired 方法用负值表示 TTL 禁用的约定没有通过常量或文档显式声明，且 NewTSEngineWithConfig 只处理了 TTL 为零的默认值替换未处理负值场景，TTL 禁用语义依赖两个分离的代码点协作完成。
+4. 修复完成后运行 go test ./internal/tsdb/ -v，需要让所有测试通过且在所有时间运行都具有确定性。
+5. 在 docs/tsdb.md 中更新模块需求文档，说明配置校验的错误返回约定和 TTL 禁用语义的实现方式。

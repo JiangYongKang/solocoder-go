@@ -95,9 +95,9 @@ type Config struct {
 ```
 
 **职责**:
-- `TTL`: 数据生存时间，从数据点时间戳开始计算，超过此时间的数据将被清理。设置为负数表示禁用 TTL，0 表示使用默认值（24小时）
-- `CleanupInterval`: 后台清理 goroutine 的运行间隔
-- `CleanupBatchSize`: 每次清理操作处理的最大数据点数量，避免单次清理耗时过长
+- `TTL`: 数据生存时间，从数据点时间戳开始计算，超过此时间的数据将被清理。设置为 `TTLDisabled`（`-1`）表示禁用 TTL，必须为正数或 `TTLDisabled`，`0` 和其他负数为非法值，将返回 `ErrInvalidTTL`
+- `CleanupInterval`: 后台清理 goroutine 的运行间隔，必须为正数，否则返回 `ErrInvalidInterval`
+- `CleanupBatchSize`: 每次清理操作处理的最大数据点数量，必须为正数，否则返回 `ErrInvalidBatchSize`
 
 ### 3.5 AggregatorType
 

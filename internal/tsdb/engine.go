@@ -7,11 +7,15 @@ import (
 	"time"
 )
 
+const (
+	TTLDisabled time.Duration = -1
+)
+
 var (
 	ErrInvalidTimeRange   = errors.New("invalid time range: start > end")
 	ErrInvalidWindowSize  = errors.New("invalid window size: must be positive")
 	ErrInvalidAggregator  = errors.New("invalid aggregator type")
-	ErrInvalidTTL         = errors.New("invalid TTL: must be non-negative")
+	ErrInvalidTTL         = errors.New("invalid TTL: must be positive or TTLDisabled")
 	ErrInvalidBatchSize   = errors.New("invalid batch size: must be positive")
 	ErrInvalidInterval    = errors.New("invalid cleanup interval: must be positive")
 	ErrEmptyTags          = errors.New("empty tags")
@@ -70,19 +74,16 @@ type TSEngine struct {
 }
 
 func NewTSEngine() *TSEngine {
-	return NewTSEngineWithConfig(DefaultConfig())
+	e, err := NewTSEngineWithConfig(DefaultConfig())
+	if err != nil {
+		panic(err)
+	}
+	return e
 }
 
-func NewTSEngineWithConfig(cfg Config) *TSEngine {
-	defaults := DefaultConfig()
-	if cfg.TTL == 0 {
-		cfg.TTL = defaults.TTL
-	}
-	if cfg.CleanupInterval <= 0 {
-		cfg.CleanupInterval = defaults.CleanupInterval
-	}
-	if cfg.CleanupBatchSize <= 0 {
-		cfg.CleanupBatchSize = defaults.CleanupBatchSize
+func NewTSEngineWithConfig(cfg Config) (*TSEngine, error) {
+	if err := ValidateConfig(cfg); err != nil {
+		return nil, err
 	}
 
 	e := &TSEngine{
@@ -97,7 +98,20 @@ func NewTSEngineWithConfig(cfg Config) *TSEngine {
 	e.wg.Add(1)
 	go e.cleanupLoop()
 
-	return e
+	return e, nil
+}
+
+func ValidateConfig(cfg Config) error {
+	if cfg.TTL != TTLDisabled && cfg.TTL <= 0 {
+		return ErrInvalidTTL
+	}
+	if cfg.CleanupInterval <= 0 {
+		return ErrInvalidInterval
+	}
+	if cfg.CleanupBatchSize <= 0 {
+		return ErrInvalidBatchSize
+	}
+	return nil
 }
 
 func (e *TSEngine) Write(points []*DataPoint) error {
@@ -381,7 +395,7 @@ func (e *TSEngine) cleanupExpired() {
 	}
 	e.closedMu.RUnlock()
 
-	if e.ttl < 0 {
+	if e.ttl == TTLDisabled {
 		return
 	}
 
