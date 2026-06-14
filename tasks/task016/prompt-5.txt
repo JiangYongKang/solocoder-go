@@ -1,0 +1,6 @@
+你实现的 WAL 存储引擎模块的 TestConcurrentReadWrite 测试在第4轮修改后仍有缺陷，需要修复：
+1. 当前测试中 reader 1 在 writer 发送 stop 信号后直接 return 退出，没有执行任何最终的数据完整性校验，这条 goroutine 对并发验证的贡献仅限于写入期间的 Offset 顺序检查。需要让 reader 1 在 writer 完成后也执行一次全量数据校验。
+2. reader 2 的 select 语句在 stop 通道关闭后存在 `<-stop` 和 `default` 两个分支同时就绪的竞态窗口，Go 的 select 可能随机选择 default 分支导致全量校验被延迟。需要消除 select 中的 default 分支，改用先等待 stop 信号到达再做全量校验的确定性流程。
+3. docs/wal.md 中"并发测试保障总览"表格里 TestConcurrentReadWrite 所在行仍然写着"单 reader + 单 writer 并行"，核心断言仍为"不崩溃、无 I/O 错误"，与测试矩阵表中该行 reader 数已更新为 2 的情况自相矛盾。需要将总览表也同步更新为 2 reader 的描述。
+4. 修复完成后运行 go test ./internal/wal/ -v，需要让所有测试通过。
+5. 在 docs/wal.md 中更新模块需求文档，确保测试矩阵表和并发保障总览表中 TestConcurrentReadWrite 的说明一致。

@@ -801,21 +801,41 @@ func TestConcurrentReadWrite(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for {
+			entries, err := wal.ReadFrom(0)
+			if err != nil {
+				atomic.AddInt64(&reader1ErrCount, 1)
+				break
+			}
+			for i, e := range entries {
+				if e.Offset != int64(i) {
+					atomic.AddInt64(&reader1ErrCount, 1)
+					break
+				}
+			}
 			select {
 			case <-stop:
-				return
-			default:
 				entries, err := wal.ReadFrom(0)
 				if err != nil {
+					atomic.AddInt64(&reader1ErrCount, 1)
+					return
+				}
+				if len(entries) != 200 {
 					atomic.AddInt64(&reader1ErrCount, 1)
 					return
 				}
 				for i, e := range entries {
 					if e.Offset != int64(i) {
 						atomic.AddInt64(&reader1ErrCount, 1)
-						break
+						return
+					}
+					expected := fmt.Sprintf("entry_%d", i)
+					if string(e.Data) != expected {
+						atomic.AddInt64(&reader1ErrCount, 1)
+						return
 					}
 				}
+				return
+			default:
 			}
 		}
 	}()
@@ -824,6 +844,17 @@ func TestConcurrentReadWrite(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for {
+			entries, err := wal.ReadFrom(0)
+			if err != nil {
+				atomic.AddInt64(&reader2ErrCount, 1)
+				break
+			}
+			for i, e := range entries {
+				if e.Offset != int64(i) {
+					atomic.AddInt64(&reader2ErrCount, 1)
+					break
+				}
+			}
 			select {
 			case <-stop:
 				entries, err := wal.ReadFrom(0)
@@ -838,27 +869,16 @@ func TestConcurrentReadWrite(t *testing.T) {
 				for i, e := range entries {
 					if e.Offset != int64(i) {
 						atomic.AddInt64(&reader2ErrCount, 1)
-						break
+						return
 					}
 					expected := fmt.Sprintf("entry_%d", i)
 					if string(e.Data) != expected {
 						atomic.AddInt64(&reader2ErrCount, 1)
-						break
+						return
 					}
 				}
 				return
 			default:
-				entries, err := wal.ReadFrom(0)
-				if err != nil {
-					atomic.AddInt64(&reader2ErrCount, 1)
-					return
-				}
-				for i, e := range entries {
-					if e.Offset != int64(i) {
-						atomic.AddInt64(&reader2ErrCount, 1)
-						break
-					}
-				}
 			}
 		}
 	}()

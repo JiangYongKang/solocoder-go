@@ -1,0 +1,5 @@
+你实现的 Pub/Sub 消息代理模块在第4轮修复中仍有残余问题，需要修复：
+1. redeliverOrDeadLetter 的正常重投路径在进入 select 之前就执行了 delete(c.pending, pm.msg.ID)，当 consumer channel 满进入 default 分支时消息被追加到 durableBuffer 但 pending map 中已无记录。这与第4轮修复的断开连接分支查询盲区性质相同，需要在该函数的所有分支中消除这种时序窗口。
+2. deliverToConsumer 的 default 分支中，持久化消息因 channel 满直接进入 durableBuffer 时未在 pending map 中创建对应记录，导致这些消息在等待重投期间无法通过 GetMessageStatus 查询到。需要确保进入 durableBuffer 的持久化消息也能被状态查询覆盖。
+3. 修复完成后运行 go test ./internal/pubsub/ -v，需要让所有测试通过。
+4. 在 docs/pubsub.md 中更新模块需求文档，说明消息进入 durableBuffer 的各个环节与 pending map 之间的一致性保证策略。

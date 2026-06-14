@@ -517,7 +517,37 @@ streamScanEntry(br)  ──► 统一底层 Peek + Discard 字节级扫描
 | **`TestConcurrentReadersDifferentOffsets`** | **12** | **0** | **200 条 × 每 reader 30 轮** | **4 种起始偏移(0/50/100/150)×3 轮重复 = 12 条 reader 并发，校验不同起始偏移下结果的数量与内容都正确** |
 | **`TestConcurrentReadersAcrossSegments`** | **4** | **0** | **5 个段 × 每 reader 40 轮** | **跨段并发：4 条 reader 跨越多段文件 ReadFrom(0)，校验多段场景下跨段拼接的 entry 顺序与前缀一致** |
 
-### 新测试用例详细说明
+### 多 reader 并发测试详细说明
+
+#### `TestConcurrentReadWrite` — 多 reader + writer 并行完整性
+
+```
+主线程：创建空 WAL，启动 3 条 goroutine
+  │
+  ├─► Writer ─── 追加 200 条 entry_0 ~ entry_199 ─── close(stop)
+  │
+  ├─► Reader 1 ─ 循环 ReadFrom(0)：
+  │              ├─ 写入期间：每次校验所有已返回 entry 的 Offset 连续递增（0,1,2,...）
+  │              └─ stop 后：最终 ReadFrom(0) 全量校验
+  │                  ├─ len(entries) == 200
+  │                  ├─ entry[i].Offset == i
+  │                  └─ entry[i].Data == "entry_i"
+  │
+  └─► Reader 2 ─ 循环 ReadFrom(0)：
+                 ├─ 写入期间：每次校验 Offset 连续递增
+                 └─ stop 后：最终 ReadFrom(0) 全量校验
+                     ├─ len(entries) == 200
+                     ├─ entry[i].Offset == i
+                     └─ entry[i].Data == "entry_i"
+  │
+  ▼
+断言：reader1ErrCount == 0 AND reader2ErrCount == 0
+```
+
+**验证点**：
+1. **多 reader 并发无偏移竞争**：2 条 reader 同时对同一段文件执行 `ReadFrom(0)`，各自独立句柄确保不会出现"reader A 消耗文件指针 → reader B 读到空/截断数据"的问题。
+2. **读写并行安全**：1 条 writer 持写锁追加数据，2 条 reader 持读锁并发读取，读锁不阻塞读锁，写锁与读锁互斥，保证数据一致性。
+3. **双方全量一致性校验**：写入完成后，reader 1 和 reader 2 **均**执行最终 ReadFrom(0) 全量 200 条数据完整性校验（数量 + Offset + Data 内容三重验证），确保并发期间写入的数据全部可读且两条 reader 独立读到的结果一致。
 
 #### `TestMultipleReadersConcurrent` — 多 reader 同偏移完整性
 
@@ -575,7 +605,7 @@ streamScanEntry(br)  ──► 统一底层 Peek + Discard 字节级扫描
 | 并发场景 | 测试覆盖 | 核心断言 |
 |---------|---------|---------|
 | 多 writer 并发写入 | `TestConcurrentAppend`（10 goroutine × 100 条） | 无重复偏移、总数 = 1000 |
-| 单 reader + 单 writer 并行 | `TestConcurrentReadWrite` | 不崩溃、无 I/O 错误 |
+| 2 reader + 单 writer 并行 | `TestConcurrentReadWrite`（2 reader × 1 writer） | 双方全量校验通过（200 条数据完整 + Offset + Data 一致） |
 | 多 reader 同偏移 | `TestMultipleReadersConcurrent`（5 goroutine × 50 轮） | 数据完整一致、0 mismatch |
 | 多 reader 异偏移 | `TestConcurrentReadersDifferentOffsets`（12 goroutine × 30 轮） | 数量与内容均匹配 |
 | 多 reader 跨多段 | `TestConcurrentReadersAcrossSegments`（4 goroutine × 40 轮） | 跨段拼接完整正确 |

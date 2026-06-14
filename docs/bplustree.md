@@ -68,14 +68,16 @@ type Iterator struct {
     tree   *BPlusTree
     node   *node
     index  int
+    key    string
     valid  bool
 }
 ```
 
 **职责**:
-- 维护当前遍历位置（节点 + 节点内索引）
+- 维护当前遍历位置（节点 + 节点内索引 + 当前键身份校验值）
 - 支持 Next/Prev 前向后向移动
-- 支持 Delete 删除当前元素后自动定位到下一个有效元素
+- 支持 Delete 删除当前元素，通过 `key` 字段进行三重身份校验防止静默漂移
+- 删除后自动定位到下一个有效元素
 
 ### 3.4 Config 与 KVItem
 
@@ -471,7 +473,7 @@ _, ok := tree.Search("user:1")
 
 | 错误 | 触发场景 |
 |------|----------|
-| `ErrKeyNotFound` | Iterator.Delete 时 index 越界或键已被外部删除 |
+| `ErrKeyNotFound` | Iterator.Delete 时 index 越界、键身份不匹配(静默漂移)或键已被外部删除 |
 | `ErrInvalidRange` | RangeScan 的 start > end |
 | `ErrInvalidMaxKeys` | MaxKeys 配置无效（< 2） |
 | `ErrIteratorInvalid` | 在无效迭代器上调用 Key/Value/Next/Prev/Delete |

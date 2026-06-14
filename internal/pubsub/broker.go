@@ -566,6 +566,7 @@ func (b *Broker) deliverToConsumer(c *Consumer, sub *Subscription, msg *Message)
 	if !c.connected {
 		if sub.Durable {
 			c.durableBuffer = append(c.durableBuffer, msg)
+			b.trackDurablePending(c, sub, msg)
 		}
 		return
 	}
@@ -573,6 +574,7 @@ func (b *Broker) deliverToConsumer(c *Consumer, sub *Subscription, msg *Message)
 	if atomic.LoadInt64(&c.unackedCount) >= int64(c.maxUnacked) {
 		if sub.Durable {
 			c.durableBuffer = append(c.durableBuffer, msg)
+			b.trackDurablePending(c, sub, msg)
 		}
 		return
 	}
@@ -583,9 +585,9 @@ func (b *Broker) deliverToConsumer(c *Consumer, sub *Subscription, msg *Message)
 	if existing, ok := c.pending[msgCopy.ID]; ok {
 		if existing.element != nil {
 			c.pendingList.Remove(existing.element)
+			atomic.AddInt64(&c.unackedCount, -1)
 		}
 		delete(c.pending, msgCopy.ID)
-		atomic.AddInt64(&c.unackedCount, -1)
 	}
 
 	select {
@@ -604,8 +606,22 @@ func (b *Broker) deliverToConsumer(c *Consumer, sub *Subscription, msg *Message)
 	default:
 		if sub.Durable {
 			c.durableBuffer = append(c.durableBuffer, msg)
+			b.trackDurablePending(c, sub, msg)
 		}
 	}
+}
+
+func (b *Broker) trackDurablePending(c *Consumer, sub *Subscription, msg *Message) {
+	if _, ok := c.pending[msg.ID]; ok {
+		return
+	}
+	pm := &pendingMessage{
+		msg:          msg,
+		status:       MessageStatusPending,
+		subscriberID: sub.ConsumerID,
+		durable:      sub.Durable,
+	}
+	c.pending[msg.ID] = pm
 }
 
 func (b *Broker) Ack(consumerID, messageID string) error {
@@ -631,9 +647,11 @@ func (b *Broker) Ack(consumerID, messageID string) error {
 	}
 
 	pm.status = MessageStatusAcked
-	c.pendingList.Remove(pm.element)
+	if pm.element != nil {
+		c.pendingList.Remove(pm.element)
+		atomic.AddInt64(&c.unackedCount, -1)
+	}
 	delete(c.pending, messageID)
-	atomic.AddInt64(&c.unackedCount, -1)
 
 	b.flushDurableBuffer(c)
 
@@ -719,8 +737,10 @@ func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
 
 	pm.msg.RetryCount++
 
-	c.pendingList.Remove(pm.element)
-	atomic.AddInt64(&c.unackedCount, -1)
+	if pm.element != nil {
+		c.pendingList.Remove(pm.element)
+		atomic.AddInt64(&c.unackedCount, -1)
+	}
 
 	if pm.msg.RetryCount > b.cfg.MaxRetry {
 		pm.status = MessageStatusDead
@@ -747,9 +767,9 @@ func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
 	}
 
 	msgCopy := *pm.msg
-	delete(c.pending, pm.msg.ID)
 	select {
 	case c.ch <- &msgCopy:
+		delete(c.pending, pm.msg.ID)
 		newPM := &pendingMessage{
 			msg:          &msgCopy,
 			status:       MessageStatusDelivered,
@@ -764,7 +784,6 @@ func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
 	default:
 		pm.status = MessageStatusPending
 		c.durableBuffer = append(c.durableBuffer, pm.msg)
-		b.flushDurableBuffer(c)
 	}
 }
 

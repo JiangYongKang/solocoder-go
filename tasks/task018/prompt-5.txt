@@ -1,0 +1,5 @@
+你实现的 B+ 树索引模块在第4轮修复中更新了文档，但部分章节与代码实现不一致，需要修正：
+1. docs/bplustree.md 第 3.3 节的 Iterator 结构体定义代码块中仍然只有 tree、node、index、valid 四个字段，缺失本轮新增的 key 字段。Iterator.Delete 的三重键身份校验完全依赖 key 字段检测静默漂移，文档结构体定义与实际代码不一致会让读者无法理解键身份校验的机制。
+2. docs/bplustree.md 第 8 节错误定义表中 ErrKeyNotFound 的触发场景描述仍为 index 越界或键已被外部删除两种，遗漏了本轮新增的静默漂移键身份不匹配这第三种场景。而 5.6 节已详细描述了三种可达场景，第 8 节与 5.6 节之间前后矛盾。
+3. 修复完成后运行 go test ./internal/bplustree/ -v，需要让所有测试通过。
+4. 在 docs/bplustree.md 中更新模块需求文档，确保所有出现 Iterator 结构体定义和 ErrKeyNotFound 触发场景描述的位置与代码实现一致。

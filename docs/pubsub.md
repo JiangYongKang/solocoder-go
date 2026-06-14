@@ -908,28 +908,168 @@ for e := c.pendingList.Front(); e != nil; e = e.Next() {
 - `pending` map：O(1) 时间通过 messageID 查找消息，用于 Ack/Nack/状态查询
 - `pendingList` 链表：按投递时间排序，用于 `ProcessTimeouts` 高效检测超时消息
 
+需要注意的是，`pending` map 中也可能存储仅在 `durableBuffer` 中等待、未进入 `pendingList` 的条目（element == nil）。这些条目由 `trackDurablePending` 创建，不计入 `unackedCount`。
+
 **一致性维护机制**：
 
 | 操作 | 一致性处理 |
 |------|-----------|
-| `deliverToConsumer` | 原子操作：同时添加到 map 和 list，unackedCount 原子递增。如检测到同 ID 旧条目，先清理旧的再添加新的 |
-| `Ack` | 原子操作：从 list 中 Remove，从 map 中 delete，unackedCount 原子递减 |
-| `Nack` | 原子操作：先移除旧条目，然后根据状态决定重投/缓存/死信 |
-| `redeliverOrDeadLetter` | 先从 list 和 map 中移除，再根据新状态决定去向 |
+| `deliverToConsumer` | 投递成功时：同时添加到 map 和 list，unackedCount 原子递增。如检测到同 ID 旧条目，按 element 是否为 nil 区别处理 |
+| `Ack` | 仅当 element != nil 时：从 list 中 Remove，unackedCount 原子递减。最后从 map 中 delete |
+| `Nack` | 先调用 `redeliverOrDeadLetter`，由其处理一致性 |
+| `redeliverOrDeadLetter` | 仅当 element != nil 时：从 list 中 Remove，unackedCount 原子递减。map 的删除视分支情况而定 |
 | `DisconnectConsumer` | 从 list 中逐个 Remove 元素，map 保留但元素的 list 指针已失效 |
 | `ReconnectConsumer` | 重投时 `deliverToConsumer` 会自动清理 map 中的旧条目 |
+| `trackDurablePending` | 仅当 map 中不存在时创建新条目（element == nil，不计入 unackedCount，不加入 pendingList） |
 
-**deliverToConsumer 中的重复检测**：
+**deliverToConsumer 中的重复检测与安全计数**：
 ```go
 if existing, ok := c.pending[msgCopy.ID]; ok {
-    c.pendingList.Remove(existing.element)
+    if existing.element != nil {   // 只有已实际投递过的消息才需要从 list 移除并递减计数
+        c.pendingList.Remove(existing.element)
+        atomic.AddInt64(&c.unackedCount, -1)
+    }
     delete(c.pending, msgCopy.ID)
-    atomic.AddInt64(&c.unackedCount, -1)
 }
 ```
-这保证了即使消费者断开后重连，pending map 中残留的旧条目也会被正确清理，不会出现计数重复或条目重复。
+这保证了即使消费者断开后重连，pending map 中残留的旧条目（包括 trackDurablePending 创建的 element==nil 条目）也会被正确清理，不会出现计数重复或条目重复，也不会导致 unackedCount 变为负数。
 
-### 6.5.4 主题树剪枝机制
+**Ack/redeliverOrDeadLetter 中的安全检查**：
+两个函数在操作 pendingList 和 unackedCount 前都必须检查 `pm.element != nil`，因为对于通过 `trackDurablePending` 创建的仅查询用条目，它们从未加入 pendingList，也从未计入 unackedCount，不能执行 Remove 或递减计数，否则会导致数据结构损坏或计数为负。
+
+### 6.5.4 pending map 与 durableBuffer 一致性保证
+
+当消息进入 `durableBuffer`（持久化缓存）时，需要与 `pending` map 保持状态一致性，确保 `GetMessageStatus()` 查询无盲区。
+
+#### 6.5.4.1 问题背景：查询盲区
+
+**问题描述**：
+在早期实现中，多个分支在将消息放入 `durableBuffer` 时，没有同步在 `pending` map 中创建对应记录。这导致：
+- 消息已经进入 `durableBuffer`（物理存在，等待重投）
+- 但 `pending` map 中查不到（逻辑不可见）
+- `GetMessageStatus()` 返回 `ErrMessageNotFound`，形成**查询盲区**
+
+**典型的盲区场景**：
+
+1. **redeliverOrDeadLetter 正常重投路径**：
+   ```
+   错误时序（已修复）：
+   1. delete(c.pending, msg.ID)        ← 先从 pending map 删除
+   2. select { case c.ch <- ... }      ← 尝试投递
+   3. default: c.durableBuffer = append(...) ← channel 满，加入缓存
+      → 此时消息在 durableBuffer 中，但 GetMessageStatus 查不到（盲区）
+   ```
+
+2. **deliverToConsumer 的多个分支**：
+   - 消费者离线时，持久化消息直接加入 durableBuffer
+   - 背压满时，持久化消息直接加入 durableBuffer
+   - channel 满 default 分支，持久化消息加入 durableBuffer
+   - 上述三个分支原来都没有在 pending map 中创建记录
+
+#### 6.5.4.2 一致性保证策略：全面覆盖
+
+**核心原则**：所有持久化消息在 `durableBuffer` 中缓存期间，必须同时在 `pending` map 中有对应记录，状态为 `MessageStatusPending`，确保状态查询的全面覆盖。
+
+**实现方式**：引入辅助方法 `trackDurablePending`，在所有将持久化消息加入 `durableBuffer` 的分支统一调用：
+
+```go
+func (b *Broker) trackDurablePending(c *Consumer, sub *Subscription, msg *Message) {
+    if _, ok := c.pending[msg.ID]; ok {   // 幂等：已存在则跳过
+        return
+    }
+    pm := &pendingMessage{
+        msg:          msg,
+        status:       MessageStatusPending,
+        subscriberID: sub.ConsumerID,
+        durable:      sub.Durable,
+        // element 字段保持 nil：不加入 pendingList，不参与超时检测
+        // 不计入 unackedCount
+    }
+    c.pending[msg.ID] = pm
+}
+```
+
+**设计要点**：
+- **幂等性**：先检查是否已存在，避免重复创建
+- **element == nil**：不加入 pendingList，因为这些消息尚未实际投递，不参与 Ack 超时检测（ProcessTimeouts 只处理 Delivered 状态的消息）
+- **不计入 unackedCount**：unackedCount 仅统计"已投递至 channel 但未确认"的消息
+
+**不同场景下的一致性处理**：
+
+| 场景 | 触发点 | 处理方式 | 状态查询 |
+|------|--------|---------|---------|
+| deliverToConsumer + 消费者离线 + 持久化 | deliverToConsumer 第1分支 | 加入 durableBuffer，调用 trackDurablePending | Pending ✓ |
+| deliverToConsumer + 背压满 + 持久化 | deliverToConsumer 第2分支 | 加入 durableBuffer，调用 trackDurablePending | Pending ✓ |
+| deliverToConsumer + channel 满 + 持久化 | deliverToConsumer default 分支 | 加入 durableBuffer，调用 trackDurablePending | Pending ✓ |
+| DisconnectConsumer + 持久化消息 | DisconnectConsumer | 状态改为 Pending，加入 durableBuffer，原 pm 保留在 pending map | Pending ✓ |
+| redeliverOrDeadLetter + 断开 + 持久化 | redeliverOrDeadLetter 断开分支 | 状态改为 Pending，加入 durableBuffer，保留在 pending map | Pending ✓ |
+| redeliverOrDeadLetter + 背压满 | redeliverOrDeadLetter 背压分支 | 状态改为 Pending，加入 durableBuffer，保留在 pending map | Pending ✓ |
+| redeliverOrDeadLetter + 正常重投 + channel 满 | redeliverOrDeadLetter 正常重投 default 分支 | delete 移至成功分支，default 保留 pending map 并改状态为 Pending | Pending ✓ |
+| redeliverOrDeadLetter + 断开 + 非持久化 | redeliverOrDeadLetter 断开分支 | 从 pending map 删除 | 消息不存在（符合预期） |
+
+#### 6.5.4.3 redeliverOrDeadLetter 正常重投路径的时序修复
+
+**错误时序（原实现）**：
+```go
+msgCopy := *pm.msg
+delete(c.pending, pm.msg.ID)        // ← 提前删除，若后续进入 default 则形成盲区
+select {
+case c.ch <- &msgCopy:
+    // 创建新 pending 条目
+default:
+    pm.status = MessageStatusPending
+    c.durableBuffer = append(c.durableBuffer, pm.msg)  // ← 消息已不在 pending map 中
+}
+```
+
+**正确时序（修复后）**：
+```go
+msgCopy := *pm.msg
+select {
+case c.ch <- &msgCopy:
+    delete(c.pending, pm.msg.ID)    // ← 仅在投递成功时才删除旧条目
+    // 创建新 pending 条目（Delivered 状态）
+default:
+    pm.status = MessageStatusPending
+    c.durableBuffer = append(c.durableBuffer, pm.msg)
+    // 不删除 pending map 中的条目，状态查询无盲区
+}
+```
+
+关键变化：将 `delete(c.pending, pm.msg.ID)` 从 select 外部移至成功投递分支内部，确保 default 分支进入 durableBuffer 的消息仍保留在 pending map 中。
+
+#### 6.5.4.4 重连时的一致性恢复
+
+当消费者重连（`ReconnectConsumer`）时，`flushDurableBuffer` 会将 `durableBuffer` 中的消息重新投递。此时 `deliverToConsumer` 的重复检测机制会自动处理一致性：
+
+1. `flushDurableBuffer` 遍历 `durableBuffer` 中的消息
+2. 调用 `deliverToConsumer` 尝试投递
+3. `deliverToConsumer` 检测到 `pending` map 中已有该消息 ID（由 trackDurablePending 或之前的流程创建）
+4. 清理旧的 pending 条目：
+   - 若 `existing.element != nil`：从 pendingList Remove，unackedCount 递减
+   - 无论如何：从 pending map delete
+5. 尝试投递到消费者 channel
+6. 投递成功：创建新的 pending 条目，状态为 Delivered，加入 pendingList，unackedCount 递增
+7. 投递失败（channel 满）：再次加入 durableBuffer，调用 trackDurablePending 创建新的查询记录
+
+这个过程保证了重连后消息状态的正确转移，不会出现重复计数或数据不一致。
+
+#### 6.5.4.5 unackedCount 计数一致性的保证
+
+引入 `trackDurablePending` 后，pending map 中存在两种条目：
+
+| 条目类型 | element | 计入 unackedCount | 来源 |
+|---------|---------|-----------------|------|
+| 已投递待确认 | 非 nil | 是 | deliverToConsumer 成功投递、redeliverOrDeadLetter 成功重投 |
+| 仅查询占位 | nil | 否 | trackDurablePending |
+
+**必须遵守的规则**：
+- 只有在 `pm.element != nil` 时，才能从 pendingList 中 Remove 并递减 unackedCount
+- 所有清理 pending 条目的地方（deliverToConsumer 重复检测、Ack、redeliverOrDeadLetter）都必须检查 element 再决定是否操作 list 和计数
+
+违反规则会导致 unackedCount 变为负数，破坏背压控制逻辑。
+
+### 6.5.5 主题树剪枝机制
 
 `Unsubscribe` 操作会触发主题树的自底向上剪枝，防止长期运行产生内存泄漏：
 
