@@ -557,10 +557,11 @@ func (t *BPlusTree) RangeScan(start, end string) ([]KVItem, error) {
 }
 
 type Iterator struct {
-	tree   *BPlusTree
-	node   *node
-	index  int
-	valid  bool
+	tree  *BPlusTree
+	node  *node
+	index int
+	key   string
+	valid bool
 }
 
 func (t *BPlusTree) NewIterator() *Iterator {
@@ -580,6 +581,7 @@ func (t *BPlusTree) NewIterator() *Iterator {
 
 	it.node = current
 	it.index = 0
+	it.key = current.keys[0]
 	it.valid = true
 
 	return it
@@ -606,11 +608,13 @@ func (t *BPlusTree) NewIteratorAt(key string) *Iterator {
 		if leaf.next != nil {
 			it.node = leaf.next
 			it.index = 0
+			it.key = leaf.next.keys[0]
 			it.valid = true
 		}
 	} else {
 		it.node = leaf
 		it.index = idx
+		it.key = leaf.keys[idx]
 		it.valid = true
 	}
 
@@ -642,6 +646,7 @@ func (it *Iterator) Next() error {
 
 	it.index++
 	if it.index < len(it.node.keys) {
+		it.key = it.node.keys[it.index]
 		return nil
 	}
 
@@ -649,6 +654,7 @@ func (it *Iterator) Next() error {
 		it.node = it.node.next
 		it.index = 0
 		if len(it.node.keys) > 0 {
+			it.key = it.node.keys[0]
 			return nil
 		}
 	}
@@ -664,6 +670,7 @@ func (it *Iterator) Prev() error {
 
 	it.index--
 	if it.index >= 0 {
+		it.key = it.node.keys[it.index]
 		return nil
 	}
 
@@ -671,6 +678,7 @@ func (it *Iterator) Prev() error {
 		it.node = it.node.prev
 		it.index = len(it.node.keys) - 1
 		if it.index >= 0 {
+			it.key = it.node.keys[it.index]
 			return nil
 		}
 	}
@@ -684,32 +692,32 @@ func (it *Iterator) Delete() error {
 		return ErrIteratorInvalid
 	}
 
-	if it.index < 0 || it.index >= len(it.node.keys) {
+	if it.index < 0 || it.index >= len(it.node.keys) || it.node.keys[it.index] != it.key {
 		it.valid = false
 		return ErrKeyNotFound
 	}
 
-	keyToDelete := it.node.keys[it.index]
+	keyToDelete := it.key
 
-	var nextKey string
+	savedNode := it.node
+	savedIndex := it.index
+	savedKey := it.key
+	savedValid := it.valid
+
 	var prevKey string
-	hasNext := false
 	hasPrev := false
-
-	if it.index < len(it.node.keys)-1 {
-		nextKey = it.node.keys[it.index+1]
-		hasNext = true
-	} else if it.node.next != nil && len(it.node.next.keys) > 0 {
-		nextKey = it.node.next.keys[0]
-		hasNext = true
-	}
-
-	if it.index > 0 {
-		prevKey = it.node.keys[it.index-1]
+	if it.Prev() == nil {
+		prevKey = it.key
 		hasPrev = true
-	} else if it.node.prev != nil && len(it.node.prev.keys) > 0 {
-		prevKey = it.node.prev.keys[len(it.node.prev.keys)-1]
-		hasPrev = true
+		it.node = savedNode
+		it.index = savedIndex
+		it.key = savedKey
+		it.valid = savedValid
+	} else {
+		it.node = savedNode
+		it.index = savedIndex
+		it.key = savedKey
+		it.valid = savedValid
 	}
 
 	deleted := it.tree.Delete(keyToDelete)
@@ -718,21 +726,21 @@ func (it *Iterator) Delete() error {
 		return ErrKeyNotFound
 	}
 
-	if hasNext {
-		newIt := it.tree.NewIteratorAt(nextKey)
-		if newIt.Valid() {
-			it.node = newIt.node
-			it.index = newIt.index
-			it.valid = true
-			return nil
-		}
+	nextIt := it.tree.NewIteratorAt(keyToDelete)
+	if nextIt.Valid() {
+		it.node = nextIt.node
+		it.index = nextIt.index
+		it.key = nextIt.key
+		it.valid = true
+		return nil
 	}
 
 	if hasPrev {
-		newIt := it.tree.NewIteratorAt(prevKey)
-		if newIt.Valid() {
-			it.node = newIt.node
-			it.index = newIt.index
+		prevIt := it.tree.NewIteratorAt(prevKey)
+		if prevIt.Valid() {
+			it.node = prevIt.node
+			it.index = prevIt.index
+			it.key = prevIt.key
 			it.valid = true
 			return nil
 		}

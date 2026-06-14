@@ -175,17 +175,16 @@ AddDocument(docID, content)
        ▼
   获取 Engine.mu 写锁
   ├─ docID 未重复? ──否──► 释放锁，返回 ErrDuplicateDocID
+  ├─ 构建倒排索引:
+  │  └─ 遍历 tokens，记录位置 pos:
+  │     └─ invertedIndex.AddTerm(token, docID, pos)
+  │        ├─ 词项首次出现 → 创建新 PostingList
+  │        ├─ 文档首次出现该词项 → 添加新 TermPosting
+  │        └─ 文档已含该词项 → Frequency++，追加位置
   └─ docs[docID] = &Document{ID, Content, Length, Terms}
   释放 Engine.mu 写锁
-  （说明：重复检查与文档写入在同一持锁范围内，防止 TOCTOU 竞态）
-       │
-       ▼
-  构建倒排索引
-  └─ 遍历 tokens，记录位置 pos:
-     └─ invertedIndex.AddTerm(token, docID, pos)
-        ├─ 词项首次出现 → 创建新 PostingList
-        ├─ 文档首次出现该词项 → 添加新 TermPosting(Frequency=1, Positions=[pos])
-        └─ 文档已含该词项 → Frequency++，追加 pos 到 Positions
+  （说明：倒排索引写入、重复检查、文档写入在同一持锁范围内原子执行，
+   防止 TOCTOU 竞态；与读操作的 Engine.mu.RLock 形成互斥）
        │
        ▼
      返回 nil (成功)

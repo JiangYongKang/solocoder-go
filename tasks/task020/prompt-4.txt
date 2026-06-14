@@ -1,0 +1,6 @@
+你实现的全文检索引擎模块在第3轮修复中存在残余并发问题和测试覆盖盲区，需要修复：
+1. Search 方法中 totalDocs 的读取在 Engine 的读锁内，而倒排索引 postingList 的读取在 InvertedIndex 的独立锁内，两段读操作不在同一临界区。当 Search 在 DeleteDocument 执行中途读取时，totalDocs 和 postingList 可能来自不同时间点的快照，导致 IDF 计算结果偏高。需要消除 Search 中的跨锁读取不一致窗口。
+2. 为 AddDocumentWithLanguage 新增的并发去重测试只覆盖了默认分词器路径，未验证注册自定义分词器后的 TOCTOU 防护是否有效。需要新增测试覆盖自定义分词器场景。
+3. docs/fulltext.md 第 4.4 节声称修复"消除了 IDF 计算窗口期"，但实际只修了写侧原子性，搜索侧的跨锁读取问题仍然存在，文档描述与代码实现不一致。需要修正文档中的一致性声称使其准确反映当前实现的保障范围。
+4. 修复完成后运行 go test ./internal/fulltext/ -v，需要让所有测试通过。
+5. 在 docs/fulltext.md 中更新模块需求文档，准确区分写操作原子性和读操作一致性的保障范围。

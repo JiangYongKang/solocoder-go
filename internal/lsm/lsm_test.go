@@ -965,6 +965,7 @@ func TestSkipList_Iterator(t *testing.T) {
 	}
 
 	iter := sl.Iterator()
+	defer iter.Close()
 	var result []string
 	for iter.Next() {
 		result = append(result, iter.Entry().Key)
@@ -991,6 +992,7 @@ func TestSkipList_Seek(t *testing.T) {
 	}
 
 	iter := sl.Iterator()
+	defer iter.Close()
 	iter.Seek("key_005")
 
 	count := 0

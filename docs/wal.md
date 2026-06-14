@@ -512,10 +512,10 @@ streamScanEntry(br)  ──► 统一底层 Peek + Discard 字节级扫描
 
 | 测试用例 | 读 goroutine 数 | 写 goroutine 数 | 数据规模 | 场景说明 |
 |---------|---------------|---------------|---------|---------|
-| `TestConcurrentReadWrite` | 1 | 1 | 200 条 | 读写并行：一条 reader 与 writer 同时运行，验证读锁下读取不受写入干扰 |
-| **`TestMultipleReadersConcurrent`** ✨ | **5** | **0** | **500 条 × 每 reader 50 轮** | **多 reader 纯并发：5 条 goroutine 反复 ReadFrom(0)，校验每条 entry 的 Offset 和 Data 前缀完全一致** |
-| **`TestConcurrentReadersDifferentOffsets`** ✨ | **12** | **0** | **200 条 × 每 reader 30 轮** | **4 种起始偏移(0/50/100/150)×3 轮重复 = 12 条 reader 并发，校验不同起始偏移下结果的数量与内容都正确** |
-| **`TestConcurrentReadersAcrossSegments`** ✨ | **4** | **0** | **5 个段 × 每 reader 40 轮** | **跨段并发：4 条 reader 跨越多段文件 ReadFrom(0)，校验多段场景下跨段拼接的 entry 顺序与前缀一致** |
+| **`TestConcurrentReadWrite`** | **2** | **1** | **200 条** | **多 reader + 单 writer 并行：2 条 reader 与 1 条 writer 同时运行，reader 1 在写入期间反复 ReadFrom(0) 校验 Offset 顺序一致性，reader 2 在写入期间反复 ReadFrom(0) 校验 Offset 顺序一致性，写入完成后做最终全量校验（200 条数据完整性 + Offset + Data 内容）** |
+| **`TestMultipleReadersConcurrent`** | **5** | **0** | **500 条 × 每 reader 50 轮** | **多 reader 纯并发：5 条 goroutine 反复 ReadFrom(0)，校验每条 entry 的 Offset 和 Data 前缀完全一致** |
+| **`TestConcurrentReadersDifferentOffsets`** | **12** | **0** | **200 条 × 每 reader 30 轮** | **4 种起始偏移(0/50/100/150)×3 轮重复 = 12 条 reader 并发，校验不同起始偏移下结果的数量与内容都正确** |
+| **`TestConcurrentReadersAcrossSegments`** | **4** | **0** | **5 个段 × 每 reader 40 轮** | **跨段并发：4 条 reader 跨越多段文件 ReadFrom(0)，校验多段场景下跨段拼接的 entry 顺序与前缀一致** |
 
 ### 新测试用例详细说明
 

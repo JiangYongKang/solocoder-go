@@ -264,14 +264,15 @@ Iterator.Delete 完全依赖 tree.Delete 完成实际的删除操作和节点下
 Iterator.Delete()
      │
      ▼
-1.  有效性检查
+1.  有效性与身份校验
     ├─ 迭代器 invalid → 返回 ErrIteratorInvalid
-    └─ index 越界（外部修改导致）→ 返回 ErrKeyNotFound
+    ├─ index 越界 → 返回 ErrKeyNotFound
+    └─ 键身份不匹配（静默漂移）→ 返回 ErrKeyNotFound
      │
      ▼
-2.  记录重定位锚点
-    ├─ 保存删除后的"下一个键"（优先）
-    └─ 保存删除后的"前一个键"（备选）
+2.  采集重定位锚点（复用已有方法）
+    ├─ prevKey：通过 Prev() 方法获取后恢复状态
+    └─ nextKey：删除后通过 NewIteratorAt(deletedKey) 自动定位
      │
      ▼
 3.  调用 tree.Delete(key) ────┐
@@ -294,34 +295,51 @@ Iterator.Delete()
      │
      ▼
 5.  复用 NewIteratorAt 重定位
-    ├─ 优先用"下一个键"调用 NewIteratorAt(nextKey)
-    ├─ 失败则用"前一个键"调用 NewIteratorAt(prevKey)
+    ├─ 用被删除键调用 NewIteratorAt → 自动定位到下一个元素
+    ├─ 失败则用 prevKey 调用 NewIteratorAt 回退定位
     └─ 都失败则标记迭代器为 invalid
 ```
 
 **核心设计原则：单一职责与代码复用**
 
 - **tree.Delete 是唯一的删除入口**：所有键值删除、节点下溢检测、借键、合并、根收缩等逻辑仅在 tree.Delete 中实现和维护。
-- **Iterator.Delete 不重复实现删除逻辑**：只负责：(1) 验证迭代器当前位置的有效性；(2) 记录用于重定位的锚点键；(3) 委托 tree.Delete 执行实际删除；(4) 复用 NewIteratorAt 完成删除后的重定位。
+- **Iterator.Delete 不重复实现删除逻辑**：只负责：(1) 验证迭代器当前位置的有效性和键身份；(2) 通过已有方法采集重定位锚点；(3) 委托 tree.Delete 执行实际删除；(4) 复用 NewIteratorAt 完成删除后的重定位。
 - **下溢处理对 Iterator 透明**：tree.Delete 内部的节点借键、合并、根收缩等平衡操作完全不影响 Iterator.Delete 的逻辑，迭代器只需在删除完成后通过锚点键重新定位即可。
 
-**ErrKeyNotFound 的可达场景**：
+**键身份校验与静默漂移防护**
 
-1.  **迭代器位置失效（index 越界）**：用户先通过 tree.Delete 删除了某个键，导致迭代器所在节点的 keys 数组长度缩短，而迭代器的 index 已超出新的数组边界。此时 Iterator.Delete 首先检测到 index 越界，直接返回 ErrKeyNotFound。
-2.  **键已被外部删除**：tree.Delete 在内部查找键时发现键不存在（例如用户在迭代器遍历间隙通过 tree.Delete 删除了同一个键），返回 false，Iterator.Delete 将其转换为 ErrKeyNotFound。
+Iterator 结构体维护一个 `key` 字段缓存当前键（每次 Next/Prev/NewIteratorAt 时同步更新），Delete 时执行三重校验：
+
+1. **valid 状态校验**：迭代器是否处于有效状态
+2. **index 范围校验**：index 是否在节点 keys 数组的合法范围内
+3. **键身份校验**：`node.keys[index] == key`，确保迭代器指向的键仍是最初定位的键
+
+**静默漂移场景**：当外部通过 tree.Delete 删除迭代器当前节点中位于 index 之前的键时，keys 数组会缩短，但 index 仍在合法范围内，此时迭代器指向的键已悄然变化（index 不变但键右移）。键身份校验能够检测到这种静默漂移，返回 ErrKeyNotFound 而非错误地删除了另一个键。
+
+**ErrKeyNotFound 的三种可达场景**：
+
+1.  **index 越界**：外部删除导致 keys 数组缩短，index 超出新的数组边界。
+2.  **静默漂移（键身份不匹配）**：index 仍在合法范围内，但指向的键已不是最初定位的键。
+3.  **键已被外部删除**：tree.Delete 在内部查找键时发现键不存在，返回 false，Iterator.Delete 将其转换为 ErrKeyNotFound。
+
+**重定位锚点采集的复用策略**
+
+重定位锚点的采集完全复用已有方法，不独立实现遍历逻辑：
+
+- **prevKey 采集**：通过调用 `Prev()` 方法移动到前一个元素获取键值，然后恢复迭代器原有状态。完全复用 Prev() 的跨节点跳转逻辑。
+- **nextKey 采集**：删除完成后，直接用被删除的键调用 `NewIteratorAt(deletedKey)`。由于该键已不存在，NewIteratorAt 会自动定位到第一个大于该键的元素，也就是删除位置的下一个元素。完全复用 NewIteratorAt 的 findLeaf + 线性扫描逻辑。
 
 **删除后重定位策略**：
 
 删除操作可能导致节点合并、借键、根收缩等结构变化，原有的 node/index 指针可能完全失效。因此 Iterator.Delete 采用"锚点键 + NewIteratorAt"的重定位策略：
 
-- 删除前记录"下一个键"和"前一个键"作为锚点
-- 删除完成后，优先用"下一个键"调用 NewIteratorAt 重新定位，确保遍历可以继续前进
-- 如果"下一个键"不存在（删除的是最后一个元素），则用"前一个键"回退定位
+- 优先用被删除键调用 NewIteratorAt 重新定位（自动指向下一个元素），确保遍历可以继续前进
+- 如果下一个元素不存在（删除的是最后一个元素），则用 prevKey 回退定位
 - 完全复用 NewIteratorAt 的 findLeaf + 线性扫描定位逻辑，确保重定位的正确性与代码一致性
 
-## 7. API 参考
+## 6. API 参考
 
-### 8.1 构造函数
+### 6.1 构造函数
 
 ```go
 func NewBPlusTree() *BPlusTree
@@ -329,7 +347,7 @@ func NewBPlusTreeWithConfig(cfg Config) *BPlusTree
 func DefaultConfig() Config
 ```
 
-### 8.2 基本操作
+### 6.2 基本操作
 
 ```go
 func (t *BPlusTree) Insert(key string, value string)
@@ -338,13 +356,13 @@ func (t *BPlusTree) Delete(key string) bool
 func (t *BPlusTree) Count() int
 ```
 
-### 8.3 范围扫描
+### 6.3 范围扫描
 
 ```go
 func (t *BPlusTree) RangeScan(start, end string) ([]KVItem, error)
 ```
 
-### 8.4 迭代器
+### 6.4 迭代器
 
 ```go
 func (t *BPlusTree) NewIterator() *Iterator
@@ -357,9 +375,9 @@ func (it *Iterator) Prev() error
 func (it *Iterator) Delete() error
 ```
 
-## 8. 使用示例
+## 7. 使用示例
 
-### 8.1 基本插入与查询
+### 7.1 基本插入与查询
 
 ```go
 tree := bplustree.NewBPlusTree()
@@ -375,14 +393,14 @@ val, ok = tree.Search("user:99")
 // val = "", ok = false
 ```
 
-### 8.2 使用自定义配置
+### 7.2 使用自定义配置
 
 ```go
 cfg := bplustree.Config{MaxKeys: 8}
 tree := bplustree.NewBPlusTreeWithConfig(cfg)
 ```
 
-### 8.3 范围扫描
+### 7.3 范围扫描
 
 ```go
 tree := bplustree.NewBPlusTree()
@@ -395,7 +413,7 @@ items, err := tree.RangeScan("banana", "cherry")
 // items = []KVItem{{Key:"banana", Value:"2"}, {Key:"cherry", Value:"3"}}
 ```
 
-### 8.4 迭代器前向遍历
+### 7.4 迭代器前向遍历
 
 ```go
 tree := bplustree.NewBPlusTree()
@@ -413,7 +431,7 @@ for it.Valid() {
 // 输出: a = 1, b = 2, c = 3
 ```
 
-### 8.5 迭代器定位与后向遍历
+### 7.5 迭代器定位与后向遍历
 
 ```go
 it := tree.NewIteratorAt("b")
@@ -425,7 +443,7 @@ for it.Valid() {
 // 输出: b, a
 ```
 
-### 8.6 迭代器删除当前元素后继续遍历
+### 7.6 迭代器删除当前元素后继续遍历
 
 ```go
 it := tree.NewIterator()
@@ -441,7 +459,7 @@ for it.Valid() {
 // 输出: a, c
 ```
 
-### 8.7 键值删除
+### 7.7 键值删除
 
 ```go
 tree.Delete("user:1")
@@ -449,7 +467,7 @@ _, ok := tree.Search("user:1")
 // ok = false
 ```
 
-## 9. 错误定义
+## 8. 错误定义
 
 | 错误 | 触发场景 |
 |------|----------|

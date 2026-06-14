@@ -1,0 +1,5 @@
+你实现的 Pub/Sub 消息代理模块在第3轮修复中引入了新问题，需要修复：
+1. DisconnectConsumer 使用粗粒度的 `hasDurable` 标记判断是否缓存消息，当消费者同时持有持久化和非持久化两个订阅时，断开后非持久化订阅的消息也被错误缓存到 durableBuffer。需要按每条消息对应的订阅类型做细粒度判断，持久化订阅的消息缓存、非持久化订阅的消息丢弃。
+2. redeliverOrDeadLetter 的断开连接分支在决定是否缓存消息到 durableBuffer 之前就先把消息从 pending map 中移除了，导致进入 durableBuffer 后的消息在状态查询时因不在 pending map 中而找不到，形成查询盲区。需要消除这个时序窗口。
+3. 修复完成后运行 go test ./internal/pubsub/ -v，需要让所有测试通过。
+4. 在 docs/pubsub.md 中更新模块需求文档，说明混合订阅场景下的消费者断开处理策略和 pending map 与 durableBuffer 之间的一致性保证。

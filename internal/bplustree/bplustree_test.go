@@ -1941,6 +1941,55 @@ func TestIteratorDelete_ReturnsErrKeyNotFound(t *testing.T) {
 	}
 }
 
+func TestIteratorDelete_SilentDrift_ReturnsErrKeyNotFound(t *testing.T) {
+	tree := NewBPlusTree()
+	tree.Insert("a", "1")
+	tree.Insert("b", "2")
+	tree.Insert("c", "3")
+	tree.Insert("d", "4")
+	tree.Insert("e", "5")
+
+	it := tree.NewIterator()
+	it.Next()
+	it.Next()
+	it.Next()
+	if !it.Valid() {
+		t.Fatal("expected valid iterator at index 3")
+	}
+	key, _ := it.Key()
+	if key != "d" {
+		t.Fatalf("expected key 'd', got %s", key)
+	}
+
+	tree.Delete("a")
+
+	if len(it.node.keys) != 4 {
+		t.Fatalf("expected node to have 4 keys after deletion, got %d", len(it.node.keys))
+	}
+	if it.index >= len(it.node.keys) {
+		t.Fatal("index should still be in range (silent drift scenario)")
+	}
+	if it.node.keys[it.index] == "d" {
+		t.Fatal("keys should have shifted, index should no longer point to 'd'")
+	}
+	if it.node.keys[it.index] != "e" {
+		t.Fatalf("after drift index should point to 'e', got %s", it.node.keys[it.index])
+	}
+
+	err := it.Delete()
+	if err != ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound for silent drift, got %v", err)
+	}
+	if it.Valid() {
+		t.Error("iterator should be invalid after ErrKeyNotFound")
+	}
+
+	_, ok := tree.Search("e")
+	if !ok {
+		t.Error("'e' should still exist in tree (Delete should not have removed wrong key)")
+	}
+}
+
 func TestUnderflow_MinKeysCalculation(t *testing.T) {
 	cases := []struct {
 		maxKeys int

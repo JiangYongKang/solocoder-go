@@ -825,17 +825,19 @@ b.Publish("notification.email", "新邮件通知")
 
 ### 6.5.2 消费者断开连接时的消息处理策略
 
-当调用 `DisconnectConsumer` 时，模块执行以下精确的消息处理流程，确保数据一致性和消息不丢失：
+当调用 `DisconnectConsumer` 时，模块执行以下精确的消息处理流程，确保数据一致性和消息不丢失。
+
+#### 6.5.2.1 基本流程
 
 ```
 消费者断开连接流程：
 ┌─────────────────────────────────────────────────┐
 │  1. 标记 c.connected = false                     │
-│  2. 检查是否存在持久化订阅                        │
-│     ├─ 是：遍历 pendingList                       │
-│     │    ├─ 状态为 Delivered → 转为 Pending       │
-│     │    └─ 消息追加到 durableBuffer              │
-│     └─ 否：不做缓存迁移                           │
+│  2. 遍历 pendingList 中的每条消息                 │
+│     ├─ 状态为 Delivered → 转为 Pending           │
+│     └─ 按消息维度判断是否持久化：                  │
+│        ├─ 是 → 消息追加到 durableBuffer          │
+│        └─ 否 → 不缓存（非持久化消息丢失）         │
 │  3. 逐个 Remove pendingList 中的所有元素          │
 │     （使用 Remove 而非 Init，确保 element.list     │
 │      被正确置为 nil，避免悬空指针）                │
@@ -844,11 +846,61 @@ b.Publish("notification.email", "新邮件通知")
 └─────────────────────────────────────────────────┘
 ```
 
-**关键设计决策**：
+#### 6.5.2.2 混合订阅场景的细粒度处理
+
+当消费者同时持有**持久化订阅**和**非持久化订阅**时，断开连接后的消息缓存策略采用**按消息维度的细粒度判断**，而非消费者级别的粗粒度标记：
+
+**问题背景**：
+- 粗粒度方案（已废弃）：用 `hasDurable` 标记消费者是否有任何持久化订阅，只要有一个持久订阅就缓存所有 pending 消息
+- 存在的问题：非持久化订阅的消息也被错误缓存到 `durableBuffer`，违背了非持久化订阅"离线即丢失"的语义
+
+**细粒度方案（当前实现）**：
+- 每条 `pendingMessage` 携带自身的 `durable` 属性，标识该消息来源于哪个订阅类型
+- 断开连接时，逐条检查消息的 `pm.durable` 属性：
+  - `pm.durable == true`：消息缓存到 `durableBuffer`，消费者重连后继续投递
+  - `pm.durable == false`：消息不缓存，消费者重连后不再投递（符合非持久化语义）
+
+**代码示例**（DisconnectConsumer）：
+```go
+for e := c.pendingList.Front(); e != nil; e = e.Next() {
+    pm := e.Value.(*pendingMessage)
+    if pm.status == MessageStatusDelivered {
+        pm.status = MessageStatusPending
+        if pm.durable {           // 按消息维度细粒度判断
+            c.durableBuffer = append(c.durableBuffer, pm.msg)
+        }
+    }
+}
+```
+
+**混合订阅场景示例**：
+```
+消费者 consumer-1 同时订阅：
+  ├─ topic.durable (Durable=true)
+  └─ topic.nondurable (Durable=false)
+
+发布消息 msg-A 到 topic.durable → pm.durable = true
+发布消息 msg-B 到 topic.nondurable → pm.durable = false
+
+断开连接后：
+  ├─ msg-A 进入 durableBuffer（持久化，重连后继续投递）
+  └─ msg-B 不进入 durableBuffer（非持久化，丢失）
+```
+
+#### 6.5.2.3 redeliverOrDeadLetter 中断开连接的处理
+
+当 `redeliverOrDeadLetter` 处理消息时遇到消费者已断开连接的情况，同样采用按消息维度的细粒度策略：
+
+- **持久化消息**：状态设为 `Pending`，放入 `durableBuffer`，**保留在 pending map 中**（确保状态查询无盲区）
+- **非持久化消息**：状态设为 `Pending`，从 pending map 中删除（消息丢失，无法查询）
+
+#### 6.5.2.4 关键设计决策
 
 1. **逐个 Remove 而非 Init()**：`list.Init()` 只清空链表头，不修改元素本身，会导致 `pending` map 中的元素持有悬空指针。逐个调用 `Remove(e)` 会正确设置 `e.list = nil`，后续对这些元素的 `Remove` 操作成为安全空操作。
 
 2. **pending map 保留**：保留状态信息供 `GetMessageStatus` 查询，同时在重连重投时，`deliverToConsumer` 会检测并清理旧条目。
+
+3. **按消息维度判断而非按消费者维度**：确保混合订阅场景下持久化和非持久化消息的语义正确性，避免非持久化消息被错误缓存。
 
 ### 6.5.3 pending map 与 pendingList 一致性保证
 

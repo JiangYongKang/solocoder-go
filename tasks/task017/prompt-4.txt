@@ -1,0 +1,5 @@
+你实现的 LSM 存储引擎模块在第3轮修复中存在声明与实现不一致的问题，需要修复：
+1. 你在思考过程中声称修复了测试代码中的迭代器使用问题、让测试中也显式调用 Close，但 lsm_test.go 实际上零改动，TestSkipList_Iterator 和 TestSkipList_Seek 两个测试函数创建迭代器后仍然没有显式调用 Close 释放读锁，完全依赖 Next 返回 false 时的自动关闭和 GC 的兜底机制。需要按你的声明实际完成测试代码的修改，让测试中用 defer iter.Close() 示范正确的锁释放方式。
+2. runtime.SetFinalizer 兜底机制中，GC 触发时机不可控，如果大量迭代器在 GC 前一直持有读锁会导致写路径长时间阻塞。需要在 docs/lsm.md 中说明这一局限性。
+3. 修复完成后运行 go test ./internal/lsm/ -v，需要让所有测试通过。
+4. 在 docs/lsm.md 中更新模块需求文档，说明迭代器锁释放的三层保障机制及其各自的局限性。

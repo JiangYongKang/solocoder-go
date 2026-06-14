@@ -782,6 +782,9 @@ func TestConcurrentReadWrite(t *testing.T) {
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 
+	var reader1ErrCount int64
+	var reader2ErrCount int64
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -802,15 +805,72 @@ func TestConcurrentReadWrite(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				_, err := wal.ReadFrom(0)
+				entries, err := wal.ReadFrom(0)
 				if err != nil {
+					atomic.AddInt64(&reader1ErrCount, 1)
 					return
+				}
+				for i, e := range entries {
+					if e.Offset != int64(i) {
+						atomic.AddInt64(&reader1ErrCount, 1)
+						break
+					}
+				}
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				entries, err := wal.ReadFrom(0)
+				if err != nil {
+					atomic.AddInt64(&reader2ErrCount, 1)
+					return
+				}
+				if len(entries) != 200 {
+					atomic.AddInt64(&reader2ErrCount, 1)
+					return
+				}
+				for i, e := range entries {
+					if e.Offset != int64(i) {
+						atomic.AddInt64(&reader2ErrCount, 1)
+						break
+					}
+					expected := fmt.Sprintf("entry_%d", i)
+					if string(e.Data) != expected {
+						atomic.AddInt64(&reader2ErrCount, 1)
+						break
+					}
+				}
+				return
+			default:
+				entries, err := wal.ReadFrom(0)
+				if err != nil {
+					atomic.AddInt64(&reader2ErrCount, 1)
+					return
+				}
+				for i, e := range entries {
+					if e.Offset != int64(i) {
+						atomic.AddInt64(&reader2ErrCount, 1)
+						break
+					}
 				}
 			}
 		}
 	}()
 
 	wg.Wait()
+
+	if v := atomic.LoadInt64(&reader1ErrCount); v > 0 {
+		t.Errorf("reader 1 encountered %d errors", v)
+	}
+	if v := atomic.LoadInt64(&reader2ErrCount); v > 0 {
+		t.Errorf("reader 2 encountered %d errors", v)
+	}
 }
 
 func TestMultipleReadersConcurrent(t *testing.T) {

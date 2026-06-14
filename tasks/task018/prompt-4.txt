@@ -1,0 +1,6 @@
+你实现的 B+ 树索引模块在第3轮修复中部分问题仍未彻底解决，需要修复：
+1. Iterator.Delete 的 ErrKeyNotFound 可达性修复只覆盖了 index 越界场景，未处理迭代器位置静默漂移。当外部代码通过 tree.Delete 删除键后 keys 数组缩短但 index 仍在合法范围内时，迭代器指向的键已发生变化，此时调用 Delete 会删除错误的键而不报错。需要增加键身份校验，确保删除的目标键仍是迭代器最初定位的键。
+2. Iterator.Delete 的重定位锚点采集逻辑仍独立于 tree.Delete 和 NewIteratorAt 存在，约 20 行的 nextKey 与 prevKey 搜索逻辑未与已有能力复用，代码重复未彻底消除。
+3. docs/bplustree.md 的 API 参考章节下面的子章节编号仍为 8.1 而非 7.1，章节编号跨层级不一致。需要完成全文编号一致性修正。
+4. 修复完成后运行 go test ./internal/bplustree/ -v，需要让所有测试通过。
+5. 在 docs/bplustree.md 中更新模块需求文档，说明 Iterator.Delete 与 tree.Delete 之间键身份校验的协作关系以及重定位逻辑的复用策略。

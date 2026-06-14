@@ -268,12 +268,11 @@ func (e *Engine) AddDocumentWithLanguage(docID string, content string, language 
 		e.mu.Unlock()
 		return ErrDuplicateDocID
 	}
-	e.docs[docID] = doc
-	e.mu.Unlock()
-
 	for pos, token := range tokens {
 		e.invertedIndex.AddTerm(token, docID, pos)
 	}
+	e.docs[docID] = doc
+	e.mu.Unlock()
 
 	return nil
 }
@@ -326,28 +325,37 @@ func (e *Engine) SearchWithLanguage(query string, language string) ([]*SearchRes
 
 	e.mu.RLock()
 	totalDocs := len(e.docs)
-	e.mu.RUnlock()
 
 	if totalDocs == 0 {
+		e.mu.RUnlock()
 		return []*SearchResult{}, nil
 	}
 
-	docScores := make(map[string]float64)
+	type termPostingData struct {
+		docsWithTerm int
+		postings     []*TermPosting
+	}
+	termDataList := make([]termPostingData, 0, len(queryTokens))
 
 	for _, term := range queryTokens {
 		postingList, exists := e.invertedIndex.GetPostingList(term)
 		if !exists {
 			continue
 		}
+		termDataList = append(termDataList, termPostingData{
+			docsWithTerm: len(postingList.Postings),
+			postings:     postingList.Postings,
+		})
+	}
 
-		docsWithTerm := len(postingList.Postings)
-		idf := math.Log(1 + float64(totalDocs)/float64(docsWithTerm+1))
+	docScores := make(map[string]float64)
+	docContents := make(map[string]string)
 
-		for _, posting := range postingList.Postings {
-			e.mu.RLock()
+	for _, td := range termDataList {
+		idf := math.Log(1 + float64(totalDocs)/float64(td.docsWithTerm+1))
+
+		for _, posting := range td.postings {
 			doc, docExists := e.docs[posting.DocID]
-			e.mu.RUnlock()
-
 			if !docExists {
 				continue
 			}
@@ -356,23 +364,23 @@ func (e *Engine) SearchWithLanguage(query string, language string) ([]*SearchRes
 			tfidf := tf * idf
 
 			docScores[posting.DocID] += tfidf
+			if _, exists := docContents[posting.DocID]; !exists {
+				docContents[posting.DocID] = doc.Content
+			}
 		}
 	}
+	e.mu.RUnlock()
 
 	results := make([]*SearchResult, 0, len(docScores))
 	for docID, score := range docScores {
-		e.mu.RLock()
-		doc, exists := e.docs[docID]
-		e.mu.RUnlock()
-
-		if !exists {
+		content, ok := docContents[docID]
+		if !ok {
 			continue
 		}
-
 		results = append(results, &SearchResult{
 			DocID:   docID,
 			Score:   score,
-			Content: doc.Content,
+			Content: content,
 		})
 	}
 
@@ -398,10 +406,18 @@ func (e *Engine) SearchPhraseWithLanguage(phrase string, language string) ([]*Se
 		return nil, ErrPhraseTooShort
 	}
 
+	e.mu.RLock()
+	totalDocs := len(e.docs)
+	if totalDocs == 0 {
+		e.mu.RUnlock()
+		return []*SearchResult{}, nil
+	}
+
 	postingLists := make([]*PostingList, 0, len(terms))
 	for _, term := range terms {
 		pl, exists := e.invertedIndex.GetPostingList(term)
 		if !exists {
+			e.mu.RUnlock()
 			return []*SearchResult{}, nil
 		}
 		postingLists = append(postingLists, pl)
@@ -425,6 +441,7 @@ func (e *Engine) SearchPhraseWithLanguage(phrase string, language string) ([]*Se
 		}
 		candidateDocs = nextCandidates
 		if len(candidateDocs) == 0 {
+			e.mu.RUnlock()
 			return []*SearchResult{}, nil
 		}
 	}
@@ -439,25 +456,56 @@ func (e *Engine) SearchPhraseWithLanguage(phrase string, language string) ([]*Se
 		}
 	}
 
-	e.mu.RLock()
-	totalDocs := len(e.docs)
-	e.mu.RUnlock()
-
-	results := make([]*SearchResult, 0, len(matchedDocs))
-	for docID := range matchedDocs {
-		e.mu.RLock()
-		doc, exists := e.docs[docID]
-		e.mu.RUnlock()
-
+	type termPostingData struct {
+		docsWithTerm int
+		postings     []*TermPosting
+	}
+	termDataList := make([]termPostingData, 0, len(terms))
+	for _, term := range terms {
+		postingList, exists := e.invertedIndex.GetPostingList(term)
 		if !exists {
 			continue
 		}
+		termDataList = append(termDataList, termPostingData{
+			docsWithTerm: len(postingList.Postings),
+			postings:     postingList.Postings,
+		})
+	}
 
-		score := e.calculatePhraseScore(docID, terms, totalDocs)
+	docScores := make(map[string]float64)
+	docContents := make(map[string]string)
+
+	for docID := range matchedDocs {
+		doc, docExists := e.docs[docID]
+		if !docExists {
+			continue
+		}
+		docContents[docID] = doc.Content
+		var score float64
+		for _, td := range termDataList {
+			idf := math.Log(1 + float64(totalDocs)/float64(td.docsWithTerm+1))
+			for _, posting := range td.postings {
+				if posting.DocID != docID {
+					continue
+				}
+				tf := float64(posting.Frequency) / float64(doc.Length)
+				score += tf * idf
+			}
+		}
+		docScores[docID] = score
+	}
+	e.mu.RUnlock()
+
+	results := make([]*SearchResult, 0, len(docScores))
+	for docID, score := range docScores {
+		content, ok := docContents[docID]
+		if !ok {
+			continue
+		}
 		results = append(results, &SearchResult{
 			DocID:   docID,
 			Score:   score,
-			Content: doc.Content,
+			Content: content,
 		})
 	}
 
@@ -496,34 +544,4 @@ func checkPhraseMatch(positionsList [][]int) bool {
 	}
 
 	return false
-}
-
-func (e *Engine) calculatePhraseScore(docID string, terms []string, totalDocs int) float64 {
-	var score float64
-
-	for _, term := range terms {
-		postingList, exists := e.invertedIndex.GetPostingList(term)
-		if !exists {
-			continue
-		}
-
-		docsWithTerm := len(postingList.Postings)
-		idf := math.Log(1 + float64(totalDocs)/float64(docsWithTerm+1))
-
-		for _, posting := range postingList.Postings {
-			if posting.DocID != docID {
-				continue
-			}
-			e.mu.RLock()
-			doc, docExists := e.docs[docID]
-			e.mu.RUnlock()
-			if !docExists {
-				continue
-			}
-			tf := float64(posting.Frequency) / float64(doc.Length)
-			score += tf * idf
-		}
-	}
-
-	return score
 }

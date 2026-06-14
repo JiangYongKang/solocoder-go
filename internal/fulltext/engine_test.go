@@ -1476,3 +1476,56 @@ func TestDeleteDocument_InvertedIndexCleanup(t *testing.T) {
 		t.Errorf("expected 2 terms remaining (sharedword, gamma), got %d", e.invertedIndex.GetTermCount())
 	}
 }
+
+func TestConcurrent_AddDocumentWithLanguage_SameDocID(t *testing.T) {
+	e := NewEngine()
+	err := e.RegisterTokenizer("ws", &WhitespaceOnlyTokenizer{})
+	if err != nil {
+		t.Fatalf("RegisterTokenizer failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	numGoroutines := 20
+	successCount := int64(0)
+	duplicateCount := int64(0)
+	var mu sync.Mutex
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			content := fmt.Sprintf("custom-tokenizer-doc-from-goroutine-%d", id)
+			err := e.AddDocumentWithLanguage("shared_custom_doc", content, "ws")
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				successCount++
+			} else if err == ErrDuplicateDocID {
+				duplicateCount++
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	if successCount != 1 {
+		t.Errorf("expected exactly 1 successful AddDocumentWithLanguage, got %d", successCount)
+	}
+
+	expectedDuplicates := int64(numGoroutines) - 1
+	if duplicateCount != expectedDuplicates {
+		t.Errorf("expected %d ErrDuplicateDocID errors with custom tokenizer, got %d", expectedDuplicates, duplicateCount)
+	}
+
+	if e.DocumentCount() != 1 {
+		t.Errorf("expected exactly 1 document in engine, got %d", e.DocumentCount())
+	}
+
+	doc, exists := e.GetDocument("shared_custom_doc")
+	if !exists {
+		t.Fatal("document should exist after concurrent insert with custom tokenizer")
+	}
+	if doc.Length < 1 {
+		t.Errorf("expected non-zero document length, got %d", doc.Length)
+	}
+}

@@ -1,0 +1,8 @@
+产物不满意：
+1. redeliverOrDeadLetter 的正常重投路径中，delete(c.pending, pm.msg.ID) 在 select 之前执行，当 consumer channel 满进入 default 分支时消息被追加到 durableBuffer 但 pending map 中已无记录，GetMessageStatus 返回 ErrMessageNotFound。这与提示词问题 2 描述的查询盲区性质完全相同，提示词虽只明确提到断开连接分支，但同一函数内其他分支面临相同的时序窗口，模型未做广义修复。正确做法是将 delete 移到 select 成功分支内部。
+2. deliverToConsumer 的 default 分支中持久化消息因 channel 满直接进入 durableBuffer，消息在 pending map 中无记录。模型在思考过程中曾尝试为此添加 pending 记录但因引入递归调用而完全回退，未寻找替代方案（如在 default 分支仅添加 pending 记录而不调用 flushDurableBuffer），导致 durableBuffer 中的消息在等待重投期间仍无法通过 GetMessageStatus 查询。
+
+过程不满意：
+1. 模型在收到提示词后未先阅读代码就直接用 todo_write 创建了 5 项子任务计划，之后才开始用 view_files 阅读 broker.go 的内容。这违反了"应先分析问题再规划"的原则，虽然本轮改动范围较小未造成严重后果，但这种习惯在复杂任务中容易导致计划与实际代码结构脱节，降低执行效率。
+2. 模型为消除查询盲区试图修改 deliverToConsumer 的 default 分支，在其中为 durableBuffer 消息添加 pending 记录同时调用 flushDurableBuffer，但未追踪完整调用链（deliverToConsumer 调用 flushDurableBuffer，后者遍历缓冲再调用 deliverToConsumer），导致运行时 panic 栈溢出。正确做法是先绘制两个函数间的调用关系确认递归路径，再决定改动方式。
+3. 遇到 panic 后模型未分析根因就完全回退了 deliverToConsumer 的全部修改，退回到原始实现。这属于试错式调试——先做大范围改动，出错后不做最小化修正就直接回退，而非定位具体递归路径后保留安全的改动部分、只移除引发递归的调用。正确做法是只移除 default 分支中对 flushDurableBuffer 的调用，保留 pending map 记录的添加。

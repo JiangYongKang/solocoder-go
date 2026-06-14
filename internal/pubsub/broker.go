@@ -67,6 +67,7 @@ type pendingMessage struct {
 	deliverAt    time.Time
 	lastDeliver  time.Time
 	subscriberID string
+	durable      bool
 	element      *list.Element
 }
 
@@ -580,7 +581,9 @@ func (b *Broker) deliverToConsumer(c *Consumer, sub *Subscription, msg *Message)
 	msgCopy.RetryCount = 0
 
 	if existing, ok := c.pending[msgCopy.ID]; ok {
-		c.pendingList.Remove(existing.element)
+		if existing.element != nil {
+			c.pendingList.Remove(existing.element)
+		}
 		delete(c.pending, msgCopy.ID)
 		atomic.AddInt64(&c.unackedCount, -1)
 	}
@@ -593,6 +596,7 @@ func (b *Broker) deliverToConsumer(c *Consumer, sub *Subscription, msg *Message)
 			deliverAt:    time.Now().Add(b.cfg.AckTimeout),
 			lastDeliver:  time.Now(),
 			subscriberID: sub.ConsumerID,
+			durable:      sub.Durable,
 		}
 		pm.element = c.pendingList.PushBack(pm)
 		c.pending[msgCopy.ID] = pm
@@ -716,20 +720,22 @@ func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
 	pm.msg.RetryCount++
 
 	c.pendingList.Remove(pm.element)
-	delete(c.pending, pm.msg.ID)
 	atomic.AddInt64(&c.unackedCount, -1)
 
 	if pm.msg.RetryCount > b.cfg.MaxRetry {
 		pm.status = MessageStatusDead
 		b.deadLetters = append(b.deadLetters, pm.msg)
+		delete(c.pending, pm.msg.ID)
 		b.flushDurableBuffer(c)
 		return
 	}
 
 	if !c.connected {
 		pm.status = MessageStatusPending
-		if b.hasDurableSubscription(c.ID) {
+		if pm.durable {
 			c.durableBuffer = append(c.durableBuffer, pm.msg)
+		} else {
+			delete(c.pending, pm.msg.ID)
 		}
 		return
 	}
@@ -741,6 +747,7 @@ func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
 	}
 
 	msgCopy := *pm.msg
+	delete(c.pending, pm.msg.ID)
 	select {
 	case c.ch <- &msgCopy:
 		newPM := &pendingMessage{
@@ -749,6 +756,7 @@ func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
 			deliverAt:    time.Now().Add(b.cfg.AckTimeout),
 			lastDeliver:  time.Now(),
 			subscriberID: c.ID,
+			durable:      pm.durable,
 		}
 		newPM.element = c.pendingList.PushBack(newPM)
 		c.pending[msgCopy.ID] = newPM
@@ -778,22 +786,12 @@ func (b *Broker) DisconnectConsumer(id string) error {
 	}
 
 	c.connected = false
-	subs, ok := b.subscriptions[id]
-	hasDurable := false
-	if ok {
-		for _, sub := range subs {
-			if sub.Durable {
-				hasDurable = true
-				break
-			}
-		}
-	}
 
-	if hasDurable {
-		for e := c.pendingList.Front(); e != nil; e = e.Next() {
-			pm := e.Value.(*pendingMessage)
-			if pm.status == MessageStatusDelivered {
-				pm.status = MessageStatusPending
+	for e := c.pendingList.Front(); e != nil; e = e.Next() {
+		pm := e.Value.(*pendingMessage)
+		if pm.status == MessageStatusDelivered {
+			pm.status = MessageStatusPending
+			if pm.durable {
 				c.durableBuffer = append(c.durableBuffer, pm.msg)
 			}
 		}

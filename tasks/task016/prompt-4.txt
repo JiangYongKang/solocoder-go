@@ -1,0 +1,4 @@
+你实现的 WAL 存储引擎模块在上一轮修复中对部分提示词要求的处理存在偏差，需要纠正：
+1. 提示词要求直接修改 TestConcurrentReadWrite 增加多 reader 并发读取验证，但你没有修改该函数本身，而是新建了其他测试函数来替代。TestConcurrentReadWrite 中仍然只有一条 reader goroutine，单独运行该测试无法验证多 reader 并发读取的正确性。需要直接在该测试函数中增加至少一条额外的 reader goroutine。
+2. 修复完成后运行 go test ./internal/wal/ -v，需要让所有测试通过。
+3. 在 docs/wal.md 中更新模块需求文档，说明 TestConcurrentReadWrite 的多 reader 并发验证策略。
