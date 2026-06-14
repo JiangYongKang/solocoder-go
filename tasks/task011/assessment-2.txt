@@ -1,9 +1,9 @@
 产物不满意：
-1. 在 broker.go 的 DisconnectConsumer 方法中，模型为持久化消费者保留了 c.pending map 中的条目（仅将 Delivered 改为 Pending 状态而不删除映射），但随后通过 c.pendingList.Init() 清空了链表。这导致 map 中每个 pendingMessage 持有指向已清空链表的悬空 element 指针。如果消费者在断开连接后通过保存的消息 ID 调用 Nack，Nack 会从 c.pending 中找到该条目并进入 redeliverOrDeadLetter，执行 c.pendingList.Remove(pm.element) 在已清空的链表上操作，造成链表结构损坏。根因是模型为了让 GetMessageStatus 能查到 Pending 状态而保留了 map 条目，却未维护 pendingList 与 pending map 之间的一致性。正确做法是清空 map 与链表同步处理，或将状态信息独立存储而非强行保留已废弃的链表引用。
+1. broker.go的DisconnectConsumer中为持久化消费者保留了c.pending map条目（仅改状态不删映射），但随后通过c.pendingList.Init()清空了链表。导致map中每个pendingMessage持有指向已清空链表的悬空element指针，后续Nack进入redeliverOrDeadLetter执行Remove操作会造成链表结构损坏。根因是为了GetMessageStatus能查到Pending状态而保留map，却未维护链表与map的一致性。应同步清空map与链表，或将状态信息独立存储而非保留已废弃的链表引用。
 
 2. 模型在 broker.go 新增了 GetMessageStatus 公有方法，对外提供消息状态查询。提示词第三条要求是让 MessageStatus 枚举在控制流中参与判断而非成为只写不读的装饰字段，核心需求是在 Ack、Nack、ProcessTimeouts 等内部方法中加入状态校验逻辑。新增对外查询 API 属于功能扩展而非缺陷修复，超出了本轮修复任务边界。此外该方法对死信状态的查询采用线性遍历 b.deadLetters 切片的方式，在死信累积较多时存在 O(n) 性能隐患。正确做法是仅完成提示词要求的内部控制流集成，不额外扩展公有 API。
 
-3. 在 broker.go 的 redeliverOrDeadLetter 方法中，第 710 行的断开连接分支设置 pm.status = MessageStatusPending 后直接 return，但此时代码已在第 699-701 行将消息从 pendingList 和 pending map 移除并递减了 unackedCount。消息从所有跟踪结构中剥离后仅靠局部变量 pm 持有引用，函数返回后即被垃圾回收，也没有被加入 durableBuffer 进行持久化缓存。对于持久化订阅者，断开连接状态下触发的重推操作会静默丢弃消息，与持久化订阅离线缓存消息的语义矛盾。应在此分支将消息放回 durableBuffer 以保证持久化语义的完整性。
+3. redeliverOrDeadLetter的断开连接分支在从pendingList和pending map移除消息并递减unackedCount后设置pm.status为Pending直接return，但消息已从所有跟踪结构中剥离且未加入durableBuffer。对于持久化订阅者，断开时触发的重推操作会静默丢弃消息，与持久化离线缓存语义矛盾。应在此分支将消息放回durableBuffer以保证持久化语义完整性。
 
 过程不满意：
 1. 模型在本轮会话第一步调用 todo_write 创建了 5 项子任务清单，之后才通过 view_files 读取 broker.go 确认当前代码状态。本轮提示词虽已明确列出三个修复点且修复目标相对清晰，但模型在未验证当前代码是否与提示词描述一致（如 ackTimerCh 是否确实只声明未使用、topicNode 剪枝逻辑是否完全缺失）的情况下先制定了执行计划。这种做法延续了第一轮评估已指出的先规划后分析的不良模式。正确做法是先读取 broker.go 理解当前代码结构，基于实际状态制定有针对性的修复计划。

@@ -1,6 +1,6 @@
 产物不满意：
-1. 提示词要求修复 DeleteDocument 的 IDF 计算窗口期，模型将 RemoveDocument 和 delete(docs) 放入同一 Engine.mu.Lock 范围后执行顺序改为先清理索引再删文档，写操作侧的原子性确实得到了保证。但 Search 方法中 totalDocs 的读取在 `e.mu.RLock` 内而倒排索引数据通过 `e.invertedIndex.GetPostingList` 在独立的 InvertedIndex 锁内读取，两段读操作不在同一临界区。当 Search 在 DeleteDocument 之前读完 totalDocs 之后才读 postingList 时，totalDocs 反映删除前状态但 postingList 已反映删除后状态，IDF 计算结果从原来的偏低变成了偏高。文档第 4.4 节声称修复"消除了 IDF 计算窗口期"与实情不符，应明确区分写操作原子性和读操作一致性两个问题。
-2. 提示词要求为 AddDocumentWithLanguage 的 TOCTOU 修复新增并发去重测试，但 TestConcurrent_AddDocument_SameDocID 通过 `e.AddDocument` 路由触发测试逻辑。AddDocument 只走默认分词器路径，而 AddDocumentWithLanguage 的 TOCTOU 防护链路包括 getTokenizer 选取分词器、调用 Tokenizer.Tokenize 分词、构建去重词项 Terms 再到持锁查重写入，自定义分词器场景下的链路更长且涉及更多共享状态读取。仅测试默认分词器路径无法验证当语言分词器被注册并使用时的 TOCTOU 防护是否仍有效。
+1. 提示词要求修复DeleteDocument的IDF计算窗口期，模型将RemoveDocument和delete(docs)放入同一锁范围后改为先清理索引再删文档，写操作的原子性得到保证。但Search中totalDocs的读取在e.mu.RLock内而倒排索引数据在独立的InvertedIndex锁内，两段读操作不在同一临界区。当Search在DeleteDocument之前读完totalDocs之后才读postingList时，IDF从偏低变成偏高。文档第4.4节声称修复"消除了IDF计算窗口期"与实情不符，应明确区分写操作原子性和读操作一致性问题。
+2. 提示词要求新增并发去重测试，但TestConcurrent_AddDocument_SameDocID通过AddDocument路由触发，只走默认分词器路径。AddDocumentWithLanguage的TOCTOU防护链路包括选取分词器、Tokenize分词、构建去重词项再到持锁查重写入，自定义分词器场景下链路更长且涉及更多共享状态读取。仅测试默认分词器无法验证当注册了语言分词器并使用时的TOCTOU防护是否有效。
 3. 文档第 4.4 节第 309 行描述修复"消除了 IDF 计算窗口期，保证 totalDocs 与 docsWithTerm 一致性"，但 Search 函数中 totalDocs 的读取与 postingList 的读取分属两个锁操作，在并发场景下 totalDocs 和 postingList 所来自的快照可能跨越 DeleteDocument 的执行边界，两者并非来自同一时刻。文档将写操作侧的原子性等价于整个搜索 IDF 计算的一致性，概念混淆容易误导读者认为并发搜索的评分已完全正确。
 
 过程不满意：

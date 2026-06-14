@@ -1,6 +1,6 @@
 产物不满意：
-1. 在 dedup.go 的 Count 方法中直接返回 len(d.idMap) 统计了 map 中所有条目数量，包括那些已经超过窗口时间但尚未被 CleanExpired 清理的过期记录。当去重器配置了非零清理间隔时，两次清理之间调用 Count 会返回包含已过期记录的虚高数字，与 dedup.md 中"查询当前有效窗口内的记录总数"的语义说明矛盾，监控场景下会给出误导性的窗口利用率数据。根因是 Count 未对每条记录做 createdAt 与 cutoff 的时间窗口校验，应像 Contains 方法那样加入时间判断，只统计 createdAt 在窗口有效期内的记录，或至少遍历链表在遇到第一个未过期节点时停止以与 CleanExpired 的终止逻辑保持一致。
-2. 在 dedup.go 中定义了 ErrDeduplicatorStop 和 ErrInvalidConfig 两个包级别导出错误变量，但整个 dedup 包中没有任何函数真正返回这两个错误。文档中标注为"保留错误，用于未来扩展"，但 Stop 方法仅设置 running 标志为 false 并关闭 stopCh，未在任何公共方法中基于 running 状态拒绝操作，导致调用方即使按文档预期使用 Start 和 Stop 管理生命周期，也无法通过 err == ErrDeduplicatorStop 来判断去重器已停止。添加未使用的导出错误变量增加了 API 表面却不提供对应的运行时行为，应要么在 CheckAndMark 等方法中检测 running 标志并在已停止时返回 ErrDeduplicatorStop，要么移除这两个未使用的错误定义。
+1. dedup.go的Count方法直接返回len(d.idMap)统计所有条目，包括已超过窗口时间但尚未被CleanExpired清理的过期记录。当配置了非零清理间隔时，两次清理之间Count返回虚高数字，与文档中"查询有效窗口内记录总数"的语义矛盾。根因是Count未对每条记录做createdAt时间窗口校验，应像Contains那样加入时间判断，只统计窗口有效期内的记录。
+2. dedup.go定义了ErrDeduplicatorStop和ErrInvalidConfig两个导出错误变量，但整个包中没有任何函数真正返回它们。文档标注为"保留用于未来扩展"，Stop方法仅设置标志并未在公共方法中拒绝操作，调用方无法通过err==ErrDeduplicatorStop判断状态。添加未使用的导出错误增加了API表面却不提供对应行为，应在CheckAndMark等方法中检测running标志并返回错误，或移除这两个未使用定义。
 
 过程不满意：
 1. 模型在刚收到提示词后未经分析就直接调用了 todo_write 创建 5 项子任务计划，之后才开始阅读 go.mod 以及 kvstore、delaysched、connpool 等现有模块代码。这违反了标注规范中"不能在刚收到任务时就直接创建 TodoList，应先分析问题再规划"的要求。虽然最终实现的模块结构与任务计划基本吻合，但先规划后分析的顺序倒置意味着计划是基于对需求的直觉猜测而非对现有代码骨架的理性分析，应在阅读项目结构和已有代码风格后再制定 TodoList。

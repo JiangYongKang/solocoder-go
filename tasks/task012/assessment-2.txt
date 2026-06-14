@@ -1,6 +1,6 @@
 产物不满意：
-1. 在修复 processMessage 的 context 传递机制后，TestStop_WaitsForNoRunningTasks 中的 handler 通过 `<-release` channel 阻塞而非监听 `<-ctx.Done()`，context 取消路径从未经过测试验证。提示词第 1 条描述的问题是 handler 死循环导致 Stop 永久挂起，修复的核心价值在于 handler 能响应 ctx 取消信号及时退出。现有测试虽然全部通过，但并未覆盖 context 真正起效的场景——如果 handler 不检查 ctx.Done() 而是像修复前一样无限循环，Stop 调用 cancel 后 taskWg.Wait 仍然会永久阻塞。根因是模型只修改了生产代码的 context 传递链路，但未编写针对性验证测试，应新增一个 handler 在 select 中同时监听 ctx.Done() 和业务 channel 的测试用例，验证 Stop 调用 cancel 后 handler 能在超时时间内退出。
+1. 修复processMessage的context传递机制后，TestStop_WaitsForNoRunningTasks中的handler仍通过`<-release` channel阻塞而非监听`<-ctx.Done()`，context取消路径从未经过测试验证。现有测试未覆盖handler通过ctx.Done()退出的场景——如果handler像修复前一样无限循环，Stop调用cancel后taskWg.Wait仍会永久阻塞。应新增一个在select中同时监听ctx.Done()和业务channel的测试，验证Stop调用cancel后handler能在超时内退出。
 
 过程不满意：
-1. 模型在刚收到提示词后还未阅读任何代码文件确认现状，就直接用 todo_write 创建了 4 项子任务计划。这种"先规划后阅读"的顺序违反了标注规范要求的"不能刚收到任务时就创建 TodoList，应先分析问题再规划"。因为模型还不知情 processMessage 中 context.Background() 的具体位置，TestConcurrent_ProcessAndQuery 中 goroutine 的结构，以及 Processor 的锁和 WaitGroup 生命周期，此时创建的 Todo 粒度必然与真实代码调整范围不匹配。正确做法是先阅读 deadletter.go 确认两处问题的具体代码位置和关联结构后，再制定修复计划。
-2. 模型运行 go test 看到 34 个测试全部通过后直接总结"修复完成"，没有检查现有测试是否真正覆盖了 context 取消路径。TestStop_WaitsForNoRunningTasks 虽然验证了 Stop 等待 handler 返回的机制，但 handler 通过外部 `<-release` channel 阻塞而非 `<-ctx.Done()`，修复是否能解决提示词描述的死循环挂起问题未曾证实。模型将"测试通过"等同于"问题已解决"，缺少对修复范围与测试覆盖范围的交叉对比——提示词要求修复 handler 死循环导致 Stop 挂起，但测试中没有一个 handler 是通过 `<-ctx.Done()` 退出的。正确做法是逐一对照提示词的每条需求与现有测试的覆盖关系，发现 context 取消路径无覆盖后补充专项验证。
+1. 模型收到提示词后未阅读任何代码文件就创建了4项子任务计划。这违反了"先分析再规划"的要求，因模型不知情processMessage中context.Background()的位置、goroutine结构以及Processor的锁和WaitGroup生命周期，此时制定的Todo必然与实际代码调整范围不匹配。应先阅读deadletter.go确认两处问题位置后再制定计划。
+2. 模型运行go test看到34个测试全部通过后直接总结"修复完成"，没有检查现有测试是否真正覆盖了context取消路径。修复是否能解决提示词描述的死循环挂起问题未曾证实。模型将"测试通过"等同于"问题已解决"，缺少对修复范围与测试覆盖的交叉对比。应逐一对照提示词每条需求与现有测试的覆盖关系，发现context取消路径无覆盖后补充专项验证。

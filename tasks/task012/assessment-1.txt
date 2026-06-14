@@ -1,6 +1,6 @@
 产物不满意：
-1. processMessage 方法中使用 context.Background() 作为 handler 的上下文，没有将处理器生命周期与 handler 执行关联起来。当 handler 内部出现无限循环或长时间阻塞的网络调用时，processMessage 永远不会返回，导致 taskWg 无法递减，Stop 方法在调用 taskWg.Wait 时永久阻塞，优雅关闭机制彻底失效。TestStop_WaitsForNoRunningTasks 测试中 handler 通过 channel 手动 release 绕过了这一场景，未覆盖 handler 卡死导致停止超时的边界情况。根因是没有设计可取消的上下文传递机制，应在 Start 时创建可取消的 context 并传入 handler，Stop 时取消该 context 使 handler 能够主动感知关闭信号并退出。
-2. TestConcurrent_ProcessAndQuery 测试中启动了一个无退出条件的无限循环 goroutine，该 goroutine 在测试函数返回后仍持续运行，不断调用 PendingCount、PermanentlyFailedCount 和 GetAllMessages 方法与已停止的处理器交互，形成了 goroutine 泄漏。虽然当前不导致测试失败，但在持续集成环境中多次运行会累积大量僵尸 goroutine 消耗系统资源。根因是并发查询 goroutine 缺少取消机制，应在循环中通过 processor 的状态或独立的 stop channel 控制 goroutine 退出。
+1. processMessage方法中使用context.Background()作为handler的上下文，没有将处理器生命周期与handler执行关联。handler内出现无限循环或长时间阻塞时processMessage永不返回，taskWg无法递减，Stop的taskWg.Wait永久阻塞。根因是没有设计可取消的上下文传递机制，应在Start时创建可取消的context传入handler，Stop时取消以让handler感知关闭信号退出。
+2. TestConcurrent_ProcessAndQuery测试中启动了一个无退出条件的无限循环goroutine，该goroutine在测试返回后持续运行，不断调用PendingCount等方法与已停止的处理器交互，形成goroutine泄漏。虽当前不导致测试失败，但在CI环境中多次运行会累积大量僵尸goroutine。根因是缺少取消机制，应通过processor状态或stop channel控制退出。
 
 过程不满意：
 1. 模型在刚收到提示词后未经分析就直接用 todo_write 创建了 5 项子任务计划，之后才开始阅读现有代码文件和运行测试。这违反了标注规范中"不能刚收到任务就直接创建 TodoList，应先分析问题再规划"的要求。从 session-cot 可以看到，模型先创建了 todos 然后才去查看 delaysched 和 jobqueue 的代码参考，导致计划的粒度划分与 deadletter 模块的实际需求边界可能不匹配。正确做法是先阅读提示词需求和项目骨架，理解模块职责后再制定执行计划。

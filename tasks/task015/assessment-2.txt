@@ -1,5 +1,5 @@
 产物不满意：
-1. 提示词要求修复 Count 返回包含过期记录的问题和让 ErrDeduplicatorStop、ErrInvalidConfig 被实际使用，但模型将 Contains 从 bool 改为 (bool, error)，Clear 从无返回值改为 error，Count 从 int 改为 (int, error)，CleanExpired 从 int 改为 (int, error)。Contains 是纯读操作，即使在去重器停止后返回 false 也不会导致调用方的业务数据出错，给它加 error 返回属于过度防御性设计。正确做法是只在 CheckAndMark、CleanExpired、Clear 这些涉及状态变更的方法中加入 stopped 检查并返回 ErrDeduplicatorStop，Contains 和 Count 保持原有签名或仅 Count 因语义修正返回双值。
+1. 提示词要求修复Count返回过期记录的问题和让错误变量被实际使用，但模型将Contains从bool改为(bool,error)，Clear和CleanExpired从无返回值改为error，Count从int改为(int,error)。Contains是纯读操作，即使在停止后返回false也不导致业务数据出错，加error返回属于过度防御设计。正确做法是只在状态变更方法中加入stopped检查，Contains和Count保持原有签名。
 2. 模型用 Write 工具完全重写了整个 dedup_test.go，导致原有测试修改与新测试混在一起无法从 git diff 区分，丢失了测试文件的修改粒度和演进历史。此外多个测试中直接访问 d.idMap 并以 len(d.idMap) 做断言，说明测试仍在依赖内部实现细节而非纯公共 API，违反了黑盒测试原则。正确做法是逐个修改现有测试用例以适配新签名，然后追加新的 stopped 状态和 Count 语义测试。
 过程不满意：
 1. 模型在刚收到提示词后未做需求分析就直接创建了 5 项 TODO 任务列表，包括修复 Count 语义、添加停止状态检查、更新测试、运行测试、更新文档。这违反了标注规范中应先分析需求文档和代码再制定计划的原则。后续模型实际对所有公共方法签名做了全量改造远超提示词范围，但 TODO 中没有任何一项预见这种级别的变更，说明计划粒度与实际任务完全不匹配。

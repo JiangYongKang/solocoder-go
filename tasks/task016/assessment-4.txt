@@ -1,6 +1,6 @@
 产物不满意：
-1. TestConcurrentReadWrite 中 reader 1 的 goroutine 在 select 语句的 `<-stop` 分支直接 return 退出了，没有执行任何最终的全量校验。提示词要求增加至少一条 reader goroutine 实现多 reader 并发读取验证，但 reader 1 在 writer 完成后的行为与 writer 完成前完全一样且在收到 stop 信号后立即退出，导致这条 reader goroutine 对最终数据一致性的验证贡献为零。此外 reader 2 的 select 语句在 stop 通道被关闭后 `<-stop` 和 `default` 两个分支同时就绪，Go 的 select 会随机选择执行路径，可能导致 `default` 分支被反复命中多轮，而 `default` 分支只校验 Offset 顺序不校验 Data 内容和条目总数，这意味着 reader 2 在 writer 已完成全部写入后仍可能做多轮仅校验 Offset 的无效读取，迟迟不进入全量校验分支。应去掉 default 分支改用纯阻塞等待 stop 信号，收到 stop 后再对两个 reader 统一做全量校验。
+1. TestConcurrentReadWrite中reader 1在select的`<-stop`分支直接return退出，没有执行全量校验。reader 2的select在stop通道关闭后`<-stop`和`default`同时就绪，Go可能随机选择default，导致读多轮仅校验Offset不校验Data和总数。应去掉default分支改用纯阻塞等待stop信号，收到后对两个reader统一做全量校验。
 2. docs/wal.md 中"并发测试保障总览"表格里 TestConcurrentReadWrite 所在行仍然写着"单 reader + 单 writer 并行"，核心断言仍然是"不崩溃、无 I/O 错误"，与提示词第三条要求的"说明 TestConcurrentReadWrite 的多 reader 并发验证策略"严重不符。文档既没有反映该测试现在实际使用了 2 个 reader goroutine 的事实，也没有描述 reader 1 和 reader 2 各自的校验策略及两者之间的分工。而测试矩阵表中该行的 reader 数已从 1 更新为 2，两处表格描述不一致会让读者产生困惑。
 
 过程不满意：
-1. 模型在 session-cot 中明确写道"现在更新总览表中的 TestConcurrentReadWrite 行"，紧接着声称修改结果是"从'单 reader + 单 writer 并行'改为'多 reader + 单 writer 并行'，核心断言明确描述双 reader 校验策略"，但实际检查 docs/wal.md 发现"并发测试保障总览"表格中 TestConcurrentReadWrite 行根本未被修改，仍保持旧的"单 reader + 单 writer 并行"和"不崩溃、无 I/O 错误"。同时还声称在 docs/wal.md 中新增了 TestConcurrentReadWrite 的详细说明章节但文档中也不存在。这属于典型的幻觉行为，模型把发起的文本编辑操作直接等价为已完成的产物变更，跳过了编辑后回读文件验证的实际步骤，正确做法是每一处文档修改完成后都应回读目标文件确认修改确实生效。
+1. 模型在session-cot中声称"更新总览表中的TestConcurrentReadWrite行"修改为"多reader+单writer并行"，但实际检查发现"并发测试保障总览"表格中该行根本未被修改，仍保持旧的"单reader+单writer并行"。同时还声称新增了详细说明章节但文档中也不存在。这是典型的幻觉行为，模型将发起的编辑操作等价为已完成的产物变更，跳过了编辑后回读验证的实际步骤。

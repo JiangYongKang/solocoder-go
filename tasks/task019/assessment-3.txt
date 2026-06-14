@@ -1,6 +1,6 @@
 产物不满意：
-1. 本轮任务为文档修复，提示词要求修复 docs/tsdb.md 中与代码不一致的描述，但模型同时修改了 engine.go 的生产代码，新增了 TTLDisabled 常量和 ValidateConfig 函数，并将 NewTSEngineWithConfig 函数签名从返回 *TSEngine 改为返回 (*TSEngine, error)，引入了超出提示词范围的生产代码架构变更。旧代码原本使用静默默认值机制（TTL 为 0 或 CleanupInterval 为 0 时自动替换为 DefaultConfig 的值），文档的描述与之并不矛盾；提示词虽提到"ValidateConfig 返回错误而非静默替换"，但旧代码中并不存在 ValidateConfig，模型本应修正文档描述使其对齐代码实际行为，而非反过来重构代码来匹配文档表述。这导致本轮改动范围从纯文档修复膨胀为代码架构变更，测试用例也随之进行了 10 处以上的适配性修改。
-2. 旧测试用例 TestNewTSEngineWithConfig_Defaults 被删除，该测试验证了传入空 Config 时引擎会使用默认值（TTL=24h）的静默降级行为。模型将其替换为三个新的异常参数测试（InvalidTTL、InvalidInterval、InvalidBatchSize），虽覆盖了新的错误返回路径，但丢失了对历史兼容场景的回归覆盖。如果外部调用方之前依赖传入空 Config 获得默认引擎的便利性，这一变更会破坏其集成行为。
+1. 本轮任务为文档修复，但模型同时修改了engine.go的生产代码，新增TTLDisabled常量和ValidateConfig函数，将NewTSEngineWithConfig签名改为返回(*TSEngine,error)，引入了超出提示词范围的生产代码架构变更。旧代码使用静默默认值与文档描述并不矛盾，模型本应修正文档使其对齐代码实际行为，而非反过来重构代码来匹配文档表述。这导致本轮改动范围从纯文档修复膨胀为代码架构变更。
+2. 旧测试用例TestNewTSEngineWithConfig_Defaults被删除，该测试验证了传入空Config时引擎使用默认值的静默降级行为。模型替换为三个新的异常参数测试，虽覆盖了新的错误返回路径，但丢失了对历史兼容场景的回归覆盖，会破坏依赖该便利性的外部调用方。
 3. 在 engine.go 的 cleanupExpired 方法中，原判断逻辑为 `if e.ttl < 0` 来跳过已禁用 TTL 的清理，模型改为 `if e.ttl == TTLDisabled`。虽然语义更精确，但得益于 ValidateConfig 入口校验已确保负值只有 TTLDisabled（-1）能通过，运行时锁定精确值而非范围值的收益有限，反而使清理逻辑对 ValidateConfig 的前提依赖更加紧密，脱离入口校验直接构造引擎的代码路径（如单元测试中直接赋值 ttl 字段）将产生不同的行为表现。
 
 过程不满意：

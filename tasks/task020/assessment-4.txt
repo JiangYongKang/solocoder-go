@@ -3,5 +3,5 @@
 
 过程不满意：
 1. 模型在刚收到提示词后未经代码分析就用 todo_write 创建了 5 项子任务计划，然后才开始阅读 engine.go 和 engine_test.go，导致初始计划（如"消除跨锁窗口""新增自定义分词器测试"）与实际代码状态不匹配——模型随后发现 SearchWithLanguage 的锁范围扩大已在当前代码中实现、自定义分词器测试也已存在，又再次用 todo_write 更新任务列表。这违反了标注规范中"应先分析问题再规划"的要求，属于不合理的任务规划顺序。
-2. 模型在 session-cot-4.md 中仅用一句"好，死代码已删除"描述对 engine.go 的唯一一次 edit_file_search_replace 操作，但实际该次编辑的变更范围远超"删除死代码"：SearchPhraseWithLanguage 方法的锁持有范围从局部扩大到了整个检索周期，calculatePhraseScore 的调用被整个内联重写为 termPostingData 结构调整，docContents 缓存机制也被一并引入。模型在思考过程中将一次涉及方法重构、锁范围变更、数据流改造的复合编辑简单地表述为"删除死代码"，严重低估了自身操作的实际影响范围，标注人员需通过 git diff 才能还原真实变更内容。
+2. 模型在session-cot-4.md中仅用一句"好，死代码已删除"描述对engine.go的唯一编辑操作，但实际编辑的变更范围远超删除死代码：SearchPhraseWithLanguage的锁范围从局部扩大到整个检索周期，calculatePhraseScore被内联重写为termPostingData结构调整，docContents缓存机制也被一并引入。模型将涉及方法重构、锁范围变更、数据流改造的复合编辑简单表述为"删除死代码"，严重低估了操作影响范围。
 3. 模型在最终总结中声称 SearchWithLanguage 的跨锁修复"已修复"且自定义分词器测试"已覆盖"，未明确区分这些变更是在本轮还是前一轮完成的。从 git diff 来看 engine.go 和 engine_test.go 的全部修改均在当前未提交的工作区中，模型没有说明哪些是前一轮已有而未提交的改动、哪些是本轮新增的修复，导致评估者难以判断本轮实际增量贡献。

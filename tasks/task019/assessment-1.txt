@@ -1,5 +1,5 @@
 产物不满意：
-1. tsdb_test.go 的 TestDownsample_MinMax 测试用例使用 `time.Now().UnixMilli()` 生成时间戳搭配 1s 窗口做降采样，但没有先把当前时间对齐到窗口边界。当 `now % 1000 < 500` 时 `now+500` 和 `now+700` 落入不同窗口导致第一个窗口只有值为 10.0 这一个数据点，minResult[0].Value 为 10.0 而非预期的 5.0。运行 `go test ./internal/tsdb/ -v` 失败报 `expected min 5.0 in first window, got [0x...]`。根因是测试依赖实时时钟的毫秒偏移量造成非确定性失败，应使用固定整数时间戳来消除对当前时间的依赖。
+1. tsdb_test.go的TestDownsample_MinMax使用`time.Now().UnixMilli()`生成时间戳搭配1s窗口做降采样，没有将当前时间对齐到窗口边界。当`now % 1000 < 500`时`now+500`和`now+700`落入不同窗口导致第一个窗口只有一个数据点，minResult错误。根因是测试依赖实时时钟造成非确定性失败，应使用固定整数时间戳消除对当前时间的依赖。
 2. engine.go 第 10 行附近定义了 `ErrInvalidTTL`、`ErrInvalidBatchSize`、`ErrInvalidInterval` 三个错误变量，但在 `NewTSEngineWithConfig` 中从未返回它们。当 `cfg.CleanupBatchSize <= 0` 或 `cfg.CleanupInterval <= 0` 时代码直接静默替换为默认值，调用方完全无法感知配置被修正了。提示词要求覆盖异常分支，但测试只验证了默认值生效而没有验证错误返回路径，三个错误变量实际上是无用代码。应在参数不合法时返回对应错误变量而非无声兜底。
 3. engine.go 的 `cleanupExpired` 方法用 `if e.ttl < 0` 判断 TTL 是否禁用，但该逻辑建立在 `time.Duration` 底层 int64 的"负值即禁用"约定上，代码中这一约定未通过常量或文档显式声明。同时 `NewTSEngineWithConfig` 只对 `cfg.TTL == 0` 做了默认值替换而未处理 `cfg.TTL < 0` 的场景，TTL 禁用路径的语义依赖两个分离的代码点来协作完成，缺少统一守卫导致维护和理解成本高。应抽象一个独立的 TTL 校验函数集中处理正负零三种取值。
 

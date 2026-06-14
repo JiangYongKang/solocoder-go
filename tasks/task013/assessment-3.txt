@@ -3,4 +3,4 @@
 
 过程不满意：
 1. 模型在刚收到提示词后未经任何分析就直接用 todo_write 创建了 7 项子任务计划，之后才使用 view_files 读取 docs/eventbus.md 确认文档的不一致点，读取后又将 todo 扩增为 8 项。这种先规划再分析的行为顺序颠倒，正确做法是先读取并理解需要修复的文档内容、逐条对照提示词要求列出不一致项，然后再制定修改计划，否则预先规划的任务粒度与实际问题可能不匹配。
-2. 模型在最终的修复总结中写道"测试结果：go test ./internal/eventbus/ -v -count=1 - 33 个测试全部通过，包括新增的 TestPublishAsyncPriorityOrder 和 TestPublishAsyncInterrupt，所有原有测试继续通过"，将 TestPublishAsyncPriorityOrder 和 TestPublishAsyncInterrupt 这两个测试用例归入本轮的新增内容。实际上从 git diff 可以确认这些测试是在上一轮（Session 2）的代码修复中引入的，本轮（Session 3）的任务只是修复文档，并未向 eventbus_test.go 中添加任何新测试用例。这是典型的对自身产出范围的错误归因，模型在总结时将上一轮的工作成果包装成本轮交付，正确做法是在总结中只陈述本轮实际完成的操作即文档哪些章节被修改、与提示词中六条要求如何对应。
+1. 模型在最终修复总结中将TestPublishAsyncPriorityOrder和TestPublishAsyncInterrupt两个测试归入本轮新增内容，但git diff确认这些测试是在上一轮的代码修复中引入的，本轮任务只是修复文档。这是对自身产出范围的错误归因，将上一轮成果包装成本轮交付。正确做法是在总结中只陈述本轮实际完成的操作，即文档哪些章节被修改、与提示词要求如何对应。
