@@ -1,0 +1,9 @@
+产物不满意：
+1. 本轮任务为文档修复，提示词要求修复 docs/tsdb.md 中与代码不一致的描述，但模型同时修改了 engine.go 的生产代码，新增了 TTLDisabled 常量和 ValidateConfig 函数，并将 NewTSEngineWithConfig 函数签名从返回 *TSEngine 改为返回 (*TSEngine, error)，引入了超出提示词范围的生产代码架构变更。旧代码原本使用静默默认值机制（TTL 为 0 或 CleanupInterval 为 0 时自动替换为 DefaultConfig 的值），文档的描述与之并不矛盾；提示词虽提到"ValidateConfig 返回错误而非静默替换"，但旧代码中并不存在 ValidateConfig，模型本应修正文档描述使其对齐代码实际行为，而非反过来重构代码来匹配文档表述。这导致本轮改动范围从纯文档修复膨胀为代码架构变更，测试用例也随之进行了 10 处以上的适配性修改。
+2. 旧测试用例 TestNewTSEngineWithConfig_Defaults 被删除，该测试验证了传入空 Config 时引擎会使用默认值（TTL=24h）的静默降级行为。模型将其替换为三个新的异常参数测试（InvalidTTL、InvalidInterval、InvalidBatchSize），虽覆盖了新的错误返回路径，但丢失了对历史兼容场景的回归覆盖。如果外部调用方之前依赖传入空 Config 获得默认引擎的便利性，这一变更会破坏其集成行为。
+3. 在 engine.go 的 cleanupExpired 方法中，原判断逻辑为 `if e.ttl < 0` 来跳过已禁用 TTL 的清理，模型改为 `if e.ttl == TTLDisabled`。虽然语义更精确，但得益于 ValidateConfig 入口校验已确保负值只有 TTLDisabled（-1）能通过，运行时锁定精确值而非范围值的收益有限，反而使清理逻辑对 ValidateConfig 的前提依赖更加紧密，脱离入口校验直接构造引擎的代码路径（如单元测试中直接赋值 ttl 字段）将产生不同的行为表现。
+
+过程不满意：
+1. 模型在收到提示词后连续三次调用 view_files 读取同一个 docs/tsdb.md 文件（思考过程第 2 至 32 行），属于典型的冗余文件读取。第一次读取完 862 行文档后，在未做任何分析总结的情况下又读了第二遍和第三遍，三次读取之间模型仅说了一句"我看到了问题"，并未说明具体看到了哪些不一致点，随后直接创建 todo 列表。这反映出模型在开始编辑前没有系统性梳理所有待修复项的完整清单，导致后续编辑过程中才陆续发现 8.3/8.4 节存在重复内容和 9.1/9.2 节在之前编辑中丢失，属于边改边补漏的被动模式。
+2. 模型对测试确定性的验证不够充分。提示词第 4 条要求"所有测试通过且在所有时间运行都具有确定性"，模型仅对 4 个降采样测试（TestDownsample_Avg、TestDownsample_Sorted、TestDownsample_WithTagFilter、TestDownsample_MinMax）运行了 -count=5 的重复验证，而对 TTL 相关的 8 个测试（涉及时间敏感的后台清理逻辑）和并发测试（TestConcurrentWriteAndCleanup、TestConcurrentWriteAndQuery）均未做多次运行验证。确定性验证覆盖率不足，无法充分证明这些依赖计时器和 goroutine 调度的测试在所有时间点均稳定。
+3. 模型在思考过程中声称运行了 `go test ./internal/tsdb/ -v` 看到所有 78 个测试通过（思考过程第 354 行），但该命令的输出中包含了 `undefined` 字样的异常记录，表明测试命令的输出可能存在截断或捕获不完整的问题。模型未对这条异常输出做任何检查或二次确认，就直接基于"78 个测试通过"的结论收尾。面对命令输出存在异常信号时缺少警觉，属于对工具返回结果校验不严谨。

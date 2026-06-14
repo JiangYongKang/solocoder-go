@@ -552,6 +552,49 @@ Stop() 正常返回
 
 3. **监控关闭耗时**：正常情况下 `Stop()` 应该在毫秒级返回，如果耗时超过预期，说明存在 Handler 未正确响应 ctx 取消，需要检查 Handler 实现。
 
+### 7.5 Context 取消的测试验证策略
+
+为了确保 context 取消机制真正有效，而非停留在接口契约层面，模块通过专门的测试用例验证完整的取消链路。
+
+#### 7.5.1 测试覆盖的两类场景
+
+| 测试用例 | 验证目标 | 设计思路 |
+|----------|----------|----------|
+| `TestStop_WaitsForNoRunningTasks` | Stop 会等待正在执行的任务完成 | 使用外部 channel 阻塞 Handler，验证 Stop 不会提前返回，只有 release 后 Stop 才完成 |
+| `TestStop_CancelContextUnblocksHandler` | Stop 调用 cancel 后，监听 ctx.Done() 的 Handler 能够及时退出 | Handler 在 select 中同时监听 `ctx.Done()` 和业务 channel，验证 Stop 触发取消后 Handler 能在超时内返回 |
+
+#### 7.5.2 Context 取消测试的核心验证点
+
+`TestStop_CancelContextUnblocksHandler` 测试用例的设计要点：
+
+1. **Handler 必须使用 select 监听 ctx.Done()**：
+   ```go
+   handler := func(ctx context.Context, msg *DeadLetterMessage) error {
+       select {
+       case <-ctx.Done():
+           // 响应取消信号
+           return ctx.Err()
+       case <-workCh:
+           // 正常业务路径
+           return nil
+       }
+   }
+   ```
+
+2. **验证 Stop 能在超时内完成**：如果 Handler 没有正确响应 ctx 取消，`Stop()` 的 `taskWg.Wait()` 会永久阻塞，测试会因超时而失败。
+
+3. **验证 ctx.Done() 确实被触发**：通过原子计数器 `ctxCancelled` 标记 Handler 是否真的走到了 `ctx.Done()` 分支，而非通过其他路径退出。
+
+4. **与外部 channel 阻塞测试的对比**：
+   - `TestStop_WaitsForNoRunningTasks`：验证 Stop 会等待任务（使用外部 channel 阻塞，不依赖 ctx）
+   - `TestStop_CancelContextUnblocksHandler`：验证 Stop 发出的取消信号能被 Handler 接收（使用 ctx.Done() 解除阻塞）
+
+#### 7.5.3 测试的安全保障
+
+- 测试设置了 `1 秒超时保护`，如果 context 取消机制失效，测试会以失败告终而非无限挂起
+- 两个测试用例从正反两个方向验证：一个证明 Stop 会等、一个证明 Stop 能通过取消信号让 Handler 退
+- 共同构成了完整的优雅关闭测试闭环
+
 ## 8. 线程安全说明
 
 DeadLetter Processor 所有公共方法均为**并发安全**，可在多个 goroutine 中同时调用：

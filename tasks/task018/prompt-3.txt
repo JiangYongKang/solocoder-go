@@ -1,0 +1,6 @@
+你实现的 B+ 树索引模块第2轮修复中部分问题未实质解决，需要修复：
+1. Iterator.Delete 方法在迭代器 valid 状态下调用 tree.Delete 对已存在的键始终返回 true，即便 tree.Delete 返回 false 时执行的 return ErrKeyNotFound 分支在正常操作下永远不可达，ErrKeyNotFound 仍然是实质死代码。需要真正让该错误变量在合理的正常业务路径上可达，而非挂在逻辑上不可达的分支上。
+2. Iterator.Delete 的删除后重定位逻辑独立实现了一套约 40 行的从 findLeaf 到根节点回退再到最右叶子遍历的搜索策略，与 tree.Delete 内部的节点下溢调整策略各自独立演进，提示词要求的消除代码重复未彻底完成。
+3. TestIteratorDelete_ReturnsErrKeyNotFound 测试名称暗示验证 ErrKeyNotFound，但实际测试流程是 Next 越过最后一个元素后调用 Delete 校验的是 ErrIteratorInvalid，测试命名与实际断言不一致。
+4. 修复完成后运行 go test ./internal/bplustree/ -v，需要让所有测试通过。
+5. 在 docs/bplustree.md 中更新模块需求文档，说明 Iterator.Delete 的重定位策略与 tree.Delete 的协作关系。

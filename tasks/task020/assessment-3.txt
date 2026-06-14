@@ -1,0 +1,8 @@
+产物不满意：
+1. 提示词要求修复 DeleteDocument 的 IDF 计算窗口期，模型将 RemoveDocument 和 delete(docs) 放入同一 Engine.mu.Lock 范围后执行顺序改为先清理索引再删文档，写操作侧的原子性确实得到了保证。但 Search 方法中 totalDocs 的读取在 `e.mu.RLock` 内而倒排索引数据通过 `e.invertedIndex.GetPostingList` 在独立的 InvertedIndex 锁内读取，两段读操作不在同一临界区。当 Search 在 DeleteDocument 之前读完 totalDocs 之后才读 postingList 时，totalDocs 反映删除前状态但 postingList 已反映删除后状态，IDF 计算结果从原来的偏低变成了偏高。文档第 4.4 节声称修复"消除了 IDF 计算窗口期"与实情不符，应明确区分写操作原子性和读操作一致性两个问题。
+2. 提示词要求为 AddDocumentWithLanguage 的 TOCTOU 修复新增并发去重测试，但 TestConcurrent_AddDocument_SameDocID 通过 `e.AddDocument` 路由触发测试逻辑。AddDocument 只走默认分词器路径，而 AddDocumentWithLanguage 的 TOCTOU 防护链路包括 getTokenizer 选取分词器、调用 Tokenizer.Tokenize 分词、构建去重词项 Terms 再到持锁查重写入，自定义分词器场景下的链路更长且涉及更多共享状态读取。仅测试默认分词器路径无法验证当语言分词器被注册并使用时的 TOCTOU 防护是否仍有效。
+3. 文档第 4.4 节第 309 行描述修复"消除了 IDF 计算窗口期，保证 totalDocs 与 docsWithTerm 一致性"，但 Search 函数中 totalDocs 的读取与 postingList 的读取分属两个锁操作，在并发场景下 totalDocs 和 postingList 所来自的快照可能跨越 DeleteDocument 的执行边界，两者并非来自同一时刻。文档将写操作侧的原子性等价于整个搜索 IDF 计算的一致性，概念混淆容易误导读者认为并发搜索的评分已完全正确。
+
+过程不满意：
+1. 模型在刚收到提示词后的第一步就用 todo_write 创建了 5 项子任务计划，然后才通过 view_files 读取 engine.go 和 engine_test.go 的代码内容。标注规范要求先分析问题再规划，而模型在未查看 DeleteDocument 当前锁结构、未了解现有测试的 TOCTOU 防护范围和覆盖盲区的情况下就制定了计划，导致后续对引擎锁和测试覆盖之间的关联没有深入分析（如未发现 Search 的读操作仍然存在跨锁不一致的残余窗口）。
+2. 首次运行测试报 DefaultTokenizer 把下划线当分隔符导致断言失败后，模型在思考过程中仅写了一句"让我修复测试用例"就直接编辑了测试文件。虽然最终改动的方向是把含下划线的测试数据换成不含下划线的纯字母词项，修改本身合理，但思考过程中缺少对失败根因的深入分析说明，比如没有解释为什么选新词项名而非保留原词项并调整断言逻辑，也没有讨论分词器行为是否会影响后续新增测试用例的数据设计。整个调试过程缺少试错前的推理环节，直接跳到了修改步骤。

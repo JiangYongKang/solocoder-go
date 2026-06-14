@@ -425,6 +425,146 @@ mergeLoop 接收 mergeCh 信号 或 定时 ticker 触发检查
 - **L0 层**：由刷盘直接写入，文件间 key 范围可重叠。查询时必须从新到旧遍历所有文件，确保读取到最新版本。
 - **L1+ 层**：文件间 key 范围严格不重叠。查询时可通过二分查找快速定位目标文件，读取性能接近有序数组。
 
+### 5.4 Level.Range 的墓碑处理策略
+
+`Level.Range`（对外范围查询）与 `Level.RangeWithTombstone`（内部使用）在墓碑处理上存在本质差异。为避免跨文件比较时墓碑被提前过滤导致已删除 key 错误复活，必须遵循"先合并去重、最后过滤"的原则。
+
+#### 错误的处理方式（已废弃）
+
+```go
+// L0 层遍历每个 SSTable 时直接调用 sst.Range（已过滤 tombstone）
+for _, sst := range l.tables {
+    entries, _ := sst.Range(start, end)  // ❌ 墓碑在这里已经被过滤了
+    for _, e := range entries {
+        if !seen[e.Key] {
+            seen[e.Key] = true
+            result = append(result, e)
+        }
+    }
+}
+```
+
+**问题**：
+- SSTable A（较新）包含 key "foo" 的 tombstone
+- SSTable B（较旧）包含 key "foo" 的存活数据
+- 遍历 A 时 sst.Range 过滤掉了 tombstone，resultMap 中无 "foo" 记录
+- 遍历 B 时 sst.Range 返回存活数据，"foo" 被错误地加入结果
+- 已删除的 key 在范围查询中"复活"了
+
+#### 正确的处理方式（当前实现）
+
+```go
+// 第一步：调用 rangeInternal 收集含 tombstone 的所有条目，按 Timestamp 去重
+func (l *Level) Range(start, end string) ([]*Entry, error) {
+    entries, err := l.rangeInternal(start, end)  // 含 tombstone
+    if err != nil {
+        return nil, err
+    }
+    // 第二步：合并去重完成后，最后才过滤 tombstone
+    result := make([]*Entry, 0, len(entries))
+    for _, e := range entries {
+        if !e.Tombstone {  // ✅ 在跨文件版本竞争之后才过滤
+            result = append(result, e)
+        }
+    }
+    return result, nil
+}
+
+// rangeInternal 内部始终使用 sst.RangeWithTombstone
+func (l *Level) rangeInternal(start, end string) ([]*Entry, error) {
+    for i := len(l.tables) - 1; i >= 0; i-- {
+        entries, _ := sst.RangeWithTombstone(start, end)  // ✅ 保留 tombstone
+        for _, e := range entries {
+            existing, ok := resultMap[e.Key]
+            if !ok || e.Timestamp > existing.Timestamp {
+                resultMap[e.Key] = e  // tombstone 靠大 Timestamp 覆盖旧版本
+            }
+        }
+    }
+    // ...
+}
+```
+
+**正确性保证**：
+- 所有层的所有条目（包括 tombstone）都先进入 `resultMap`
+- 同 key 的多个版本按 `Timestamp` 比较，时间戳大的胜出
+- 如果最新版本是 tombstone，它会覆盖下层的存活数据
+- 所有层合并完成后，才统一过滤掉 `Tombstone=true` 的条目
+- 已删除的 key 不会"复活"
+
+### 5.5 Range/RangeWithTombstone 的代码复用设计
+
+`Range`（过滤 tombstone）和 `RangeWithTombstone`（保留 tombstone）两个方法的逻辑几乎完全相同，仅差一行墓碑过滤。如果分别维护两套代码，未来修改时极易出现同步遗漏导致的 bug（例如只改了 Range 忘了改 RangeWithTombstone）。
+
+#### SSTable 的参数化复用
+
+通过私有方法 `rangeInternal` + `filterTombstone` 布尔参数实现统一实现：
+
+```go
+// 对外 API：过滤 tombstone
+func (sst *SSTable) Range(start, end string) ([]*Entry, error) {
+    return sst.rangeInternal(start, end, true)
+}
+
+// 对内 API：保留 tombstone
+func (sst *SSTable) RangeWithTombstone(start, end string) ([]*Entry, error) {
+    return sst.rangeInternal(start, end, false)
+}
+
+// 统一实现：仅在追加结果时根据参数决定是否过滤
+func (sst *SSTable) rangeInternal(start, end string, filterTombstone bool) ([]*Entry, error) {
+    // ... 打开文件、按范围收集 key、排序等公共逻辑 ...
+    for _, key := range sortedKeys {
+        // ... 读取并解码 entry ...
+        if !filterTombstone || !entry.Tombstone {
+            result = append(result, entry)  // 唯一的差异点
+        }
+    }
+    return result, nil
+}
+```
+
+**优点**：
+- 公共逻辑（文件打开、范围过滤、key 排序、磁盘 I/O）只有一份
+- 修改核心逻辑时只需改动一处
+- 两个对外方法仅为简单的参数转发，不可能出现行为不一致
+
+#### Level 的分层复用
+
+Level 层的差异点更多（不仅是过滤 tombstone，还要跨文件版本合并），采用"先合并、后过滤"的分层策略：
+
+```go
+// 对外 API：先收集全部含 tombstone 条目去重，最后再过滤
+func (l *Level) Range(start, end string) ([]*Entry, error) {
+    entries, err := l.rangeInternal(start, end)  // 步骤 1：含 tombstone 的合并去重
+    if err != nil {
+        return nil, err
+    }
+    result := make([]*Entry, 0, len(entries))
+    for _, e := range entries {
+        if !e.Tombstone {  // 步骤 2：最后过滤
+            result = append(result, e)
+        }
+    }
+    return result, nil
+}
+
+// 对内 API：直接返回合并去重后的结果（含 tombstone）
+func (l *Level) RangeWithTombstone(start, end string) ([]*Entry, error) {
+    return l.rangeInternal(start, end)
+}
+
+// 统一核心实现：跨文件按 Timestamp 合并去重
+func (l *Level) rangeInternal(start, end string) ([]*Entry, error) {
+    // ... 遍历 SSTable、调用 sst.RangeWithTombstone、版本竞争去重 ...
+}
+```
+
+**复用原则**：
+- SSTable 层：使用布尔参数 `filterTombstone`，因为两个方法的结构完全一致
+- Level 层：使用"内部方法 + 外层过滤"的分层方式，因为 `Range` 需要在去重后才能过滤 tombstone
+- 无论采用哪种方式，核心原则都是"差异逻辑最小化，公共逻辑唯一化"
+
 ## 6. 使用示例
 
 ### 6.1 基本使用
@@ -656,16 +796,183 @@ fmt.Println("Recovered:", val) // critical_value
 | 组件 | 锁机制 | 说明 |
 |------|--------|------|
 | DB 整体状态 | `sync.RWMutex` | 保护 memTable / immutable / flushing / levels / seqNum / closed |
-| MemTable | `sync.RWMutex` | 保护跳表读写，MemTable 内部锁 |
+| MemTable | `sync.RWMutex` | 保护跳表引用、大小统计、冻结状态 |
+| SkipList | `sync.RWMutex` | 保护跳表内部节点结构。迭代器在整个迭代期间持有读锁，防止并发修改导致 panic |
 | SSTable | `sync.RWMutex` | 保护索引与元数据读取（SSTable 本身不可变，锁主要用于加载） |
 | Level | `sync.RWMutex` | 保护该层 SSTable 列表的增删与排序 |
 | Compaction | `mergeMu` + `atomic.Bool` | `merging` 原子标记防止并发合并，`mergeMu` 串行化合并过程 |
 
-**已验证场景**：
+### 10.1 SkipList 迭代器锁生命周期管理
+
+SkipListIterator 在创建时获取 SkipList 的读锁，并通过三层保底机制确保锁最终一定会被释放，防止读锁泄漏导致写路径永久阻塞。
+
+#### 锁生命周期的三层保底机制
+
+```
+创建迭代器（Iterator()）
+        │
+        ▼
+  ① 构造时获取读锁 + 注册 runtime.SetFinalizer
+        │
+        ▼
+  ② 迭代结束自动释放：Next() 返回 false 时自动调用 Close()
+        │
+        ▼
+  ③ GC 兜底释放：迭代器对象被 GC 时 finalizer 调用 Close()
+```
+
+**代码实现**：
+```go
+// SkipList.Iterator(): 构造时加锁 + 注册 finalizer
+func (sl *SkipList) Iterator() *SkipListIterator {
+    sl.mu.RLock()
+    it := &SkipListIterator{
+        sl:      sl,
+        current: sl.header.forward[0],
+        locked:  true,
+    }
+    runtime.SetFinalizer(it, func(iter *SkipListIterator) {
+        iter.Close()  // 第三层：GC 兜底
+    })
+    return it
+}
+
+// Next(): 迭代结束时自动释放锁
+func (it *SkipListIterator) Next() bool {
+    if !it.started {
+        it.started = true
+        if it.current == nil {
+            it.Close()  // 第二层：空迭代器立即释放
+            return false
+        }
+        return true
+    }
+    if it.current == nil {
+        it.Close()
+        return false
+    }
+    it.current = it.current.forward[0]
+    if it.current == nil {
+        it.Close()  // 第二层：遍历到末尾自动释放
+        return false
+    }
+    return true
+}
+
+// Close(): 幂等操作，多次调用安全
+func (it *SkipListIterator) Close() {
+    if it.locked {
+        it.sl.mu.RUnlock()
+        it.locked = false
+    }
+}
+```
+
+#### 各层保底的触发场景
+
+| 层级 | 机制 | 触发时机 | 说明 |
+|------|------|---------|------|
+| ① 最佳实践 | 调用者 `defer iter.Close()` | 迭代器使用完毕立即释放 | 释放最及时，推荐所有内部代码使用 |
+| ② 自动释放 | `Next()` 返回 `false` | 迭代正常结束（遍历到末尾或空表） | 覆盖正常遍历完成的场景 |
+| ③ 兜底释放 | `runtime.SetFinalizer` | 迭代器对象被 GC 回收 | 覆盖调用者忘记 Close 且提前 break 的场景 |
+
+#### 为什么需要三层保底
+
+最初版本仅依赖调用者显式调用 `Close()`，存在以下问题：
+- 测试代码中创建迭代器后未调用 `Close()`
+- 调用者遍历到一半 `break` 跳出循环时，`Next()` 还没返回 `false`
+- 迭代器被提前丢弃，引用丢失
+
+如果读锁永久不释放：
+- SkipList 的所有写操作（`Insert`/`Delete`）会永久阻塞等待写锁
+- 整个 LSM-Tree 写入路径卡死，数据库停止响应
+
+三层保底确保即使上层调用方式不规范，锁最终仍会被释放。
+
+#### 为什么迭代器需要在整个迭代期间持有锁
+
+- 如果迭代器仅在构造时获取 `current` 指针后立即释放锁
+- 其他 goroutine 在迭代过程中修改跳表节点（`Insert`/`Delete`）
+- 节点的 `forward` 指针可能被修改或节点内存被回收
+- 迭代器访问 `current.forward[0]` 时可能读到已修改的指针导致 panic
+
+**已修复的问题**：原实现中 SkipList 没有任何锁保护，Iterator 在构造时获取 current 指针后不再持有锁，并发场景下存在严重的并发安全隐患，且锁泄漏会导致写路径永久阻塞。
+
+### 10.2 关闭状态检查的原子性（TOCTOU 问题修复）
+
+DB 的 `closed` 字段表示数据库是否已关闭。所有对外 API（Put/Delete/Get/Range）必须在操作前检查该字段，防止关闭后继续写入导致数据丢失。
+
+#### 错误的检查方式（已废弃）
+```go
+db.mu.RLock()
+if db.closed {
+    db.mu.RUnlock()
+    return ErrDBClosed
+}
+db.mu.RUnlock()  // 这里释放了锁
+
+// ┌───────────────────────┐
+// │  TOCTOU 窗口期        │
+// │  此时其他 goroutine   │
+// │  可能调用 db.Close()  │
+// └───────────────────────┘
+
+db.mu.Lock()  // 重新获取锁，但此时 db.closed 可能已经是 true
+db.memTable.Put(key, value)  // 已关闭的 DB 仍可接受写入！
+db.mu.Unlock()
+```
+
+这是典型的 **TOCTOU（Time Of Check, Time Of Use）** 竞态条件：检查和使用之间的时间窗口内，状态可能被改变。
+
+#### 正确的原子性检查（当前实现）
+
+**对于写入操作（Put/Delete）**：
+```go
+db.mu.Lock()
+defer db.mu.Unlock()
+
+if db.closed {  // 检查和操作在同一个写锁持有期间
+    return ErrDBClosed
+}
+db.memTable.Put(key, value)  // 安全，锁保证了 closed 不会在操作中改变
+```
+检查和操作在同一个写锁持有期间完成，不存在窗口期。
+
+**对于读取操作（Get/Range）**：
+```go
+db.mu.RLock()
+if db.closed {
+    db.mu.RUnlock()
+    return ErrDBClosed
+}
+// 内存部分搜索在同一个读锁持有期间完成
+entry, found := db.memTable.GetWithTombstone(key)
+// ... immutable / flushing 也在同一个读锁下搜索
+db.mu.RUnlock()
+
+// SSTable 部分搜索不需要持有 DB 读锁（SSTable 有自己的锁）
+// 但每一层搜索前重新检查 closed
+for level := 0; level < maxLevel; level++ {
+    db.mu.RLock()
+    if db.closed {
+        db.mu.RUnlock()
+        return ErrDBClosed
+    }
+    db.mu.RUnlock()
+    // ... 搜索该层 SSTable
+}
+```
+- 内存部分的搜索与 `closed` 检查在同一个读锁持有期间，保证原子性
+- SSTable 部分每次搜索前重新检查 `closed`，即使中途被关闭也能及时响应
+- 不存在 TOCTOU 窗口期
+
+### 10.3 已验证场景
 - 多 goroutine 并发 Put（10 goroutine × 100 条）无数据丢失
 - 并发 Put + Get 无幽灵丢失（数据已写入但返回不存在）
 - 刷盘过程中读取不丢失不可变 MemTable 中的数据
 - Close 后所有操作正确返回 ErrDBClosed
+- 并发迭代跳表 + 并发修改跳表无 panic
+- Close 与 Put 并发执行时不会出现已关闭 DB 仍写入的情况
 
 ## 11. 注意事项与限制
 

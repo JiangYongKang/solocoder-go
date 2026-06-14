@@ -1,0 +1,5 @@
+你实现的 WAL 存储引擎模块在第2轮修复中存在代码重复和测试覆盖不足的问题，需要修复：
+1. scanSegmentOffsets 方法内联了手动 CRC32 校验逻辑而 readSegmentEntries 和 recoverSegment 通过 decodeEntry 完成校验，三个读取函数对相同的解码任务使用了不一致的实现策略，scan 绕过了已有的 decodeEntry 函数。如果二进制格式变更需要同时修改两处，增加了维护风险。需要让三个方法统一复用 decodeEntry 做解码和校验。
+2. 提示词第 2 条指出"两个 reader 同时持有读锁调用时文件位置共享竞争"，修复后的 TestConcurrentReadWrite 只有一条读 goroutine，没有覆盖两个以上 reader 并发读取的场景。需要新增至少两条读 goroutine 并发调用 ReadFrom 的测试用例，验证每个 reader 都能独立读到完整数据。
+3. 修复完成后运行 go test ./internal/wal/ -v，需要让所有测试通过。
+4. 在 docs/wal.md 中更新模块需求文档，说明流式读取函数中的条目解码策略统一性和并发读取的测试覆盖情况。

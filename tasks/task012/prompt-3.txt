@@ -1,0 +1,4 @@
+你实现的死信队列处理器模块在第2轮修复中上下文传递的测试覆盖不完整，需要修复：
+1. TestStop_WaitsForNoRunningTasks 中的 handler 通过外部 release channel 阻塞而非监听 ctx.Done()，context 取消路径从未经过测试验证。提示词要求 handler 能响应 ctx 取消信号以避免 Stop 永久挂起，但现有测试无法验证 handler 是否真的检查了 ctx.Done()。需要新增测试用例，让 handler 在 select 中同时监听 ctx.Done() 和业务 channel，验证 Stop 调用 cancel 后 handler 能在超时时间内退出。
+2. 修复完成后运行 go test ./internal/deadletter/ -v，需要让所有测试通过。
+3. 在 docs/deadletter.md 中更新模块需求文档，说明 context 取消的测试验证策略。

@@ -1,0 +1,6 @@
+你实现的 TSDB 时序数据库模块第2轮的文档更新存在遗漏和矛盾，需要修复：
+1. docs/tsdb.md 中错误定义表里 ErrInvalidTTL 描述仍为"当前实现中 0 表示使用默认值，负数表示禁用"，ErrInvalidBatchSize 和 ErrInvalidInterval 描述仍为"当前实现中使用默认值"，与代码中 ValidateConfig 在参数不合法时返回错误而非静默替换的实际机制矛盾。
+2. docs/tsdb.md 中 8.4 节禁用 TTL 的示例代码仍使用 TTL: -1 字面量而非代码中定义的 TTLDisabled 常量，且判断逻辑仍为 engine.GetTTL() < 0 而非使用 TTLDisabled 做比较。
+3. docs/tsdb.md 中 5.4.2 节清理流程图的 TTL 判断条件仍写为"ttl < 0 → 直接返回"而非使用 TTLDisabled 常量名称。
+4. 修复完成后运行 go test ./internal/tsdb/ -v，需要让所有测试通过且在所有时间运行都具有确定性。
+5. 在 docs/tsdb.md 中更新模块需求文档，确保错误变量的描述、配置校验约定、TTL 禁用语义的示例代码与当前代码实现完全一致。

@@ -1894,7 +1894,7 @@ func TestUnderflow_LeafLinkedListAfterMerge(t *testing.T) {
 	}
 }
 
-func TestIteratorDelete_ReturnsErrKeyNotFound(t *testing.T) {
+func TestIteratorDelete_ReturnsErrIteratorInvalid(t *testing.T) {
 	tree := NewBPlusTree()
 	tree.Insert("a", "1")
 
@@ -1907,6 +1907,37 @@ func TestIteratorDelete_ReturnsErrKeyNotFound(t *testing.T) {
 	err := it.Delete()
 	if err != ErrIteratorInvalid {
 		t.Errorf("expected ErrIteratorInvalid on invalid iterator, got %v", err)
+	}
+}
+
+func TestIteratorDelete_ReturnsErrKeyNotFound(t *testing.T) {
+	tree := NewBPlusTree()
+	tree.Insert("a", "1")
+	tree.Insert("b", "2")
+	tree.Insert("c", "3")
+
+	it := tree.NewIterator()
+	it.Next()
+	it.Next()
+	if !it.Valid() {
+		t.Fatal("expected valid iterator at c")
+	}
+	key, _ := it.Key()
+	if key != "c" {
+		t.Fatalf("expected key 'c', got %s", key)
+	}
+
+	deleted := tree.Delete("c")
+	if !deleted {
+		t.Fatal("expected tree.Delete to succeed")
+	}
+
+	err := it.Delete()
+	if err != ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound when index out of range after tree.Delete, got %v", err)
+	}
+	if it.Valid() {
+		t.Error("iterator should be invalid after ErrKeyNotFound")
 	}
 }
 

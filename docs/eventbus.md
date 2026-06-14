@@ -216,39 +216,46 @@ type EventBus struct {
           │                                          │
           ▼                                          ▼
 ┌────────────────────┐                    ┌────────────────────┐
-│  逐个调用 Handler  │                    │  为每个匹配订阅者   │
-│  （按优先级顺序）  │                    │  启动 goroutine     │
+│  逐个调用 Handler  │                    │  启动单个后台       │
+│  （按优先级顺序）  │                    │  goroutine          │
 └──────────┬─────────┘                    └──────────┬─────────┘
            │                                          │
            ▼                                          ▼
 ┌────────────────────┐                    ┌────────────────────┐
-│  Panic 恢复包装    │                    │  Panic 恢复包装    │
-│  callHandler()     │                    │  后台异步执行      │
+│  Panic 恢复包装    │                    │  按优先级顺序       │
+│  callHandler()     │                    │  逐个调用 Handler   │
 └──────────┬─────────┘                    └──────────┬─────────┘
            │                                          │
            ▼                                          ▼
 ┌────────────────────┐                    ┌────────────────────┐
-│  检查返回 error    │                    │  发布者立即返回     │
-└──────────┬─────────┘                    │  订阅者后台执行     │
-           │                              └────────────────────┘
-           ├───────────┐
-           │           │
-           ▼           ▼
-      ErrInterrupt   其他 error
-           │           │
-           ▼           ▼
-┌────────────────────┐│
-│  中断后续调用      ││
-│  返回 ErrInterrupt ││
-└────────────────────┘│
-           │           ▼
-           │  继续调用后续订阅者
-           │  收集第一个非 nil error
-           ▼
-┌────────────────────┐
-│  返回第一个 error  │
-│  （或 nil）        │
-└────────────────────┘
+│  检查返回 error    │                    │  Panic 恢复包装    │
+└──────────┬─────────┘                    │  callHandler()     │
+           │                              └──────────┬─────────┘
+           ├───────────┐                             │
+           │           │                             ▼
+           ▼           ▼                   ┌────────────────────┐
+      ErrInterrupt   其他 error            │  检查返回 error    │
+           │           │                   └──────────┬─────────┘
+           ▼           ▼                              │
+┌────────────────────┐│                 ┌─────────────┴─────────────┐
+│  中断后续调用      ││                 │                           │
+│  返回 ErrInterrupt ││                 ▼                           ▼
+└────────────────────┘│           ErrInterrupt          其他 error / nil
+           │           │                 │                           │
+           │  继续调用后续订阅者         ▼                           │
+           │  收集第一个非 nil error ┌────────────────────┐         │
+           ▼                       │  中断后续调用      │         │
+┌────────────────────┐             │  后台 goroutine    │         │
+│  返回第一个 error  │             │  直接返回          │         │
+│  （或 nil）        │             └────────────────────┘         │
+└────────────────────┘                                           │
+                                                   继续调用后续订阅者
+                                                                 │
+                                                                 ▼
+                                                   ┌────────────────────┐
+                                                   │  后台 goroutine    │
+                                                   │  处理完毕          │
+                                                   └────────────────────┘
 ```
 
 ### 3.1 链路阶段说明
@@ -280,20 +287,43 @@ type EventBus struct {
      - 若订阅者返回非 `nil error`，继续调用后续订阅者，但记录第一个 error
      - 所有订阅者处理完成后返回第一个 error（或 nil）
    - **异步分发（PublishAsync）**：
-     - 为每个匹配的订阅者启动一个独立的 goroutine
-     - 每个 goroutine 中通过 `callHandler()` 包装，自动捕获 panic
-     - 发布者立即返回，不等待订阅者处理完成
-     - 可通过 `Wait()` 等待所有异步分发的订阅者处理完成
-     - 异步模式下忽略订阅者返回的 error（包括 `ErrInterrupt`）
+     - 启动单个后台 goroutine，发布者立即返回
+     - 在后台 goroutine 中按优先级顺序逐个调用订阅者处理函数（与同步模式相同）
+     - 每个调用通过 `callHandler()` 包装，自动捕获 panic
+     - 若订阅者返回 `ErrInterrupt`，后台 goroutine 立即停止调用后续低优先级订阅者并退出
+     - 若订阅者返回非 `nil error`（非 `ErrInterrupt`），继续调用后续订阅者
+     - 可通过 `Wait()` 等待所有异步分发完成
+     - 异步模式下订阅者返回的 error 不会传递给发布者（因为发布者已提前返回）
 
 ### 3.2 中断机制说明
 
-中断机制仅在**同步分发**模式下生效：
+中断机制在**同步分发和异步分发**模式下均生效：
 
 - 订阅者返回 `ErrInterrupt` 特殊错误值时，事件总线立即停止调用后续低优先级订阅者
 - 已调用的高优先级订阅者不受影响
-- `PublishSync()` 返回 `ErrInterrupt`
-- 异步分发模式下，`ErrInterrupt` 不触发中断，所有匹配的订阅者都会被并发调用
+- **同步模式**：`PublishSync()` 返回 `ErrInterrupt`
+- **异步模式**：后台 goroutine 检测到 `ErrInterrupt` 后停止调用剩余订阅者，发布者不会收到此错误（已提前返回）
+
+#### 3.2.1 异步分发优先级与中断的设计策略
+
+异步分发的核心设计原则是：**在保证发布者非阻塞的前提下，维持与同步模式完全一致的优先级顺序和中断语义**。
+
+具体实现策略：
+
+1. **单 goroutine 顺序执行**：`PublishAsync` 启动一个后台 goroutine，在该 goroutine 内部按优先级从高到低逐个调用订阅者。不为每个订阅者单独启动 goroutine，因为并发执行会导致优先级顺序丢失和中断机制失效。
+
+2. **中断传播**：每个订阅者执行完毕后，后台 goroutine 检查返回值。若返回 `ErrInterrupt`，立即退出循环，跳过所有剩余低优先级订阅者。
+
+3. **Panic 隔离**：每个订阅者通过 `callHandler()` 包装执行。即使某个订阅者 panic，也不会影响后续订阅者的调用（panic 被恢复为 error，且该 error 不是 `ErrInterrupt`）。
+
+4. **等待机制**：每次 `PublishAsync` 调用对应一个 `sync.WaitGroup` 计数器。调用 `Wait()` 可阻塞等待所有异步分发（包括其中所有订阅者）处理完毕。
+
+**为什么不为每个订阅者启动独立 goroutine？**
+
+若为每个匹配的订阅者并发启动独立 goroutine，会导致以下问题：
+- **优先级丢失**：所有 goroutine 并发执行，操作系统调度不可控，高优先级订阅者可能晚于低优先级完成
+- **中断失效**：并发执行时无法在某个订阅者返回 `ErrInterrupt` 后阻止低优先级订阅者的执行，因为低优先级 goroutine 可能已经开始运行
+- **语义不一致**：同步和异步模式的优先级与中断行为会产生差异，增加使用者的认知负担
 
 ## 4. 核心算法与策略
 
@@ -358,7 +388,64 @@ func callHandler(handler HandlerFunc, event Event) (retErr error) {
 }
 ```
 
-### 4.5 ID 生成算法
+### 4.5 异步分发执行与中断策略
+
+`PublishAsync` 的核心目标是在保证发布者非阻塞的同时，维持与同步模式一致的优先级顺序和中断语义。为此采用**单 goroutine 顺序执行**策略，而非为每个订阅者独立启动 goroutine。
+
+核心实现：
+
+```go
+func (bus *EventBus) PublishAsync(event Event) {
+    matched := bus.getMatchedSubscribers(event.Type, event)
+    if len(matched) == 0 {
+        return
+    }
+
+    bus.asyncWg.Add(1)
+    go func(subs []*subscriber, e Event) {
+        defer bus.asyncWg.Done()
+        for _, sub := range subs {
+            err := callHandler(sub.Handler, e)
+            if err != nil && errors.Is(err, ErrInterrupt) {
+                return
+            }
+        }
+    }(matched, event)
+}
+```
+
+#### 4.5.1 优先级保证机制
+
+`getMatchedSubscribers()` 在分发前已完成按 `Priority` 降序排序（见 4.3 节）。后台 goroutine 使用 `for range` 遍历该已排序切片，由于遍历在单个 goroutine 内顺序执行，天然保证了高优先级订阅者的 Handler 先于低优先级开始执行和返回。即使在多核 CPU 上，也不会出现低优先级订阅者先执行的竞态。
+
+与"每订阅者独立 goroutine"方案的对比：
+- **独立 goroutine 方案（错误）**：调度顺序由 Go runtime 决定，`Priority=100` 的 Handler 可能晚于 `Priority=10` 的 Handler 获得执行时间片，优先级仅为注释，无实际语义。
+- **单 goroutine 方案（实际实现）**：调度顺序由代码的 `for` 循环决定，`Priority=100` 必然在 `Priority=10` 之前开始执行，优先级为强语义保证。
+
+#### 4.5.2 中断保证机制
+
+中断通过 `ErrInterrupt` + 每次循环后的 error 检查实现：
+
+1. 每个订阅者执行完毕后，判断 `errors.Is(err, ErrInterrupt)`：
+   - 若为 `true`：立即 `return` 跳出循环，剩余未遍历的低优先级订阅者均不会被调用
+   - 若为 `false`（`nil` 或其他 error）：继续下一次循环
+
+2. 由于在单个 goroutine 中顺序执行，中断判断是一个完全同步的决策点，不存在以下竞态：
+   - 中断触发时低优先级订阅者已在另一个 goroutine 中开始运行
+   - 中断信号传递存在延迟导致部分低优先级执行
+
+#### 4.5.3 错误语义差异
+
+同步与异步模式在错误传递上存在差异：
+
+| 模式 | `ErrInterrupt` 中断行为 | 一般错误（非中断） | 返回值 |
+|------|------------------------|-------------------|--------|
+| PublishSync | 中断后续调用 | 继续调用，记录第一个 | 返回第一个 error 或 `ErrInterrupt` |
+| PublishAsync | 中断后续调用 | 继续调用，不记录 | 无返回值，所有 error 不向外传递 |
+
+原因：异步模式下发布者已提前返回，无渠道接收错误。若业务需要感知异步分发的错误或中断结果，应在订阅者 Handler 内部将错误写入独立的错误收集 channel、日志或指标系统。
+
+### 4.6 ID 生成算法
 
 订阅者 ID 采用递增序列生成，格式为 "sub-{n}"：
 
@@ -408,6 +495,8 @@ func main() {
 
 ### 5.2 异步分发
 
+异步分发模式下，发布者立即返回，订阅者在后台 goroutine 中按优先级顺序执行，中断机制同样生效：
+
 ```go
 bus := eventbus.NewEventBus()
 
@@ -425,6 +514,51 @@ fmt.Println("发布完成，无需等待邮件发送")
 // 可选：等待所有异步处理完成
 bus.Wait()
 fmt.Println("所有异步处理已完成")
+```
+
+异步模式下的优先级与中断示例：
+
+```go
+bus := eventbus.NewEventBus()
+
+var order []int
+var mu sync.Mutex
+
+// 高优先级：风控检查
+bus.Subscribe("order.create", func(event eventbus.Event) error {
+    mu.Lock()
+    order = append(order, 100)
+    mu.Unlock()
+    amount := event.Attributes["amount"].(float64)
+    if amount > 100000 {
+        fmt.Println("大额订单风控拦截")
+        return eventbus.ErrInterrupt // 异步模式下同样触发中断
+    }
+    return nil
+}, eventbus.SubscribeConfig{Priority: 100})
+
+// 中优先级：扣减库存
+bus.Subscribe("order.create", func(event eventbus.Event) error {
+    mu.Lock()
+    order = append(order, 50)
+    mu.Unlock()
+    return nil
+}, eventbus.SubscribeConfig{Priority: 50})
+
+// 低优先级：创建订单记录
+bus.Subscribe("order.create", func(event eventbus.Event) error {
+    mu.Lock()
+    order = append(order, 10)
+    mu.Unlock()
+    return nil
+}, eventbus.SubscribeConfig{Priority: 10})
+
+// 触发风控拦截，order 结果为 [100]，50 和 10 不会执行
+bus.PublishAsync(eventbus.Event{
+    Type:       "order.create",
+    Attributes: map[string]interface{}{"amount": 200000.0},
+})
+bus.Wait()
 ```
 
 ### 5.3 事件过滤
@@ -591,7 +725,7 @@ wg.Wait()
 |------|------|
 | `ErrSubscriberNotFound` | 取消订阅时指定的事件类型或订阅者 ID 不存在 |
 | `ErrSubscriberExists` | 注册订阅者时指定的 ID 已存在于该事件类型 |
-| `ErrInterrupt` | 订阅者返回此错误以中断后续低优先级订阅者的调用（仅同步模式） |
+| `ErrInterrupt` | 订阅者返回此错误以中断后续低优先级订阅者的调用（同步模式和异步模式均生效） |
 | `errors.New("handler panic: ...")` | 订阅者处理函数发生 panic 时自动包装的错误 |
 | `errors.New("handler cannot be nil")` | 调用 Subscribe() 时传入 nil handler |
 
@@ -612,7 +746,7 @@ EventBus 所有公共方法均为**并发安全**，可在多个 goroutine 中�
 | 分发模式 | 同步/异步 | 异步（channel 推送） |
 | 过滤机制 | 基于事件属性的灵活过滤 | 基于 Topic 模式匹配 |
 | 优先级 | 支持 | 不支持 |
-| 中断机制 | 支持（同步模式） | 不支持 |
+| 中断机制 | 支持（同步/异步模式） | 不支持 |
 | 消息持久化 | 不支持 | 支持（死信队列、持久订阅） |
 | ACK 机制 | 不支持 | 支持 |
 | 重试机制 | 不支持 | 支持（指数退避） |

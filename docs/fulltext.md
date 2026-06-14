@@ -300,15 +300,14 @@ DeleteDocument(docID)
   获取 Engine.mu 写锁
   ├─ docID 存在? ──否──► 释放锁，返回 ErrDocNotFound
   ├─ 读取 doc.Terms（去重词项集合）
+  ├─ invertedIndex.RemoveDocument(docID, doc.Terms)
+  │  └─ 遍历文档中的每个词项 term:
+  │     ├─ 从该 term 的 PostingList 中移除 docID 对应的 TermPosting
+  │     └─ 若移除后 PostingList 为空，则从倒排索引中删除该 term 条目
   ├─ 从 docs map 中删除 docID
   └─ 释放 Engine.mu 写锁
-       │
-       ▼
-  清理倒排索引
-  └─ invertedIndex.RemoveDocument(docID, doc.Terms)
-     └─ 遍历文档中的每个词项 term:
-        ├─ 从该 term 的 PostingList 中移除 docID 对应的 TermPosting
-        └─ 若移除后 PostingList 为空，则从倒排索引中删除该 term 条目
+  （说明：倒排索引清理和 docs 删除在同一持锁范围内原子执行，
+   消除了 IDF 计算窗口期，保证 totalDocs 与 docsWithTerm 一致性）
        │
        ▼
      返回 nil (成功)
@@ -479,6 +478,26 @@ type Tokenizer interface {
   → 保证同一 docID 只有一个 goroutine 能成功写入
 ```
 
+**文档删除的原子性保证**:
+- `DeleteDocument` 中，倒排索引清理（`invertedIndex.RemoveDocument`）和 docs map 删除在**同一个 Engine.mu 写锁范围内**原子执行
+- 先清理倒排索引（减少各词项的 docsWithTerm 计数），再删除 docs map（减少 totalDocs），顺序固定
+- 消除了「先删 docs 再清理索引」的时间窗口——该窗口期会导致搜索用已减少的 totalDocs 计算 IDF，但词项的 docsWithTerm 仍包含被删文档，造成评分偏低
+
+**IDF 一致性保证**:
+```
+错误模式（窗口期 IDF 失真）:
+  删除前状态: totalDocs=3, docsWithTerm("hello")=2
+  goroutine A (Delete): Lock → 删 docs[docID] → Unlock → [窗口] → 清理索引
+  goroutine B (Search):        Lock → 读 totalDocs=2 → Unlock
+                              → 读 invertedIndex: docsWithTerm("hello")=2（未清理）
+                              → IDF = ln(1 + 2/(2+1))  ← 分母偏大，评分偏低
+
+正确模式（本实现）:
+  goroutine A (Delete): Lock → 清理索引 → 删 docs → Unlock
+  goroutine B (Search):        [等待锁] 或 读完整一致状态
+                              → totalDocs 与 docsWithTerm 始终保持一致
+```
+
 ### 8.4 死锁避免
 
 - 固定锁获取顺序：Engine 锁 → InvertedIndex 锁（如需要）
@@ -643,4 +662,63 @@ wg.Wait()
 5. **并发度**: 读写锁设计允许多读者并发，写操作串行，适合读多写少场景
 6. **TF-IDF 变体**: 本实现使用 `ln(1 + N/(df+1))` 确保分数非负，与经典公式略有差异
 7. **短语匹配数据隔离**: 短语查询过程中使用位置切片的独立副本进行匹配判定，避免与倒排索引内部数据结构发生隐式共享，确保扩展匹配策略时的安全性
-8. **删除期间的评分一致性**: 文档删除操作先从 docs map 移除记录再清理倒排索引，期间进行的搜索会因文档已从 docs 中移除而正确跳过该文档，保证评分一致性
+8. **删除原子性**: DeleteDocument 将倒排索引清理和 docs 删除放在同一写锁范围内原子执行，消除 IDF 计算窗口期，保证 totalDocs 与 docsWithTerm 一致性
+
+## 13. 测试策略与验证方法
+
+### 13.1 并发去重测试策略
+
+文档添加的并发去重正确性通过 `TestConcurrent_AddDocument_SameDocID` 测试验证：
+
+**测试设计**:
+- 启动 20 个 goroutine 并发调用 `AddDocument`，全部使用**同一个 docID**
+- 每个 goroutine 传入不同的 content 以区分写入路径
+- 使用独立 mutex 保护 successCount 和 duplicateCount 的原子累加
+
+**验证断言**:
+1. **恰好 1 次成功**: `successCount == 1` — 验证 TOCTOU 防护有效，只有第一个获取写锁的 goroutine 能成功写入
+2. **N-1 次重复错误**: `duplicateCount == numGoroutines - 1` — 验证其余 goroutine 正确收到 `ErrDuplicateDocID` 错误
+3. **最终文档数为 1**: `DocumentCount() == 1` — 验证未因竞态条件产生重复文档
+
+**与 `TestConcurrent_AddDocument` 的区别**:
+- 后者每个 goroutine 使用唯一 docID，仅验证数据结构的并发安全（无竞态崩溃）
+- 前者刻意制造 docID 冲突，专门验证 TOCTOU 漏洞的防护有效性
+
+### 13.2 倒排索引清理验证方法
+
+文档删除时的倒排索引清理通过多层测试直接验证内部状态，而非仅依赖搜索结果间接推断：
+
+#### 层次一：InvertedIndex 单元级验证
+
+| 测试用例 | 验证目标 | 关键断言 |
+|---------|---------|---------|
+| `TestInvertedIndex_RemoveDocument_UniqueTerms` | 独有词项被完全从 index map 移除 | `GetTermCount() == 0`、`HasTerm(term) == false` |
+| `TestInvertedIndex_RemoveDocument_SharedTerms` | 共享词项的 PostingList 长度正确减少 | `len(Postings) == N-1`、剩余文档 ID 正确、独有词项被清理 |
+
+#### 层次二：Engine 集成级验证
+
+`TestDeleteDocument_InvertedIndexCleanup` 在 Engine 层面验证端到端清理：
+
+1. **独有词项验证**: 删除文档后，该文档独有的词项（如 `xray`、`alpha`）应从倒排索引中完全消失
+   - 验证: `invertedIndex.HasTerm("xray") == false`
+2. **共享词项验证**: 多文档共有的词项（如 `sharedword`）的 PostingList 应仅移除被删文档
+   - 验证: `len(Postings) == 1` 且剩余 DocID 为未删除文档
+3. **词项总数验证**: 索引中的词项总数应精确减少
+   - 验证: 删除前 4 个词项 → 删除后剩 2 个（sharedword + gamma）
+
+**为何需要直接验证而非仅依赖搜索结果**:
+- 仅通过 `Search` 间接验证可能遗漏索引泄露：`Search` 在计算 TF 时会再次检查 docs map 中是否存在该文档，即使倒排索引中残留了被删文档的 Posting，也会因文档已从 docs 中删除而被跳过，从而掩盖索引泄露问题
+- 直接检查倒排索引内部状态（`HasTerm`、`GetPostingList`、`GetTermCount`）可以发现 docs map 删除但索引未清理的不一致状态
+
+### 13.3 DeleteDocument 原子性测试保证
+
+删除操作的原子性通过以下机制保障：
+
+**代码层面**:
+- `invertedIndex.RemoveDocument()` 和 `delete(e.docs, docID)` 在同一个 `Engine.mu.Lock()` 保护范围内执行
+- 固定执行顺序：先清理索引 → 再删 docs，确保搜索时看到的状态是一致的
+
+**测试层面**:
+- `TestDeleteDocument_SearchAfterDelete`: 验证删除后搜索结果正确排除被删文档
+- `TestDeleteDocument_InvertedIndexCleanup`: 验证删除后索引内部状态正确
+- 两组测试分别从外部行为和内部状态两个维度确保删除操作的完整性

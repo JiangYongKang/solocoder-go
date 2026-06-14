@@ -344,6 +344,246 @@ Close() 调用
 
 ---
 
+## 文件句柄管理策略
+
+### 设计原则
+
+WAL 模块采用**"活跃段持久持有 + 非活跃段按需打开"**的文件句柄管理策略，确保任意时刻进程内只为 WAL 打开 **1 个持久文件描述符**（即当前活跃段的写入句柄），彻底避免段切分导致的 FD 累积泄漏问题。
+
+### 各场景下的句柄生命周期
+
+| 场景 | 句柄打开方式 | 句柄关闭时机 | 存活时间 |
+|------|------------|------------|---------|
+| WAL 加载（`New`） | 每个旧段临时 `os.Open(O_RDONLY)` | `scanSegmentOffsets` 返回后 `defer f.Close()` | 单次扫描 |
+| 活跃段写入 | `os.OpenFile(O_RDWR\|O_APPEND)` | `rotateSegment` 或 `Close` 时 | 整个活跃期（直到被切分） |
+| 段切分（`rotateSegment`） | 新段 `os.OpenFile(O_RDWR\|O_APPEND)` | 下一次切分或 `Close` 时 | 整个活跃期 |
+| 段切分（旧段） | 旧段原句柄 `file.Close()` | 切分瞬间同步关闭 | 立即释放 |
+| 段读取（`ReadFrom`） | 每段 `os.Open(O_RDONLY)` | 读取完成 `defer f.Close()` | 单次读取调用 |
+| 段恢复（`RecoverFrom`） | 每段 `os.Open(O_RDONLY)` | 恢复完成 `defer f.Close()` | 单次恢复调用 |
+| WAL 关闭（`Close`） | — | 仅关闭当前活跃段句柄（非活跃段已为 nil） | — |
+
+### 关键实现要点
+
+1. **`segment.file` 字段语义变化**：仅 `activeSeg` 的 `file` 字段非 nil，所有非活跃段恒为 nil。`Close` 遍历时只需 `seg.file != nil` 判断。
+2. **`rotateSegment` 三步保障**：先 `Sync` 刷盘 → 再 `Close` 旧句柄 → 最后 `file = nil` 标记，确保数据完整后才释放 FD。
+3. **按需打开即开即关**：`readSegmentEntries` 和 `recoverSegment` 对每个段都是 `os.Open` 开头、`defer f.Close()` 结尾，函数退出即释放。
+
+### FD 上限保证
+
+假设系统默认 `ulimit -n` = 1024，极端高并发下：
+
+- 持久占用：**1**（活跃段写入句柄）
+- 并发读取：每 `ReadFrom` / `RecoverFrom` 调用占用 = 段数量（通常 N ≤ 数十）
+- 总占用 = 1 + 并发 reader 数 × 段数量，远低于系统 FD 上限
+
+---
+
+## 并发读取安全保证
+
+### 问题背景
+
+`*os.File` 内部维护共享的文件偏移量（file offset）。若多个 goroutine 持有同一句柄并发 `Seek` + `Read`：
+
+```
+Goroutine A: Seek(0) → Read() → 读到位置 0
+Goroutine B: Seek(0) → （A 已推进偏移到末尾）→ Read() → 读到空/截断
+```
+
+### 解决方案：每次读取独立句柄
+
+`ReadFrom` 和 `RecoverFrom` 内部对每个段都执行 `os.Open(seg.path)`，获取全新的 `*os.File`，各自维护独立的文件位置：
+
+```
+Goroutine A: os.Open(seg1) → fd=5, offset=0 → 顺序读到末尾
+Goroutine B: os.Open(seg1) → fd=6, offset=0 → 顺序读到末尾  （互不干扰）
+Goroutine C: os.Open(seg2) → fd=7, offset=0 → ...
+```
+
+配合 `sync.RWMutex` 读锁保护 `segments` 切片和元数据，整个读取链路完全并发安全。
+
+### 并发层级安全总结
+
+| 层级 | 保护机制 | 说明 |
+|------|---------|------|
+| 元数据（segments / activeSeg / nextOffset） | `sync.RWMutex` | 写操作加写锁，读操作加读锁 |
+| 文件偏移量（每个 reader） | 独立 `os.Open` 句柄 | 每个 reader 持有独立 fd + 独立 offset |
+| 活跃段写入 | `sync.RWMutex` 写锁 | `Append` 串行化写入 |
+| 段文件磁盘内容 | OS 页缓存 + `fsync` | `O_RDONLY` 只读打开，与写入互不干扰 |
+
+### 性能考虑
+
+`os.Open` 的开销约为微秒级（Linux 下典型 < 5μs），相比 64MB 段文件的读取成本（毫秒级）可忽略不计。流式缓冲读取（`bufio.NewReaderSize(64KB)`）进一步降低了系统调用次数。
+
+---
+
+## 内存使用优化
+
+### 旧方案问题
+
+`io.ReadAll` 将整个段文件一次性加载到内存：
+
+```go
+rawData, err := io.ReadAll(seg.file)  // 64MB 段 → 64MB 内存分配
+```
+
+问题：
+- **峰值内存高**：默认 64MB 段，读取 N 个段即 64×N MB，极端场景触发 GC 压力甚至 OOM。
+- **扫描偏移量浪费**：`scanSegmentOffsets` 仅需 `startOffset` / `endOffset` 两个整数，却加载了整段数据。
+- **GC 压力大**：大块字节切片在堆上分配，GC 扫描和回收成本高。
+
+### 新方案：流式缓冲读取
+
+所有涉及文件读取的函数（`scanSegmentOffsets` / `readSegmentEntriesStream` / `recoverSegmentStream`）统一使用 `bufio.NewReaderSize(f, 64*1024)` 流式读取：
+
+1. **固定缓冲**：64KB `bufio.Reader` 缓冲，单次系统调用批量填充，避免频繁 syscall。
+2. **按需分配**：
+   - 仅分配 `entryHeaderSize` (19B) 头部缓冲
+   - 仅在 Magic 匹配后才按 `DataLen` 分配数据缓冲
+   - 单条数据处理完立即被 GC 回收
+3. **峰值内存恒定**：与段文件大小无关，仅取决于最大单条记录的数据长度。
+
+### 内存占用对比
+
+| 场景 | 旧方案（io.ReadAll） | 新方案（流式读取） |
+|------|-------------------|----------------|
+| 64MB 段扫描偏移量 | ~64 MB | < 100 KB |
+| 64MB 段顺序读取 | ~64 MB | ~64 KB + 最大单条记录 |
+| 10 个段并发读取 | ~640 MB | ~640 KB + 记录总数 |
+| GC 压力 | 高（大块分配） | 低（小块短生命周期） |
+
+---
+
+## 条目解码策略统一性
+
+### 历史问题
+
+最初实现中，三个流式读取函数对二进制条目解码采用了不一致的策略：
+
+| 函数 | 解码策略 | 问题 |
+|------|---------|------|
+| `scanSegmentOffsets` | **内联手动实现**：独立读取 Magic/Offset/DataLen/CRC，手动拼装 checksumPayload 计算 CRC32 做校验，手动解析 Offset | 代码重复，格式变更需改两处 |
+| `readSegmentEntriesStream` | 拼装 `fullBuf` 后调用 `decodeEntry` 统一解码 | 正确 |
+| `recoverSegmentStream` | 拼装 `fullBuf` 后调用 `decodeEntry` 统一解码 | 正确 |
+
+**风险**：若日志条目二进制格式（如 Magic、头部字段、校验算法）后续变更，需同时修改 `decodeEntry` 和 `scanSegmentOffsets` 的内联逻辑，极容易遗漏导致两者校验结果不一致或产生隐蔽 Bug。
+
+### 统一方案：`streamScanEntry` 辅助函数
+
+引入包级辅助函数 `streamScanEntry(br *bufio.Reader)` 作为三个读取函数的统一入口，所有解码与校验完全复用 `decodeEntry`：
+
+```
+调用者（scan/read/recover）循环调用：
+    │
+    ▼
+streamScanEntry(br)  ──► 统一底层 Peek + Discard 字节级扫描
+    │
+    ├─ Peek(entryHeaderSize) 预读头部不消费
+    │   └─ 检查 Magic，不匹配则 Discard(1) 返回 advanced=1
+    │
+    ├─ Peek(totalLen) 预读整条（header+data）不消费
+    │   └─ 不足则返回 readErr=io.EOF
+    │
+    └─ ★ decodeEntry(fullPeek[:totalLen]) 统一解码+CRC校验
+        ├─ 失败：Discard(1)，返回 decodeErr + advanced=1
+        └─ 成功：Discard(totalLen)，返回 entry + advanced=totalLen
+```
+
+**设计要点**：
+1. **单一事实来源**：所有校验（Magic、CRC32、DataLen 边界）完全由 `decodeEntry` 决定。格式变更只改 `encodeEntry` + `decodeEntry` 两处。
+2. **字节级正确扫描**：使用 `bufio.Reader.Peek + Discard` 模式，而非 `ReadFull + Discard(1)`，保证 Magic 不匹配或校验失败时逐字节推进扫描，不会因之前已 `ReadFull` 消耗 19 字节而跳过中间候选位置。
+3. **返回四元组**：`(entry *Entry, advanced int64, decodeErr error, readErr error)`，让调用方自主决定是否记录警告、过滤偏移量、调用回调等差异化逻辑：
+   - `scanSegmentOffsets`：忽略 `decodeErr`，仅用 `entry.Offset` 维护 first/last
+   - `readSegmentEntriesStream`：忽略 `decodeErr`，收集满足 `minOffset` 的 entry
+   - `recoverSegmentStream`：用 `decodeErr + advanced` 生成 `CorruptedEntryWarning{SegmentID, filePos, Reason}`，对满足 `minOffset` 的 entry 调用 `cb`
+
+### 维护性收益
+
+- **格式变更零重复**：新增字段、调整校验算法、修改 Magic 等改动只需在 `encodeEntry` / `decodeEntry` 中完成，`scanSegmentOffsets` 自动同步。
+- **减少逻辑分支**：三个流式处理函数从 50+ 行各自实现 → 10 行以内循环调用 `streamScanEntry`。
+- **扫描正确性**：修复了旧版 `ReadFull(header) → Magic 不匹配 → Discard(1)` 会跳过 19 字节候选窗口的隐蔽 Bug。
+
+---
+
+## 并发读取测试覆盖
+
+### 测试矩阵
+
+针对并发读取安全性，模块设计了 **4 个层级** 的测试覆盖，验证"每次读取独立句柄"方案确实消除了文件偏移量竞争：
+
+| 测试用例 | 读 goroutine 数 | 写 goroutine 数 | 数据规模 | 场景说明 |
+|---------|---------------|---------------|---------|---------|
+| `TestConcurrentReadWrite` | 1 | 1 | 200 条 | 读写并行：一条 reader 与 writer 同时运行，验证读锁下读取不受写入干扰 |
+| **`TestMultipleReadersConcurrent`** ✨ | **5** | **0** | **500 条 × 每 reader 50 轮** | **多 reader 纯并发：5 条 goroutine 反复 ReadFrom(0)，校验每条 entry 的 Offset 和 Data 前缀完全一致** |
+| **`TestConcurrentReadersDifferentOffsets`** ✨ | **12** | **0** | **200 条 × 每 reader 30 轮** | **4 种起始偏移(0/50/100/150)×3 轮重复 = 12 条 reader 并发，校验不同起始偏移下结果的数量与内容都正确** |
+| **`TestConcurrentReadersAcrossSegments`** ✨ | **4** | **0** | **5 个段 × 每 reader 40 轮** | **跨段并发：4 条 reader 跨越多段文件 ReadFrom(0)，校验多段场景下跨段拼接的 entry 顺序与前缀一致** |
+
+### 新测试用例详细说明
+
+#### `TestMultipleReadersConcurrent` — 多 reader 同偏移完整性
+
+```
+主线程：预加载 500 条条目（每条含可识别索引前缀）
+  │
+  ├─► Reader 0 ─ ReadFrom(0) 50 次 ─ 校验 500 条都在 + 顺序正确
+  ├─► Reader 1 ─ ReadFrom(0) 50 次 ─ 校验 500 条都在 + 顺序正确
+  ├─► Reader 2 ─ ReadFrom(0) 50 次 ─ 校验 500 条都在 + 顺序正确
+  ├─► Reader 3 ─ ReadFrom(0) 50 次 ─ 校验 500 条都在 + 顺序正确
+  └─► Reader 4 ─ ReadFrom(0) 50 次 ─ 校验 500 条都在 + 顺序正确
+  │
+  ▼
+断言：errCount=0 AND dataMismatch=0
+```
+
+**验证点**：5 条 reader 互不干扰，不会出现"reader A 把文件指针消耗到末尾 → reader B 读到空/截断数据"的竞争问题。
+
+#### `TestConcurrentReadersDifferentOffsets` — 异偏移并发正确性
+
+```
+主线程：预加载 200 条条目
+  │
+  ├─ Run 0: Reader(off=0) / Reader(off=50) / Reader(off=100) / Reader(off=150)
+  ├─ Run 1: Reader(off=0) / Reader(off=50) / Reader(off=100) / Reader(off=150)  ← 同偏移多实例
+  └─ Run 2: Reader(off=0) / Reader(off=50) / Reader(off=100) / Reader(off=150)
+  │
+  ▼
+每个 reader 30 轮迭代，校验：
+  - 条目数量 = 200 - startOffset
+  - 第 i 条 entry.Offset == startOffset + i
+  - 第 i 条 entry.Data == "entry_{startOffset+i}"
+```
+
+**验证点**：即使多条 goroutine 从不同偏移量开始读取同一段文件，各自独立的文件句柄也能返回正确子集。同偏移多实例（Run 0/1/2 相同 startOffset）进一步验证高并发下的结果一致性。
+
+#### `TestConcurrentReadersAcrossSegments` — 跨段并发拼接完整性
+
+```
+主线程：预加载 5 个日志段（MaxSegmentSize=250B 小尺寸强制切分）
+  │
+  ├─► Reader 0 ─ ReadFrom(0) 40 次 ─ 跨段读取 1-N 段
+  ├─► Reader 1 ─ ReadFrom(0) 40 次 ─ 跨段读取 1-N 段
+  ├─► Reader 2 ─ ReadFrom(0) 40 次 ─ 跨段读取 1-N 段
+  └─► Reader 3 ─ ReadFrom(0) 40 次 ─ 跨段读取 1-N 段
+  │
+  ▼
+校验：每条 reader 返回的所有段拼接后，entry.Data 前缀与全局索引一致
+```
+
+**验证点**：跨多段文件的 `ReadFrom` 拼接逻辑在并发下依然正确，所有段的独立句柄打开/关闭互不干扰。
+
+### 并发测试保障总览
+
+| 并发场景 | 测试覆盖 | 核心断言 |
+|---------|---------|---------|
+| 多 writer 并发写入 | `TestConcurrentAppend`（10 goroutine × 100 条） | 无重复偏移、总数 = 1000 |
+| 单 reader + 单 writer 并行 | `TestConcurrentReadWrite` | 不崩溃、无 I/O 错误 |
+| 多 reader 同偏移 | `TestMultipleReadersConcurrent`（5 goroutine × 50 轮） | 数据完整一致、0 mismatch |
+| 多 reader 异偏移 | `TestConcurrentReadersDifferentOffsets`（12 goroutine × 30 轮） | 数量与内容均匹配 |
+| 多 reader 跨多段 | `TestConcurrentReadersAcrossSegments`（4 goroutine × 40 轮） | 跨段拼接完整正确 |
+
+所有并发测试均使用 `-race` 友好的同步原语（`atomic` + `sync.WaitGroup`），可在 `go test -race` 下无警告通过。
+
+---
+
 ## 使用示例
 
 ### 示例 1：基础使用 — 追加与顺序读取

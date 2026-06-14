@@ -1303,3 +1303,176 @@ func TestTermPosting_Structure(t *testing.T) {
 		t.Errorf("expected positions [0,5], got %v", p.Positions)
 	}
 }
+
+func TestConcurrent_AddDocument_SameDocID(t *testing.T) {
+	e := NewEngine()
+
+	var wg sync.WaitGroup
+	numGoroutines := 20
+	successCount := int64(0)
+	duplicateCount := int64(0)
+	var mu sync.Mutex
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			content := fmt.Sprintf("content from goroutine %d", id)
+			err := e.AddDocument("shared_doc_id", content)
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				successCount++
+			} else if err == ErrDuplicateDocID {
+				duplicateCount++
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	if successCount != 1 {
+		t.Errorf("expected exactly 1 successful AddDocument, got %d", successCount)
+	}
+
+	expectedDuplicates := int64(numGoroutines) - 1
+	if duplicateCount != expectedDuplicates {
+		t.Errorf("expected %d ErrDuplicateDocID errors, got %d", expectedDuplicates, duplicateCount)
+	}
+
+	if e.DocumentCount() != 1 {
+		t.Errorf("expected exactly 1 document in engine, got %d", e.DocumentCount())
+	}
+}
+
+func TestInvertedIndex_RemoveDocument_UniqueTerms(t *testing.T) {
+	ii := NewInvertedIndex()
+
+	ii.AddTerm("alpha", "doc1", 0)
+	ii.AddTerm("beta", "doc1", 1)
+	ii.AddTerm("gamma", "doc1", 2)
+
+	if ii.GetTermCount() != 3 {
+		t.Fatalf("expected 3 terms before removal, got %d", ii.GetTermCount())
+	}
+
+	terms := map[string]struct{}{
+		"alpha": {},
+		"beta":  {},
+		"gamma": {},
+	}
+	ii.RemoveDocument("doc1", terms)
+
+	if ii.GetTermCount() != 0 {
+		t.Errorf("expected 0 terms after removing unique terms, got %d", ii.GetTermCount())
+	}
+
+	if ii.HasTerm("alpha") {
+		t.Error("unique term 'alpha' should be removed from index")
+	}
+	if ii.HasTerm("beta") {
+		t.Error("unique term 'beta' should be removed from index")
+	}
+	if ii.HasTerm("gamma") {
+		t.Error("unique term 'gamma' should be removed from index")
+	}
+}
+
+func TestInvertedIndex_RemoveDocument_SharedTerms(t *testing.T) {
+	ii := NewInvertedIndex()
+
+	ii.AddTerm("shared", "doc1", 0)
+	ii.AddTerm("shared", "doc2", 0)
+	ii.AddTerm("shared", "doc3", 0)
+	ii.AddTerm("only_doc1", "doc1", 1)
+	ii.AddTerm("only_doc2", "doc2", 1)
+
+	pl, _ := ii.GetPostingList("shared")
+	if len(pl.Postings) != 3 {
+		t.Fatalf("expected 3 postings for 'shared' before removal, got %d", len(pl.Postings))
+	}
+
+	termsDoc1 := map[string]struct{}{
+		"shared":   {},
+		"only_doc1": {},
+	}
+	ii.RemoveDocument("doc1", termsDoc1)
+
+	if ii.HasTerm("only_doc1") {
+		t.Error("unique term 'only_doc1' should be removed from index")
+	}
+	if !ii.HasTerm("only_doc2") {
+		t.Error("term 'only_doc2' belonging to doc2 should still exist")
+	}
+
+	pl, exists := ii.GetPostingList("shared")
+	if !exists {
+		t.Fatal("shared term 'shared' should still exist in index")
+	}
+	if len(pl.Postings) != 2 {
+		t.Errorf("expected 2 postings for 'shared' after removing doc1, got %d", len(pl.Postings))
+	}
+
+	foundDoc2 := false
+	foundDoc3 := false
+	for _, posting := range pl.Postings {
+		if posting.DocID == "doc2" {
+			foundDoc2 = true
+		}
+		if posting.DocID == "doc3" {
+			foundDoc3 = true
+		}
+	}
+	if !foundDoc2 {
+		t.Error("doc2 should still be in posting list for 'shared'")
+	}
+	if !foundDoc3 {
+		t.Error("doc3 should still be in posting list for 'shared'")
+	}
+}
+
+func TestDeleteDocument_InvertedIndexCleanup(t *testing.T) {
+	e := NewEngine()
+
+	e.AddDocument("doc1", "xray alpha sharedword")
+	e.AddDocument("doc2", "sharedword gamma")
+
+	if e.invertedIndex.GetTermCount() != 4 {
+		t.Fatalf("expected 4 unique terms in index, got %d", e.invertedIndex.GetTermCount())
+	}
+
+	sharedPl, _ := e.invertedIndex.GetPostingList("sharedword")
+	if len(sharedPl.Postings) != 2 {
+		t.Fatalf("expected 2 postings for 'sharedword' before delete, got %d", len(sharedPl.Postings))
+	}
+
+	err := e.DeleteDocument("doc1")
+	if err != nil {
+		t.Fatalf("DeleteDocument failed: %v", err)
+	}
+
+	if e.invertedIndex.HasTerm("xray") {
+		t.Error("unique term 'xray' should be removed from inverted index after delete")
+	}
+	if e.invertedIndex.HasTerm("alpha") {
+		t.Error("unique term 'alpha' should be removed from inverted index after delete")
+	}
+	if !e.invertedIndex.HasTerm("gamma") {
+		t.Error("term 'gamma' from doc2 should still exist")
+	}
+
+	sharedPlAfter, exists := e.invertedIndex.GetPostingList("sharedword")
+	if !exists {
+		t.Fatal("'sharedword' should still exist since doc2 still contains it")
+	}
+	if len(sharedPlAfter.Postings) != 1 {
+		t.Errorf("expected 1 posting for 'sharedword' after deleting doc1, got %d", len(sharedPlAfter.Postings))
+	}
+	if sharedPlAfter.Postings[0].DocID != "doc2" {
+		t.Errorf("expected remaining posting to be for doc2, got '%s'", sharedPlAfter.Postings[0].DocID)
+	}
+
+	if e.invertedIndex.GetTermCount() != 2 {
+		t.Errorf("expected 2 terms remaining (sharedword, gamma), got %d", e.invertedIndex.GetTermCount())
+	}
+}

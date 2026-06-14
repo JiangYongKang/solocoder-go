@@ -802,6 +802,119 @@ b.Publish("notification.email", "新邮件通知")
 | `ErrBackpressureFull` | 消费者背压缓冲区已满（预留错误） |
 | `ErrConsumerDisconnected` | 尝试重连已被移除的消费者 |
 
+## 6.5 内部机制详解
+
+### 6.5.1 消息状态管理策略
+
+`MessageStatus` 枚举不仅是状态标识，更深度参与模块的核心控制流程，确保消息生命周期的正确性：
+
+| 状态 | 控制流中的作用 |
+|------|---------------|
+| `MessageStatusPending` | 标识消息在持久化缓存中等待投递，或消费者离线后暂存的消息。`ProcessTimeouts` 会跳过此状态的消息，不触发超时重推 |
+| `MessageStatusDelivered` | 标识消息已投递至消费者但未确认。`ProcessTimeouts` 仅处理此状态的消息，检查是否超时需要重推。`Ack` 和 `Nack` 操作仅接受此状态或 `Pending` 状态的消息 |
+| `MessageStatusAcked` | 标识消息已被确认。进入此状态后，`Ack`/`Nack`/`ProcessTimeouts` 均不再处理该消息，防止重复操作 |
+| `MessageStatusDead` | 标识消息已进入死信队列。此状态的消息被从 `pending` 中完全移除，仅保留在死信队列中供人工干预 |
+
+**状态转移控制流**：
+
+- `Ack` 操作：先检查状态必须是 `Delivered` 或 `Pending`，否则返回 `ErrMessageNotFound`，防止重复确认
+- `Nack` 操作：先检查状态必须是 `Delivered` 或 `Pending`，否则返回 `ErrMessageNotFound`
+- `redeliverOrDeadLetter`：入口处检查状态有效性，非 `Delivered`/`Pending` 直接返回
+- `disconnectConsumer`：将 `Delivered` 状态转为 `Pending`，确保离线期间不被误判为超时
+- `deliverToConsumer`：重投时清理旧的 `pending` 条目，防止同一消息 ID 在 `pending` 中重复存在
+
+### 6.5.2 消费者断开连接时的消息处理策略
+
+当调用 `DisconnectConsumer` 时，模块执行以下精确的消息处理流程，确保数据一致性和消息不丢失：
+
+```
+消费者断开连接流程：
+┌─────────────────────────────────────────────────┐
+│  1. 标记 c.connected = false                     │
+│  2. 检查是否存在持久化订阅                        │
+│     ├─ 是：遍历 pendingList                       │
+│     │    ├─ 状态为 Delivered → 转为 Pending       │
+│     │    └─ 消息追加到 durableBuffer              │
+│     └─ 否：不做缓存迁移                           │
+│  3. 逐个 Remove pendingList 中的所有元素          │
+│     （使用 Remove 而非 Init，确保 element.list     │
+│      被正确置为 nil，避免悬空指针）                │
+│  4. pending map 保留不变，unackedCount 保留不变    │
+│     （用于 GetMessageStatus 查询和重连时的清理）   │
+└─────────────────────────────────────────────────┘
+```
+
+**关键设计决策**：
+
+1. **逐个 Remove 而非 Init()**：`list.Init()` 只清空链表头，不修改元素本身，会导致 `pending` map 中的元素持有悬空指针。逐个调用 `Remove(e)` 会正确设置 `e.list = nil`，后续对这些元素的 `Remove` 操作成为安全空操作。
+
+2. **pending map 保留**：保留状态信息供 `GetMessageStatus` 查询，同时在重连重投时，`deliverToConsumer` 会检测并清理旧条目。
+
+### 6.5.3 pending map 与 pendingList 一致性保证
+
+`pending` map 和 `pendingList` 链表维护相同的消息集合，但用途不同：
+- `pending` map：O(1) 时间通过 messageID 查找消息，用于 Ack/Nack/状态查询
+- `pendingList` 链表：按投递时间排序，用于 `ProcessTimeouts` 高效检测超时消息
+
+**一致性维护机制**：
+
+| 操作 | 一致性处理 |
+|------|-----------|
+| `deliverToConsumer` | 原子操作：同时添加到 map 和 list，unackedCount 原子递增。如检测到同 ID 旧条目，先清理旧的再添加新的 |
+| `Ack` | 原子操作：从 list 中 Remove，从 map 中 delete，unackedCount 原子递减 |
+| `Nack` | 原子操作：先移除旧条目，然后根据状态决定重投/缓存/死信 |
+| `redeliverOrDeadLetter` | 先从 list 和 map 中移除，再根据新状态决定去向 |
+| `DisconnectConsumer` | 从 list 中逐个 Remove 元素，map 保留但元素的 list 指针已失效 |
+| `ReconnectConsumer` | 重投时 `deliverToConsumer` 会自动清理 map 中的旧条目 |
+
+**deliverToConsumer 中的重复检测**：
+```go
+if existing, ok := c.pending[msgCopy.ID]; ok {
+    c.pendingList.Remove(existing.element)
+    delete(c.pending, msgCopy.ID)
+    atomic.AddInt64(&c.unackedCount, -1)
+}
+```
+这保证了即使消费者断开后重连，pending map 中残留的旧条目也会被正确清理，不会出现计数重复或条目重复。
+
+### 6.5.4 主题树剪枝机制
+
+`Unsubscribe` 操作会触发主题树的自底向上剪枝，防止长期运行产生内存泄漏：
+
+**剪枝触发时机**：
+- 调用 `Unsubscribe` 移除单个订阅时
+- 调用 `RemoveConsumer` 移除消费者时（会移除其所有订阅）
+
+**剪枝算法**（`removeFromTopicTree`）：
+```
+1. 沿主题过滤模式向下遍历主题树，记录路径上的节点
+2. 在目标节点删除订阅者
+3. 检查目标节点是否为空（无订阅者、无通配符订阅、无子节点）
+4. 从最深节点开始向上回溯：
+   - 若当前节点为空 → 从父节点的 children 中删除
+   - 若当前节点非空 → 终止剪枝（上层节点必然非空）
+```
+
+**空节点判断**（`topicNode.isEmpty()`）：
+```go
+func (n *topicNode) isEmpty() bool {
+    return len(n.children) == 0 &&
+        len(n.subscribers) == 0 &&
+        len(n.wildcardOne) == 0 &&
+        len(n.wildcardAny) == 0
+}
+```
+
+**剪枝示例**：
+```
+订阅路径: a.b.c.d
+取消订阅后自底向上检查:
+       d → 空，删除
+       c → 空，删除
+       b → 空，删除
+       a → 还有其他子节点，停止
+```
+
 ## 7. 线程安全说明
 
 Broker 所有公共方法均为**并发安全**，可在多个 goroutine 中同时调用：

@@ -1,0 +1,6 @@
+你实现的全文检索引擎模块在第2轮修复中存在测试覆盖不足和并发窗口问题，需要修复：
+1. AddDocumentWithLanguage 的 TOCTOU 修复缺少并发去重测试。现有 TestConcurrent_AddDocument 中每个 goroutine 使用互不重复的唯一 docID，无法验证同一 docID 被多 goroutine 并发插入时是否正确拒绝重复。需要新增测试用多个 goroutine 同时插入相同 docID，验证仅一个成功另一个返回 ErrDuplicateDocID。
+2. DeleteDocument 的倒排索引清理缺少直接验证。TestDeleteDocument_SearchAfterDelete 仅通过搜索结果间接推断索引已清理，如果 RemoveDocument 实现有遗漏会因 docs map 先删除而掩盖索引泄露。需要直接检查倒排索引内部状态，验证文档独有词项被从 index map 中移除、共享词项的 PostingList 长度正确减少。
+3. DeleteDocument 先删 docs map 再清理索引的操作顺序存在并发窗口，期间执行的 Search 会用已减少的 totalDocs 计算 IDF 但词项的 docsWithTerm 仍包含被删文档，导致评分偏低。需要消除这个 IDF 计算窗口期或在该方法中对操作加锁保证原子性。
+4. 修复完成后运行 go test ./internal/fulltext/ -v，需要让所有测试通过。
+5. 在 docs/fulltext.md 中更新模块需求文档，说明并发去重的测试策略、DeleteDocument 的原子性保证以及倒排索引清理的验证方法。

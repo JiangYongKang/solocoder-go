@@ -289,10 +289,9 @@ func (e *Engine) DeleteDocument(docID string) error {
 		e.mu.Unlock()
 		return ErrDocNotFound
 	}
+	e.invertedIndex.RemoveDocument(docID, doc.Terms)
 	delete(e.docs, docID)
 	e.mu.Unlock()
-
-	e.invertedIndex.RemoveDocument(docID, doc.Terms)
 
 	return nil
 }

@@ -2,6 +2,7 @@ package lsm
 
 import (
 	"math/rand"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -170,11 +171,15 @@ func (sl *SkipList) Size() int {
 
 func (sl *SkipList) Iterator() *SkipListIterator {
 	sl.mu.RLock()
-	return &SkipListIterator{
+	it := &SkipListIterator{
 		sl:      sl,
 		current: sl.header.forward[0],
 		locked:  true,
 	}
+	runtime.SetFinalizer(it, func(iter *SkipListIterator) {
+		iter.Close()
+	})
+	return it
 }
 
 func (sl *SkipList) Range(start, end string) []*Entry {
@@ -213,13 +218,22 @@ type SkipListIterator struct {
 func (it *SkipListIterator) Next() bool {
 	if !it.started {
 		it.started = true
-		return it.current != nil
+		if it.current == nil {
+			it.Close()
+			return false
+		}
+		return true
 	}
 	if it.current == nil {
+		it.Close()
 		return false
 	}
 	it.current = it.current.forward[0]
-	return it.current != nil
+	if it.current == nil {
+		it.Close()
+		return false
+	}
+	return true
 }
 
 func (it *SkipListIterator) Entry() *Entry {
@@ -237,6 +251,10 @@ func (it *SkipListIterator) HasNext() bool {
 }
 
 func (it *SkipListIterator) Seek(key string) {
+	if !it.locked {
+		it.sl.mu.RLock()
+		it.locked = true
+	}
 	x := it.sl.header
 	for i := it.sl.level - 1; i >= 0; i-- {
 		for x.forward[i] != nil && x.forward[i].entry.Key < key {

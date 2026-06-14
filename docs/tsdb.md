@@ -321,7 +321,7 @@ cleanupExpired()
   引擎状态检查 → closed? → 直接返回
        │
        ▼
-  TTL 检查: ttl < 0 → 直接返回（TTL 禁用）
+  TTL 检查: ttl == TTLDisabled → 直接返回（TTL 禁用）
        │
        ▼
   计算过期截止时间:
@@ -547,7 +547,10 @@ cfg := tsdb.Config{
     CleanupBatchSize: 500,
 }
 
-engine := tsdb.NewTSEngineWithConfig(cfg)
+engine, err := tsdb.NewTSEngineWithConfig(cfg)
+if err != nil {
+    log.Fatalf("Invalid config: %v", err)
+}
 defer engine.Close()
 
 // 写入数据
@@ -560,20 +563,47 @@ engine.Write([]*tsdb.DataPoint{
 engine.ForceCleanup()
 ```
 
+**错误返回示例**：
+
+```go
+// TTL=0 为非法值，返回 ErrInvalidTTL
+badCfg1 := tsdb.Config{TTL: 0, CleanupInterval: time.Minute, CleanupBatchSize: 100}
+_, err := tsdb.NewTSEngineWithConfig(badCfg1)
+// err == tsdb.ErrInvalidTTL
+
+// CleanupBatchSize=0 为非法值，返回 ErrInvalidBatchSize
+badCfg2 := tsdb.Config{TTL: time.Hour, CleanupInterval: time.Minute, CleanupBatchSize: 0}
+_, err = tsdb.NewTSEngineWithConfig(badCfg2)
+// err == tsdb.ErrInvalidBatchSize
+
+// CleanupInterval<0 为非法值，返回 ErrInvalidInterval
+badCfg3 := tsdb.Config{TTL: time.Hour, CleanupInterval: -time.Minute, CleanupBatchSize: 100}
+_, err = tsdb.NewTSEngineWithConfig(badCfg3)
+// err == tsdb.ErrInvalidInterval
+```
+
 ### 8.4 禁用 TTL
 
 ```go
-// TTL 设置为负数禁用自动过期清理
+// 使用 TTLDisabled 常量显式禁用自动过期清理
 cfg := tsdb.Config{
-    TTL:              -1,
+    TTL:              tsdb.TTLDisabled,
     CleanupInterval:  time.Minute,
     CleanupBatchSize: 100,
 }
 
-engine := tsdb.NewTSEngineWithConfig(cfg)
+engine, err := tsdb.NewTSEngineWithConfig(cfg)
+if err != nil {
+    log.Fatalf("Invalid config: %v", err)
+}
 defer engine.Close()
 
-fmt.Printf("TTL disabled: %v\n", engine.GetTTL() < 0) // true
+fmt.Printf("TTL disabled: %v\n", engine.GetTTL() == tsdb.TTLDisabled) // true
+
+// 注意：使用其他负值（如 -2）不是合法的禁用方式，将返回错误
+badCfg := tsdb.Config{TTL: -2, CleanupInterval: time.Minute, CleanupBatchSize: 100}
+_, err = tsdb.NewTSEngineWithConfig(badCfg)
+// err == tsdb.ErrInvalidTTL
 ```
 
 ### 8.5 多标签组合查询
@@ -660,12 +690,79 @@ fmt.Printf("Total points: %d\n", engine.Count()) // 1000
 | `ErrInvalidTimeRange` | 无效的时间范围 | `Query` 或 `Downsample` 时 start > end |
 | `ErrInvalidWindowSize` | 无效的窗口大小 | `Downsample` 时 windowSize <= 0 |
 | `ErrInvalidAggregator` | 无效的聚合算子 | `Downsample` 时使用未定义的 AggregatorType |
-| `ErrInvalidTTL` | 无效的 TTL | 配置 TTL 时校验失败（当前实现中 0 表示使用默认值，负数表示禁用） |
-| `ErrInvalidBatchSize` | 无效的批次大小 | 配置 CleanupBatchSize <= 0（当前实现中使用默认值） |
-| `ErrInvalidInterval` | 无效的清理间隔 | 配置 CleanupInterval <= 0（当前实现中使用默认值） |
+| `ErrInvalidTTL` | 无效的 TTL | `NewTSEngineWithConfig` 时 TTL 为 0 或非 `TTLDisabled` 的负值 |
+| `ErrInvalidBatchSize` | 无效的批次大小 | `NewTSEngineWithConfig` 时 CleanupBatchSize <= 0 |
+| `ErrInvalidInterval` | 无效的清理间隔 | `NewTSEngineWithConfig` 时 CleanupInterval <= 0 |
 | `ErrEmptyTags` | 标签为空 | 写入数据点时 Tags map 为空 |
 | `ErrNilDataPoint` | 数据点为 nil | 写入的 points 切片中包含 nil 元素 |
 | `ErrEngineClosed` | 引擎已关闭 | 在 Close() 之后调用 Write/Query/Downsample |
+
+## 9.1 配置校验错误返回约定
+
+`NewTSEngineWithConfig` 在创建引擎时通过 `ValidateConfig` 函数对配置参数进行严格校验，校验失败时返回具体的错误变量，而非静默替换为默认值。这确保了调用方能够感知配置被拒绝，避免在不知情的情况下使用了非预期的配置运行。
+
+**校验规则**:
+
+| 字段 | 合法值 | 非法值 | 错误变量 |
+|------|--------|--------|----------|
+| `TTL` | 正数 或 `TTLDisabled`(-1) | 0、其他负值 | `ErrInvalidTTL` |
+| `CleanupInterval` | 正数 | 0、负数 | `ErrInvalidInterval` |
+| `CleanupBatchSize` | 正数 | 0、负数 | `ErrInvalidBatchSize` |
+
+**设计原则**:
+1. **显式优于隐式**：非法配置直接报错，让调用方明确知道问题所在，而非静默修正后产生难以排查的行为差异
+2. **快速失败**：引擎创建时即校验，避免运行时才发现配置问题
+3. **默认配置安全**：`DefaultConfig()` 返回的配置总是合法的，`NewTSEngine()` 内部调用时不会 panic
+
+**ValidateConfig 函数**：
+
+```go
+func ValidateConfig(cfg Config) error {
+    if cfg.TTL != TTLDisabled && cfg.TTL <= 0 {
+        return ErrInvalidTTL
+    }
+    if cfg.CleanupInterval <= 0 {
+        return ErrInvalidInterval
+    }
+    if cfg.CleanupBatchSize <= 0 {
+        return ErrInvalidBatchSize
+    }
+    return nil
+}
+```
+
+## 9.2 TTL 禁用语义的实现方式
+
+TTL 禁用通过 `TTLDisabled` 常量（值为 `-1`）显式声明，实现涉及两个协作的代码点：
+
+### 9.2.1 入口校验：ValidateConfig
+
+```go
+if cfg.TTL != TTLDisabled && cfg.TTL <= 0 {
+    return ErrInvalidTTL
+}
+```
+
+此逻辑的含义是：
+- 如果 TTL == TTLDisabled(-1)：跳过校验，合法
+- 如果 TTL > 0：合法
+- 如果 TTL == 0 或 TTL 为其他负值：返回 ErrInvalidTTL
+
+### 9.2.2 运行时检查：cleanupExpired
+
+```go
+if e.ttl == TTLDisabled {
+    return
+}
+```
+
+当引擎的 TTL 设置为 `TTLDisabled` 时，`cleanupExpired()` 在开头直接返回，跳过所有清理逻辑。后台 goroutine 仍然正常运行（按 `CleanupInterval` 周期触发），但每次触发都不执行任何操作。
+
+### 9.2.3 两点协作保证
+
+- **入口保证**：`ValidateConfig` 确保只有 `TTLDisabled` 这一个负值能通过校验，其他负值（如 `-2`）不会进入引擎
+- **运行时保证**：`cleanupExpired` 使用 `== TTLDisabled` 精确匹配而非 `<= 0`，确保即使未来有人绕过校验直接构造引擎，也只有 `TTLDisabled` 这一个值能触发禁用语义
+- **常量集中声明**：`TTLDisabled` 作为导出常量，是调用方和实现方之间的唯一契约，消除了"负值表示禁用"的隐式约定
 
 ## 10. 性能特征
 

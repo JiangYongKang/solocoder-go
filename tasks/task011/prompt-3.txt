@@ -1,0 +1,5 @@
+你实现的 Pub/Sub 消息代理模块在第2轮修复中引入了新问题，需要修复：
+1. DisconnectConsumer 方法中 c.pending map 保留了消息条目但 c.pendingList 链表被 Init() 清空，导致 map 中的元素持有指向已清空链表的悬空指针，消费者断开后调用 Nack 会在已清空链表上执行 Remove 操作造成数据结构损坏。需要保证 pending map 与 pendingList 在断开消费者时同步处理。
+2. redeliverOrDeadLetter 方法中断开连接分支在从 pendingList 和 pending map 移除消息后仅设置状态并 return，消息既没有放回 durableBuffer 也没有放入死信队列，持久化订阅者的离线消息被静默丢弃。
+3. 修复完成后运行 go test ./internal/pubsub/ -v，需要让所有测试通过。
+4. 在 docs/pubsub.md 中更新模块需求文档，说明消费者断开连接时的消息处理策略和 pending map 与 pendingList 的一致性保证。

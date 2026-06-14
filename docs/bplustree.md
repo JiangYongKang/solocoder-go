@@ -256,9 +256,72 @@ type KVItem struct {
 叶子(根): [a, b, c]
 ```
 
-## 6. API 参考
+### 5.6 Iterator.Delete 与 tree.Delete 的协作关系
 
-### 6.1 构造函数
+Iterator.Delete 完全依赖 tree.Delete 完成实际的删除操作和节点下溢平衡，二者的协作流程如下：
+
+```
+Iterator.Delete()
+     │
+     ▼
+1.  有效性检查
+    ├─ 迭代器 invalid → 返回 ErrIteratorInvalid
+    └─ index 越界（外部修改导致）→ 返回 ErrKeyNotFound
+     │
+     ▼
+2.  记录重定位锚点
+    ├─ 保存删除后的"下一个键"（优先）
+    └─ 保存删除后的"前一个键"（备选）
+     │
+     ▼
+3.  调用 tree.Delete(key) ────┐
+     │                         │
+     │                         ▼
+     │                    tree.Delete 内部完整执行：
+     │                      ├─ findLeaf 定位叶子节点
+     │                      ├─ 删除键值对
+     │                      ├─ 叶子节点下溢处理（借键/合并）
+     │                      ├─ 内部节点下溢处理（借键/合并）
+     │                      └─ 根节点收缩
+     │                         │
+     │                         ▼
+     │                    返回 bool（是否成功删除）
+     │                         │
+     └─────────────────────────┘
+     │
+     ▼
+4.  tree.Delete 返回 false → 返回 ErrKeyNotFound
+     │
+     ▼
+5.  复用 NewIteratorAt 重定位
+    ├─ 优先用"下一个键"调用 NewIteratorAt(nextKey)
+    ├─ 失败则用"前一个键"调用 NewIteratorAt(prevKey)
+    └─ 都失败则标记迭代器为 invalid
+```
+
+**核心设计原则：单一职责与代码复用**
+
+- **tree.Delete 是唯一的删除入口**：所有键值删除、节点下溢检测、借键、合并、根收缩等逻辑仅在 tree.Delete 中实现和维护。
+- **Iterator.Delete 不重复实现删除逻辑**：只负责：(1) 验证迭代器当前位置的有效性；(2) 记录用于重定位的锚点键；(3) 委托 tree.Delete 执行实际删除；(4) 复用 NewIteratorAt 完成删除后的重定位。
+- **下溢处理对 Iterator 透明**：tree.Delete 内部的节点借键、合并、根收缩等平衡操作完全不影响 Iterator.Delete 的逻辑，迭代器只需在删除完成后通过锚点键重新定位即可。
+
+**ErrKeyNotFound 的可达场景**：
+
+1.  **迭代器位置失效（index 越界）**：用户先通过 tree.Delete 删除了某个键，导致迭代器所在节点的 keys 数组长度缩短，而迭代器的 index 已超出新的数组边界。此时 Iterator.Delete 首先检测到 index 越界，直接返回 ErrKeyNotFound。
+2.  **键已被外部删除**：tree.Delete 在内部查找键时发现键不存在（例如用户在迭代器遍历间隙通过 tree.Delete 删除了同一个键），返回 false，Iterator.Delete 将其转换为 ErrKeyNotFound。
+
+**删除后重定位策略**：
+
+删除操作可能导致节点合并、借键、根收缩等结构变化，原有的 node/index 指针可能完全失效。因此 Iterator.Delete 采用"锚点键 + NewIteratorAt"的重定位策略：
+
+- 删除前记录"下一个键"和"前一个键"作为锚点
+- 删除完成后，优先用"下一个键"调用 NewIteratorAt 重新定位，确保遍历可以继续前进
+- 如果"下一个键"不存在（删除的是最后一个元素），则用"前一个键"回退定位
+- 完全复用 NewIteratorAt 的 findLeaf + 线性扫描定位逻辑，确保重定位的正确性与代码一致性
+
+## 7. API 参考
+
+### 8.1 构造函数
 
 ```go
 func NewBPlusTree() *BPlusTree
@@ -266,7 +329,7 @@ func NewBPlusTreeWithConfig(cfg Config) *BPlusTree
 func DefaultConfig() Config
 ```
 
-### 6.2 基本操作
+### 8.2 基本操作
 
 ```go
 func (t *BPlusTree) Insert(key string, value string)
@@ -275,13 +338,13 @@ func (t *BPlusTree) Delete(key string) bool
 func (t *BPlusTree) Count() int
 ```
 
-### 6.3 范围扫描
+### 8.3 范围扫描
 
 ```go
 func (t *BPlusTree) RangeScan(start, end string) ([]KVItem, error)
 ```
 
-### 6.4 迭代器
+### 8.4 迭代器
 
 ```go
 func (t *BPlusTree) NewIterator() *Iterator
@@ -294,9 +357,9 @@ func (it *Iterator) Prev() error
 func (it *Iterator) Delete() error
 ```
 
-## 7. 使用示例
+## 8. 使用示例
 
-### 7.1 基本插入与查询
+### 8.1 基本插入与查询
 
 ```go
 tree := bplustree.NewBPlusTree()
@@ -312,14 +375,14 @@ val, ok = tree.Search("user:99")
 // val = "", ok = false
 ```
 
-### 7.2 使用自定义配置
+### 8.2 使用自定义配置
 
 ```go
 cfg := bplustree.Config{MaxKeys: 8}
 tree := bplustree.NewBPlusTreeWithConfig(cfg)
 ```
 
-### 7.3 范围扫描
+### 8.3 范围扫描
 
 ```go
 tree := bplustree.NewBPlusTree()
@@ -332,7 +395,7 @@ items, err := tree.RangeScan("banana", "cherry")
 // items = []KVItem{{Key:"banana", Value:"2"}, {Key:"cherry", Value:"3"}}
 ```
 
-### 7.4 迭代器前向遍历
+### 8.4 迭代器前向遍历
 
 ```go
 tree := bplustree.NewBPlusTree()
@@ -350,7 +413,7 @@ for it.Valid() {
 // 输出: a = 1, b = 2, c = 3
 ```
 
-### 7.5 迭代器定位与后向遍历
+### 8.5 迭代器定位与后向遍历
 
 ```go
 it := tree.NewIteratorAt("b")
@@ -362,7 +425,7 @@ for it.Valid() {
 // 输出: b, a
 ```
 
-### 7.6 迭代器删除当前元素后继续遍历
+### 8.6 迭代器删除当前元素后继续遍历
 
 ```go
 it := tree.NewIterator()
@@ -378,7 +441,7 @@ for it.Valid() {
 // 输出: a, c
 ```
 
-### 7.7 键值删除
+### 8.7 键值删除
 
 ```go
 tree.Delete("user:1")
@@ -386,11 +449,11 @@ _, ok := tree.Search("user:1")
 // ok = false
 ```
 
-## 8. 错误定义
+## 9. 错误定义
 
 | 错误 | 触发场景 |
 |------|----------|
-| `ErrKeyNotFound` | Iterator.Delete 被调用时当前键在树中不存在 |
+| `ErrKeyNotFound` | Iterator.Delete 时 index 越界或键已被外部删除 |
 | `ErrInvalidRange` | RangeScan 的 start > end |
 | `ErrInvalidMaxKeys` | MaxKeys 配置无效（< 2） |
 | `ErrIteratorInvalid` | 在无效迭代器上调用 Key/Value/Next/Prev/Delete |

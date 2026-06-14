@@ -235,56 +235,14 @@ func (sst *SSTable) Get(key string) (*Entry, bool, error) {
 }
 
 func (sst *SSTable) Range(start, end string) ([]*Entry, error) {
-	sst.mu.RLock()
-	defer sst.mu.RUnlock()
-
-	if end < sst.minKey || start > sst.maxKey {
-		return nil, nil
-	}
-
-	file, err := os.Open(sst.filename)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open SSTable: %w", err)
-	}
-	defer file.Close()
-
-	sortedKeys := make([]string, 0, len(sst.index))
-	for k := range sst.index {
-		if k >= start && k <= end {
-			sortedKeys = append(sortedKeys, k)
-		}
-	}
-	sort.Strings(sortedKeys)
-
-	var result []*Entry
-	for _, key := range sortedKeys {
-		ie := sst.index[key]
-
-		_, err = file.Seek(ie.Offset, 0)
-		if err != nil {
-			return nil, fmt.Errorf("failed to seek to entry: %w", err)
-		}
-
-		entryData := make([]byte, ie.EntryLen)
-		_, err = file.Read(entryData)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read entry data: %w", err)
-		}
-
-		entry, _, err := DecodeEntry(entryData)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode entry: %w", err)
-		}
-
-		if !entry.Tombstone {
-			result = append(result, entry)
-		}
-	}
-
-	return result, nil
+	return sst.rangeInternal(start, end, true)
 }
 
 func (sst *SSTable) RangeWithTombstone(start, end string) ([]*Entry, error) {
+	return sst.rangeInternal(start, end, false)
+}
+
+func (sst *SSTable) rangeInternal(start, end string, filterTombstone bool) ([]*Entry, error) {
 	sst.mu.RLock()
 	defer sst.mu.RUnlock()
 
@@ -326,7 +284,9 @@ func (sst *SSTable) RangeWithTombstone(start, end string) ([]*Entry, error) {
 			return nil, fmt.Errorf("failed to decode entry: %w", err)
 		}
 
-		result = append(result, entry)
+		if !filterTombstone || !entry.Tombstone {
+			result = append(result, entry)
+		}
 	}
 
 	return result, nil

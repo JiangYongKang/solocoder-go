@@ -1,0 +1,6 @@
+你实现的 LSM 存储引擎模块在第2轮修复中引入了多个新问题，需要修复：
+1. SkipList.Iterator 创建时获取读锁的唯一释放途径是调用者显式调用 Close，没有保底机制。如果调用者遍历完忘记 Close 或迭代器被提前丢弃，读锁将永远不释放，导致所有写路径永久阻塞。需要确保所有创建迭代器的代码路径（包括内部使用场景和测试用例）都正确释放锁。
+2. Level.Range 方法在使用 Range 而非 RangeWithTombstone 遍历 L0 层 SSTable，与实际 DB.Range 路径的行为不一致。如果外部代码直接调用 Level.Range，已删除的 key 会在跨文件比较时因墓碑被提前过滤而错误复活。
+3. SSTable 和 Level 的 Range 与 RangeWithTombstone 方法存在大量代码重复，两个方法仅差一行墓碑过滤逻辑。需要通过参数化或内部统一实现消除重复，避免未来维护时两套代码同步修改。
+4. 修复完成后运行 go test ./internal/lsm/ -v，需要让所有测试通过。
+5. 在 docs/lsm.md 中更新模块需求文档，说明 SkipList 迭代器的锁生命周期管理策略和 Range/RangeWithTombstone 的代码复用设计。

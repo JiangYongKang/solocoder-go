@@ -1490,3 +1490,61 @@ func TestStop_WaitsForNoRunningTasks(t *testing.T) {
 		t.Fatal("Stop did not complete in time")
 	}
 }
+
+func TestStop_CancelContextUnblocksHandler(t *testing.T) {
+	var started int32
+	var ctxCancelled int32
+	workCh := make(chan struct{})
+
+	handler := func(ctx context.Context, msg *DeadLetterMessage) error {
+		atomic.StoreInt32(&started, 1)
+		select {
+		case <-ctx.Done():
+			atomic.StoreInt32(&ctxCancelled, 1)
+			return ctx.Err()
+		case <-workCh:
+			return nil
+		}
+	}
+
+	p, err := NewProcessor(Config{
+		MaxRetries: 3,
+		DelayStrategy: DelayStrategy{
+			Type: DelayStrategyFixed,
+			Base: 10 * time.Millisecond,
+			Max:  time.Second,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewProcessor failed: %v", err)
+	}
+	p.SetHandler(handler)
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	_, err = p.MoveToDeadLetter("topic", "payload", "reason", 3)
+	if err != nil {
+		t.Fatalf("MoveToDeadLetter failed: %v", err)
+	}
+
+	for atomic.LoadInt32(&started) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		p.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not complete in time - handler may not be responding to ctx.Done()")
+	}
+
+	if atomic.LoadInt32(&ctxCancelled) == 0 {
+		t.Error("expected handler to receive ctx.Done() signal, but it did not")
+	}
+}

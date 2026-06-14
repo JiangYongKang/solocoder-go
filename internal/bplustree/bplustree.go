@@ -684,65 +684,55 @@ func (it *Iterator) Delete() error {
 		return ErrIteratorInvalid
 	}
 
-	currentNode := it.node
-	currentIdx := it.index
-
-	hasNext := currentIdx < len(currentNode.keys)-1
-	nextNode := currentNode.next
-	prevNode := currentNode.prev
-	lenPrev := 0
-	if prevNode != nil {
-		lenPrev = len(prevNode.keys)
-	}
-	nextKeyExists := false
-	var nextKey string
-	if hasNext {
-		nextKey = currentNode.keys[currentIdx+1]
-		nextKeyExists = true
-	} else if nextNode != nil && len(nextNode.keys) > 0 {
-		nextKey = nextNode.keys[0]
-		nextKeyExists = true
-	}
-
-	deleted := it.tree.Delete(currentNode.keys[currentIdx])
-	if !deleted {
+	if it.index < 0 || it.index >= len(it.node.keys) {
+		it.valid = false
 		return ErrKeyNotFound
 	}
 
-	if !it.tree.root.isLeaf || len(it.tree.root.keys) > 0 {
-		if nextKeyExists {
-			leaf := it.tree.findLeaf(nextKey)
-			foundIdx := -1
-			for i := 0; i < len(leaf.keys); i++ {
-				if leaf.keys[i] == nextKey {
-					foundIdx = i
-					break
-				}
-			}
-			if foundIdx >= 0 {
-				it.node = leaf
-				it.index = foundIdx
-				it.valid = true
-				return nil
-			}
-		}
+	keyToDelete := it.node.keys[it.index]
 
-		if lenPrev > 0 && prevNode != nil {
-			if len(prevNode.keys) >= lenPrev {
-				it.node = prevNode
-				it.index = len(prevNode.keys) - 1
-				it.valid = true
-				return nil
-			}
-		}
+	var nextKey string
+	var prevKey string
+	hasNext := false
+	hasPrev := false
 
-		current := it.tree.root
-		for !current.isLeaf {
-			current = current.children[len(current.children)-1]
+	if it.index < len(it.node.keys)-1 {
+		nextKey = it.node.keys[it.index+1]
+		hasNext = true
+	} else if it.node.next != nil && len(it.node.next.keys) > 0 {
+		nextKey = it.node.next.keys[0]
+		hasNext = true
+	}
+
+	if it.index > 0 {
+		prevKey = it.node.keys[it.index-1]
+		hasPrev = true
+	} else if it.node.prev != nil && len(it.node.prev.keys) > 0 {
+		prevKey = it.node.prev.keys[len(it.node.prev.keys)-1]
+		hasPrev = true
+	}
+
+	deleted := it.tree.Delete(keyToDelete)
+	if !deleted {
+		it.valid = false
+		return ErrKeyNotFound
+	}
+
+	if hasNext {
+		newIt := it.tree.NewIteratorAt(nextKey)
+		if newIt.Valid() {
+			it.node = newIt.node
+			it.index = newIt.index
+			it.valid = true
+			return nil
 		}
-		if len(current.keys) > 0 {
-			it.node = current
-			it.index = len(current.keys) - 1
+	}
+
+	if hasPrev {
+		newIt := it.tree.NewIteratorAt(prevKey)
+		if newIt.Valid() {
+			it.node = newIt.node
+			it.index = newIt.index
 			it.valid = true
 			return nil
 		}

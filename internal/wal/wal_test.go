@@ -813,6 +813,195 @@ func TestConcurrentReadWrite(t *testing.T) {
 	wg.Wait()
 }
 
+func TestMultipleReadersConcurrent(t *testing.T) {
+	tmpDir := t.TempDir()
+	wal, err := New(&Config{Dir: tmpDir, MaxSegmentSize: 1024 * 1024})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer wal.Close()
+
+	totalEntries := 500
+	for i := 0; i < totalEntries; i++ {
+		data := []byte(fmt.Sprintf("preload_entry_%06d_data_%s", i, bytes.Repeat([]byte("x"), 30)))
+		_, err := wal.Append(OpPut, data)
+		if err != nil {
+			t.Fatalf("Append(%d) error = %v", i, err)
+		}
+	}
+
+	numReaders := 5
+	var wg sync.WaitGroup
+	var errCount int64
+	var dataMismatch int64
+
+	wg.Add(numReaders)
+	for r := 0; r < numReaders; r++ {
+		readerID := r
+		go func() {
+			defer wg.Done()
+			for iter := 0; iter < 50; iter++ {
+				entries, err := wal.ReadFrom(0)
+				if err != nil {
+					atomic.AddInt64(&errCount, 1)
+					return
+				}
+				if len(entries) != totalEntries {
+					atomic.AddInt64(&dataMismatch, 1)
+					continue
+				}
+				for i, e := range entries {
+					if e.Offset != int64(i) {
+						atomic.AddInt64(&dataMismatch, 1)
+						break
+					}
+					expectedPrefix := fmt.Sprintf("preload_entry_%06d", i)
+					if !bytes.HasPrefix(e.Data, []byte(expectedPrefix)) {
+						atomic.AddInt64(&dataMismatch, 1)
+						break
+					}
+				}
+			}
+			t.Logf("reader %d completed 50 iterations", readerID)
+		}()
+	}
+	wg.Wait()
+
+	if errCount > 0 {
+		t.Errorf("reader errors = %d, want 0", errCount)
+	}
+	if dataMismatch > 0 {
+		t.Errorf("data mismatches = %d, want 0", dataMismatch)
+	}
+}
+
+func TestConcurrentReadersDifferentOffsets(t *testing.T) {
+	tmpDir := t.TempDir()
+	wal, err := New(&Config{Dir: tmpDir, MaxSegmentSize: 1024 * 1024})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer wal.Close()
+
+	totalEntries := 200
+	for i := 0; i < totalEntries; i++ {
+		_, err := wal.Append(OpPut, []byte(fmt.Sprintf("entry_%d", i)))
+		if err != nil {
+			t.Fatalf("Append(%d) error = %v", i, err)
+		}
+	}
+
+	offsets := []int64{0, 50, 100, 150}
+	var wg sync.WaitGroup
+	var errCount int64
+	var dataMismatch int64
+
+	wg.Add(len(offsets) * 3)
+	for run := 0; run < 3; run++ {
+		for idx, startOff := range offsets {
+			startOffset := startOff
+			readerIdx := idx + run*len(offsets)
+			go func() {
+				defer wg.Done()
+				for iter := 0; iter < 30; iter++ {
+					entries, err := wal.ReadFrom(startOffset)
+					if err != nil {
+						atomic.AddInt64(&errCount, 1)
+						return
+					}
+					expectedCount := totalEntries - int(startOffset)
+					if len(entries) != expectedCount {
+						atomic.AddInt64(&dataMismatch, 1)
+						continue
+					}
+					for i, e := range entries {
+						expectedOffset := startOffset + int64(i)
+						if e.Offset != expectedOffset {
+							atomic.AddInt64(&dataMismatch, 1)
+							break
+						}
+						expectedData := fmt.Sprintf("entry_%d", expectedOffset)
+						if string(e.Data) != expectedData {
+							atomic.AddInt64(&dataMismatch, 1)
+							break
+						}
+					}
+				}
+				t.Logf("offset reader %d (startOffset=%d) done", readerIdx, startOffset)
+			}()
+		}
+	}
+	wg.Wait()
+
+	if errCount > 0 {
+		t.Errorf("reader errors = %d, want 0", errCount)
+	}
+	if dataMismatch > 0 {
+		t.Errorf("data mismatches = %d, want 0", dataMismatch)
+	}
+}
+
+func TestConcurrentReadersAcrossSegments(t *testing.T) {
+	tmpDir := t.TempDir()
+	maxSegSize := int64(250)
+	wal, err := New(&Config{Dir: tmpDir, MaxSegmentSize: maxSegSize})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer wal.Close()
+
+	entryData := bytes.Repeat([]byte("y"), 60)
+	var totalEntries int
+	for wal.SegmentCount() < 5 {
+		_, err := wal.Append(OpPut, append([]byte(fmt.Sprintf("idx_%04d_", totalEntries)), entryData...))
+		if err != nil {
+			t.Fatalf("Append(%d) error = %v", totalEntries, err)
+		}
+		totalEntries++
+	}
+	t.Logf("loaded %d entries across %d segments", totalEntries, wal.SegmentCount())
+
+	numReaders := 4
+	var wg sync.WaitGroup
+	var errCount int64
+	var dataMismatch int64
+
+	wg.Add(numReaders)
+	for r := 0; r < numReaders; r++ {
+		readerID := r
+		go func() {
+			defer wg.Done()
+			for iter := 0; iter < 40; iter++ {
+				entries, err := wal.ReadFrom(0)
+				if err != nil {
+					atomic.AddInt64(&errCount, 1)
+					return
+				}
+				if len(entries) != totalEntries {
+					atomic.AddInt64(&dataMismatch, 1)
+					continue
+				}
+				for i, e := range entries {
+					expectedPrefix := fmt.Sprintf("idx_%04d_", i)
+					if !bytes.HasPrefix(e.Data, []byte(expectedPrefix)) {
+						atomic.AddInt64(&dataMismatch, 1)
+						break
+					}
+				}
+			}
+			t.Logf("multi-seg reader %d done", readerID)
+		}()
+	}
+	wg.Wait()
+
+	if errCount > 0 {
+		t.Errorf("reader errors = %d, want 0", errCount)
+	}
+	if dataMismatch > 0 {
+		t.Errorf("data mismatches = %d, want 0", dataMismatch)
+	}
+}
+
 func TestEncodeDecodeEntry(t *testing.T) {
 	entries := []*Entry{
 		{Offset: 0, Type: OpPut, Data: []byte("hello")},

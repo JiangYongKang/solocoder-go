@@ -579,6 +579,12 @@ func (b *Broker) deliverToConsumer(c *Consumer, sub *Subscription, msg *Message)
 	msgCopy := *msg
 	msgCopy.RetryCount = 0
 
+	if existing, ok := c.pending[msgCopy.ID]; ok {
+		c.pendingList.Remove(existing.element)
+		delete(c.pending, msgCopy.ID)
+		atomic.AddInt64(&c.unackedCount, -1)
+	}
+
 	select {
 	case c.ch <- &msgCopy:
 		pm := &pendingMessage{
@@ -689,6 +695,19 @@ func (b *Broker) Nack(consumerID, messageID string) error {
 	return nil
 }
 
+func (b *Broker) hasDurableSubscription(consumerID string) bool {
+	subs, ok := b.subscriptions[consumerID]
+	if !ok {
+		return false
+	}
+	for _, sub := range subs {
+		if sub.Durable {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
 	if pm.status != MessageStatusDelivered && pm.status != MessageStatusPending {
 		return
@@ -709,6 +728,9 @@ func (b *Broker) redeliverOrDeadLetter(c *Consumer, pm *pendingMessage) {
 
 	if !c.connected {
 		pm.status = MessageStatusPending
+		if b.hasDurableSubscription(c.ID) {
+			c.durableBuffer = append(c.durableBuffer, pm.msg)
+		}
 		return
 	}
 
@@ -757,21 +779,30 @@ func (b *Broker) DisconnectConsumer(id string) error {
 
 	c.connected = false
 	subs, ok := b.subscriptions[id]
+	hasDurable := false
 	if ok {
 		for _, sub := range subs {
 			if sub.Durable {
-				for e := c.pendingList.Front(); e != nil; e = e.Next() {
-					pm := e.Value.(*pendingMessage)
-					if pm.status == MessageStatusDelivered {
-						pm.status = MessageStatusPending
-						c.durableBuffer = append(c.durableBuffer, pm.msg)
-					}
-				}
-				c.pendingList.Init()
-				atomic.StoreInt64(&c.unackedCount, 0)
+				hasDurable = true
 				break
 			}
 		}
+	}
+
+	if hasDurable {
+		for e := c.pendingList.Front(); e != nil; e = e.Next() {
+			pm := e.Value.(*pendingMessage)
+			if pm.status == MessageStatusDelivered {
+				pm.status = MessageStatusPending
+				c.durableBuffer = append(c.durableBuffer, pm.msg)
+			}
+		}
+	}
+
+	for e := c.pendingList.Front(); e != nil; {
+		next := e.Next()
+		c.pendingList.Remove(e)
+		e = next
 	}
 
 	return nil
