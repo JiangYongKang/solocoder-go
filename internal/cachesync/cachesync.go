@@ -884,14 +884,14 @@ func (c *Cluster) reliableBroadcast(fromNodeID string, msg *Message) {
 	for _, node := range nodes {
 		msgCopy := *msg
 		msgCopy.ToNodeID = node.ID
-		func(n *Node, m Message) {
+		func() {
 			defer func() { recover() }()
 			retries := 5
 			retryDelay := 20 * time.Millisecond
 			for i := 0; i < retries; i++ {
 				select {
-				case n.inbox <- &m:
-					atomic.AddUint64(&n.msgRecv, 1)
+				case node.inbox <- &msgCopy:
+					atomic.AddUint64(&node.msgRecv, 1)
 					return
 				case <-time.After(100 * time.Millisecond):
 					if i < retries-1 {
@@ -900,7 +900,7 @@ func (c *Cluster) reliableBroadcast(fromNodeID string, msg *Message) {
 					}
 				}
 			}
-		}(node, msgCopy)
+		}()
 	}
 }
 

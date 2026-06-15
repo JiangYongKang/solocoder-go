@@ -1,0 +1,3 @@
+你实现的分布式缓存一致性协议模块在上一轮修复后仍存在一个代码结构问题，需要修复：
+1. reliableBroadcast 从并发改为串行发送后，原有 goroutine 中用于变量值拷贝的匿名函数体被原样保留为立即调用的 `func(n *Node, m Message) { ... }(node, msgCopy)` 闭包。在串行 for 循环场景下这层匿名函数包装已经没有语义价值，msgCopy 在循环体内已经完成拷贝，额外嵌套一层函数调用徒增缩进层级和阅读负担。
+2. 修复后运行 go test ./internal/cachesync/ -v，需要让所有测试通过。
