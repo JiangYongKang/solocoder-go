@@ -1558,12 +1558,17 @@ func TestConcurrentSubscribeUnsubscribe(t *testing.T) {
 }
 
 func TestConcurrentStartStop(t *testing.T) {
-	r := NewRegistry(DefaultRegistryConfig())
-
-	initialStarts := atomic.LoadInt32(&r.expiryLoopStarts)
-	if initialStarts != 0 {
-		t.Fatalf("expected initial expiryLoopStarts=0, got %d", initialStarts)
+	cfg := RegistryConfig{
+		HeartbeatTTL:  80 * time.Millisecond,
+		CheckInterval: 20 * time.Millisecond,
 	}
+	r := NewRegistry(cfg)
+
+	r.mu.RLock()
+	if r.expiryRunning {
+		t.Fatal("expected expiryRunning to be false before Start")
+	}
+	r.mu.RUnlock()
 
 	const n = 10
 	var wg sync.WaitGroup
@@ -1585,9 +1590,22 @@ func TestConcurrentStartStop(t *testing.T) {
 		t.Error("expected expiryRunning to be true after concurrent Start calls")
 	}
 
-	startsAfterConcurrent := atomic.LoadInt32(&r.expiryLoopStarts)
-	if startsAfterConcurrent != 1 {
-		t.Errorf("expected expiryLoopStarts=1 after %d concurrent Start calls, got %d", n, startsAfterConcurrent)
+	inst := &ServiceInstance{ID: "inst-1", ServiceName: "svc-test", Address: "addr-1"}
+	err := r.Register(inst)
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	var eventCount int32
+	r.Subscribe("svc-test", func(event ServiceChangeEvent) {
+		if event.Action == "expire" {
+			atomic.AddInt32(&eventCount, 1)
+		}
+	})
+
+	time.Sleep(200 * time.Millisecond)
+	if atomic.LoadInt32(&eventCount) == 0 {
+		t.Error("expected at least one expire event, indicating background expiry loop is running")
 	}
 
 	r.Stop()
@@ -1599,30 +1617,64 @@ func TestConcurrentStartStop(t *testing.T) {
 		t.Error("expected expiryRunning to be false after Stop")
 	}
 
-	startsAfterStop := atomic.LoadInt32(&r.expiryLoopStarts)
-	if startsAfterStop != startsAfterConcurrent {
-		t.Errorf("expiryLoopStarts should not change after Stop, expected %d, got %d", startsAfterConcurrent, startsAfterStop)
-	}
-
 	r.Start()
 
-	startsAfterRestart := atomic.LoadInt32(&r.expiryLoopStarts)
-	if startsAfterRestart != 2 {
-		t.Errorf("expected expiryLoopStarts=2 after restart, got %d", startsAfterRestart)
+	r.mu.RLock()
+	running = r.expiryRunning
+	r.mu.RUnlock()
+	if !running {
+		t.Error("expected expiryRunning to be true after restart")
+	}
+
+	inst2 := &ServiceInstance{ID: "inst-2", ServiceName: "svc-test-2", Address: "addr-2"}
+	err = r.Register(inst2)
+	if err != nil {
+		t.Fatalf("Register after restart failed: %v", err)
+	}
+
+	var eventCount2 int32
+	r.Subscribe("svc-test-2", func(event ServiceChangeEvent) {
+		if event.Action == "expire" {
+			atomic.AddInt32(&eventCount2, 1)
+		}
+	})
+
+	time.Sleep(200 * time.Millisecond)
+	if atomic.LoadInt32(&eventCount2) == 0 {
+		t.Error("expected expire event after restart, indicating expiry loop was restarted successfully")
 	}
 
 	r.Stop()
-
-	startsAfterSecondStop := atomic.LoadInt32(&r.expiryLoopStarts)
-	if startsAfterSecondStop != 2 {
-		t.Errorf("expiryLoopStarts should remain 2 after second Stop, got %d", startsAfterSecondStop)
-	}
 
 	r.mu.RLock()
 	running = r.expiryRunning
 	r.mu.RUnlock()
 	if running {
 		t.Error("expected expiryRunning to be false after second Stop")
+	}
+
+	for round := 0; round < 5; round++ {
+		r.Start()
+		r.Start()
+		r.Start()
+
+		r.mu.RLock()
+		running := r.expiryRunning
+		r.mu.RUnlock()
+		if !running {
+			t.Errorf("round %d: expected expiryRunning=true after idempotent Start calls", round)
+		}
+
+		r.Stop()
+		r.Stop()
+		r.Stop()
+
+		r.mu.RLock()
+		running = r.expiryRunning
+		r.mu.RUnlock()
+		if running {
+			t.Errorf("round %d: expected expiryRunning=false after idempotent Stop calls", round)
+		}
 	}
 }
 

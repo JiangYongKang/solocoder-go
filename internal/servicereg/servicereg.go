@@ -63,16 +63,15 @@ type subscriber struct {
 }
 
 type Registry struct {
-	mu             sync.RWMutex
-	instances      map[string]map[string]*ServiceInstance
-	subscribers    map[string]map[string]*subscriber
-	cfg            RegistryConfig
-	running        bool
-	expiryRunning  bool
-	expiryLoopStarts int32
-	stopCh         chan struct{}
-	wg             sync.WaitGroup
-	nextSubID      uint64
+	mu            sync.RWMutex
+	instances     map[string]map[string]*ServiceInstance
+	subscribers   map[string]map[string]*subscriber
+	cfg           RegistryConfig
+	running       bool
+	expiryRunning bool
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	nextSubID     uint64
 }
 
 func NewRegistry(cfg RegistryConfig) *Registry {
@@ -348,7 +347,6 @@ func (r *Registry) Start() {
 	}
 	r.expiryRunning = true
 	r.wg.Add(1)
-	atomic.AddInt32(&r.expiryLoopStarts, 1)
 	r.mu.Unlock()
 
 	go r.expiryLoop()

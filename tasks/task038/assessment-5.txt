@@ -1,0 +1,5 @@
+产物不满意：
+本轮修复成功解决了第4轮标注中指出的生产代码向测试妥协问题。Registry 结构体中已完全移除 expiryLoopStarts 字段，Start 方法不再包含计数器递增逻辑，生产代码恢复纯粹无任何测试专用字段。TestConcurrentStartStop 测试改为间接验证方式：使用短 TTL 配置注册实例并订阅过期事件，等待后断言收到 expire 事件来证明后台协程正在运行，结合 expiryRunning 标志位的并发一致性验证，替代了原来直接读取生产代码内置计数器的方案。10个并发 Start 后 expiryRunning 为 true，Stop 后为 false，重启后过期事件再次触发，5轮 Start/Stop 幂等循环中状态始终一致。未发现新的产物问题。
+
+过程不满意：
+模型在第一版测试中使用了 DefaultRegistryConfig 构造 Registry 并 sleep 后检查过期事件，但该配置的默认 HeartbeatTTL 为 30 秒，短时间内不可能触发任何过期。模型运行测试失败后才搜索 defaultHeartbeatTTL 常量发现默认值，随即将配置改为 80ms 短 TTL。这说明模型在编写测试前没有先了解 RegistryConfig 默认值与等待时间的匹配关系，如果能先读一下常量定义就会意识到 30 秒 TTL 无法在毫秒级等待中过期，从而避免这一次无谓的试错往返。

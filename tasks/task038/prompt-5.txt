@@ -1,0 +1,5 @@
+你实现的服务注册与发现模块的 TestConcurrentStartStop 测试用例存在生产代码向测试妥协的问题：
+1. Registry 结构体中新增的 expiryLoopStarts 字段完全是为测试目的而添加的，生产代码无任何业务用途。标注规范明确指出"生产代码向测试妥协"是不可接受的设计问题，正确的做法是保持生产代码结构不变，通过间接方式验证协程启动行为。
+2. 移除 Registry 结构体中的 expiryLoopStarts 字段以及 Start 方法中对该字段的递增逻辑，保持生产代码的纯粹性。
+3. 重写 TestConcurrentStartStop 测试，在不依赖生产代码内置测试计数器的情况下，通过已有的公开 API 和间接手段验证以下行为：多次并发的 Start 调用仅启动恰好一个后台过期协程，Stop 后 expiryRunning 为 false，重启后协程正常恢复。
+4. 运行 go test ./internal/servicereg/ -v，需要让所有测试通过。
