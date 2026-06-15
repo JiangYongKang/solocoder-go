@@ -146,11 +146,6 @@ type RequestConverter func(r *http.Request) (*http.Request, error)
 
 type ResponseConverter func(statusCode int, header http.Header, body []byte) (int, http.Header, []byte, error)
 
-type VersionedHandler struct {
-	Version Version
-	Handler http.HandlerFunc
-}
-
 type converterPair struct {
 	From Version
 	To   Version
@@ -320,9 +315,10 @@ func stripVersionPrefix(path string, v Version) string {
 }
 
 type responseCapture struct {
-	header     http.Header
-	statusCode int
-	body       []byte
+	header      http.Header
+	statusCode  int
+	body        []byte
+	wroteHeader bool
 }
 
 func newResponseCapture() *responseCapture {
@@ -337,7 +333,11 @@ func (rc *responseCapture) Header() http.Header {
 }
 
 func (rc *responseCapture) WriteHeader(code int) {
+	if rc.wroteHeader {
+		return
+	}
 	rc.statusCode = code
+	rc.wroteHeader = true
 }
 
 func (rc *responseCapture) Write(b []byte) (int, error) {
@@ -375,7 +375,7 @@ func (vr *VersionRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, hasReqConv := vr.GetRequestConverter(requestedVersion, latestVersion)
+	reqConv, hasReqConv := vr.GetRequestConverter(requestedVersion, latestVersion)
 	if !hasReqConv {
 		vr.mu.RLock()
 		handler := vr.handlers[requestedVersion]
@@ -384,7 +384,7 @@ func (vr *VersionRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	convertedReq, err := vr.convertRequest(req, requestedVersion, latestVersion)
+	convertedReq, err := reqConv(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -396,12 +396,16 @@ func (vr *VersionRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	vr.mu.RUnlock()
 	latestHandler(capture, convertedReq)
 
-	statusCode, header, body, err := vr.convertResponse(
+	respConv, hasRespConv := vr.GetResponseConverter(latestVersion, requestedVersion)
+	if !hasRespConv {
+		http.Error(w, ErrConverterNotFound.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	statusCode, header, body, err := respConv(
 		capture.statusCode,
 		capture.header,
 		capture.body,
-		latestVersion,
-		requestedVersion,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -415,32 +419,6 @@ func (vr *VersionRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(statusCode)
 	w.Write(body)
-}
-
-func (vr *VersionRouter) convertRequest(r *http.Request, from, to Version) (*http.Request, error) {
-	if from.Compare(to) == 0 {
-		return r, nil
-	}
-
-	conv, ok := vr.GetRequestConverter(from, to)
-	if !ok {
-		return nil, ErrConverterNotFound
-	}
-
-	return conv(r)
-}
-
-func (vr *VersionRouter) convertResponse(statusCode int, header http.Header, body []byte, from, to Version) (int, http.Header, []byte, error) {
-	if from.Compare(to) == 0 {
-		return statusCode, header, body, nil
-	}
-
-	conv, ok := vr.GetResponseConverter(from, to)
-	if !ok {
-		return 0, nil, nil, ErrConverterNotFound
-	}
-
-	return conv(statusCode, header, body)
 }
 
 func StrippedPathFromContext(ctx context.Context) (string, bool) {

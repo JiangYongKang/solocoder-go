@@ -1,0 +1,6 @@
+你实现的 OAuth2 授权服务模块仍存在一些代码质量问题，需要修复：
+1. handleAuthorizationCode 方法的 Scope 校验存在两层冗余检查，第一层校验请求 Scope 是否在 client.Scopes 范围内，第二层校验是否为 authCode.Scope 的子集。由于授权码的 Scope 在 Authorize 阶段已通过 client.Scopes 校验，第二层已完全覆盖第一层，第一层属于不必要的重复，应当精简。
+2. docs/oauth2svc.md 中描述刷新令牌行为为"使用后旧令牌立即失效"，但实际是否吊销旧令牌取决于 Config.RefreshTokenRotation 配置值，当该字段为 false 时旧令牌不会被吊销，文档描述与实现不一致。需要在文档中分情况说明两种行为模式。
+3. docs/oauth2svc.md 的安全注意事项中未提及 JWT 算法白名单校验机制，缺失了算法混淆攻击的防护说明，应当补充。
+4. 运行 go test ./internal/oauth2svc/ -v，需要让所有测试通过。
+5. 在 docs/oauth2svc.md 中更新模块需求文档。

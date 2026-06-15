@@ -956,7 +956,7 @@ func TestClientStream_InterfaceIntegrity(t *testing.T) {
 		}
 	}
 
-	resp, err := streamInterface.Send()
+	resp, err := streamInterface.RecvFromServer()
 	if err != nil {
 		t.Fatalf("Send through Stream interface failed: %v", err)
 	}
@@ -1000,7 +1000,7 @@ func TestBidiStream_InterfaceIntegrity(t *testing.T) {
 			t.Fatalf("PutRecv through Stream interface failed: %v", err)
 		}
 
-		msg, err := streamInterface.Send()
+		msg, err := streamInterface.RecvFromServer()
 		if err != nil {
 			t.Fatalf("Send through Stream interface failed: %v", err)
 		}
@@ -1013,7 +1013,7 @@ func TestBidiStream_InterfaceIntegrity(t *testing.T) {
 
 	select {
 	case err := <-handlerDone:
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrStreamClosed) {
 			t.Fatalf("unexpected handler error: %v", err)
 		}
 	case <-time.After(1 * time.Second):
@@ -1381,7 +1381,7 @@ func (m *mockStream) Context() context.Context    { return context.Background() 
 func (m *mockStream) SendMsg(msg interface{}) error { return nil }
 func (m *mockStream) RecvMsg(msg interface{}) error { return nil }
 func (m *mockStream) Recv() (interface{}, error)   { return nil, nil }
-func (m *mockStream) Send() (interface{}, error)   { return nil, nil }
+func (m *mockStream) RecvFromServer() (interface{}, error) { return nil, nil }
 func (m *mockStream) PutRecv(msg interface{}) error { return nil }
 func (m *mockStream) SetHeader(md MD)              {}
 func (m *mockStream) SetTrailer(md MD)             {}
@@ -1778,5 +1778,338 @@ func TestServerOptions_Options(t *testing.T) {
 	}
 	if got.ConnectionTimeout != 15*time.Second {
 		t.Errorf("expected ConnectionTimeout 15s, got %v", got.ConnectionTimeout)
+	}
+}
+
+func TestRecvMsg_DataPopulation(t *testing.T) {
+	s := NewServer()
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "EchoService", "BidiStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = stream.PutRecv("hello-world")
+	if err != nil {
+		t.Fatalf("PutRecv failed: %v", err)
+	}
+
+	var msg string
+	err = stream.RecvMsg(&msg)
+	if err != nil {
+		t.Fatalf("RecvMsg failed: %v", err)
+	}
+	if msg != "hello-world" {
+		t.Errorf("expected msg to be 'hello-world', got '%s'", msg)
+	}
+}
+
+func TestRecvMsg_MultipleDataPopulation(t *testing.T) {
+	s := NewServer()
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "EchoService", "BidiStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		err = stream.PutRecv(fmt.Sprintf("msg-%d", i))
+		if err != nil {
+			t.Fatalf("PutRecv %d failed: %v", i, err)
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		var msg string
+		err = stream.RecvMsg(&msg)
+		if err != nil {
+			t.Fatalf("RecvMsg %d failed: %v", i, err)
+		}
+		if msg != fmt.Sprintf("msg-%d", i) {
+			t.Errorf("expected msg-%d, got %s", i, msg)
+		}
+	}
+}
+
+func TestRecvMsg_NilPointer(t *testing.T) {
+	s := NewServer()
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "EchoService", "BidiStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = stream.PutRecv("test")
+	if err != nil {
+		t.Fatalf("PutRecv failed: %v", err)
+	}
+
+	err = stream.RecvMsg(nil)
+	if err == nil {
+		t.Error("expected error for nil msg, got nil")
+	}
+
+	var ptr *string
+	err = stream.RecvMsg(ptr)
+	if err == nil {
+		t.Error("expected error for nil pointer, got nil")
+	}
+}
+
+func TestRecvMsg_IntegerData(t *testing.T) {
+	s := NewServer()
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "EchoService", "BidiStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = stream.PutRecv(42)
+	if err != nil {
+		t.Fatalf("PutRecv failed: %v", err)
+	}
+
+	var val int
+	err = stream.RecvMsg(&val)
+	if err != nil {
+		t.Fatalf("RecvMsg failed: %v", err)
+	}
+	if val != 42 {
+		t.Errorf("expected val to be 42, got %d", val)
+	}
+}
+
+func TestCancel_ReleaseOnStreamClose(t *testing.T) {
+	opts := ServerOptions{
+		MaxConcurrentStreams: 100,
+		ConnectionTimeout:    5 * time.Minute,
+	}
+	s := NewServerWithOptions(opts)
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ss := stream.(*serverStream)
+	if ss.cancelFn == nil {
+		t.Fatal("expected cancelFn to be set when ConnectionTimeout > 0")
+	}
+
+	ctx := stream.Context()
+	if ctx.Err() != nil {
+		t.Fatal("expected context to not be cancelled before close")
+	}
+
+	err = stream.Close()
+	if err != nil {
+		t.Fatalf("unexpected error closing stream: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	if ctx.Err() == nil {
+		t.Error("expected context to be cancelled after stream close (cancelFn should be called)")
+	}
+}
+
+func TestCancel_NoLeakOnStreamClose(t *testing.T) {
+	opts := ServerOptions{
+		MaxConcurrentStreams: 100,
+		ConnectionTimeout:    5 * time.Minute,
+	}
+	s := NewServerWithOptions(opts)
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = stream.Close()
+	if err != nil {
+		t.Fatalf("unexpected error closing stream: %v", err)
+	}
+
+	ss := stream.(*serverStream)
+	if ss.cancelFn == nil {
+		t.Fatal("expected cancelFn to be set")
+	}
+
+	ctx := stream.Context()
+	select {
+	case <-ctx.Done():
+		if ctx.Err() != context.Canceled {
+			t.Errorf("expected context.Canceled, got %v", ctx.Err())
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("expected context to be cancelled promptly after Close()")
+	}
+}
+
+func TestCancel_CancelFnSetWithConnectionTimeout(t *testing.T) {
+	opts := ServerOptions{
+		MaxConcurrentStreams: 100,
+		ConnectionTimeout:    10 * time.Second,
+	}
+	s := NewServerWithOptions(opts)
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ss := stream.(*serverStream)
+	if ss.cancelFn == nil {
+		t.Fatal("expected cancelFn to be set when ConnectionTimeout > 0")
+	}
+
+	stream.Close()
+}
+
+func TestRecvFromServer_NamingCorrectness(t *testing.T) {
+	s := NewServer()
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var streamInterface Stream = stream
+
+	handlerDone := make(chan error, 1)
+	go func() {
+		handlerDone <- s.HandleStream(context.Background(), "EchoService", "ServerStream", stream)
+	}()
+
+	var received []string
+	for i := 0; i < 3; i++ {
+		msg, err := streamInterface.RecvFromServer()
+		if err != nil {
+			t.Fatalf("RecvFromServer failed: %v", err)
+		}
+		received = append(received, msg.(string))
+	}
+
+	expected := []string{"msg-0", "msg-1", "msg-2"}
+	if len(received) != len(expected) {
+		t.Fatalf("expected %d messages, got %d", len(expected), len(received))
+	}
+	for i, v := range expected {
+		if received[i] != v {
+			t.Errorf("expected %s at index %d, got %s", v, i, received[i])
+		}
+	}
+
+	select {
+	case err := <-handlerDone:
+		if err != nil {
+			t.Fatalf("unexpected handler error: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("handler did not complete")
+	}
+}
+
+func TestRecvFromServer_BidiNaming(t *testing.T) {
+	s := NewServer()
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "EchoService", "BidiStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var streamInterface Stream = stream
+
+	handlerDone := make(chan error, 1)
+	go func() {
+		handlerDone <- s.HandleStream(context.Background(), "EchoService", "BidiStream", stream)
+	}()
+
+	for i := 0; i < 3; i++ {
+		err := streamInterface.PutRecv(fmt.Sprintf("ping-%d", i))
+		if err != nil {
+			t.Fatalf("PutRecv failed: %v", err)
+		}
+
+		msg, err := streamInterface.RecvFromServer()
+		if err != nil {
+			t.Fatalf("RecvFromServer failed: %v", err)
+		}
+		if msg != "echo" {
+			t.Errorf("expected 'echo', got %v", msg)
+		}
+	}
+
+	stream.Close()
+
+	select {
+	case err := <-handlerDone:
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrStreamClosed) {
+			t.Fatalf("unexpected handler error: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("handler did not complete")
+	}
+}
+
+func TestRecvFromServer_ClientStream(t *testing.T) {
+	s := NewServer()
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "EchoService", "ClientStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var streamInterface Stream = stream
+
+	handlerDone := make(chan error, 1)
+	go func() {
+		handlerDone <- s.HandleStream(context.Background(), "EchoService", "ClientStream", stream)
+	}()
+
+	for i := 0; i < 5; i++ {
+		err := streamInterface.PutRecv(fmt.Sprintf("msg-%d", i))
+		if err != nil {
+			t.Fatalf("PutRecv failed: %v", err)
+		}
+	}
+
+	resp, err := streamInterface.RecvFromServer()
+	if err != nil {
+		t.Fatalf("RecvFromServer failed: %v", err)
+	}
+	if resp != "received 5 messages" {
+		t.Errorf("expected 'received 5 messages', got %v", resp)
+	}
+
+	stream.Close()
+
+	select {
+	case err := <-handlerDone:
+		if err != nil && !errors.Is(err, ErrStreamClosed) {
+			t.Fatalf("unexpected handler error: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("handler did not complete")
 	}
 }

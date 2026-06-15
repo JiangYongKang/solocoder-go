@@ -218,8 +218,6 @@ func buildNSResponse(zone string, nsServers []string, glueIPs map[string]string,
 	binary.BigEndian.PutUint16(resp[offset:offset+2], ClassIN)
 	offset += 2
 
-	questionEnd := offset
-
 	for _, ns := range nsServers {
 		resp[offset] = 0xC0
 		resp[offset+1] = 0x0C
@@ -276,7 +274,6 @@ func buildNSResponse(zone string, nsServers []string, glueIPs map[string]string,
 		offset += 4
 	}
 
-	_ = questionEnd
 	return resp[:offset]
 }
 
@@ -1055,10 +1052,14 @@ func TestBuildQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildQuery failed: %v", err)
 	}
-	_ = id
 
 	if len(query) < 12 {
 		t.Fatalf("query too short: %d bytes", len(query))
+	}
+
+	queryID := binary.BigEndian.Uint16(query[0:2])
+	if queryID != id {
+		t.Errorf("expected transaction ID %d, got %d", id, queryID)
 	}
 
 	flags := binary.BigEndian.Uint16(query[2:4])
@@ -2167,5 +2168,276 @@ func TestDNSErrorIsComparison(t *testing.T) {
 	}
 	if !errors.Is(err3, ErrSERVFAIL) {
 		t.Error("expected err3 to match ErrSERVFAIL")
+	}
+}
+
+func TestIsSameZone(t *testing.T) {
+	tests := []struct {
+		domain  string
+		zone    string
+		sameZne bool
+	}{
+		{"cdn.example.com", "example.com.", true},
+		{"www.example.com", "example.com.", true},
+		{"example.com", "example.com.", true},
+		{"sub.example.com", "example.com.", true},
+		{"deep.sub.example.com", "example.com.", true},
+		{"example.org", "example.com.", false},
+		{"notexample.com", "example.com.", false},
+		{"cdn.otherdomain.net", "example.com.", false},
+		{"anything", ".", true},
+		{"anything", "", true},
+		{"anything", ".", true},
+		{"test.com", "com.", true},
+		{"test.com", "org.", false},
+	}
+
+	for _, tt := range tests {
+		result := isSameZone(tt.domain, tt.zone)
+		if result != tt.sameZne {
+			t.Errorf("isSameZone(%q, %q) = %v, expected %v", tt.domain, tt.zone, result, tt.sameZne)
+		}
+	}
+}
+
+func TestCNAMEFollowSameZoneNoFullRecursion(t *testing.T) {
+	cfg := Config{
+		EnableCache:       false,
+		EnableRecursion:   true,
+		RootServers:       []string{"192.0.2.1:53"},
+		QueryTimeout:      100 * time.Millisecond,
+		MaxRecursionDepth: 10,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	queryCount := 0
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		queryCount++
+		switch queryCount {
+		case 1:
+			return &mockConn{
+				readData: buildNSResponse(".", []string{"a.root-servers.net"}, map[string]string{"a.root-servers.net": "192.0.2.1"}, 3600),
+			}, nil
+		case 2:
+			return &mockConn{
+				readData: buildNSResponse("com.", []string{"a.gtld-servers.net"}, map[string]string{"a.gtld-servers.net": "192.0.2.2"}, 3600),
+			}, nil
+		case 3:
+			return &mockConn{
+				readData: buildNSResponse("example.com.", []string{"ns1.example.com"}, map[string]string{"ns1.example.com": "192.0.2.3"}, 3600),
+			}, nil
+		case 4:
+			return &mockConn{
+				readData: buildCNAMEResponse("www.example.com", "cdn.example.com", 300),
+			}, nil
+		case 5:
+			return &mockConn{
+				readData: buildTestResponse("cdn.example.com", "1.2.3.4", 300, TypeA),
+			}, nil
+		default:
+			return &mockConn{
+				readErr: fmt.Errorf("unexpected query #%d: same-zone CNAME should not trigger full recursion", queryCount),
+			}, nil
+		}
+	}
+
+	ips, err := r.ResolveA("www.example.com")
+	if err != nil {
+		t.Fatalf("ResolveA failed: %v", err)
+	}
+	if len(ips) != 1 || ips[0] != "1.2.3.4" {
+		t.Errorf("expected [1.2.3.4], got %v", ips)
+	}
+
+	if queryCount != 5 {
+		t.Errorf("expected exactly 5 queries (3 NS + 1 CNAME + 1 A), got %d — same-zone CNAME should not trigger full recursion", queryCount)
+	}
+}
+
+func TestCNAMEFollowSameZoneDeepSubdomain(t *testing.T) {
+	cfg := Config{
+		EnableCache:       false,
+		EnableRecursion:   true,
+		RootServers:       []string{"192.0.2.1:53"},
+		QueryTimeout:      100 * time.Millisecond,
+		MaxRecursionDepth: 10,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	queryCount := 0
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		queryCount++
+		switch queryCount {
+		case 1:
+			return &mockConn{
+				readData: buildNSResponse(".", []string{"a.root-servers.net"}, map[string]string{"a.root-servers.net": "192.0.2.1"}, 3600),
+			}, nil
+		case 2:
+			return &mockConn{
+				readData: buildNSResponse("com.", []string{"a.gtld-servers.net"}, map[string]string{"a.gtld-servers.net": "192.0.2.2"}, 3600),
+			}, nil
+		case 3:
+			return &mockConn{
+				readData: buildNSResponse("example.com.", []string{"ns1.example.com"}, map[string]string{"ns1.example.com": "192.0.2.3"}, 3600),
+			}, nil
+		case 4:
+			return &mockConn{
+				readData: buildCNAMEResponse("api.v2.example.com", "cdn.example.com", 300),
+			}, nil
+		case 5:
+			return &mockConn{
+				readData: buildTestResponse("cdn.example.com", "5.6.7.8", 300, TypeA),
+			}, nil
+		default:
+			return &mockConn{
+				readErr: fmt.Errorf("unexpected query #%d: same-zone CNAME should not trigger full recursion", queryCount),
+			}, nil
+		}
+	}
+
+	ips, err := r.ResolveA("api.v2.example.com")
+	if err != nil {
+		t.Fatalf("ResolveA failed: %v", err)
+	}
+	if len(ips) != 1 || ips[0] != "5.6.7.8" {
+		t.Errorf("expected [5.6.7.8], got %v", ips)
+	}
+	if queryCount != 5 {
+		t.Errorf("expected exactly 5 queries for same-zone deep subdomain CNAME, got %d", queryCount)
+	}
+}
+
+func TestCNAMEFollowCrossZoneTriggersRecursion(t *testing.T) {
+	cfg := Config{
+		EnableCache:       false,
+		EnableRecursion:   true,
+		RootServers:       []string{"192.0.2.1:53"},
+		QueryTimeout:      100 * time.Millisecond,
+		MaxRecursionDepth: 20,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	queryCount := 0
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		queryCount++
+		switch queryCount {
+		case 1:
+			return &mockConn{
+				readData: buildNSResponse(".", []string{"a.root-servers.net"}, map[string]string{"a.root-servers.net": "192.0.2.1"}, 3600),
+			}, nil
+		case 2:
+			return &mockConn{
+				readData: buildNSResponse("com.", []string{"a.gtld-servers.net"}, map[string]string{"a.gtld-servers.net": "192.0.2.2"}, 3600),
+			}, nil
+		case 3:
+			return &mockConn{
+				readData: buildNSResponse("example.com.", []string{"ns1.example.com"}, map[string]string{"ns1.example.com": "192.0.2.3"}, 3600),
+			}, nil
+		case 4:
+			return &mockConn{
+				readData: buildRcodeResponse("www.example.com", RCODE_NOERROR, TypeNS),
+			}, nil
+		case 5:
+			return &mockConn{
+				readData: buildCNAMEResponse("www.example.com", "cdn.otherdomain.net", 300),
+			}, nil
+		case 6:
+			return &mockConn{
+				readData: buildNSResponse(".", []string{"a.root-servers.net"}, map[string]string{"a.root-servers.net": "192.0.2.1"}, 3600),
+			}, nil
+		case 7:
+			return &mockConn{
+				readData: buildNSResponse("net.", []string{"b.gtld-servers.net"}, map[string]string{"b.gtld-servers.net": "192.0.2.4"}, 3600),
+			}, nil
+		case 8:
+			return &mockConn{
+				readData: buildNSResponse("otherdomain.net.", []string{"ns1.otherdomain.net"}, map[string]string{"ns1.otherdomain.net": "192.0.2.5"}, 3600),
+			}, nil
+		case 9:
+			return &mockConn{
+				readData: buildRcodeResponse("cdn.otherdomain.net", RCODE_NOERROR, TypeNS),
+			}, nil
+		case 10:
+			return &mockConn{
+				readData: buildTestResponse("cdn.otherdomain.net", "9.10.11.12", 300, TypeA),
+			}, nil
+		default:
+			return &mockConn{
+				readErr: fmt.Errorf("unexpected query #%d", queryCount),
+			}, nil
+		}
+	}
+
+	ips, err := r.ResolveA("www.example.com")
+	if err != nil {
+		t.Fatalf("ResolveA failed (queryCount=%d): %v", queryCount, err)
+	}
+	if len(ips) != 1 || ips[0] != "9.10.11.12" {
+		t.Errorf("expected [9.10.11.12], got %v", ips)
+	}
+
+	if queryCount < 10 {
+		t.Errorf("expected at least 10 queries for cross-zone CNAME, got %d", queryCount)
+	}
+}
+
+func TestCNAMEFollowSameZoneChainedCNAME(t *testing.T) {
+	cfg := Config{
+		EnableCache:       false,
+		EnableRecursion:   true,
+		RootServers:       []string{"192.0.2.1:53"},
+		QueryTimeout:      100 * time.Millisecond,
+		MaxRecursionDepth: 10,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	queryCount := 0
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		queryCount++
+		switch queryCount {
+		case 1:
+			return &mockConn{
+				readData: buildNSResponse(".", []string{"a.root-servers.net"}, map[string]string{"a.root-servers.net": "192.0.2.1"}, 3600),
+			}, nil
+		case 2:
+			return &mockConn{
+				readData: buildNSResponse("com.", []string{"a.gtld-servers.net"}, map[string]string{"a.gtld-servers.net": "192.0.2.2"}, 3600),
+			}, nil
+		case 3:
+			return &mockConn{
+				readData: buildNSResponse("example.com.", []string{"ns1.example.com"}, map[string]string{"ns1.example.com": "192.0.2.3"}, 3600),
+			}, nil
+		case 4:
+			return &mockConn{
+				readData: buildCNAMEResponse("www.example.com", "cdn.example.com", 300),
+			}, nil
+		case 5:
+			return &mockConn{
+				readData: buildCNAMEResponse("cdn.example.com", "origin.example.com", 300),
+			}, nil
+		case 6:
+			return &mockConn{
+				readData: buildTestResponse("origin.example.com", "3.4.5.6", 300, TypeA),
+			}, nil
+		default:
+			return &mockConn{
+				readErr: fmt.Errorf("unexpected query #%d: chained same-zone CNAMEs should not trigger full recursion", queryCount),
+			}, nil
+		}
+	}
+
+	ips, err := r.ResolveA("www.example.com")
+	if err != nil {
+		t.Fatalf("ResolveA failed: %v", err)
+	}
+	if len(ips) != 1 || ips[0] != "3.4.5.6" {
+		t.Errorf("expected [3.4.5.6], got %v", ips)
+	}
+	if queryCount != 6 {
+		t.Errorf("expected exactly 6 queries (3 NS + 3 same-zone queries), got %d", queryCount)
 	}
 }

@@ -1,0 +1,6 @@
+你实现的 TCP 反向代理模块仍存在一些并发 Bug，需要修复：
+1. TestConnPool_ConcurrentRemoveAndPut 测试中 for 循环变量 i 被 goroutine 闭包直接引用，所有 goroutine 共享同一个 i。goroutine 执行到 if i%3==0 时循环早已结束，i 已固定为终值，导致 pool.Remove 分支在整个测试期间从未被触发，该测试名义上覆盖并发 Remove 和 Put 混合场景但实际上只跑了 Put 路径。
+2. ConnPool.Get 方法的超时等待机制在多 waiter 场景下存在缺陷：deadline goroutine 只广播一次就退出，如果多个 waiter 被同时唤醒但只有一个连接可用，竞争失败的 waiter 会重新进入 cond.Wait 永久阻塞，应采用每次进入等待循环时重新计算剩余超时的方案。
+3. ConnPool.Get 方法在扫描过期连接时，对过期连接在持锁期间直接调用 conn.Close()。TCP 连接的 Close 操作可能阻塞，持锁执行网络 IO 会阻塞整个连接池的所有 Get/Put/Remove 操作，应当将关闭操作移到解锁之后执行。
+4. 修复以上问题后，运行 go test ./internal/tcpproxy/ -v -race，需要让所有测试通过。
+5. 在 docs/tcpproxy.md 中更新模块需求文档。

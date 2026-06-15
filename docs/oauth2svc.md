@@ -19,7 +19,9 @@
 - 访问令牌采用 JWT 格式，携带过期时间
 - 支持使用刷新令牌换取新的访问令牌
 - 刷新令牌可配置过期时间
-- 刷新令牌使用后旧令牌立即失效（滚动刷新）
+- **刷新令牌滚动刷新（可配置）**：
+  - 当 `Config.RefreshTokenRotation = true`（默认）时：刷新令牌使用后旧令牌立即失效，同时签发新的刷新令牌
+  - 当 `Config.RefreshTokenRotation = false` 时：刷新令牌使用后旧令牌仍然有效，不会签发新的刷新令牌（非滚动模式）
 
 ### 1.4 Scope 校验
 - 客户端请求时声明所需的权限范围
@@ -174,6 +176,8 @@ JWT 访问令牌声明：
 
 ### 刷新令牌时序
 
+#### 滚动刷新模式（RefreshTokenRotation = true，默认）
+
 ```
 客户端                          授权服务器
   |                                 |
@@ -196,6 +200,33 @@ JWT 访问令牌声明：
   |   "token_type": "Bearer",       |
   |   "expires_in": 3600,            |
   |   "refresh_token": "NEW_REFRESH"|
+  | }                               |
+```
+
+#### 非滚动模式（RefreshTokenRotation = false）
+
+```
+客户端                          授权服务器
+  |                                 |
+  | 1. 使用刷新令牌                 |
+  | POST /token                     |
+  |   grant_type=refresh_token      |
+  |   &refresh_token=OLD_REFRESH    |
+  |   &client_id=xxx                |
+  |   &client_secret=xxx            |------------------------------>|
+  |                                 | 2. 验证刷新令牌               |
+  |                                 |    - 校验 client_id/secret    |
+  |                                 |    - 校验 refresh_token 有效  |
+  |                                 |    - **不吊销旧 refresh_token**|
+  |                                 |    - 生成新 access_token      |
+  |                                 |    - **不生成新 refresh_token**|
+  |<--------------------------------|
+  | 3. 返回新访问令牌               |
+  | {                               |
+  |   "access_token": "NEW_JWT",    |
+  |   "token_type": "Bearer",       |
+  |   "expires_in": 3600,            |
+  |   "refresh_token": "OLD_REFRESH"|
   | }                               |
 ```
 
@@ -313,7 +344,8 @@ if err != nil {
     // 处理错误
 }
 
-// 旧的刷新令牌已被吊销，必须使用新的
+// 滚动刷新模式（RefreshTokenRotation = true）时，旧的刷新令牌已被吊销，必须使用新的
+// 非滚动模式（RefreshTokenRotation = false）时，旧的刷新令牌仍然有效
 fmt.Printf("New Access Token: %s\n", newTokenResp.AccessToken)
 fmt.Printf("New Refresh Token: %s\n", newTokenResp.RefreshToken)
 ```
@@ -378,3 +410,4 @@ if hasScope("read") {
 5. **授权码过期**: 授权码应设置较短的过期时间（默认 10 分钟）
 6. **刷新令牌安全**: 刷新令牌应安全存储，避免泄露
 7. **Scope 最小化**: 只请求必要的 Scope，遵循最小权限原则
+8. **JWT 算法白名单校验**: 实现了严格的算法白名单机制，仅允许 `HS256` 算法签名，防止算法混淆攻击（如 `alg=none` 攻击）。在解析 JWT 时会先校验 `alg` 头字段，非白名单算法的令牌将被直接拒绝

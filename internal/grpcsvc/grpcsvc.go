@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -153,7 +154,7 @@ type Stream interface {
 	SendMsg(msg interface{}) error
 	RecvMsg(msg interface{}) error
 	Recv() (interface{}, error)
-	Send() (interface{}, error)
+	RecvFromServer() (interface{}, error)
 	PutRecv(msg interface{}) error
 	SetHeader(md MD)
 	SetTrailer(md MD)
@@ -457,56 +458,35 @@ func (s *Server) Invoke(ctx context.Context, serviceName, methodName string, req
 			resp interface{}
 			err  error
 		}
-		resultCh := make(chan result, 1)
+		handlerDone := make(chan result, 1)
 
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					resultCh <- result{nil, fmt.Errorf("handler panic: %v", r)}
+					handlerDone <- result{nil, fmt.Errorf("handler panic: %v", r)}
 				}
 			}()
-
-			ticker := time.NewTicker(10 * time.Millisecond)
-			defer ticker.Stop()
-
-			done := make(chan struct{})
-			handlerDone := make(chan result, 1)
-
-			go func() {
-				resp, err := md.Handler(ctx, req)
-				handlerDone <- result{resp, err}
-				close(done)
-			}()
-
-			for {
-				select {
-				case <-ticker.C:
-					if err := checkDeadline(ctx); err != nil {
-						resultCh <- result{nil, err}
-						return
-					}
-				case r := <-handlerDone:
-					resultCh <- r
-					return
-				case <-ctx.Done():
-					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-						resultCh <- result{nil, ErrDeadlineExceeded}
-					} else {
-						resultCh <- result{nil, ctx.Err()}
-					}
-					return
-				}
-			}
+			resp, err := md.Handler(ctx, req)
+			handlerDone <- result{resp, err}
 		}()
 
-		select {
-		case r := <-resultCh:
-			return r.resp, r.err
-		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return nil, ErrDeadlineExceeded
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := checkDeadline(ctx); err != nil {
+					return nil, err
+				}
+			case r := <-handlerDone:
+				return r.resp, r.err
+			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					return nil, ErrDeadlineExceeded
+				}
+				return nil, ctx.Err()
 			}
-			return nil, ctx.Err()
 		}
 	})
 
@@ -548,14 +528,14 @@ func (s *Server) NewStream(ctx context.Context, serviceName, streamName string) 
 		ctx = NewContextWithHeader(ctx)
 	}
 
+	var cancelFn context.CancelFunc
 	if s.options.ConnectionTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.options.ConnectionTimeout)
-		_ = cancel
+		ctx, cancelFn = context.WithTimeout(ctx, s.options.ConnectionTimeout)
 	}
 
 	stream := &serverStream{
 		ctx:        ctx,
+		cancelFn:   cancelFn,
 		sendCh:     make(chan interface{}, 64),
 		recvCh:     make(chan interface{}, 64),
 		header:     NewMD(),
@@ -618,56 +598,35 @@ func (s *Server) HandleStream(ctx context.Context, serviceName, streamName strin
 		type result struct {
 			err error
 		}
-		resultCh := make(chan result, 1)
+		handlerDone := make(chan result, 1)
 
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					resultCh <- result{fmt.Errorf("handler panic: %v", r)}
+					handlerDone <- result{fmt.Errorf("handler panic: %v", r)}
 				}
 			}()
-
-			ticker := time.NewTicker(10 * time.Millisecond)
-			defer ticker.Stop()
-
-			done := make(chan struct{})
-			handlerDone := make(chan result, 1)
-
-			go func() {
-				err := sd.Handler(srv, st)
-				handlerDone <- result{err}
-				close(done)
-			}()
-
-			for {
-				select {
-				case <-ticker.C:
-					if err := checkDeadline(st.Context()); err != nil {
-						resultCh <- result{err}
-						return
-					}
-				case r := <-handlerDone:
-					resultCh <- r
-					return
-				case <-st.Context().Done():
-					if errors.Is(st.Context().Err(), context.DeadlineExceeded) {
-						resultCh <- result{ErrDeadlineExceeded}
-					} else {
-						resultCh <- result{st.Context().Err()}
-					}
-					return
-				}
-			}
+			err := sd.Handler(srv, st)
+			handlerDone <- result{err}
 		}()
 
-		select {
-		case r := <-resultCh:
-			return r.err
-		case <-st.Context().Done():
-			if errors.Is(st.Context().Err(), context.DeadlineExceeded) {
-				return ErrDeadlineExceeded
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := checkDeadline(st.Context()); err != nil {
+					return err
+				}
+			case r := <-handlerDone:
+				return r.err
+			case <-st.Context().Done():
+				if errors.Is(st.Context().Err(), context.DeadlineExceeded) {
+					return ErrDeadlineExceeded
+				}
+				return st.Context().Err()
 			}
-			return st.Context().Err()
 		}
 	}
 
@@ -741,6 +700,7 @@ func (s *Server) Options() ServerOptions {
 
 type serverStream struct {
 	ctx        context.Context
+	cancelFn   context.CancelFunc
 	sendCh     chan interface{}
 	recvCh     chan interface{}
 	header     MD
@@ -787,15 +747,21 @@ func (ss *serverStream) RecvMsg(msg interface{}) error {
 	}
 	ss.mu.RUnlock()
 
+	rv := reflect.ValueOf(msg)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return fmt.Errorf("grpcsvc: msg must be a non-nil pointer")
+	}
+
 	if err := checkDeadline(ss.ctx); err != nil {
 		return err
 	}
 
 	select {
-	case _, ok := <-ss.recvCh:
+	case data, ok := <-ss.recvCh:
 		if !ok {
 			return ErrStreamClosed
 		}
+		rv.Elem().Set(reflect.ValueOf(data))
 		return nil
 	case <-ss.ctx.Done():
 		if errors.Is(ss.ctx.Err(), context.DeadlineExceeded) {
@@ -831,7 +797,7 @@ func (ss *serverStream) Recv() (interface{}, error) {
 	}
 }
 
-func (ss *serverStream) Send() (interface{}, error) {
+func (ss *serverStream) RecvFromServer() (interface{}, error) {
 	ss.mu.RLock()
 	if ss.closed {
 		ss.mu.RUnlock()
@@ -911,6 +877,9 @@ func (ss *serverStream) Header() (MD, bool) {
 
 func (ss *serverStream) Close() error {
 	ss.closeOnce.Do(func() {
+		if ss.cancelFn != nil {
+			ss.cancelFn()
+		}
 		ss.mu.Lock()
 		ss.closed = true
 		close(ss.sendCh)

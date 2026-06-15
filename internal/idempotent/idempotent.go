@@ -260,31 +260,40 @@ func (i *Idempotent) Middleware(next http.Handler) http.Handler {
 
 		resp, fromCache, err := i.Execute(key, handler)
 		if err != nil {
+			if rr.statusCode != 0 {
+				writeResponse(w, rr.statusCode, rr.body, rr.header, "MISS")
+				return
+			}
 			if errors.Is(err, ErrIdempotentStopped) {
 				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 				return
 			}
-			next.ServeHTTP(w, r)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
 
-		if resp.Header != nil {
-			for k, vv := range resp.Header {
-				for _, v := range vv {
-					w.Header().Add(k, v)
-				}
+		writeResponse(w, resp.StatusCode, resp.Body, resp.Header, cacheFlag(fromCache))
+	})
+}
+
+func cacheFlag(fromCache bool) string {
+	if fromCache {
+		return "HIT"
+	}
+	return "MISS"
+}
+
+func writeResponse(w http.ResponseWriter, statusCode int, body []byte, header http.Header, cacheStatus string) {
+	if header != nil {
+		for k, vv := range header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
 			}
 		}
-
-		if fromCache {
-			w.Header().Set("X-Idempotent-Cache", "HIT")
-		} else {
-			w.Header().Set("X-Idempotent-Cache", "MISS")
-		}
-
-		w.WriteHeader(resp.StatusCode)
-		w.Write(resp.Body)
-	})
+	}
+	w.Header().Set("X-Idempotent-Cache", cacheStatus)
+	w.WriteHeader(statusCode)
+	w.Write(body)
 }
 
 type responseRecorder struct {

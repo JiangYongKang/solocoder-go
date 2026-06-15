@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestVersion_String(t *testing.T) {
@@ -1190,18 +1192,165 @@ func TestVersionRouter_ErrorVariables(t *testing.T) {
 	}
 }
 
-func TestVersionedHandler_Struct(t *testing.T) {
-	h := func(w http.ResponseWriter, r *http.Request) {}
-	vh := VersionedHandler{
-		Version: "v1",
-		Handler: h,
+func TestResponseCapture_WriteHeaderIdempotent(t *testing.T) {
+	rc := newResponseCapture()
+
+	rc.WriteHeader(http.StatusCreated)
+	rc.WriteHeader(http.StatusBadRequest)
+	rc.WriteHeader(http.StatusNotFound)
+
+	if rc.statusCode != http.StatusCreated {
+		t.Errorf("expected first WriteHeader status 201, got %d", rc.statusCode)
+	}
+	if !rc.wroteHeader {
+		t.Error("wroteHeader should be true after first WriteHeader")
+	}
+}
+
+func TestResponseCapture_WriteHeaderDefaultNotSet(t *testing.T) {
+	rc := newResponseCapture()
+
+	if rc.wroteHeader {
+		t.Error("wroteHeader should be false initially")
+	}
+	if rc.statusCode != http.StatusOK {
+		t.Errorf("default status should be 200, got %d", rc.statusCode)
+	}
+}
+
+func TestServeHTTP_ConverterDeletedDuringRequest(t *testing.T) {
+	vr := NewVersionRouter()
+
+	var reqConvDeleted atomic.Bool
+
+	vr.RegisterHandler("v1", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("v1 fallback"))
+	})
+	vr.RegisterHandler("v2", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("v2"))
+	})
+
+	vr.RegisterRequestConverter("v1", "v2", func(r *http.Request) (*http.Request, error) {
+		if reqConvDeleted.Load() {
+			t.Log("request converter called even though it was supposed to be deleted")
+		}
+		return r, nil
+	})
+	vr.RegisterResponseConverter("v2", "v1", func(status int, header http.Header, body []byte) (int, http.Header, []byte, error) {
+		return status, header, body, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/users", nil)
+	w := httptest.NewRecorder()
+	vr.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "v2") {
+		t.Errorf("expected converted response, got: %s", w.Body.String())
 	}
 
-	if vh.Version != "v1" {
-		t.Errorf("expected v1, got %s", vh.Version)
+	reqConvDeleted.Store(true)
+	vr.RegisterRequestConverter("v1", "v2", nil)
+	delete(vr.requestConvs, converterPair{From: "v1", To: "v2"})
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/users", nil)
+	w2 := httptest.NewRecorder()
+	vr.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Errorf("expected 200 with graceful degradation, got %d", w2.Code)
 	}
-	if vh.Handler == nil {
-		t.Error("handler should not be nil")
+	if !strings.Contains(w2.Body.String(), "v1 fallback") {
+		t.Errorf("expected v1 fallback response after converter deleted, got: %s", w2.Body.String())
+	}
+}
+
+func TestServeHTTP_ResponseTypeConverterDeletedAfterRequestConvExists(t *testing.T) {
+	vr := NewVersionRouter()
+
+	vr.RegisterHandler("v1", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("v1"))
+	})
+	vr.RegisterHandler("v2", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte("v2 response"))
+	})
+
+	vr.RegisterRequestConverter("v1", "v2", func(r *http.Request) (*http.Request, error) {
+		return r, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/users", nil)
+	w := httptest.NewRecorder()
+	vr.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 when response converter missing, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), ErrConverterNotFound.Error()) {
+		t.Errorf("expected converter error, got: %s", w.Body.String())
+	}
+}
+
+func TestServeHTTP_ConcurrentConverterDeletion(t *testing.T) {
+	vr := NewVersionRouter()
+
+	v1Called := int64(0)
+	v2Called := int64(0)
+
+	vr.RegisterHandler("v1", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&v1Called, 1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("v1"))
+	})
+	vr.RegisterHandler("v2", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&v2Called, 1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("v2"))
+	})
+
+	vr.RegisterRequestConverter("v1", "v2", func(r *http.Request) (*http.Request, error) {
+		return r, nil
+	})
+	vr.RegisterResponseConverter("v2", "v1", func(status int, header http.Header, body []byte) (int, http.Header, []byte, error) {
+		return status, header, body, nil
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/v1/users", nil)
+			w := httptest.NewRecorder()
+			vr.ServeHTTP(w, req)
+		}()
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	delete(vr.requestConvs, converterPair{From: "v1", To: "v2"})
+	delete(vr.responseConvs, converterPair{From: "v2", To: "v1"})
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/v1/users", nil)
+			w := httptest.NewRecorder()
+			vr.ServeHTTP(w, req)
+		}()
+	}
+
+	wg.Wait()
+
+	total := atomic.LoadInt64(&v1Called) + atomic.LoadInt64(&v2Called)
+	if total != 100 {
+		t.Errorf("expected 100 total handler calls, got %d (v1=%d, v2=%d)", total, v1Called, v2Called)
 	}
 }
 

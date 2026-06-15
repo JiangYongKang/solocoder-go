@@ -22,7 +22,7 @@ DNS 解析器是一个功能完整的 DNS 客户端组件，支持递归解析�
 | F10 | RCODE 错误处理 | 正确解析并传递 DNS 协议级响应码（NXDOMAIN、SERVFAIL、FORMERR、REFUSED 等），保留真实错误语义 |
 | F11 | 事务 ID 校验 | UDP 环境下校验响应事务 ID 与查询是否匹配，防止接受无关响应包 |
 | F12 | Context 取消传播 | 查询全程支持 context 取消，超时时立即关闭连接并停止 goroutine，避免资源泄漏 |
-| F13 | CNAME 同区优化 | CNAME 追踪时若目标域名与原域名属同一区域，直接复用当前权威服务器查询，避免重建整条 NS 链 |
+| F13 | CNAME 同区优化 | CNAME 追踪时基于 DNS 区域边界判定（isSameZone）判断目标域名是否在当前权威服务器的 zone 内，同区则直接复用当前服务器查询，避免重建整条 NS 链 |
 
 ## 3. 核心结构体与职责
 
@@ -210,11 +210,15 @@ resolveRecursive(domain, qtype, depth)
    └─ 返回结果
 ```
 
-**CNAME 同区优化说明：**
-- 当 CNAME 目标域名与原域名共享相同后缀（属同一区域）时，直接向当前权威服务器查询
-- 避免从根服务器开始重新构建整条 NS 委派链，显著提升解析效率
+**CNAME 同区优化说明（修复后）：**
+- 使用 DNS 区域边界判定（`isSameZone`）替代标签级后缀比较
+- 递归解析过程中跟踪当前授权区域（zone），通过 NS 委派链自动确定
+- 当 CNAME 目标域名在当前权威服务器的 zone 内时，直接向当前服务器查询
+- 判定逻辑：`domain == zone` 或 `domain` 以 `."+zone"` 为后缀
+- 例如 `www.example.com` → `cdn.example.com`：zone 为 `example.com.`，`cdn.example.com` 以 `.example.com` 为后缀，判定为同区，直接复用 example.com 权威服务器
 - 跨区 CNAME 仍需完整递归解析，确保正确性
 - 若当前响应已附带目标记录（如 A 记录），直接使用无需额外查询
+- 修复前的问题：标签级比较要求 CNAME 标签数 ≥ 原始标签数且完全匹配后缀，导致 `www.example.com` → `cdn.example.com` 被误判为跨区（标签数相同但首标签不同），触发不必要的完整根递归
 
 ### 4.3 并行查询流程 (queryParallel)
 
@@ -587,7 +591,7 @@ if err != nil {
 | RCODE 处理 | NXDOMAIN、SERVFAIL、FORMERR、REFUSED 响应码解析与传递 |
 | 事务 ID | 事务 ID 匹配验证、不匹配错误处理 |
 | Context 传播 | 查询取消、超时传播、goroutine 泄漏防护 |
-| CNAME 优化 | 同区 CNAME 优化效率、跨区 CNAME 完整递归 |
+| CNAME 优化 | 同区 CNAME 优化效率、跨区 CNAME 完整递归、isSameZone 判定、深层子域名同区、链式 CNAME 同区 |
 
 ### 8.2 关键测试说明
 
@@ -618,13 +622,16 @@ if err != nil {
 - 验证同区 CNAME 追踪复用当前权威服务器（查询数更少）
 - 验证跨区 CNAME 追踪回退到完整递归解析
 - 验证 CNAME 链上的多级追踪正确性
+- 验证 `isSameZone` 函数的边界判定（同域名、子域名、不同 TLD、根区域等）
+- 验证深层子域名同区优化（如 `api.v2.example.com` → `cdn.example.com`）
+- 验证链式同区 CNAME（A → B → C 均在同一 zone 内）不触发完整递归
 
 ## 9. 文件结构
 
 ```
 internal/dnsresolver/
 ├── dnsresolver.go      # DNS 解析器核心实现
-└── dnsresolver_test.go # 单元测试（72 个测试用例）
+└── dnsresolver_test.go # 单元测试（70 个测试用例）
 
 docs/
 └── dnsresolver.md      # 本文档
@@ -640,7 +647,7 @@ docs/
 - 错误类型：预定义错误变量与 `DNSError` 结构体
 
 **dnsresolver_test.go：**
-- 72 个单元测试用例，覆盖全部功能
+- 70 个单元测试用例，覆盖全部功能
 - Mock 组件：`mockConn`、`mockConnWithDeadline`、`mockDNSServer`
 - 测试分类：基础功能、缓存、迭代解析、递归解析、并行查询、
   协议编解码、并发安全、错误处理、边界条件、RCODE 处理、

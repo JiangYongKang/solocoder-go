@@ -165,10 +165,6 @@ func (s *AuthorizationServer) handleAuthorizationCode(req *TokenRequest) (*Token
 		return nil, err
 	}
 
-	if req.Scope != "" && !s.validateScope(client.Scopes, req.Scope) {
-		return nil, ErrInvalidScope
-	}
-
 	if req.Scope != "" {
 		requested := parseScope(req.Scope)
 		original := parseScope(authCode.Scope)

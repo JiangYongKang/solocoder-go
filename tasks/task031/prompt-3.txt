@@ -1,0 +1,8 @@
+你实现的 API 版本化路由模块仍存在一些代码质量问题，需要修复：
+1. apiver.go 中定义了 VersionedHandler 结构体但在整个模块中从未被使用，属于残留的死代码，需要清理。
+2. ServeHTTP 方法中对 GetRequestConverter 执行了两次独立调用，两次调用之间存在时间窗口，并发删除转换器时可能导致本应降级处理的请求返回内部错误，需要消除重复调用和竞态条件。
+3. responseCapture 的 WriteHeader 未做幂等保护，不符合标准 http.ResponseWriter 只允许调用一次 WriteHeader 的规范，多次调用会导致状态码被错误覆盖。
+4. docs/apiver.md 中将请求转换器缺失和响应转换器缺失两种场景合并描述为"两者都缺失"，但代码中两种场景的处理逻辑截然不同，文档需要区分说明各自的处理结果。
+5. 修复以上问题后，为 ServeHTTP 的竞态窗口和 WriteHeader 的幂等性补充单元测试。
+6. 运行 go test ./internal/apiver/ -v，需要让所有测试通过。
+7. 在 docs/apiver.md 中更新模块需求文档，修正转换器缺失场景的描述。

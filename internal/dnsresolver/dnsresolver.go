@@ -268,16 +268,17 @@ func (r *Resolver) resolveRecursiveWithServers(domain string, qtype uint16, dept
 	}
 
 	labels := splitDomain(domain)
+	zone := "."
 
 	for i := 0; i <= len(labels); i++ {
-		var zone string
+		var candidateZone string
 		if i == 0 {
-			zone = "."
+			candidateZone = "."
 		} else {
-			zone = strings.Join(labels[len(labels)-i:], ".") + "."
+			candidateZone = strings.Join(labels[len(labels)-i:], ".") + "."
 		}
 
-		resp, err := r.queryParallel(servers, zone, TypeNS)
+		resp, err := r.queryParallel(servers, candidateZone, TypeNS)
 		if err == nil && len(resp.Authorities) > 0 {
 			nsRecords := filterRecords(resp.Authorities, TypeNS)
 			if len(nsRecords) > 0 {
@@ -303,6 +304,7 @@ func (r *Resolver) resolveRecursiveWithServers(domain string, qtype uint16, dept
 				}
 
 				if len(nextServers) > 0 {
+					zone = candidateZone
 					servers = nextServers
 					continue
 				}
@@ -325,7 +327,7 @@ func (r *Resolver) resolveRecursiveWithServers(domain string, qtype uint16, dept
 		if depth+1 >= r.cfg.MaxRecursionDepth {
 			return nil, ErrMaxDepthExceeded
 		}
-		cnameRecords, cnameErr := r.followCNAME(domain, cname, qtype, depth, servers, resp)
+		cnameRecords, cnameErr := r.followCNAME(domain, cname, qtype, depth, servers, resp, zone)
 		if cnameErr == nil {
 			return cnameRecords, nil
 		}
@@ -340,7 +342,7 @@ func (r *Resolver) resolveRecursiveWithServers(domain string, qtype uint16, dept
 	return answers, nil
 }
 
-func (r *Resolver) followCNAME(originalDomain, cname string, qtype uint16, depth int, currentServers []string, currentResp *DNSResponse) ([]DNSRecord, error) {
+func (r *Resolver) followCNAME(originalDomain, cname string, qtype uint16, depth int, currentServers []string, currentResp *DNSResponse, zone string) ([]DNSRecord, error) {
 	if depth+1 >= r.cfg.MaxRecursionDepth {
 		return nil, ErrMaxDepthExceeded
 	}
@@ -352,36 +354,38 @@ func (r *Resolver) followCNAME(originalDomain, cname string, qtype uint16, depth
 		}
 	}
 
-	cnameDomain := cname
-	originalLabels := splitDomain(originalDomain)
-	cnameLabels := splitDomain(cnameDomain)
-
-	if len(cnameLabels) >= len(originalLabels) {
-		sameSuffix := true
-		for i := 0; i < len(originalLabels); i++ {
-			if cnameLabels[len(cnameLabels)-1-i] != originalLabels[len(originalLabels)-1-i] {
-				sameSuffix = false
-				break
+	if isSameZone(cname, zone) {
+		resp, err := r.queryParallel(currentServers, cname, qtype)
+		if err == nil {
+			answers := resp.Answers
+			cnames := filterRecords(answers, TypeCNAME)
+			if len(cnames) > 0 {
+				nextCname := strings.TrimSuffix(cnames[0].Data, ".")
+				return r.followCNAME(cname, nextCname, qtype, depth+1, currentServers, resp, zone)
 			}
-		}
-		if sameSuffix {
-			resp, err := r.queryParallel(currentServers, cnameDomain, qtype)
-			if err == nil {
-				answers := resp.Answers
-				cnames := filterRecords(answers, TypeCNAME)
-				if len(cnames) > 0 {
-					nextCname := strings.TrimSuffix(cnames[0].Data, ".")
-					return r.followCNAME(cnameDomain, nextCname, qtype, depth+1, currentServers, resp)
-				}
-				targetRecords := filterRecords(answers, qtype)
-				if len(targetRecords) > 0 {
-					return answers, nil
-				}
+			targetRecords := filterRecords(answers, qtype)
+			if len(targetRecords) > 0 {
+				return answers, nil
 			}
 		}
 	}
 
-	return r.resolveRecursive(cnameDomain, qtype, depth+1)
+	return r.resolveRecursive(cname, qtype, depth+1)
+}
+
+func isSameZone(domain, zone string) bool {
+	zone = strings.TrimSuffix(strings.ToLower(strings.Trim(zone, ".")), ".")
+	domain = strings.ToLower(strings.Trim(domain, "."))
+
+	if zone == "" || zone == "." {
+		return true
+	}
+
+	if domain == zone {
+		return true
+	}
+
+	return strings.HasSuffix(domain, "."+zone)
 }
 
 func (r *Resolver) resolveIterative(domain string, qtype uint16) ([]DNSRecord, error) {

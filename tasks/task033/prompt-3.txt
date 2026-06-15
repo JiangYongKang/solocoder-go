@@ -1,0 +1,8 @@
+你第 2 轮重写的 gRPC 服务框架模块引入了新的代码缺陷，需要修复：
+1. serverStream 的 RecvMsg 方法从 recvCh 读取消息时使用空白标识符接收后丢弃，传入的 msg 参数未填充任何实际数据。通过 Stream 接口调用 RecvMsg 的代码永远收不到流消息内容，导致客户端流式和双向流式模式无法正常工作，需要确保 msg 参数能收到 recvCh 中的数据。
+2. NewStream 方法使用 context.WithTimeout 创建派生 context 后返回的 cancel 函数被赋值给空白标识符丢弃，流提前关闭时 cancel 不会被调用，context 内部的清理 goroutine 一直驻留到超时自然过期才会释放，造成资源泄漏。
+3. serverStream 的 Send 方法实际语义是从 sendCh 读取消息（"接收服务端发来的消息"），而 SendMsg 是向 sendCh 写入消息（"发送消息"），两个方向相反的 API 在 Stream 接口上命名冲突，调用方在双向流场景下极易误用，需要重新设计命名以消除歧义。
+4. Invoke 和 HandleStream 中存在双层 goroutine 嵌套设计，每调用一次 RPC 就启动两个 goroutine，高并发场景下不必要的调度开销成倍增加，应简化为单层 goroutine 配合 select 多路复用。
+5. 修复以上问题后，为 RecvMsg 数据传递、cancel 资源释放、双向流 API 命名正确性补充单元测试。
+6. 运行 go test ./internal/grpcsvc/ -v，需要让所有测试通过。
+7. 在 docs/grpcsvc.md 中更新模块需求文档，修正 Stream 接口的 Send/Recv 语义描述。

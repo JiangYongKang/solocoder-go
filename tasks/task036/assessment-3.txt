@@ -1,0 +1,5 @@
+产物不满意：
+1. docs/oauth2svc.md 非滚动模式刷新令牌时序图标注返回 `"refresh_token": "OLD_REFRESH"`，但 oauth2svc.go 中 handleRefreshToken 方法在 RefreshTokenRotation 为 false 时调用 createTokenResponse 传入 includeRefresh=false，不会在响应中返回任何 refresh_token 字段。测试 TestToken_RefreshToken_RotationDisabled 也期望 refreshResp.RefreshToken 为空，文档与实现不一致会误导使用者在非滚动模式下期待返回旧令牌。原因是绘制时序图时没有对照 createTokenResponse 的参数逻辑，应当在时序图中移除这一行以匹配实际行为。
+
+过程不满意：
+1. 模型在收到提示词后直接通过 todo_write 创建了 6 项子任务计划，然后才用 file_search 和 view_files 读取源码和文档。这违反了"先分析问题再规划"的项目规范，先制定计划再理解上下文会导致任务划分与实际修改范围不匹配。正确做法是先阅读 oauth2svc.go 中 handleAuthorizationCode 的实现以及 docs/oauth2svc.md 的现有内容，理清所有需要修改的位置后再做规划。

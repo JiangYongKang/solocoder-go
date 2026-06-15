@@ -146,7 +146,28 @@ CheckPermission(userID, resource, action)
 1. **默认拒绝**：除非明确授权，否则默认拒绝访问
 2. **权限聚合**：用户的权限是其所有角色权限的并集
 3. **权限去重**：用户从多个角色获得相同权限时，只保留一份
-4. **拒绝原因**：拒绝访问时必须提供清晰的原因说明
+4. **拒绝原因**：拒绝访问时必须提供清晰、无冗余的原因说明
+
+### 3.3 拒绝原因格式说明
+
+| 拒绝场景 | Decision.Reason 内容 |
+|---------|---------------------|
+| 用户 ID 为空 | `ErrEmptyUserID.Error()` → `"user id cannot be empty"` |
+| 资源标识为空 | `ErrEmptyResource.Error()` → `"resource cannot be empty"` |
+| 操作标识为空 | `ErrEmptyAction.Error()` → `"action cannot be empty"` |
+| 请求的权限未注册 | `"permission {resource}:{action} is not registered"` |
+| 用户不存在（从未分配过角色） | `ErrUserNotFound.Error()` → `"user not found"` |
+| 用户存在但无角色分配 | `"user {userID} has no roles assigned"` |
+| 用户有角色但无所需权限 | `"user {userID} does not have permission {resource}:{action}"` |
+
+### 3.4 用户不存在 vs 用户无权限
+
+在权限校验中，严格区分以下两种情况：
+
+- **用户不存在（ErrUserNotFound）**：用户从未被分配过任何角色，或所有角色已被完全撤销（用户记录已从系统中删除）
+- **用户存在但权限不足**：用户已被分配角色，但其角色的权限集合中不包含所请求的操作
+
+这种区分有助于调用方更好地诊断问题：是需要先为用户分配角色，还是需要调整角色的权限配置。
 
 ## 4. API 接口说明
 

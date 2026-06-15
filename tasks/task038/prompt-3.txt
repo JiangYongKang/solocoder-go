@@ -1,0 +1,7 @@
+你实现的服务注册与发现模块仍存在一些并发安全和测试质量问题，需要修复：
+1. expiryLoop 的 defer 函数中先执行 wg.Done() 后设置 expiryRunning = false，Stop 的 wg.Wait() 在 Done 后立即返回但 expiryRunning 仍为 true，导致紧接着调用 Start 时误判为过期协程已在运行而拒绝启动新的过期循环。应调整为先在 defer 中设置 expiryRunning = false 再调用 wg.Done()。
+2. expireInstances 方法在删除过期实例后才构建 expire 事件通知，传入订阅者的是删除后的存活实例列表而非删除前的快照。当某服务全部实例过期时，expire 事件的 Instances 为空，订阅者无法获知哪些实例被逐出了。应在删除实例前先构建过期前快照再发送事件。
+3. TestMultiServiceExpireNotificationAtomic 测试中定义了 atomicViolation 变量但从未被任何代码递增为非零值，断言始终为 true，不提供任何有效测试覆盖，是一个虚假的测试用例。应当重写为真正验证多服务通知一致性的测试。
+4. TestConcurrentStartStop 仅验证了没有 panic 就退出，未检查 expireLoop 是否被正确启动了恰好一次，也未验证 expiryRunning 的状态一致性，无法覆盖并发 Start/Stop 交叉语义。需要补充对后台协程启动次数和状态标志一致性的验证。
+5. 修复以上问题后，运行 go test ./internal/servicereg/ -v -race，需要让所有测试通过。
+6. 在 docs/servicereg.md 中更新模块需求文档。

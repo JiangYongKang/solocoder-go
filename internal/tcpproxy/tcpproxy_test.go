@@ -1428,21 +1428,21 @@ func TestConnPool_ConcurrentRemoveAndPut(t *testing.T) {
 
 	for i := 0; i < numOps; i++ {
 		wg.Add(1)
-		go func() {
+		go func(idx int) {
 			defer wg.Done()
 			conn, err := pool.Get()
 			if err != nil {
 				return
 			}
 			pc := conn.(*pooledConn)
-			if i%3 == 0 {
+			if idx%3 == 0 {
 				_ = pool.Remove(pc.pc)
 			}
 			_ = conn.Close()
 			if pool.ActiveCount() < 0 || pool.TotalCount() < 0 {
 				countErrors.Add(1)
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 

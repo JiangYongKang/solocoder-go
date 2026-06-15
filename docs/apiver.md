@@ -330,13 +330,31 @@ vr.RegisterHandler("v1", func(w http.ResponseWriter, r *http.Request) {
 
 ### 5.1 转换器缺失处理逻辑
 
-- **请求转换器缺失**：当请求版本对应的处理器已注册，但缺少请求版本到最新版本的请求转换器时，**自动优雅降级**，直接调用请求版本的处理器处理请求。
+- **请求转换器缺失**：当请求版本对应的处理器已注册，但缺少请求版本到最新版本的请求转换器时，**自动优雅降级**，直接调用请求版本的处理器处理请求。此场景下响应转换器是否存在不影响行为，因为不会进入版本转换流程。
 - **响应转换器缺失**：当请求转换器存在但响应转换器缺失时，返回 `ErrConverterNotFound` 错误 (HTTP 500)。这是为了避免新版本格式的响应直接透传给旧版本客户端，导致客户端解析失败且错误难以定位。
-- **两者都缺失**：自动优雅降级，直接调用请求版本的处理器。
+
+两种场景的处理结果截然不同：
+- 请求转换器缺失 → HTTP 200 + 请求版本处理器的原始响应（优雅降级）
+- 响应转换器缺失 → HTTP 500 + 错误信息（严格报错）
 
 ## 6. 并发安全
 
 `VersionRouter` 的所有公共方法都是并发安全的，内部使用 `sync.RWMutex` 保证多 goroutine 安全访问。
+
+### 6.1 转换器查找竞态防护
+
+`ServeHTTP` 方法中对转换器的查找采用"查询即使用"模式，避免重复查找带来的竞态窗口：
+
+- **修复前**：先调用 `GetRequestConverter` 检查转换器是否存在，再通过 `convertRequest` 间接调用 `GetRequestConverter` 获取转换器执行转换。两次调用之间存在时间窗口，期间转换器可能被并发删除，导致本应降级处理的请求返回 500 错误。
+- **修复后**：`GetRequestConverter` 只调用一次，保存转换器函数引用后直接使用。无论后续是否有并发的转换器删除操作，已获取的函数引用始终有效。`GetResponseConverter` 同理。
+
+### 6.2 responseCapture.WriteHeader 幂等性
+
+`responseCapture` 的 `WriteHeader` 方法实现了幂等保护，符合标准 `http.ResponseWriter` 只允许调用一次 `WriteHeader` 的规范：
+
+- 内部维护 `wroteHeader` 布尔标志
+- 首次调用时记录状态码并设置标志
+- 后续调用直接忽略，防止状态码被错误覆盖
 
 ## 7. 测试覆盖
 
@@ -355,6 +373,9 @@ vr.RegisterHandler("v1", func(w http.ResponseWriter, r *http.Request) {
 - 并发访问安全性
 - 响应捕获和转换
 - 上下文路径传递
+- WriteHeader 幂等性保护
+- 转换器删除后 ServeHTTP 竞态安全性
+- 并发转换器删除场景下的降级行为
 
 运行测试：
 ```bash

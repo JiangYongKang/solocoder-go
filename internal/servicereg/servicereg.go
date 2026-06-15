@@ -354,10 +354,10 @@ func (r *Registry) Start() {
 
 func (r *Registry) expiryLoop() {
 	defer func() {
-		r.wg.Done()
 		r.mu.Lock()
 		r.expiryRunning = false
 		r.mu.Unlock()
+		r.wg.Done()
 	}()
 
 	ticker := time.NewTicker(r.cfg.CheckInterval)
@@ -384,14 +384,11 @@ func (r *Registry) expireInstances() {
 	changed := make(map[string]bool)
 
 	for serviceName, svc := range r.instances {
-		for instID, inst := range svc {
+		for _, inst := range svc {
 			if now.Sub(inst.LastHeartbeat) > r.cfg.HeartbeatTTL {
-				delete(svc, instID)
 				changed[serviceName] = true
+				break
 			}
-		}
-		if len(svc) == 0 {
-			delete(r.instances, serviceName)
 		}
 	}
 
@@ -409,6 +406,20 @@ func (r *Registry) expireInstances() {
 				event:    event,
 				handlers: handlers,
 			})
+		}
+	}
+
+	for serviceName, svc := range r.instances {
+		if !changed[serviceName] {
+			continue
+		}
+		for instID, inst := range svc {
+			if now.Sub(inst.LastHeartbeat) > r.cfg.HeartbeatTTL {
+				delete(svc, instID)
+			}
+		}
+		if len(svc) == 0 {
+			delete(r.instances, serviceName)
 		}
 	}
 

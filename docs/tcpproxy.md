@@ -206,14 +206,17 @@ type poolConn struct {
 ```
 Get()
   ├─ [遍历 idleList 从尾到头]
-  │    ├─ 超时 → 关闭、跳过
+  │    ├─ 超时 → 收集到 expired 列表（锁内收集，锁外关闭）
   │    └─ 有效 → activeCount++ → 返回包装后的 pooledConn
   │
   ├─ activeCount < MaxConns → 新建 → 成功/失败均正确维护计数
   │
   └─ 已满
        ├─ WaitTimeout=0 → ErrPoolExhausted
-       └─ WaitTimeout>0 → cond.Wait 循环，含 deadline 检查
+       └─ WaitTimeout>0 → cond.Wait 循环
+            ├─ 每次等待前计算 remaining = time.Until(deadline)
+            ├─ AfterFunc(remaining) 注册定时 Broadcast
+            └─ 超时 → ErrPoolExhausted
 ```
 
 ### 3.7 pooledConn - 池化连接包装器
@@ -417,7 +420,7 @@ idleTimeoutLoop（ticker = IdleTimeout/2）
 | MuxConn.streams | RWMutex | 读多写少场景，数据分发用 RLock 降低冲突 |
 | Stream 状态 | atomic.Bool + sync.Once | closed/finSent 用原子变量，channel 关闭用 Once |
 | HealthChecker | RWMutex + 快照 | 探测 IO 移到锁外，仅状态更新持写锁 |
-| ConnPool | Mutex + Cond | 所有状态修改持互斥锁，等待/唤醒用 Cond |
+| ConnPool | Mutex + Cond | 所有状态修改持互斥锁，等待/唤醒用 Cond；过期连接锁内收集锁外关闭；等待超时每轮重新计时 |
 | Balancer.mapping | 先 RLock 再 Lock | 写入路径罕见，尽量缩短写锁持有时间 |
 | TCPProxy | WaitGroup + stopCh | 所有后台协程统一注册 wg，Stop 处集中等待 |
 
@@ -511,6 +514,72 @@ if uh.upstream != upstream { return }  // upstream 是 RLock 阶段保存的指�
 - 引入 `closeUpstream` 函数（由 `sync.Once` 保护），任一方向退出时调用 `upstreamConn.SetDeadline(time.Now())`
 - SetDeadline 强制阻塞的 Read/Write 立即返回 deadline 错误，使另一方向协程也能退出
 - 两个协程都退出后 `wg.Wait()` 返回，`upstreamConn.Close()` 正确归还连接到池中
+
+#### 6.1.7 ConnPool.Get 超时等待多 waiter 永久阻塞
+
+**问题**：原 `ConnPool.Get` 在连接池满时使用一次性 deadline goroutine 实现 `cond.Wait` 超时：启动一个 goroutine 在 `time.After(deadline)` 后执行一次 `cond.Broadcast()` 然后退出。当多个 waiter 同时被唤醒但只有一个连接可用时，竞争失败的 waiter 重新进入 `cond.Wait()`，此时 deadline goroutine 已退出，再无人唤醒这些 waiter，导致永久阻塞。
+
+**修复**：改用每次进入等待循环时重新计算剩余超时并注册定时唤醒的方案：
+1. 在内层 for 循环中，每次 `cond.Wait()` 前调用 `time.Until(deadline)` 计算剩余超时
+2. 使用 `time.AfterFunc(remaining, func() { p.cond.Broadcast() })` 注册一次性定时器
+3. 即使多个 waiter 被同时唤醒、竞争失败后重新进入等待，下一次迭代仍会重新计算剩余时间并注册新的定时器
+4. 若剩余时间 ≤ 0，直接返回 `ErrPoolExhausted`，不注册定时器
+
+```
+修复前（一次性广播）：
+  waiter 1,2,3 进入 cond.Wait()
+  deadline goroutine → Broadcast → 1,2,3 同时唤醒
+  waiter 1 获得连接，waiter 2,3 竞争失败 → 重新 cond.Wait() → 永久阻塞
+
+修复后（每轮重新计时）：
+  waiter 1,2,3 进入 cond.Wait()
+  AfterFunc(remaining) → Broadcast → 1,2,3 同时唤醒
+  waiter 1 获得连接，waiter 2,3 竞争失败
+  waiter 2,3 重新计算 remaining → AfterFunc(remaining') → cond.Wait()
+  → 到时再次 Broadcast → waiter 2,3 被唤醒 → 检查超时返回 ErrPoolExhausted
+```
+
+#### 6.1.8 ConnPool.Get 持锁关闭过期连接
+
+**问题**：原 `ConnPool.Get` 在扫描空闲连接时，对过期连接在持锁期间直接调用 `conn.Close()`。TCP 连接的 Close 操作可能阻塞（例如对端已关闭但本地仍有未发送数据，Close 需要等待缓冲区刷出），持锁执行网络 IO 会阻塞整个连接池的所有 `Get/Put/Remove` 操作。
+
+**修复**：将过期连接的关闭操作移到解锁之后执行：
+1. 在持锁阶段仅收集过期连接到 `expired` 切片，不执行 Close
+2. 通过闭包 `closeExpired` 捕获 `expired` 切片引用
+3. 在每个 `p.mu.Unlock()` 之后的返回点调用 `closeExpired()`
+4. 与 `reclaimIdle()` 采用相同的"锁内收集、锁外关闭"模式
+
+```
+修复前：
+  Lock → 遍历 idleList → 发现过期 → conn.Close() (可能阻塞!) → Unlock
+  → 持锁期间执行网络 IO，阻塞所有池操作
+
+修复后：
+  Lock → 遍历 idleList → 发现过期 → 收集到 expired 切片 → Unlock → closeExpired()
+  → 网络IO 在锁外执行，不阻塞其他池操作
+```
+
+#### 6.1.9 测试闭包变量捕获修复
+
+**问题**：`TestConnPool_ConcurrentRemoveAndPut` 中 for 循环变量 `i` 被 goroutine 闭包直接引用。Go 1.22 之前的版本中，所有 goroutine 共享同一个 `i` 变量。当 goroutine 实际执行到 `if i%3 == 0` 时，循环早已结束，`i` 已固定为终值 `numOps`（100），导致 `pool.Remove` 分支在整个测试期间从未被触发。该测试名义上覆盖并发 Remove 和 Put 混合场景，但实际上只跑了 Put 路径。
+
+**修复**：将循环变量作为参数传入 goroutine，使每个 goroutine 获得独立的副本：
+
+```go
+// 修复前
+for i := 0; i < numOps; i++ {
+    go func() {
+        if i%3 == 0 { ... }  // i 始终为 numOps，Remove 从未执行
+    }()
+}
+
+// 修复后
+for i := 0; i < numOps; i++ {
+    go func(idx int) {
+        if idx%3 == 0 { ... }  // idx 为各 goroutine 独立值，约 1/3 走 Remove
+    }(i)
+}
+```
 
 ## 7. 使用示例
 
@@ -686,7 +755,7 @@ for _, u := range hc.GetHealthyUpstreams() {
 | TestConnPool_RemoveThenCloseNoNegativeCount | Remove 后 Close 不导致 activeCount 负数 |
 | TestConnPool_RemoveIdempotent | 多次 Remove 同一连接 activeCount 只减一次 |
 | TestConnPool_PutAfterRemovedNoReturnToIdle | Remove 后 Put 不将已关闭连接放回空闲列表 |
-| TestConnPool_ConcurrentRemoveAndPut | 并发 Remove+Put 不出现负计数或脏连接 |
+| TestConnPool_ConcurrentRemoveAndPut | 并发 Remove+Put 不出现负计数或脏连接（修复闭包变量捕获后约 1/3 走 Remove 路径） |
 | TestConnPool_GetIdleExpiryNoIndexPanic | 空闲过期并发 Get 不触发索引越界 panic |
 | TestIPHashBalancer_NoDeadlockWithHealthChecker | HC onChange 回调与 GetUpstream 并发不死锁 |
 | TestMuxConcurrentFinAndRst | 同一 StreamID 的 FIN/RST 并发到达不 panic |

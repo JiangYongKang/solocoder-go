@@ -1573,7 +1573,21 @@ func TestConcurrentStartStop(t *testing.T) {
 
 	wg.Wait()
 
+	r.mu.RLock()
+	running := r.expiryRunning
+	r.mu.RUnlock()
+	if !running {
+		t.Error("expected expiryRunning to be true after concurrent Start calls")
+	}
+
 	r.Stop()
+
+	r.mu.RLock()
+	running = r.expiryRunning
+	r.mu.RUnlock()
+	if running {
+		t.Error("expected expiryRunning to be false after Stop")
+	}
 }
 
 func TestStartStopNoPanic(t *testing.T) {
@@ -1687,9 +1701,24 @@ func TestMultiServiceExpireNotificationConsistency(t *testing.T) {
 			continue
 		}
 		for _, inst := range event.Instances {
-			if inst.ID == "inst-c3" {
-				t.Errorf("expire notification for %s contains inst-c3 which was never in the expired snapshot",
-					event.ServiceName)
+			if inst.ServiceName != event.ServiceName {
+				t.Errorf("expire notification for %s contains instance from different service %s",
+					event.ServiceName, inst.ServiceName)
+			}
+		}
+		if event.ServiceName == "svc-a" {
+			foundA1 := false
+			foundA2 := false
+			for _, inst := range event.Instances {
+				if inst.ID == "inst-a1" {
+					foundA1 = true
+				}
+				if inst.ID == "inst-a2" {
+					foundA2 = true
+				}
+			}
+			if !foundA1 || !foundA2 {
+				t.Errorf("expire event for svc-a should contain inst-a1 and inst-a2 in pre-deletion snapshot")
 			}
 		}
 	}
@@ -1701,42 +1730,74 @@ func TestMultiServiceExpireNotificationAtomic(t *testing.T) {
 		CheckInterval: 20 * time.Millisecond,
 	}
 	r := NewRegistry(cfg)
+	r.Start()
+	defer r.Stop()
 
-	r.Subscribe("svc-a", func(event ServiceChangeEvent) {})
-	r.Subscribe("svc-b", func(event ServiceChangeEvent) {})
+	var expireEvents []ServiceChangeEvent
+	var mu sync.Mutex
+
+	for _, svcName := range []string{"svc-a", "svc-b"} {
+		svc := svcName
+		r.Subscribe(svc, func(event ServiceChangeEvent) {
+			if event.Action == "expire" {
+				mu.Lock()
+				expireEvents = append(expireEvents, event)
+				mu.Unlock()
+			}
+		})
+	}
 
 	instA := &ServiceInstance{ID: "inst-a1", ServiceName: "svc-a", Address: "addr-a1"}
 	instB := &ServiceInstance{ID: "inst-b1", ServiceName: "svc-b", Address: "addr-b1"}
 	r.Register(instA)
 	r.Register(instB)
 
-	stopCh := make(chan struct{})
-	var atomicViolation int32
+	time.Sleep(300 * time.Millisecond)
 
-	go func() {
-		for {
-			select {
-			case <-stopCh:
-				return
-			default:
-				inst := &ServiceInstance{ID: "inst-b-new", ServiceName: "svc-b", Address: "addr-b-new"}
-				err := r.Register(inst)
-				if err == nil {
-					r.Deregister("svc-b", "inst-b-new")
-				}
-				time.Sleep(time.Microsecond)
-			}
-		}
-	}()
+	mu.Lock()
+	defer mu.Unlock()
 
-	time.Sleep(200 * time.Millisecond)
-	close(stopCh)
-
-	if atomic.LoadInt32(&atomicViolation) != 0 {
-		t.Errorf("detected %d atomic violations in multi-service expire notifications", atomicViolation)
+	if len(expireEvents) == 0 {
+		t.Fatal("expected at least one expire event")
 	}
 
-	r.Stop()
+	svcAExpired := false
+	svcBExpired := false
+	for _, event := range expireEvents {
+		if event.Action != "expire" {
+			continue
+		}
+		switch event.ServiceName {
+		case "svc-a":
+			svcAExpired = true
+			foundA1 := false
+			for _, inst := range event.Instances {
+				if inst.ID == "inst-a1" {
+					foundA1 = true
+				}
+			}
+			if !foundA1 {
+				t.Error("expire event for svc-a should contain inst-a1 in pre-deletion snapshot")
+			}
+		case "svc-b":
+			svcBExpired = true
+			foundB1 := false
+			for _, inst := range event.Instances {
+				if inst.ID == "inst-b1" {
+					foundB1 = true
+				}
+			}
+			if !foundB1 {
+				t.Error("expire event for svc-b should contain inst-b1 in pre-deletion snapshot")
+			}
+		}
+	}
+	if !svcAExpired {
+		t.Error("expected expire event for svc-a")
+	}
+	if !svcBExpired {
+		t.Error("expected expire event for svc-b")
+	}
 }
 
 func TestExpireNotificationSnapshot(t *testing.T) {
@@ -1748,15 +1809,13 @@ func TestExpireNotificationSnapshot(t *testing.T) {
 	r.Start()
 	defer r.Stop()
 
-	var lastEvent ServiceChangeEvent
-	var hasEvent bool
+	var expireEvents []ServiceChangeEvent
 	var eventMu sync.Mutex
 
 	r.Subscribe("svc-a", func(event ServiceChangeEvent) {
 		eventMu.Lock()
 		if event.Action == "expire" {
-			lastEvent = event
-			hasEvent = true
+			expireEvents = append(expireEvents, event)
 		}
 		eventMu.Unlock()
 	})
@@ -1766,34 +1825,45 @@ func TestExpireNotificationSnapshot(t *testing.T) {
 	r.Register(instA1)
 	r.Register(instA2)
 
+	gotFirstExpire := make(chan struct{})
 	go func() {
-		time.Sleep(120 * time.Millisecond)
-		instA3 := &ServiceInstance{ID: "inst-a3", ServiceName: "svc-a", Address: "addr-a3"}
-		r.Register(instA3)
+		for {
+			time.Sleep(10 * time.Millisecond)
+			eventMu.Lock()
+			hasExpire := len(expireEvents) > 0
+			eventMu.Unlock()
+			if hasExpire {
+				close(gotFirstExpire)
+				return
+			}
+		}
 	}()
 
-	time.Sleep(300 * time.Millisecond)
+	<-gotFirstExpire
+
+	instA3 := &ServiceInstance{ID: "inst-a3", ServiceName: "svc-a", Address: "addr-a3"}
+	r.Register(instA3)
+
+	time.Sleep(50 * time.Millisecond)
 
 	eventMu.Lock()
 	defer eventMu.Unlock()
 
-	if !hasEvent {
+	if len(expireEvents) == 0 {
 		t.Fatal("expected at least one expire event")
 	}
 
-	for _, inst := range lastEvent.Instances {
-		if inst.ID == "inst-a3" {
-			t.Error("expire event contains inst-a3 which was registered after the expiry scan started")
-		}
-	}
-
+	firstExpire := expireEvents[0]
 	ids := make(map[string]bool)
-	for _, inst := range lastEvent.Instances {
+	for _, inst := range firstExpire.Instances {
 		ids[inst.ID] = true
 	}
 
-	if ids["inst-a1"] || ids["inst-a2"] {
-		t.Error("expire event should not contain expired instances")
+	if !ids["inst-a1"] || !ids["inst-a2"] {
+		t.Error("first expire event pre-deletion snapshot should contain the expired instances inst-a1 and inst-a2")
+	}
+	if ids["inst-a3"] {
+		t.Error("first expire event should not contain inst-a3 which was registered after the expiry scan")
 	}
 }
 

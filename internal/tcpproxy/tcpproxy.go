@@ -639,8 +639,11 @@ func (p *ConnPool) Get() (net.Conn, error) {
 			}
 		}
 		p.idleList = p.idleList[:validIdx]
-		for _, pc := range expired {
-			pc.conn.Close()
+
+		closeExpired := func() {
+			for _, pc := range expired {
+				_ = pc.conn.Close()
+			}
 		}
 
 		if selected != nil {
@@ -653,12 +656,14 @@ func (p *ConnPool) Get() (net.Conn, error) {
 			selected.idle.Store(false)
 			p.activeCount++
 			p.mu.Unlock()
+			closeExpired()
 			return &pooledConn{pc: selected, pool: p}, nil
 		}
 
 		if p.activeCount < p.cfg.MaxConns {
 			p.activeCount++
 			p.mu.Unlock()
+			closeExpired()
 			conn, err := p.upstream.Connect()
 			if err != nil {
 				p.mu.Lock()
@@ -676,36 +681,36 @@ func (p *ConnPool) Get() (net.Conn, error) {
 		}
 		if p.cfg.WaitTimeout == 0 {
 			p.mu.Unlock()
+			closeExpired()
 			return nil, ErrPoolExhausted
 		}
 		if deadline.IsZero() {
 			deadline = time.Now().Add(p.cfg.WaitTimeout)
-			go func(d time.Time) {
-				select {
-				case <-time.After(time.Until(d)):
-					p.mu.Lock()
-					p.cond.Broadcast()
-					p.mu.Unlock()
-				case <-p.stopCh:
-					return
-				}
-			}(deadline)
 		}
 		for {
 			if p.closed {
 				p.mu.Unlock()
+				closeExpired()
 				return nil, ErrPoolClosed
 			}
 			if time.Now().After(deadline) {
 				p.mu.Unlock()
+				closeExpired()
 				return nil, ErrPoolExhausted
 			}
 			if len(p.idleList) > 0 || p.activeCount < p.cfg.MaxConns {
 				break
 			}
+			remaining := time.Until(deadline)
+			if remaining > 0 {
+				time.AfterFunc(remaining, func() {
+					p.cond.Broadcast()
+				})
+			}
 			p.cond.Wait()
 		}
 		p.mu.Unlock()
+		closeExpired()
 	}
 }
 

@@ -14,7 +14,7 @@
 | F2 | 完整响应结果缓存 | 将首次请求的处理结果（响应状态码 + 响应体 + 响应头）与幂等键关联缓存，确保缓存响应与原响应完全一致 |
 | F3 | 并发请求锁等待 | 相同幂等键的并发请求中，第一个请求获取锁并执行业务逻辑，其余请求等待第一个完成后共享结果；Stop 时所有等待请求均收到正确错误 |
 | F4 | 过期键自动回收 | 每个幂等键记录携带过期时间，后台定时扫描并清理已过期的记录 |
-| F5 | HTTP 中间件 (Middleware) | 提供标准 `http.Handler` 中间件，可直接集成到任何 net/http 兼容的 Web 框架中，缓存命中时完整恢复所有响应头 |
+| F5 | HTTP 中间件 (Middleware) | 提供标准 `http.Handler` 中间件，可直接集成到任何 net/http 兼容的 Web 框架中，缓存命中时完整恢复所有响应头；错误处理时严格保证 handler 最多执行一次，绝不二次调用下游处理器 |
 | F6 | 手动过期清理 (CleanExpired) | 主动扫描并清理过期的幂等记录，返回清理数量 |
 | F7 | 存在性查询 (Contains) | 查询幂等键是否在有效期内，不改变其状态 |
 | F8 | 获取缓存结果 (Get) | 获取指定幂等键的缓存结果（状态码、响应体、响应头） |
@@ -320,23 +320,60 @@ Middleware(next http.Handler) http.Handler
          ├─ 调用 Execute(key, handler)，获得 (resp, fromCache, err)
          │
          ├─ [err != nil]
-         │     ├─ ErrIdempotentStopped → 返回 503 Service Unavailable
-         │     └─ 其他错误 → 降级为直接调用 next.ServeHTTP(w, r)
+         │     ├─ rr.statusCode != 0（handler 已执行，副作用已发生）
+         │     │     └─ 使用 rr 中已记录的响应：writeResponse(..., "MISS")
+         │     │           保证语义一致性：副作用只发生一次，返回实际处理结果
+         │     │
+         │     ├─ ErrIdempotentStopped（handler 未执行前就已停止）
+         │     │     └─ 返回 503 Service Unavailable
+         │     │
+         │     └─ 其他错误（handler 未执行）
+         │           └─ 返回 500 Internal Server Error
+         │           [ 注意：绝不降级为 next.ServeHTTP(w, r) ]
+         │           [ 防止有副作用的 handler 被重复执行两次 ]
          │
-         ├─ [resp.Header != nil] → 将缓存的响应头完整写入真实 ResponseWriter
-         │     （包括 Content-Type、Location、自定义头等所有业务设置的响应头）
+         ├─ [成功] → writeResponse(w, resp.StatusCode, resp.Body, resp.Header, cacheFlag(fromCache))
          │
-         ├─ 设置 X-Idempotent-Cache 响应头：
-         │     ├─ fromCache=true  → "HIT"
-         │     └─ fromCache=false → "MISS"
-         │
-         ├─ w.WriteHeader(resp.StatusCode)
-         └─ w.Write(resp.Body)
+         └─ 所有写响应操作统一通过 writeResponse() 完成：
+               ├─ 写入所有响应头（从缓存或记录器恢复）
+               ├─ 设置 X-Idempotent-Cache: "HIT" 或 "MISS"
+               ├─ 写入状态码
+               └─ 写入响应体
 ```
 
 **响应头说明：**
 - `X-Idempotent-Cache: HIT`：该请求命中了幂等缓存，未执行业务逻辑，所有响应头均从缓存中完整恢复
-- `X-Idempotent-Cache: MISS`：该请求未命中缓存，执行业务逻辑并缓存了完整响应结果（含所有响应头）
+- `X-Idempotent-Cache: MISS`：该请求未命中缓存，执行业务逻辑并缓存了完整响应结果（含所有响应头）；或在降级路径中 handler 已执行过但 Execute 返回错误
+
+### 4.10 Middleware 降级安全保障（防止二次执行）
+
+Middleware 的错误处理路径严格遵循"handler 最多执行一次"原则，避免数据库写入等副作用被重复触发：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Execute 返回错误的情况                      │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  rr.statusCode != 0 ?                                        │
+│       │                                                      │
+│       ├─ YES ─▶ handler 已通过 responseRecorder 执行过一次    │
+│       │         副作用（写数据库、发消息等）已经发生            │
+│       │         必须将已记录的响应原样返回给客户端              │
+│       │         绝不能再调用 next.ServeHTTP(w, r)            │
+│       │         否则会造成：扣款两次、插入两条记录...          │
+│       │                                                      │
+│       └─ NO ─▶ handler 还没执行（在进入 handler 前就出错）     │
+│                 │                                            │
+│                 ├─ ErrIdempotentStopped → 返回 503           │
+│                 └─ 其他错误             → 返回 500           │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**关键设计原则：**
+- **禁止降级为 `next.ServeHTTP(w, r)`**：错误路径一旦允许直接调用，结合 handler 已执行过的场景就会造成重复执行
+- **状态码为 0 作为"未执行"标志**：`responseRecorder` 的 `statusCode` 初始值为 0，`WriteHeader` 或 `Write` 才会设置非零值，因此 `statusCode != 0` 等价于"handler 已执行过至少一条写指令"
+- **降级也设置 X-Idempotent-Cache=MISS**：即使是降级路径返回的已记录响应，语义上也属于"首次执行"而非缓存命中
 
 ### 4.6 过期与清理机制
 
@@ -449,7 +486,7 @@ NewIdempotent() → Start() → [Execute()/Middleware 反复调用] → Stop() �
 | `CleanExpired` | `(int, error)` | 已停止返回 `ErrIdempotentStopped` |
 | `Clear` | `error` | 已停止返回 `ErrIdempotentStopped` |
 
-## 5. 线程安全设计
+## 5. 线程安全与测试可靠性设计
 
 所有公共方法均通过互斥锁 `mu` 保护内部状态：
 - **写操作**（`Execute`、`Set`、`Delete`、`Clear`、`CleanExpired`、`Start`、`Stop`）：获取排他锁
@@ -457,6 +494,64 @@ NewIdempotent() → Start() → [Execute()/Middleware 反复调用] → Stop() �
 - **并发安全验证**：单元测试中的 `TestConcurrent_*` 系列测试通过多协程并发调用验证无竞态条件；在支持的平台上可使用 `-race` 标志运行测试
 - **Pending 队列**：处理中的请求通过 channel 实现等待，不占用锁资源
 - **响应头隔离**：所有跨边界传递的 `http.Header` 均通过 `cloneHeader` 深拷贝，杜绝并发读写共享 map 引发的数据竞争
+
+### 5.1 并发测试最佳实践（子协程错误收集）
+
+在并发测试场景中，子协程不应直接调用 `t.Errorf` / `t.Fatalf` 报告错误，而应通过共享数据结构（错误切片/channel）收集后在主协程统一断言，原因如下：
+
+| 问题 | 说明 |
+|------|------|
+| **测试归属不明确** | 子协程中 `t.Errorf` 报告的错误无法被精确关联到具体子测试，报告的栈/行号可能与主测试混合 |
+| **平台兼容性** | 部分测试框架/平台对子协程的测试失败信息支持不佳，可能导致错误被静默吞掉或输出混乱 |
+| **竞态检测** | 直接在子协程调用测试断言，可能与 `-race` 的检测逻辑产生交互，造成误报 |
+| **测试可控性** | 通过 channel/切片收集后，主协程可以按 goroutine ID 逐条断言，便于定位哪个协程出了问题 |
+
+**推荐模式（错误切片 + 互斥锁）：**
+```go
+goroutineErrs := make([][]error, numGoroutines)
+var errsMu sync.Mutex
+
+for g := 0; g < numGoroutines; g++ {
+    wg.Add(1)
+    go func(gid int) {
+        defer wg.Done()
+        localErrs := make([]error, 0)
+        for ... {
+            _, _, err := i.Execute(...)
+            if err != nil {
+                localErrs = append(localErrs, fmt.Errorf("gid %d: %w", gid, err))
+            }
+        }
+        errsMu.Lock()
+        goroutineErrs[gid] = append(goroutineErrs[gid], localErrs...)
+        errsMu.Unlock()
+    }(g)
+}
+
+wg.Wait()
+// 主协程统一断言
+for gid, errs := range goroutineErrs {
+    for _, err := range errs {
+        t.Errorf("goroutine %d: %v", gid, err)
+    }
+}
+```
+
+**推荐模式（共享变量 + 主协程读取）：**
+对于只需判断单个结果值的场景，将错误赋值给共享变量（确保 wg.Wait() 后读取，有 happens-before 保证）：
+```go
+var firstReqErr error
+wg.Add(1)
+go func() {
+    defer wg.Done()
+    _, _, err := i.Execute(...)
+    firstReqErr = err
+}()
+wg.Wait()
+if !errors.Is(firstReqErr, ErrIdempotentStopped) {
+    t.Errorf("expected ErrIdempotentStopped, got %v", firstReqErr)
+}
+```
 
 ## 6. 使用示例
 
@@ -771,7 +866,7 @@ docs/
 
 ## 8. 测试覆盖说明
 
-单元测试覆盖以下场景类别（共 47 个测试用例）：
+单元测试覆盖以下场景类别（共 50 个测试用例）：
 
 | 测试类别 | 代表性测试用例 | 覆盖目标 |
 |----------|---------------|----------|
@@ -780,9 +875,10 @@ docs/
 | **响应缓存** | `TestExecute_DifferentStatusCodes`、`TestGet`、`TestSet`、`TestSet_Overwrite` | 状态码/响应体/响应头缓存、Get/Set 操作、覆盖写入 |
 | **响应头隔离** | `TestGet_HeaderIsolation`、`TestCloneHeader` | 缓存响应头深拷贝隔离、cloneHeader 函数正确性 |
 | **边界条件** | `TestExecute_EmptyKey`、`TestExecute_NilHandler`、`TestDelete` | 空键处理、nil 处理器、删除操作 |
-| **并发锁等待** | `TestExecute_ConcurrentSameKey`、`TestExecute_ConcurrentDifferentKeys` | 同键并发只执行一次、不同键并发独立执行、响应头在并发中正确传递 |
-| **Stop 期间错误通知** | `TestExecute_StopDuringHandler_WaitingRequestsReturnError`、`TestExecute_StopWithPendingRequests` | Stop 时第一个请求和所有等待请求均返回 ErrIdempotentStopped、无 channel 重复关闭 panic |
+| **并发锁等待** | `TestExecute_ConcurrentSameKey`、`TestExecute_ConcurrentDifferentKeys` | 同键并发只执行一次、不同键并发独立执行、子协程错误通过切片收集后主协程断言 |
+| **Stop 期间错误通知** | `TestExecute_StopDuringHandler_WaitingRequestsReturnError`、`TestExecute_StopWithPendingRequests` | Stop 时第一个请求和所有等待请求均返回 ErrIdempotentStopped、无 channel 重复关闭 panic、第一个请求的错误通过共享变量收集后主协程断言 |
 | **HTTP 中间件** | `TestMiddleware_NoKey`、`TestMiddleware_WithKeyFirstRequest`、`TestMiddleware_WithKeyCacheHit`、`TestMiddleware_CacheHitPreservesMultipleHeaderValues`、`TestMiddleware_CustomHeader` | 无键跳过、首次请求 MISS、缓存命中 HIT 时完整恢复响应头（含多值头）、自定义请求头 |
+| **Middleware 降级安全（防二次执行）** | `TestMiddleware_SideEffectHandlerNotCalledTwice`、`TestMiddleware_StopAfterHandlerExecuted_UsesRecordedResponse`、`TestMiddleware_HandlerNotExecuted_Stop_Returns503` | 有副作用 handler 严格只调用一次、handler 已执行后 Stop 返回已记录响应而非 503、handler 未执行时 Stop 正确返回 503 且不调用 handler |
 | **过期清理** | `TestCleanExpired_NoExpired`、`TestCleanExpired_AllExpired`、`TestCleanExpired_PartialExpired` | 无过期/全过期/部分过期清理 |
 | **过期行为** | `TestExecute_ExpiredThenReexecute`、`TestGet_Expired`、`TestContains_Expired` | 过期后重新执行、Get/Contains 过期判断 |
 | **Count 语义** | `TestCount`、`TestCount_ExcludesExpired` | Count 只统计有效记录、排除已过期但未清理的记录 |

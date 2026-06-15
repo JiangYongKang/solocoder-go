@@ -1,0 +1,6 @@
+产物不满意：
+本轮产物无明显缺陷。提示词要求的三项修复均已正确完成：（1）dnsresolver.go 新增 isSameZone 函数实现了基于 DNS 区域边界的后缀匹配判定，resolveRecursiveWithServers 方法在 NS 委派链逐级遍历时通过 zone 变量跟踪当前授权区域并传递给 followCNAME，followCNAME 方法使用 isSameZone 替代了原有的标签级字符串比较。以提示词示例 `www.example.com` 指向 `cdn.example.com` 为例，zone 为 `example.com.`，isSameZone 判定为同区，直接复用当前权威服务器查询而非走完整根递归。（2）buildNSResponse 函数中不再存在 questionEnd 变量或 `_ = questionEnd` 残留，TestBuildQuery 中原有的 `_ = id` 已被替换为实际的事务 ID 验证逻辑，校验 buildQuery 返回的 id 与查询报文中编码的 Transaction ID 一致。（3）新增了 5 个测试用例覆盖 isSameZone 的 13 种边界判定、同区 CNAME 不触发完整递归（期望 5 次查询）、深层子域名同区优化、跨区 CNAME 触发完整递归（期望不少于 10 次查询）、链式同区 CNAME 优化。全部 70 个测试通过，文档 docs/dnsresolver.md 已更新 F13 功能描述和 CNAME 同区优化说明。
+
+过程不满意：
+1. 模型在刚收到提示词后未经任何前置分析就直接用 todo_write 创建了 6 项子任务计划，之后才开始阅读 internal/dnsresolver/ 下的代码和需求文档。这导致计划粒度的划分先于对问题本质的理解，违反了应当先分析需求文档和代码骨架再制定执行计划的规范。虽然本轮任务范围明确、所有子任务最终都完成了，但这种行为模式在更复杂的任务中可能导致计划与实际模块边界不匹配。
+2. 模型在编写 TestCNAMEFollowCrossZoneTriggersRecursion 跨区 CNAME 测试时经历了三轮试错式调试：第一轮 queryCount 停在 5 报 `ErrNoRecordsFound`，第二轮调整 mock 顺序仍不通过，第三轮才意识到 NS 委派循环在 i=3 时会对 `www.example.com.` 发起 TypeNS 查询，需额外提供空 Authority 的 mock 响应给叶子域名。模型在前两轮失败后没有先画出完整查询调用链再做 mock 设计，而是通过修改代码再运行测试来反推正确的 mock 顺序，属于典型试错式调试模式。正确做法是先基于解析器 NS 循环逻辑画出调用图，再按序编排 mock 响应。

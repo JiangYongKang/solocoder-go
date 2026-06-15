@@ -1,0 +1,6 @@
+你实现的 DNS 解析器模块仍存在一些功能缺陷，需要修复：
+1. followCNAME 方法的同区 CNAME 优化使用字符串标签比较判定区域归属，例如"www.example.com"指向"cdn.example.com"时标签级比较判定为跨区，导致本可在当前权威服务器直接查询的记录走了完整的根递归解析链，产生 3 到 4 次多余查询。需要改用 DNS 区域边界判定。
+2. 测试辅助函数 buildNSResponse 和 TestBuildQuery 中仍存在无意义的空白标识符赋值残留，提示词要求全部清理但未彻底执行。
+3. 修复以上问题后，为 CNAME 同区优化补充单元测试，验证同区场景下不会触发完整递归。
+4. 运行 go test ./internal/dnsresolver/ -v，需要让所有测试通过。
+5. 在 docs/dnsresolver.md 中更新模块需求文档。

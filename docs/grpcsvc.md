@@ -132,7 +132,7 @@ type Stream interface {
     SendMsg(msg interface{}) error
     RecvMsg(msg interface{}) error
     Recv() (interface{}, error)
-    Send() (interface{}, error)
+    RecvFromServer() (interface{}, error)
     PutRecv(msg interface{}) error
     SetHeader(md MD)
     SetTrailer(md MD)
@@ -145,18 +145,27 @@ type Stream interface {
 **主要职责：**
 - 抽象底层 gRPC 流，与具体实现解耦
 - `Context()` - 获取流上下文
-- `SendMsg(msg)` - 向客户端发送消息（写入 sendCh）
-- `RecvMsg(msg)` - 从客户端接收消息（从 recvCh 读取，仅返回错误）
-- `Recv()` - 从客户端接收消息并返回（从 recvCh 读取，返回消息内容）
-- `Send()` - 读取服务端发送的消息（从 sendCh 读取，供测试和框架内部使用）
-- `PutRecv(msg)` - 向 recvCh 写入消息（模拟客户端发送，供测试和框架内部使用）
+- `SendMsg(msg)` - 服务端向客户端发送消息（写入 sendCh），供服务端 handler 调用
+- `RecvMsg(msg)` - 服务端从客户端接收消息（从 recvCh 读取），通过 reflect 将数据写入 msg 指针，msg 必须是非 nil 指针
+- `Recv()` - 服务端从客户端接收消息并返回（从 recvCh 读取，返回消息内容）
+- `RecvFromServer()` - 从 sendCh 读取服务端发送的消息（供客户端/测试方消费服务端响应），语义为"接收来自服务端的消息"
+- `PutRecv(msg)` - 向 recvCh 写入消息（模拟客户端发送，供客户端/测试方注入客户端消息）
 - `SetHeader(md)` - 设置响应 header
 - `SetTrailer(md)` - 设置响应 trailer
 - `Header()` - 获取已设置的 header
-- `Close()` - 关闭流
+- `Close()` - 关闭流，同时调用 cancelFn 释放 context 资源
 - `Closed()` - 查询流是否已关闭
 
-实现细节见 [Stream](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/grpcsvc/grpcsvc.go#L151-L163)
+**消息流向说明：**
+
+| 方法 | 数据方向 | 使用方 |
+|------|----------|--------|
+| `SendMsg(msg)` | 服务端 → sendCh → 客户端 | 服务端 handler |
+| `RecvFromServer()` | sendCh → 客户端/测试方 | 客户端/测试方 |
+| `PutRecv(msg)` | 客户端/测试方 → recvCh | 客户端/测试方 |
+| `Recv()` / `RecvMsg(msg)` | recvCh → 服务端 handler | 服务端 handler |
+
+实现细节见 [Stream](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/grpcsvc/grpcsvc.go#L152-L164)
 
 ### 3.7 MD - 元数据类型
 
@@ -279,4 +288,731 @@ Invoke(ctx, serviceName, methodName, req)
    │
    ├─ 查找服务 → 不存在 → 返回 ErrServiceNotFound
    │
-   ├─ 查找方法 → 不存在
+   ├─ 查找方法 → 不存在 → 返回 ErrMethodNotFound
+   │
+   ├─ 获取拦截器链和服务实现
+   │
+   ├─ mu.RUnlock()
+   │
+   ├─ 检查超时 → 已超时 → 返回 ErrDeadlineExceeded
+   │
+   ├─ 确保上下文有 header 和 trailer 存储空间
+   │
+   ├─ 应用 ConnectionTimeout → 创建带超时的上下文
+   │
+   ├─ 构建 UnaryServerInfo
+   │
+   └─ 执行拦截器链 + 持续超时检查
+        │
+        ├─ 启动单 goroutine 执行实际 handler（含 panic 恢复）
+        │
+        └─ 调用方直接 select 多路复用：
+              ├─ ticker 触发 → 检查超时 → 超时则返回 ErrDeadlineExceeded
+              ├─ handler 完成 → 返回结果
+              └─ ctx 取消 → 返回对应错误
+```
+
+实现细节见 [Invoke()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/grpcsvc/grpcsvc.go#L403-L513)
+
+### 4.3 流式调用流程
+
+```
+HandleStream(ctx, serviceName, streamName, stream)
+   │
+   ├─ mu.RLock() → 检查 running → 返回 ErrServerStopped
+   │
+   ├─ 查找服务 → 不存在 → 返回 ErrServiceNotFound
+   │
+   ├─ 查找流方法 → 不存在 → 返回 ErrMethodNotFound
+   │
+   ├─ 获取拦截器链和服务实现
+   │
+   ├─ mu.RUnlock()
+   │
+   ├─ 检查超时 → 已超时 → 返回 ErrDeadlineExceeded
+   │
+   ├─ 确保上下文有 header 和 trailer 存储空间
+   │
+   ├─ 构建 StreamServerInfo
+   │
+   └─ 执行拦截器链 + 持续超时检查
+        │
+        ├─ 启动单 goroutine 执行实际 stream handler（含 panic 恢复）
+        │
+        └─ 调用方直接 select 多路复用：
+              ├─ ticker 触发 → 检查超时 → 超时则返回 ErrDeadlineExceeded
+              ├─ handler 完成 → 返回结果
+              └─ ctx 取消 → 返回对应错误
+```
+
+实现细节见 [HandleStream()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/grpcsvc/grpcsvc.go#L569-L676)
+
+### 4.4 流创建与并发控制流程
+
+```
+NewStream(ctx, serviceName, streamName)
+   │
+   ├─ mu.RLock() → 检查 running → 返回 ErrServerStopped
+   │
+   ├─ 查找服务 → 不存在 → 返回 ErrServiceNotFound
+   │
+   ├─ 查找流方法 → 不存在 → 返回 ErrMethodNotFound
+   │
+   ├─ mu.RUnlock()
+   │
+   ├─ 检查超时 → 已超时 → 返回 ErrDeadlineExceeded
+   │
+   ├─ acquireStream() → 原子增加活跃流计数
+   │     └─ 超过 MaxConcurrentStreams → 返回 ErrTooManyStreams
+   │
+   ├─ 确保上下文有 header 和 trailer 存储空间
+   │
+   ├─ 应用 ConnectionTimeout → 创建带超时的上下文，保存 cancelFn
+   │
+   ├─ 创建 serverStream，注册 cancelFn 和 releaseFn
+   │
+   └─ 返回 Stream 接口
+```
+
+实现细节见 [NewStream()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/grpcsvc/grpcsvc.go#L515-L567)
+
+### 4.5 拦截器链执行顺序
+
+拦截器按照注册顺序执行，形成洋葱模型：
+
+```
+请求 → 拦截器1 before → 拦截器2 before → ... → 实际处理器
+                ↑                                    ↓
+                └── 拦截器1 after ← 拦截器2 after ← ┘
+```
+
+**执行顺序说明：**
+1. 先注册的拦截器先执行 before 逻辑
+2. 后注册的拦截器更靠近实际处理器
+3. after 逻辑的执行顺序与 before 相反
+4. 拦截器可以通过不调用 `handler` 来中断请求处理
+
+实现细节见 [UnaryInterceptorChain()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/grpcsvc/grpcsvc.go#L343-L361)
+
+### 4.6 超时持续校验流程
+
+```
+Handler 包装器（一元和流式相同）
+   │
+   ├─ 启动单 goroutine 执行实际 handler
+   │     ├─ defer 捕获 panic → 返回 panic 错误
+   │     └─ 将结果写入 handlerDone channel
+   │
+   ├─ 创建 ticker = time.NewTicker(10ms)
+   ├─ defer ticker.Stop()
+   │
+   └─ for 循环 select 多路复用：
+         ├─ case <-ticker.C:
+         │     └─ checkDeadline(ctx) → 超时 → 返回 ErrDeadlineExceeded
+         ├─ case r := <-handlerDone:
+         │     └─ 返回 handler 结果
+         └─ case <-ctx.Done():
+               ├─ DeadlineExceeded → 返回 ErrDeadlineExceeded
+               └─ 其他 → 返回 ctx.Err()
+```
+
+**关键特性：**
+- 每 10ms 检查一次超时
+- handler 在独立 goroutine 中执行，即使阻塞也不影响超时检查
+- 超时后立即返回错误，即使 handler 仍在后台运行
+- 支持 panic 恢复，避免服务器崩溃
+- 同时监听 ctx.Done() 信号
+- 单 goroutine + select 多路复用，避免双层 goroutine 嵌套的调度开销
+
+实现细节见 [Invoke() handler wrapper](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/grpcsvc/grpcsvc.go#L450-L510)
+
+### 4.7 元数据透传流程
+
+**请求元数据（入站）：**
+```
+客户端 → HTTP/2 Headers → 框架解析为 MD → 注入 context → 拦截器/业务逻辑读取
+```
+
+**响应 Header 元数据（出站）：**
+```
+业务逻辑 → SetHeader(ctx, md) → 写入 context → 框架读取 → HTTP/2 Headers → 客户端
+```
+
+**响应 Trailer 元数据（出站）：**
+```
+业务逻辑 → SetTrailer(ctx, md) → 写入 context → 框架读取 → HTTP/2 Trailers → 客户端
+```
+
+**使用方式：**
+- 服务端：通过 `FromContext(ctx)` 读取请求元数据，通过 `SetHeader(ctx, md)` 和 `SetTrailer(ctx, md)` 设置响应元数据
+- 客户端：通过 `NewContextWithMD(ctx, md)` 附加请求元数据，通过 `HeaderFromContext(ctx)` 和 `TrailerFromContext(ctx)` 读取响应元数据
+
+## 5. 核心机制说明
+
+### 5.1 服务注册机制
+
+服务采用"描述符 + 实现"分离的注册模式：
+- `ServiceDesc` 描述服务的接口定义（方法名、处理函数等）
+- `srv` 是服务的具体实现对象
+- 框架通过闭包的方式将调用分发到具体实现
+
+### 5.2 拦截器链构建机制
+
+拦截器链采用"洋葱模型"设计：
+- 通过闭包嵌套的方式构建处理链
+- 每个拦截器接收 `handler` 参数，即链中的下一个处理器
+- 从最后一个拦截器开始向前构建，最外层是第一个注册的拦截器
+- 支持零个或多个拦截器
+
+实现细节见 [ChainUnaryInterceptors()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/grpcsvc/grpcsvc.go#L914-L930)
+
+### 5.3 超时持续校验机制
+
+超时采用"单 goroutine handler + select 多路复用"模式：
+- 实际 handler 在独立 goroutine 中执行，不受阻塞影响
+- 调用方 goroutine 通过 select 同时监听 ticker、handlerDone 和 ctx.Done()
+- 每 10ms 检查一次 deadline
+- 超时后立即返回错误，不等待 handler 完成
+- 支持 panic 恢复，保证服务器稳定性
+- 相比双层 goroutine 嵌套，减少 50% 的 goroutine 创建开销
+
+### 5.4 元数据透传机制
+
+元数据采用"上下文携带"模式：
+- 请求元数据通过 `mdKey` 存储在 context 中
+- 响应 header 通过 `headerKey` 存储在 context 中
+- 响应 trailer 通过 `trailerKey` 存储在 context 中
+- header 和 trailer 使用指针存储，支持在处理过程中动态设置
+- 提供 `NewContextWithHeader` 和 `NewContextWithTrailer` 函数创建存储空间
+
+### 5.5 并发流控制机制
+
+并发流控制采用"原子计数 + CAS 操作"模式：
+- `activeStreams` 使用 int32 原子变量存储活跃流数量
+- `acquireStream()` 使用 CompareAndSwap 原子操作增加计数
+- `releaseFn` 在流关闭时自动减少计数
+- 达到 `MaxConcurrentStreams` 限制时返回 `ErrTooManyStreams`
+- 使用 `sync/atomic` 包保证并发安全，性能优于互斥锁
+
+实现细节见 [acquireStream()](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/grpcsvc/grpcsvc.go#L383-L393)
+
+### 5.6 连接超时机制
+
+连接超时采用"自动包装上下文"模式：
+- 如果配置了 `ConnectionTimeout`（> 0），自动为请求创建带超时的上下文
+- 使用 `context.WithTimeout` 包装原始上下文
+- 超时时间与客户端设置的 deadline 取更严格的一个
+- 一元调用和流式调用都应用此机制
+
+### 5.7 并发安全设计
+
+服务器完全并发安全：
+- 所有共享状态（services、interceptors、running）受 `mu` 互斥锁保护
+- 活跃流计数使用 `sync/atomic` 原子操作
+- 服务内部状态通过各自的机制保证安全
+- 后台 goroutine 通过 `running` 标志控制
+- 使用 `sync.RWMutex` 提高读多写少场景的性能
+
+### 5.8 Panic 恢复机制
+
+所有 handler 执行都包含 panic 恢复：
+- 使用 defer + recover 捕获 handler 中的 panic
+- 将 panic 转换为错误返回
+- 避免单个请求的 panic 导致整个服务器崩溃
+- 一元和流式调用都应用此机制
+
+## 6. 使用示例
+
+### 6.1 基础使用：简单 Echo 服务
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    "solocoder-go/internal/grpcsvc"
+)
+
+type echoServiceImpl struct{}
+
+func main() {
+    // 1. 创建服务器（带自定义配置）
+    opts := grpcsvc.ServerOptions{
+        MaxConcurrentStreams: 200,
+        ConnectionTimeout:    60 * time.Second,
+    }
+    server := grpcsvc.NewServerWithOptions(opts)
+
+    // 2. 定义服务描述符
+    sd := &grpcsvc.ServiceDesc{
+        ServiceName: "EchoService",
+        Methods: []grpcsvc.MethodDesc{
+            {
+                MethodName: "Echo",
+                Handler: func(ctx context.Context, req interface{}) (interface{}, error) {
+                    return req, nil
+                },
+            },
+            {
+                MethodName: "Hello",
+                Handler: func(ctx context.Context, req interface{}) (interface{}, error) {
+                    name := req.(string)
+                    return fmt.Sprintf("Hello, %s!", name), nil
+                },
+            },
+        },
+    }
+
+    // 3. 注册服务
+    err := server.RegisterService(sd, &echoServiceImpl{})
+    if err != nil {
+        log.Fatalf("Failed to register service: %v", err)
+    }
+
+    // 4. 调用一元方法
+    ctx := context.Background()
+    resp, err := server.Invoke(ctx, "EchoService", "Hello", "World")
+    if err != nil {
+        log.Printf("Invoke failed: %v", err)
+        return
+    }
+    fmt.Printf("Response: %v\n", resp) // Output: Response: Hello, World!
+
+    // 5. 查询服务器状态
+    fmt.Printf("Active streams: %d\n", server.ActiveStreams())
+    fmt.Printf("Max concurrent streams: %d\n", server.Options().MaxConcurrentStreams)
+}
+```
+
+### 6.2 使用拦截器
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "time"
+
+    "solocoder-go/internal/grpcsvc"
+)
+
+func loggingInterceptor(ctx context.Context, req interface{}, info *grpcsvc.UnaryServerInfo, handler grpcsvc.UnaryHandler) (interface{}, error) {
+    start := time.Now()
+    log.Printf("Request started: %s", info.FullMethod)
+
+    resp, err := handler(ctx, req)
+
+    log.Printf("Request completed: %s, duration: %v, error: %v",
+        info.FullMethod, time.Since(start), err)
+    return resp, err
+}
+
+func authInterceptor(ctx context.Context, req interface{}, info *grpcsvc.UnaryServerInfo, handler grpcsvc.UnaryHandler) (interface{}, error) {
+    md, ok := grpcsvc.FromContext(ctx)
+    if !ok {
+        return nil, errors.New("missing metadata")
+    }
+
+    token := md.Get("authorization")
+    if len(token) == 0 || token[0] != "Bearer valid-token" {
+        return nil, errors.New("unauthorized")
+    }
+
+    return handler(ctx, req)
+}
+
+func main() {
+    server := grpcsvc.NewServer()
+
+    // 添加拦截器（按注册顺序执行）
+    server.AddUnaryInterceptor(loggingInterceptor)
+    server.AddUnaryInterceptor(authInterceptor)
+
+    // 注册服务...
+}
+```
+
+### 6.3 使用元数据
+
+```go
+func handler(ctx context.Context, req interface{}) (interface{}, error) {
+    // 读取请求元数据
+    md, ok := grpcsvc.FromContext(ctx)
+    if ok {
+        requestID := md.Get("x-request-id")
+        log.Printf("Request ID: %v", requestID)
+    }
+
+    // 设置响应 header
+    header := grpcsvc.NewMD()
+    header.Set("x-server-version", "1.0.0")
+    grpcsvc.SetHeader(ctx, header)
+
+    // 设置响应 trailer
+    trailer := grpcsvc.NewMD()
+    trailer.Set("x-trace-id", "trace-123")
+    grpcsvc.SetTrailer(ctx, trailer)
+
+    return "response", nil
+}
+
+func clientCall() {
+    // 客户端设置请求元数据
+    md := grpcsvc.NewMD()
+    md.Set("authorization", "Bearer token")
+    ctx := grpcsvc.NewContextWithMD(context.Background(), md)
+
+    // 准备接收 header 和 trailer
+    ctx = grpcsvc.NewContextWithHeader(ctx)
+    ctx = grpcsvc.NewContextWithTrailer(ctx)
+
+    resp, err := server.Invoke(ctx, "Service", "Method", req)
+
+    // 读取响应 header
+    header, ok := grpcsvc.HeaderFromContext(ctx)
+    if ok {
+        version := header.Get("x-server-version")
+        log.Printf("Server version: %v", version)
+    }
+
+    // 读取响应 trailer
+    trailer, ok := grpcsvc.TrailerFromContext(ctx)
+    if ok {
+        traceID := trailer.Get("x-trace-id")
+        log.Printf("Trace ID: %v", traceID)
+    }
+}
+```
+
+### 6.4 使用超时
+
+```go
+func main() {
+    // 方式 1：客户端设置超时
+    server := grpcsvc.NewServer()
+    // 注册服务...
+
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    resp, err := server.Invoke(ctx, "SlowService", "SlowMethod", req)
+    if err != nil {
+        if errors.Is(err, grpcsvc.ErrDeadlineExceeded) {
+            log.Println("Request timed out")
+        }
+        return
+    }
+
+    // 方式 2：服务器配置连接超时
+    opts := grpcsvc.ServerOptions{
+        ConnectionTimeout: 10 * time.Second,
+    }
+    server2 := grpcsvc.NewServerWithOptions(opts)
+
+    // 所有请求自动应用 10 秒超时
+    resp, err = server2.Invoke(context.Background(), "Service", "Method", req)
+}
+```
+
+### 6.5 并发流控制
+
+```go
+func main() {
+    opts := grpcsvc.ServerOptions{
+        MaxConcurrentStreams: 10,
+    }
+    server := grpcsvc.NewServerWithOptions(opts)
+    // 注册服务...
+
+    // 创建流
+    streams := make([]grpcsvc.Stream, 0, 10)
+    for i := 0; i < 10; i++ {
+        stream, err := server.NewStream(context.Background(), "Service", "Stream")
+        if err != nil {
+            log.Fatalf("Failed to create stream: %v", err)
+        }
+        streams = append(streams, stream)
+    }
+
+    // 第 11 个流会失败
+    _, err := server.NewStream(context.Background(), "Service", "Stream")
+    if errors.Is(err, grpcsvc.ErrTooManyStreams) {
+        log.Println("Too many concurrent streams")
+    }
+
+    // 关闭一个流后可以创建新的
+    streams[0].Close()
+    time.Sleep(10 * time.Millisecond)
+
+    stream, err := server.NewStream(context.Background(), "Service", "Stream")
+    if err != nil {
+        log.Fatalf("Failed to create stream: %v", err)
+    }
+    defer stream.Close()
+
+    log.Printf("Active streams: %d", server.ActiveStreams())
+}
+```
+
+### 6.6 客户端流式 RPC
+
+```go
+// 服务端实现
+func clientStreamHandler(srv interface{}, stream grpcsvc.Stream) error {
+    count := 0
+    for {
+        msg, err := stream.Recv()
+        if err != nil {
+            if errors.Is(err, grpcsvc.ErrStreamClosed) {
+                break
+            }
+            return err
+        }
+        log.Printf("Received: %v", msg)
+        count++
+        if count == 5 {
+            break
+        }
+    }
+    return stream.SendMsg(fmt.Sprintf("processed %d messages", count))
+}
+
+// 客户端使用（通过 Stream 接口）
+func clientSend(stream grpcsvc.Stream) error {
+    for i := 0; i < 5; i++ {
+        // 通过 Stream 接口的 PutRecv 发送消息
+        err := stream.PutRecv(fmt.Sprintf("msg-%d", i))
+        if err != nil {
+            return err
+        }
+    }
+
+    // 读取服务端响应（通过 Stream 接口的 RecvFromServer）
+    resp, err := stream.RecvFromServer()
+    if err != nil {
+        return err
+    }
+    log.Printf("Response: %v", resp)
+
+    stream.Close()
+    return nil
+}
+```
+
+### 6.7 双向流式 RPC
+
+```go
+// 服务端实现
+func bidiStreamHandler(srv interface{}, stream grpcsvc.Stream) error {
+    for {
+        msg, err := stream.Recv()
+        if err != nil {
+            if errors.Is(err, grpcsvc.ErrStreamClosed) {
+                return nil
+            }
+            return err
+        }
+        log.Printf("Received: %v", msg)
+
+        response := fmt.Sprintf("echo: %v", msg)
+        if err := stream.SendMsg(response); err != nil {
+            return err
+        }
+    }
+}
+
+// 客户端使用
+func clientBidi(stream grpcsvc.Stream) error {
+    for i := 0; i < 3; i++ {
+        // 发送请求
+        err := stream.PutRecv(fmt.Sprintf("ping-%d", i))
+        if err != nil {
+            return err
+        }
+
+        // 读取服务端响应（RecvFromServer 语义为"接收来自服务端的消息"）
+        resp, err := stream.RecvFromServer()
+        if err != nil {
+            return err
+        }
+        log.Printf("Response: %v", resp)
+    }
+
+    stream.Close()
+    return nil
+}
+```
+
+### 6.8 流式拦截器
+
+```go
+func streamLoggingInterceptor(srv interface{}, ss grpcsvc.Stream, info *grpcsvc.StreamServerInfo, handler grpcsvc.StreamHandler) error {
+    start := time.Now()
+    log.Printf("Stream started: %s, type: server=%v client=%v",
+        info.FullMethod, info.IsServerStream, info.IsClientStream)
+
+    err := handler(srv, ss)
+
+    log.Printf("Stream completed: %s, duration: %v, error: %v",
+        info.FullMethod, time.Since(start), err)
+    return err
+}
+
+func main() {
+    server := grpcsvc.NewServer()
+    server.AddStreamInterceptor(streamLoggingInterceptor)
+    // ...
+}
+```
+
+## 7. 文件结构
+
+```
+internal/grpcsvc/
+├── grpcsvc.go       # gRPC 服务框架核心实现
+└── grpcsvc_test.go  # 单元测试（覆盖正常流程、边界条件、异常分支）
+
+docs/
+└── grpcsvc.md       # 本文档
+```
+
+## 8. 测试覆盖范围
+
+单元测试覆盖以下场景：
+
+### 正常流程
+- ✅ 服务器创建与配置
+- ✅ 服务注册与查询
+- ✅ 一元 RPC 调用
+- ✅ 流式 RPC 调用（服务端流、客户端流、双向流）
+- ✅ 一元拦截器链执行
+- ✅ 流式拦截器链执行
+- ✅ 元数据读取与设置（header 和 trailer）
+- ✅ 超时正常请求
+- ✅ Header 和 Trailer 设置与读取
+- ✅ 并发调用
+- ✅ 并发注册
+- ✅ 并发流创建与释放
+- ✅ Stream 接口完整性（PutRecv、Recv、Send 通过接口调用）
+- ✅ 服务器配置选项读取
+- ✅ 活跃流统计
+
+### 边界条件
+- ✅ 空服务名注册
+- ✅ nil 服务描述符
+- ✅ nil 服务实现
+- ✅ 重复注册服务
+- ✅ nil 拦截器
+- ✅ 空拦截器链
+- ✅ nil 元数据操作
+- ✅ 服务器停止后操作
+- ✅ 流关闭后操作
+- ✅ 双重关闭流
+- ✅ RPC 类型字符串转换
+- ✅ 零值配置自动应用默认值
+- ✅ 并发流达到上限
+- ✅ 并发流释放后可重新创建
+
+### 异常分支
+- ✅ 调用不存在的服务
+- ✅ 调用不存在的方法
+- ✅ 请求超时
+- ✅ 立即超时（deadline 已过）
+- ✅ **长时间阻塞 handler 的持续超时检查**（一元调用）
+- ✅ **长时间阻塞 handler 的持续超时检查**（流式调用）
+- ✅ 连接超时配置生效（一元调用）
+- ✅ 连接超时配置生效（流式调用）
+- ✅ 流式调用超时
+- ✅ 拦截器中断请求
+- ✅ 元数据认证失败
+- ✅ 已关闭流的发送/接收
+- ✅ 服务器停止后的注册
+- ✅ 服务器停止后的调用
+- ✅ 无效方法描述符
+- ✅ nil 处理器注册
+- ✅ **并发流超过上限**
+- ✅ **Stream 接口完整性验证（客户端流）**
+- ✅ **Stream 接口完整性验证（双向流）**
+- ✅ **RecvMsg 数据传递验证（字符串、整数、多条消息）**
+- ✅ **RecvMsg 无效参数（nil、非指针）**
+- ✅ **cancel 资源释放验证（流关闭后 context 立即取消）**
+- ✅ **cancelFn 存在性验证（ConnectionTimeout > 0 时设置）**
+- ✅ **RecvFromServer 命名正确性（服务端流、客户端流、双向流）**
+
+## 9. 修复记录
+
+### v2.0 修复内容（针对设计缺陷）
+
+1. **修复持续超时校验**
+   - 问题：checkDeadline 只在调用前检查一次，handler 阻塞时无法中断
+   - 修复：在 Invoke 和 HandleStream 中添加独立的监控 goroutine，每 10ms 检查一次超时
+   - 新增：panic 恢复机制，避免 handler panic 导致服务器崩溃
+   - 相关测试：`TestDeadline_ContinuousCheck`, `TestDeadline_StreamContinuousCheck`
+
+2. **修复 Stream 接口完整性**
+   - 问题：PutRecv 方法仅在 *serverStream 上定义，未暴露在 Stream 接口中
+   - 修复：在 Stream 接口中添加 PutRecv、Send、Recv、Header 方法
+   - 新增 Send() 方法用于读取服务端发送的消息
+   - 相关测试：`TestClientStream_InterfaceIntegrity`, `TestBidiStream_InterfaceIntegrity`, `TestStream_RecvInterface`
+
+3. **移除虚假 API 表面积**
+   - 问题：ServiceDesc 的 HandlerType 和 Metadata 字段定义后从未使用
+   - 修复：从 ServiceDesc 中移除这两个字段
+   - 影响：简化 API，减少混淆
+
+4. **简化接口设计**
+   - 问题：ServerStream 和 ClientStream 接口仅内嵌 Stream，无额外方法
+   - 修复：移除这两个接口，统一使用 Stream 接口
+   - 影响：简化 API，避免不必要的类型转换
+
+5. **实现 ServerOptions 配置**
+   - 问题：MaxConcurrentStreams 和 ConnectionTimeout 定义后从未使用
+   - 修复：
+     - MaxConcurrentStreams：新增 activeStreams 原子计数，acquireStream/releaseStream 机制
+     - ConnectionTimeout：自动为请求创建带超时的上下文
+   - 新增错误：ErrTooManyStreams
+   - 新增方法：ActiveStreams(), Options()
+   - 相关测试：`TestMaxConcurrentStreams`, `TestNewStream_TooManyConcurrent`, `TestConnectionTimeout`, `TestConnectionTimeout_Stream`
+
+6. **修复 SetHeader 机制**
+   - 问题：newContextWithStream 和 streamKey 定义后从未使用，SetHeader 为空操作
+   - 修复：移除 streamKey 和 newContextWithStream，重新设计 header 机制
+   - 新增：headerKey, NewContextWithHeader(), SetHeader(), HeaderFromContext()
+   - 相关测试：`TestHeader`, `TestStreamHeader`
+
+7. **新增测试用例**
+   - 超时持续校验：一元调用、流式调用
+   - ServerOptions 验证：默认值、自定义值、零值处理
+   - 并发流控制：达到上限、释放后恢复
+   - 连接超时：一元调用、流式调用
+   - Stream 接口完整性：客户端流、双向流
+   - Header 元数据：一元调用、流式调用
+
+### v3.0 修复内容（针对代码缺陷）
+
+1. **修复 RecvMsg 数据传递**
+   - 问题：RecvMsg 从 recvCh 读取消息后用空白标识符丢弃，msg 参数从未填充
+   - 修复：使用 reflect.ValueOf 将 recvCh 数据写入 msg 指针，msg 必须为非 nil 指针
+   - 校验顺序：先检查流是否关闭，再校验 msg 参数（避免无效参数导致数据丢失）
+   - 相关测试：`TestRecvMsg_DataPopulation`, `TestRecvMsg_MultipleDataPopulation`, `TestRecvMsg_NilPointer`, `TestRecvMsg_IntegerData`
+
+2. **修复 cancel 资源泄漏**
+   - 问题：NewStream 中 context.WithTimeout 的 cancel 函数被 `_ = cancel` 丢弃，流关闭后 context 内部 goroutine 泄漏
+   - 修复：在 serverStream 中新增 cancelFn 字段，Close() 时调用 cancelFn 释放资源
+   - 相关测试：`TestCancel_ReleaseOnStreamClose`, `TestCancel_NoLeakOnStreamClose`, `TestCancel_CancelFnSetWithConnectionTimeout`
+
+3. **修复 Send/Recv 命名冲突**
+   - 问题：Send() 方法实际从 sendCh 读取（接收服务端消息），与 SendMsg()（写入 sendCh）方向相反，命名极易混淆
+   - 修复：将 Send() 重命名为 RecvFromServer()，语义为"接收来自服务端的消息"
+   - 更新：Stream 接口、serverStream 实现、mockStream、所有测试用例和文档示例
+   - 相关测试：`TestRecvFromServer_NamingCorrectness`, `TestRecvFromServer_BidiNaming`, `TestRecvFromServer_ClientStream`
+
+4. **简化双层 goroutine 为单层+select**
+   - 问题：Invoke 和 HandleStream 中每调用一次 RPC 启动两个 goroutine（外层监控+内层 handler），高并发下调度开销成倍
+   - 修复：改为单 goroutine 执行 handler，调用方 goroutine 直接 select 监听 handlerDone/ticker.C/ctx.Done()
+   - 消除：resultCh 中转 channel 和多余的 done channel
+   - 影响：每 RPC 调用减少 1 个 goroutine，降低调度开销

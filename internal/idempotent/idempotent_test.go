@@ -319,10 +319,18 @@ func TestExecute_ConcurrentDifferentKeys(t *testing.T) {
 	var wg sync.WaitGroup
 	var totalCalls int64
 
+	goroutineErrs := make([][]error, numGoroutines)
+	for g := 0; g < numGoroutines; g++ {
+		goroutineErrs[g] = make([]error, 0, keysPerGoroutine)
+	}
+
+	var errsMu sync.Mutex
+
 	for g := 0; g < numGoroutines; g++ {
 		wg.Add(1)
 		go func(gid int) {
 			defer wg.Done()
+			localErrs := make([]error, 0, keysPerGoroutine)
 			for k := 0; k < keysPerGoroutine; k++ {
 				key := fmt.Sprintf("g%d-k%d", gid, k)
 				handler := func() Response {
@@ -331,13 +339,22 @@ func TestExecute_ConcurrentDifferentKeys(t *testing.T) {
 				}
 				_, _, err := i.Execute(key, handler)
 				if err != nil {
-					t.Errorf("goroutine %d key %s error: %v", gid, key, err)
+					localErrs = append(localErrs, fmt.Errorf("goroutine %d key %s error: %w", gid, key, err))
 				}
 			}
+			errsMu.Lock()
+			goroutineErrs[gid] = append(goroutineErrs[gid], localErrs...)
+			errsMu.Unlock()
 		}(g)
 	}
 
 	wg.Wait()
+
+	for gid, errs := range goroutineErrs {
+		for _, err := range errs {
+			t.Errorf("goroutine %d: %v", gid, err)
+		}
+	}
 
 	expected := int64(numGoroutines * keysPerGoroutine)
 	if totalCalls != expected {
@@ -366,14 +383,13 @@ func TestExecute_StopDuringHandler_WaitingRequestsReturnError(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+	var firstReqErr error
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		_, _, err := i.Execute("stop-wait-key", handler)
-		if !errors.Is(err, ErrIdempotentStopped) {
-			t.Errorf("first request: expected ErrIdempotentStopped, got %v", err)
-		}
+		firstReqErr = err
 	}()
 
 	<-handlerStarted
@@ -406,6 +422,10 @@ func TestExecute_StopDuringHandler_WaitingRequestsReturnError(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("deadlock waiting for goroutines")
+	}
+
+	if !errors.Is(firstReqErr, ErrIdempotentStopped) {
+		t.Errorf("first request: expected ErrIdempotentStopped, got %v", firstReqErr)
 	}
 
 	for idx, err := range waiterErrs {
@@ -1295,3 +1315,174 @@ func TestCloneHeader(t *testing.T) {
 		t.Error("cloneHeader(nil) should return nil")
 	}
 }
+
+func TestMiddleware_SideEffectHandlerNotCalledTwice(t *testing.T) {
+	i := NewIdempotent()
+
+	var sideEffectCount int64
+	var callCount int64
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&callCount, 1)
+		atomic.AddInt64(&sideEffectCount, 1)
+		w.Header().Set("X-Result", "applied")
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte("resource created"))
+	})
+
+	mw := i.Middleware(handler)
+
+	req := httptest.NewRequest("POST", "/test", nil)
+	req.Header.Set("X-Idempotency-Key", "side-effect-key")
+	rr := httptest.NewRecorder()
+	mw.ServeHTTP(rr, req)
+
+	cc := atomic.LoadInt64(&callCount)
+	sec := atomic.LoadInt64(&sideEffectCount)
+	if cc != 1 {
+		t.Fatalf("expected handler callCount=1, got %d", cc)
+	}
+	if sec != 1 {
+		t.Fatalf("expected sideEffectCount=1, got %d", sec)
+	}
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected status %d, got %d", http.StatusCreated, rr.Code)
+	}
+	if rr.Body.String() != "resource created" {
+		t.Errorf("expected body 'resource created', got '%s'", rr.Body.String())
+	}
+	if rr.Header().Get("X-Result") != "applied" {
+		t.Errorf("expected X-Result='applied', got '%s'", rr.Header().Get("X-Result"))
+	}
+	if rr.Header().Get("X-Idempotent-Cache") != "MISS" {
+		t.Errorf("expected X-Idempotent-Cache=MISS, got '%s'", rr.Header().Get("X-Idempotent-Cache"))
+	}
+
+	req2 := httptest.NewRequest("POST", "/test", nil)
+	req2.Header.Set("X-Idempotency-Key", "side-effect-key")
+	rr2 := httptest.NewRecorder()
+	mw.ServeHTTP(rr2, req2)
+
+	cc2 := atomic.LoadInt64(&callCount)
+	sec2 := atomic.LoadInt64(&sideEffectCount)
+	if cc2 != 1 {
+		t.Errorf("after cache hit: handler should not be called again, callCount=%d", cc2)
+	}
+	if sec2 != 1 {
+		t.Errorf("after cache hit: side effect should not happen twice, sideEffectCount=%d", sec2)
+	}
+	if rr2.Header().Get("X-Idempotent-Cache") != "HIT" {
+		t.Errorf("expected cache HIT on second request, got '%s'", rr2.Header().Get("X-Idempotent-Cache"))
+	}
+}
+
+func TestMiddleware_StopAfterHandlerExecuted_UsesRecordedResponse(t *testing.T) {
+	i := NewIdempotent()
+
+	handlerStarted := make(chan struct{})
+	handlerCanFinish := make(chan struct{})
+
+	var sideEffectCount int64
+	var callCount int64
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&callCount, 1)
+		atomic.AddInt64(&sideEffectCount, 1)
+		close(handlerStarted)
+		<-handlerCanFinish
+		w.Header().Set("X-Result", "committed")
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte("request accepted"))
+	})
+
+	mw := i.Middleware(handler)
+
+	var mwRespCode int
+	var mwRespBody string
+	var mwRespResult string
+	var mwCacheStatus string
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest("POST", "/test", nil)
+		req.Header.Set("X-Idempotency-Key", "stop-during-handler")
+		rr := httptest.NewRecorder()
+		mw.ServeHTTP(rr, req)
+		mwRespCode = rr.Code
+		mwRespBody = rr.Body.String()
+		mwRespResult = rr.Header().Get("X-Result")
+		mwCacheStatus = rr.Header().Get("X-Idempotent-Cache")
+	}()
+
+	<-handlerStarted
+
+	go func() {
+		i.Stop()
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+
+	close(handlerCanFinish)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock waiting for middleware to finish")
+	}
+
+	cc := atomic.LoadInt64(&callCount)
+	sec := atomic.LoadInt64(&sideEffectCount)
+	if cc != 1 {
+		t.Errorf("expected handler to be called exactly once, got %d", cc)
+	}
+	if sec != 1 {
+		t.Errorf("expected side effect to happen exactly once, got %d", sec)
+	}
+
+	if mwRespCode != http.StatusAccepted {
+		t.Errorf("expected recorded status %d, got %d — handler executed, must not return 503",
+			http.StatusAccepted, mwRespCode)
+	}
+	if mwRespBody != "request accepted" {
+		t.Errorf("expected recorded body 'request accepted', got '%s'", mwRespBody)
+	}
+	if mwRespResult != "committed" {
+		t.Errorf("expected recorded header X-Result='committed', got '%s'", mwRespResult)
+	}
+	if mwCacheStatus != "MISS" {
+		t.Errorf("expected X-Idempotent-Cache=MISS for recorded response, got '%s'", mwCacheStatus)
+	}
+}
+
+func TestMiddleware_HandlerNotExecuted_Stop_Returns503(t *testing.T) {
+	i := NewIdempotent()
+	i.Stop()
+
+	var callCount int64
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&callCount, 1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("never reached"))
+	})
+
+	mw := i.Middleware(handler)
+
+	req := httptest.NewRequest("POST", "/test", nil)
+	req.Header.Set("X-Idempotency-Key", "before-execute-stop")
+	rr := httptest.NewRecorder()
+	mw.ServeHTTP(rr, req)
+
+	cc := atomic.LoadInt64(&callCount)
+	if cc != 0 {
+		t.Errorf("handler should not have been called, callCount=%d", cc)
+	}
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected status %d when stopped before execution, got %d",
+			http.StatusServiceUnavailable, rr.Code)
+	}
+	if rr.Body.String() == "never reached" {
+		t.Error("response body should not contain handler output when stopped")
+	}
+}
+
