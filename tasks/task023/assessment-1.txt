@@ -1,0 +1,8 @@
+产物不满意：
+1. colstore.go 中 Config 结构体的 DictionaryEnabled 字段从未被任何代码引用或检查。NewColumnStoreWithConfig 虽然接收 Config 参数并存储，但 Column 的 encode 方法和 appendValues 方法中完全无条件地执行字典编码，无论用户将 DictionaryEnabled 设置为 true 还是 false 压缩始终生效。TestNewColumnStoreWithConfig 测试仅验证存储初始化成功而未验证配置的实际效果，导致该问题被掩盖。根本原因是模型设计了配置开关 API 但在核心编码路径中忘记加入 `if config.DictionaryEnabled` 的条件分支，应在 encode 和 decode 方法中根据配置状态决定是否走字典编码逻辑或是直接存储原始值。
+2. colstore.go 的 compareValues 函数在处理类型不匹配的组合时使用 `fmt.Sprintf("%v", a)` 将两侧值转为字符串后按字典序比较，而不是返回明确的类型不兼容错误。这导致 int(1) 与 string("1") 在 OpEq 谓词下被判定为相等，因为两者 %v 格式化输出均为 "1"，进而使谓词下推过滤返回错误的行集合。同样，bool 与 string 类型比较时也走此兜底路径。根本原因是类型 switch 只覆盖了 int、float64、string、bool 四种 input 类型与对应 output 类型的组合，缺少对不兼容类型对（如 int 与 string）的显式错误处理，应返回比较错误或规定类型不兼容时直接跳过该谓词。
+3. colstore.go 中 Column 结构体内部维护了独立的 sync.RWMutex，appendValues 获取写锁、getValueAt 和 getValuesAt 获取读锁。但这些列级方法全部在 ColumnStore 的 Write（已持 cs.mu 写锁）或 Read/ReadWithFilter（已持 cs.mu 读锁）方法内部调用，列级锁从未被独立使用形成双重加锁机制。每次列操作都需要在全局锁基础上再获取一次列级锁，增加了不必要的锁竞争开销却未提供任何并发收益。根本原因是 Column 设计时添加了独立锁但 Write 和 Read 的实现路径全部经过 ColumnStore 全局锁，应去除列级锁来消除冗余。
+
+过程不满意：
+1. 模型在探索项目结构后直接一次性将 colstore.go 全部 400 余行代码写完，随后又是一次性写完 colstore_test.go，然后才运行 go test 验证。这种全量编码再统一验证的策略导致 Config.DictionaryEnabled 未被接入编码逻辑的设计缺陷被直接固化——模型在设计 API 表面时添加了配置开关却在核心编码路径中遗漏了条件分支，而一次交付加一次测试验证的模式掩盖了此问题。正确做法是先将基础读写功能实现并编写对应测试跑通，再逐步叠加字典编码和谓词过滤，每完成一个子特性立即用最小测试集验证，这样更容易在早期发现功能遗漏。
+2. 模型首次运行 go test 后仅发现空行写入测试失败，便直接定位到 Write 函数中 early return 的逻辑将列创建提前到 `if expectedRows == 0` 之前，修改后重新测试通过即宣布完成。但模型没有进一步审查 Write 函数中其他校验分支是否存在类似的"校验成功后才执行副作用"的问题。例如列长度不一致的校验同样在列创建之前执行确保了原子性，但模型并未验证这一路径的正确性，也未主动检查列边界越界访问等隐蔽风险。这表明模型在调试时倾向于修补测试指出的具体问题而非系统性地扫描同类逻辑缺陷。正确做法是在修复一处后排查同一函数内所有校验路径，确保没有相似的模式缺陷残留。

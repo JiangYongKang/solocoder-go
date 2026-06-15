@@ -1,0 +1,797 @@
+package cachesync
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	ErrNodeNotFound       = errors.New("cachesync: node not found")
+	ErrNodeExists         = errors.New("cachesync: node already exists")
+	ErrKeyNotFound        = errors.New("cachesync: key not found")
+	ErrLockTimeout        = errors.New("cachesync: lock acquisition timed out")
+	ErrLockNotHeld        = errors.New("cachesync: lock not held by caller")
+	ErrClusterStopped     = errors.New("cachesync: cluster is stopped")
+	ErrInvalidMessageType = errors.New("cachesync: invalid message type")
+	ErrVersionTooOld      = errors.New("cachesync: update rejected due to older version")
+)
+
+const (
+	defaultLockTimeout    = 5 * time.Second
+	defaultReconcileInterval = 2 * time.Second
+	defaultMessageBuffer  = 1024
+)
+
+type MessageType int
+
+const (
+	MsgUpdateNotify MessageType = iota
+	MsgInvalidate
+	MsgReconcileRequest
+	MsgReconcileResponse
+	MsgLockAcquire
+	MsgLockRelease
+	MsgLockGranted
+	MsgLockDenied
+)
+
+type CacheEntry struct {
+	Key       string
+	Value     interface{}
+	Version   uint64
+	UpdatedAt time.Time
+	NodeID    string
+}
+
+type Message struct {
+	Type       MessageType
+	FromNodeID string
+	ToNodeID   string
+	Key        string
+	Value      interface{}
+	Version    uint64
+	Timestamp  time.Time
+	LockHolder string
+	LockTTL    time.Duration
+	Entries    map[string]uint64
+}
+
+type lockInfo struct {
+	holder     string
+	expiresAt  time.Time
+	acquiredAt time.Time
+}
+
+type Config struct {
+	LockTimeout       time.Duration
+	ReconcileInterval time.Duration
+	MessageBuffer     int
+}
+
+func DefaultConfig() Config {
+	return Config{
+		LockTimeout:       defaultLockTimeout,
+		ReconcileInterval: defaultReconcileInterval,
+		MessageBuffer:     defaultMessageBuffer,
+	}
+}
+
+type pendingLock struct {
+	grantCh chan bool
+	denyCh  chan string
+}
+
+type Node struct {
+	ID              string
+	cache           map[string]*CacheEntry
+	locks           map[string]*lockInfo
+	pendingLocks    map[string]*pendingLock
+	cacheMu         sync.RWMutex
+	lockMu          sync.Mutex
+	pendingLockMu   sync.Mutex
+	inbox           chan *Message
+	cluster         *Cluster
+	running         bool
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
+	msgSent         uint64
+	msgRecv         uint64
+}
+
+type Cluster struct {
+	cfg          Config
+	nodes        map[string]*Node
+	nodesMu      sync.RWMutex
+	running      bool
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+	msgDropRate  float64
+	msgDropMu    sync.Mutex
+}
+
+func NewCluster(cfg Config) *Cluster {
+	if cfg.LockTimeout <= 0 {
+		cfg.LockTimeout = defaultLockTimeout
+	}
+	if cfg.ReconcileInterval <= 0 {
+		cfg.ReconcileInterval = defaultReconcileInterval
+	}
+	if cfg.MessageBuffer <= 0 {
+		cfg.MessageBuffer = defaultMessageBuffer
+	}
+
+	return &Cluster{
+		cfg:     cfg,
+		nodes:   make(map[string]*Node),
+		running: true,
+		stopCh:  make(chan struct{}),
+	}
+}
+
+func (c *Cluster) SetMessageDropRate(rate float64) {
+	c.msgDropMu.Lock()
+	defer c.msgDropMu.Unlock()
+	c.msgDropRate = rate
+}
+
+func (c *Cluster) shouldDropMessage() bool {
+	c.msgDropMu.Lock()
+	defer c.msgDropMu.Unlock()
+	if c.msgDropRate <= 0 {
+		return false
+	}
+	return time.Now().UnixNano()%1000 < int64(c.msgDropRate*1000)
+}
+
+func (c *Cluster) AddNode(nodeID string) (*Node, error) {
+	if nodeID == "" {
+		return nil, ErrNodeNotFound
+	}
+
+	c.nodesMu.Lock()
+	defer c.nodesMu.Unlock()
+
+	if !c.running {
+		return nil, ErrClusterStopped
+	}
+
+	if _, exists := c.nodes[nodeID]; exists {
+		return nil, ErrNodeExists
+	}
+
+	node := &Node{
+		ID:           nodeID,
+		cache:        make(map[string]*CacheEntry),
+		locks:        make(map[string]*lockInfo),
+		pendingLocks: make(map[string]*pendingLock),
+		inbox:        make(chan *Message, c.cfg.MessageBuffer),
+		cluster:      c,
+		running:      true,
+		stopCh:       make(chan struct{}),
+	}
+
+	c.nodes[nodeID] = node
+
+	node.wg.Add(1)
+	go node.messageLoop()
+
+	return node, nil
+}
+
+func (c *Cluster) RemoveNode(nodeID string) error {
+	c.nodesMu.Lock()
+	node, exists := c.nodes[nodeID]
+	if !exists {
+		c.nodesMu.Unlock()
+		return ErrNodeNotFound
+	}
+	delete(c.nodes, nodeID)
+	c.nodesMu.Unlock()
+
+	node.running = false
+	close(node.stopCh)
+	node.wg.Wait()
+	close(node.inbox)
+
+	return nil
+}
+
+func (c *Cluster) GetNode(nodeID string) (*Node, error) {
+	c.nodesMu.RLock()
+	defer c.nodesMu.RUnlock()
+
+	node, exists := c.nodes[nodeID]
+	if !exists {
+		return nil, ErrNodeNotFound
+	}
+	return node, nil
+}
+
+func (c *Cluster) NodeCount() int {
+	c.nodesMu.RLock()
+	defer c.nodesMu.RUnlock()
+	return len(c.nodes)
+}
+
+func (c *Cluster) broadcast(fromNodeID string, msg *Message) {
+	c.nodesMu.RLock()
+	defer c.nodesMu.RUnlock()
+
+	for id, node := range c.nodes {
+		if id == fromNodeID {
+			continue
+		}
+		if c.shouldDropMessage() {
+			continue
+		}
+		msgCopy := *msg
+		msgCopy.ToNodeID = id
+		select {
+		case node.inbox <- &msgCopy:
+			atomic.AddUint64(&node.msgRecv, 1)
+		default:
+		}
+	}
+}
+
+func (c *Cluster) unicast(fromNodeID, toNodeID string, msg *Message) error {
+	c.nodesMu.RLock()
+	node, exists := c.nodes[toNodeID]
+	c.nodesMu.RUnlock()
+
+	if !exists {
+		return ErrNodeNotFound
+	}
+
+	if c.shouldDropMessage() {
+		return nil
+	}
+
+	msgCopy := *msg
+	msgCopy.FromNodeID = fromNodeID
+	msgCopy.ToNodeID = toNodeID
+
+	select {
+	case node.inbox <- &msgCopy:
+		atomic.AddUint64(&node.msgRecv, 1)
+		return nil
+	default:
+		return nil
+	}
+}
+
+func (c *Cluster) Stop() {
+	c.nodesMu.Lock()
+	if !c.running {
+		c.nodesMu.Unlock()
+		return
+	}
+	c.running = false
+	close(c.stopCh)
+
+	nodes := make([]*Node, 0, len(c.nodes))
+	for _, n := range c.nodes {
+		nodes = append(nodes, n)
+	}
+	c.nodesMu.Unlock()
+
+	for _, node := range nodes {
+		node.running = false
+		close(node.stopCh)
+	}
+
+	c.wg.Wait()
+	for _, node := range nodes {
+		node.wg.Wait()
+		close(node.inbox)
+	}
+}
+
+func (c *Cluster) StartReconciler() {
+	c.wg.Add(1)
+	go c.reconcileLoop()
+}
+
+func (c *Cluster) reconcileLoop() {
+	defer c.wg.Done()
+
+	ticker := time.NewTicker(c.cfg.ReconcileInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			c.runReconciliation()
+		}
+	}
+}
+
+func (c *Cluster) runReconciliation() {
+	c.nodesMu.RLock()
+	nodeIDs := make([]string, 0, len(c.nodes))
+	for id := range c.nodes {
+		nodeIDs = append(nodeIDs, id)
+	}
+	c.nodesMu.RUnlock()
+
+	if len(nodeIDs) < 2 {
+		return
+	}
+
+	versionMap := make(map[string]map[string]uint64)
+	for _, id := range nodeIDs {
+		c.nodesMu.RLock()
+		node, ok := c.nodes[id]
+		c.nodesMu.RUnlock()
+		if !ok {
+			continue
+		}
+		versionMap[id] = node.getAllVersions()
+	}
+
+	mergedVersions := make(map[string]uint64)
+	mergedSources := make(map[string]string)
+	for nodeID, versions := range versionMap {
+		for key, version := range versions {
+			if existing, ok := mergedVersions[key]; !ok || version > existing {
+				mergedVersions[key] = version
+				mergedSources[key] = nodeID
+			}
+		}
+	}
+
+	for nodeID, versions := range versionMap {
+		c.nodesMu.RLock()
+		node, ok := c.nodes[nodeID]
+		c.nodesMu.RUnlock()
+		if !ok {
+			continue
+		}
+
+		for key, highestVersion := range mergedVersions {
+			localVersion, hasLocal := versions[key]
+			if !hasLocal || localVersion < highestVersion {
+				sourceNodeID := mergedSources[key]
+				if sourceNodeID == nodeID {
+					continue
+				}
+				c.nodesMu.RLock()
+				sourceNode, ok := c.nodes[sourceNodeID]
+				c.nodesMu.RUnlock()
+				if !ok {
+					continue
+				}
+				sourceEntry := sourceNode.Get(key)
+				if sourceEntry != nil {
+					msg := &Message{
+						Type:      MsgUpdateNotify,
+						Key:       key,
+						Value:     sourceEntry.Value,
+						Version:   sourceEntry.Version,
+						Timestamp: time.Now(),
+					}
+					node.handleUpdateNotify(msg)
+				}
+			}
+		}
+	}
+}
+
+func (n *Node) messageLoop() {
+	defer n.wg.Done()
+
+	for {
+		select {
+		case <-n.stopCh:
+			return
+		case msg, ok := <-n.inbox:
+			if !ok {
+				return
+			}
+			n.handleMessage(msg)
+		}
+	}
+}
+
+func (n *Node) handleMessage(msg *Message) {
+	switch msg.Type {
+	case MsgUpdateNotify:
+		n.handleUpdateNotify(msg)
+	case MsgInvalidate:
+		n.handleInvalidate(msg)
+	case MsgLockAcquire:
+		n.handleLockAcquire(msg)
+	case MsgLockRelease:
+		n.handleLockRelease(msg)
+	case MsgReconcileRequest:
+		n.handleReconcileRequest(msg)
+	case MsgLockGranted:
+		n.handleLockGranted(msg)
+	case MsgLockDenied:
+		n.handleLockDenied(msg)
+	}
+}
+
+func (n *Node) handleLockGranted(msg *Message) {
+	n.pendingLockMu.Lock()
+	pl, ok := n.pendingLocks[msg.Key]
+	n.pendingLockMu.Unlock()
+	if ok {
+		select {
+		case pl.grantCh <- true:
+		default:
+		}
+	}
+}
+
+func (n *Node) handleLockDenied(msg *Message) {
+	n.pendingLockMu.Lock()
+	pl, ok := n.pendingLocks[msg.Key]
+	n.pendingLockMu.Unlock()
+	if ok {
+		select {
+		case pl.denyCh <- msg.LockHolder:
+		default:
+		}
+	}
+}
+
+func (n *Node) handleUpdateNotify(msg *Message) {
+	n.cacheMu.Lock()
+	defer n.cacheMu.Unlock()
+
+	existing, ok := n.cache[msg.Key]
+	if !ok || msg.Version > existing.Version {
+		n.cache[msg.Key] = &CacheEntry{
+			Key:       msg.Key,
+			Value:     msg.Value,
+			Version:   msg.Version,
+			UpdatedAt: msg.Timestamp,
+			NodeID:    msg.FromNodeID,
+		}
+	}
+}
+
+func (n *Node) handleInvalidate(msg *Message) {
+	n.cacheMu.Lock()
+	defer n.cacheMu.Unlock()
+	delete(n.cache, msg.Key)
+}
+
+func (n *Node) handleLockAcquire(msg *Message) {
+	n.lockMu.Lock()
+	defer n.lockMu.Unlock()
+
+	li, ok := n.locks[msg.Key]
+	if ok && time.Now().Before(li.expiresAt) {
+		denyMsg := &Message{
+			Type:       MsgLockDenied,
+			FromNodeID: n.ID,
+			Key:        msg.Key,
+			LockHolder: li.holder,
+			Timestamp:  time.Now(),
+		}
+		_ = n.cluster.unicast(n.ID, msg.FromNodeID, denyMsg)
+		return
+	}
+
+	n.locks[msg.Key] = &lockInfo{
+		holder:     msg.FromNodeID,
+		expiresAt:  time.Now().Add(msg.LockTTL),
+		acquiredAt: time.Now(),
+	}
+
+	grantMsg := &Message{
+		Type:       MsgLockGranted,
+		FromNodeID: n.ID,
+		Key:        msg.Key,
+		Timestamp:  time.Now(),
+	}
+	_ = n.cluster.unicast(n.ID, msg.FromNodeID, grantMsg)
+}
+
+func (n *Node) handleLockRelease(msg *Message) {
+	n.lockMu.Lock()
+	defer n.lockMu.Unlock()
+
+	li, ok := n.locks[msg.Key]
+	if !ok {
+		return
+	}
+	if li.holder == msg.FromNodeID {
+		delete(n.locks, msg.Key)
+	}
+}
+
+func (n *Node) handleReconcileRequest(msg *Message) {
+	versions := n.getAllVersions()
+	resp := &Message{
+		Type:      MsgReconcileResponse,
+		FromNodeID: n.ID,
+		Entries:   versions,
+		Timestamp: time.Now(),
+	}
+	_ = n.cluster.unicast(n.ID, msg.FromNodeID, resp)
+}
+
+func (n *Node) getAllVersions() map[string]uint64 {
+	n.cacheMu.RLock()
+	defer n.cacheMu.RUnlock()
+
+	versions := make(map[string]uint64, len(n.cache))
+	for k, v := range n.cache {
+		versions[k] = v.Version
+	}
+	return versions
+}
+
+func (n *Node) Get(key string) *CacheEntry {
+	n.cacheMu.RLock()
+	defer n.cacheMu.RUnlock()
+
+	entry, ok := n.cache[key]
+	if !ok {
+		return nil
+	}
+	entryCopy := *entry
+	return &entryCopy
+}
+
+func (n *Node) GetAll() []*CacheEntry {
+	n.cacheMu.RLock()
+	defer n.cacheMu.RUnlock()
+
+	entries := make([]*CacheEntry, 0, len(n.cache))
+	for _, v := range n.cache {
+		entryCopy := *v
+		entries = append(entries, &entryCopy)
+	}
+	return entries
+}
+
+func (n *Node) Set(key string, value interface{}) *CacheEntry {
+	if !n.running {
+		return nil
+	}
+
+	n.cacheMu.Lock()
+	newVersion := uint64(1)
+	if existing, ok := n.cache[key]; ok {
+		newVersion = existing.Version + 1
+	}
+
+	entry := &CacheEntry{
+		Key:       key,
+		Value:     value,
+		Version:   newVersion,
+		UpdatedAt: time.Now(),
+		NodeID:    n.ID,
+	}
+	n.cache[key] = entry
+	n.cacheMu.Unlock()
+
+	notifyMsg := &Message{
+		Type:      MsgUpdateNotify,
+		FromNodeID: n.ID,
+		Key:       key,
+		Value:     value,
+		Version:   newVersion,
+		Timestamp: entry.UpdatedAt,
+	}
+	n.cluster.broadcast(n.ID, notifyMsg)
+	atomic.AddUint64(&n.msgSent, 1)
+
+	return entry
+}
+
+func (n *Node) SetWithInvalidate(key string, value interface{}) *CacheEntry {
+	if !n.running {
+		return nil
+	}
+
+	n.cacheMu.Lock()
+	newVersion := uint64(1)
+	if existing, ok := n.cache[key]; ok {
+		newVersion = existing.Version + 1
+	}
+
+	entry := &CacheEntry{
+		Key:       key,
+		Value:     value,
+		Version:   newVersion,
+		UpdatedAt: time.Now(),
+		NodeID:    n.ID,
+	}
+	n.cache[key] = entry
+	n.cacheMu.Unlock()
+
+	invalidMsg := &Message{
+		Type:      MsgInvalidate,
+		FromNodeID: n.ID,
+		Key:       key,
+		Timestamp: entry.UpdatedAt,
+	}
+	n.cluster.broadcast(n.ID, invalidMsg)
+	atomic.AddUint64(&n.msgSent, 1)
+
+	return entry
+}
+
+func (n *Node) Delete(key string) bool {
+	n.cacheMu.Lock()
+	_, existed := n.cache[key]
+	if existed {
+		delete(n.cache, key)
+	}
+	n.cacheMu.Unlock()
+
+	if existed {
+		invalidMsg := &Message{
+			Type:      MsgInvalidate,
+			FromNodeID: n.ID,
+			Key:       key,
+			Timestamp: time.Now(),
+		}
+		n.cluster.broadcast(n.ID, invalidMsg)
+		atomic.AddUint64(&n.msgSent, 1)
+	}
+
+	return existed
+}
+
+func (n *Node) Lock(key string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = n.cluster.cfg.LockTimeout
+	}
+
+	n.cluster.nodesMu.RLock()
+	peerCount := len(n.cluster.nodes) - 1
+	n.cluster.nodesMu.RUnlock()
+
+	n.lockMu.Lock()
+	li, ok := n.locks[key]
+	if ok && time.Now().Before(li.expiresAt) {
+		if li.holder == n.ID {
+			n.lockMu.Unlock()
+			return n.ID, nil
+		}
+		holder := li.holder
+		n.lockMu.Unlock()
+		return "", fmt.Errorf("%w: held by %s", ErrLockTimeout, holder)
+	}
+	n.lockMu.Unlock()
+
+	pl := &pendingLock{
+		grantCh: make(chan bool, peerCount+1),
+		denyCh:  make(chan string, peerCount+1),
+	}
+
+	n.pendingLockMu.Lock()
+	n.pendingLocks[key] = pl
+	n.pendingLockMu.Unlock()
+
+	defer func() {
+		n.pendingLockMu.Lock()
+		delete(n.pendingLocks, key)
+		n.pendingLockMu.Unlock()
+	}()
+
+	acquireMsg := &Message{
+		Type:       MsgLockAcquire,
+		FromNodeID: n.ID,
+		Key:        key,
+		LockTTL:    timeout,
+		Timestamp:  time.Now(),
+	}
+
+	n.cluster.broadcast(n.ID, acquireMsg)
+	atomic.AddUint64(&n.msgSent, 1)
+
+	grantCount := 0
+	deniedHolder := ""
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	requiredGrants := peerCount
+	if requiredGrants <= 0 {
+		n.lockMu.Lock()
+		n.locks[key] = &lockInfo{
+			holder:     n.ID,
+			expiresAt:  time.Now().Add(timeout),
+			acquiredAt: time.Now(),
+		}
+		n.lockMu.Unlock()
+		return n.ID, nil
+	}
+
+	for {
+		select {
+		case <-pl.grantCh:
+			grantCount++
+			if grantCount >= requiredGrants {
+				n.lockMu.Lock()
+				n.locks[key] = &lockInfo{
+					holder:     n.ID,
+					expiresAt:  time.Now().Add(timeout),
+					acquiredAt: time.Now(),
+				}
+				n.lockMu.Unlock()
+				return n.ID, nil
+			}
+		case holder := <-pl.denyCh:
+			deniedHolder = holder
+			return "", fmt.Errorf("%w: held by %s", ErrLockTimeout, holder)
+		case <-timer.C:
+			if deniedHolder != "" {
+				return "", fmt.Errorf("%w: timed out waiting for lock held by %s", ErrLockTimeout, deniedHolder)
+			}
+			return "", fmt.Errorf("%w: timed out waiting for lock consensus", ErrLockTimeout)
+		}
+	}
+}
+
+func (n *Node) Unlock(key string) error {
+	n.lockMu.Lock()
+	li, ok := n.locks[key]
+	if !ok {
+		n.lockMu.Unlock()
+		return ErrLockNotHeld
+	}
+	if li.holder != n.ID {
+		holder := li.holder
+		n.lockMu.Unlock()
+		return fmt.Errorf("%w: lock held by %s", ErrLockNotHeld, holder)
+	}
+	delete(n.locks, key)
+	n.lockMu.Unlock()
+
+	releaseMsg := &Message{
+		Type:      MsgLockRelease,
+		FromNodeID: n.ID,
+		Key:       key,
+		Timestamp: time.Now(),
+	}
+	n.cluster.broadcast(n.ID, releaseMsg)
+	atomic.AddUint64(&n.msgSent, 1)
+
+	return nil
+}
+
+func (n *Node) GetLockHolder(key string) string {
+	n.lockMu.Lock()
+	defer n.lockMu.Unlock()
+
+	li, ok := n.locks[key]
+	if !ok {
+		return ""
+	}
+	if !time.Now().Before(li.expiresAt) {
+		return ""
+	}
+	return li.holder
+}
+
+func (n *Node) IsLocked(key string) bool {
+	return n.GetLockHolder(key) != ""
+}
+
+func (n *Node) Reconcile() {
+	n.cluster.runReconciliation()
+}
+
+func (n *Node) Stats() (sent, recv uint64, cacheSize int, lockCount int) {
+	sent = atomic.LoadUint64(&n.msgSent)
+	recv = atomic.LoadUint64(&n.msgRecv)
+	n.cacheMu.RLock()
+	cacheSize = len(n.cache)
+	n.cacheMu.RUnlock()
+	n.lockMu.Lock()
+	lockCount = len(n.locks)
+	n.lockMu.Unlock()
+	return
+}

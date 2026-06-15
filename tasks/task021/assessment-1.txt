@@ -1,0 +1,9 @@
+产物不满意：
+1. objstore.go 中声明了 `ErrInvalidMaxVersion` 和 `ErrInvalidBatchSize` 两个导出错误变量，但 `NewObjectStoreWithConfig` 在接收到无效配置参数时直接静默替换为默认值而非返回这些错误。调用方传入 MaxVersions=-1 后拿到一个默认10的存储实例，无法感知配置被静默修正，引用这两个错误变量做错误匹配也永远不会命中。原因是无效参数的两种处理策略未统一，正确做法是构造函数中返回对应 error 让调用方感知配置非法，或移除未使用的错误变量消除误导。
+2. `CleanupAll` 方法在 objstore.go 第255行定义，方法名暗示一次性清理全部超出版本数上限的旧版本，但实际每次调用只对每个键清理最多 CleanupBatchSize 个版本。测试用例 `TestCleanupAll_MultipleBatches` 验证了同一键从6个版本降到2个需连续调用4次 CleanupAll 才能完成。如果调用方按方法名理解并在一次调用后即认为数据已清理完毕，后续写入可能因存量版本数仍超限而触发意外清理。原因是实现时将批处理逻辑与"全部清理"的语义混淆了，正确做法是方法内部循环调用清理逻辑直到所有键都不再超限，或更名为 CleanupBatch 以如实表达单次批处理行为。
+3. objstore.go 中 `GetVersion` 方法第138行和 `Rollback` 方法第187行都通过 `for _, v := range versions` 线性遍历来查找指定版本号。对象存储中版本切片始终按版本号升序排列——Put 总是 append 到尾部、清理只从头截断——因此该数据结构天然支持二分查找。当用户配置较大的 MaxVersions 时，每次版本回滚或历史版本读取都需遍历全部版本，时间复杂度 O(n)。虽然在默认 MaxVersions=10 下影响不大，但模块未利用已排序特性优化查找。原因是没有识别到版本切片的不变式，应用 `sort.Search` 将查找降至 O(log n)。
+
+过程不满意：
+1. 模型在初版 objstore.go 编写阶段遗漏了提示词第4条需求——提示词明确要求"清理策略的触发时机和清理批次大小可配置"，但初版 Config 只有 MaxVersions 和 CleanupBatchSize 两个字段，缺少 CleanupInterval 触发间隔配置。第一次 go test 运行后出现 TestCleanup_BatchSize、TestCleanupAll 和 TestConcurrentRollback 共3个失败用例，模型才在观察失败原因后被动意识到设计中缺失了 CleanupInterval。这表明模型在开始编码前未逐条分析提示词中的所有配置维度，正确做法是先列出功能需求清单，在设计 Config 时确保每个可配置维度都有对应字段后再编码。
+2. 在修复 TestCleanup_BatchSize 时模型采用了试错式数字调整策略。模型先将期望值写为 15，测试运行失败后说"等一下，让我重新计算一下，第二次清理后应该是 16 个版本而不是 15 个"然后直接改数字。这是根据实际输出反推预期值的行为——模型没有事先建立清理触发时序的完整推导，而是让测试结果来告诉自己对不对。虽然最终 16 是正确的，但这一行为说明模型依赖测试做算术而非在编码前系统推演配置下每次 Put 后版本数的变化轨迹。正确做法是在编写测试前先推演 CleanupInterval=10 条件下第 10 次和第 20 次 Put 的完整清理效果。
+3. 模型在第一次测试运行出现3个失败用例后，没有逐一分析每个失败用例的根因再做最小范围修复，而是直接用 Write 工具将 objstore.go 和 objstore_test.go 两个文件整体重写。会话日志显示模型说"我需要重新思考一下清理策略的设计"，随后用 Write 全量覆盖两个文件。这种整体推倒重来的方式丢失了第一版的调试上下文，也在重写中引入了 TestCleanup_BatchSize 期望值计算错误，形成了三轮修复循环。正确做法是针对3个失败用例逐一定位根因——本质上都是 Config 缺少 CleanupInterval 导致的——然后只对 Config 结构体和相关函数做增量修改。

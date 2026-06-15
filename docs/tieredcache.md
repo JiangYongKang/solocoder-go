@@ -1,0 +1,552 @@
+# TieredCache 多级缓存架构模块
+
+## 1. 模块概述
+
+TieredCache 是一个高性能的多级缓存架构模块，实现了 L1 内存缓存 + L2 磁盘缓存的两级缓存架构。通过级联查询、智能写入策略和独立容量控制，在保证访问速度的同时提供了数据持久化能力，适用于需要权衡性能与存储容量的场景。
+
+**包路径**: `internal/tieredcache`
+
+## 2. 核心功能
+
+| 功能 | 描述 |
+|------|------|
+| L1/L2 级联查询 | 查询时先检查 L1 内存缓存，未命中再查 L2 磁盘缓存，L2 命中后自动回填到 L1 |
+| 双写模式（Write Through） | 写入时同时更新 L1 和 L2，保证数据一致性 |
+| 回写模式（Write Back） | 写入时仅更新 L1 并标记为脏，异步刷入 L2，提升写入性能 |
+| 独立容量控制 | L1 和 L2 各自维护独立的容量上限，支持条目数量或字节数两种计量方式 |
+| LRU 淘汰策略 | 内置 LRU（最近最少使用）淘汰算法，缓存满时自动逐出最久未使用的条目 |
+| 磁盘持久化 | L2 缓存数据持久化到磁盘，重启后可自动加载恢复 |
+| 并发安全 | 所有操作均支持并发访问，通过读写锁保证线程安全 |
+
+## 3. 核心结构体与职责
+
+### 3.1 TieredCache
+
+多级缓存主结构体，对外提供所有操作接口。
+
+```go
+type TieredCache struct {
+    l1              *lruCache
+    l2              *lruCache
+    l2Dir           string
+    writePolicy     WritePolicy
+    mu              sync.RWMutex
+    writeBackTicker *time.Ticker
+    writeBackStop   chan struct{}
+}
+```
+
+**职责**:
+- 协调 L1 和 L2 两级缓存的交互
+- 实现级联查询逻辑与数据回填
+- 根据配置的写入策略执行写入操作
+- 管理回写模式下的异步刷盘定时器
+- 提供统一的并发访问控制
+
+### 3.2 lruCache
+
+LRU 缓存实现，作为 L1 和 L2 的底层存储引擎。
+
+```go
+type lruCache struct {
+    items       map[string]*list.Element
+    orderList   *list.List
+    capacity    int64
+    capacityMode CapacityMode
+    count       int64
+    totalBytes  int64
+    mu          sync.RWMutex
+    onEvict     func(*CacheEntry)
+}
+```
+
+**职责**:
+- 基于 `container/list` 实现 O(1) 复杂度的 LRU 算法
+- 维护缓存条目，支持按容量或字节数限制
+- 缓存满时自动执行淘汰策略
+- 支持淘汰回调通知，用于清理磁盘文件或回写脏数据
+
+### 3.3 CacheEntry
+
+缓存条目结构体，存储单个键值对的元数据。
+
+```go
+type CacheEntry struct {
+    Key       string
+    Value     []byte
+    Size      int
+    Timestamp int64
+    Dirty     bool
+}
+```
+
+**职责**:
+- 存储键值对数据及大小信息
+- `Dirty` 标记用于回写模式，表示数据需要同步到磁盘
+- `Timestamp` 记录创建/更新时间，用于调试和监控
+
+### 3.4 Config
+
+多级缓存配置结构体。
+
+```go
+type Config struct {
+    L1Config          CacheLevelConfig
+    L2Config          CacheLevelConfig
+    WritePolicy       WritePolicy
+    L2Dir             string
+    WriteBackInterval time.Duration
+}
+```
+
+### 3.5 CacheLevelConfig
+
+单级缓存配置结构体。
+
+```go
+type CacheLevelConfig struct {
+    Capacity       int64
+    CapacityMode   CapacityMode
+    EvictionPolicy EvictionPolicy
+}
+```
+
+## 4. 核心常量与类型
+
+### 4.1 写入策略（WritePolicy）
+
+| 常量 | 描述 |
+|------|------|
+| `WritePolicyWriteThrough` | 双写模式：同时写入 L1 和 L2 |
+| `WritePolicyWriteBack` | 回写模式：仅写入 L1，异步刷入 L2 |
+
+### 4.2 容量模式（CapacityMode）
+
+| 常量 | 描述 |
+|------|------|
+| `CapacityModeCount` | 按条目数量限制容量 |
+| `CapacityModeBytes` | 按总字节数限制容量 |
+
+### 4.3 淘汰策略（EvictionPolicy）
+
+| 常量 | 描述 |
+|------|------|
+| `EvictionPolicyLRU` | LRU（最近最少使用）淘汰算法 |
+
+### 4.4 错误定义
+
+| 错误变量 | 含义 | 触发场景 |
+|----------|------|----------|
+| `ErrKeyNotFound` | 键不存在 | L1 和 L2 中均未找到指定键 |
+| `ErrInvalidCapacity` | 无效容量 | 配置容量小于等于 0 |
+| `ErrInvalidPolicy` | 无效策略 | 配置了未支持的写入策略 |
+| `ErrNilValue` | 值为空 | Put 操作传入 nil 值 |
+| `ErrEmptyKey` | 键为空 | 操作传入空字符串键 |
+
+## 5. 数据流转路径
+
+### 5.1 查询流程（Get）
+
+```
+Get(key) 流程:
+  ┌──────────────────────────┐
+  │ 1. 检查 L1 内存缓存      │
+  │    l1.get(key)           │
+  └──────────┬───────────────┘
+             │
+        ┌────┴────┐
+        │  命中?  │
+        └┬───────┬┘
+         是       否
+         ▼        ▼
+      返回值  ┌─────────────────────┐
+              │ 2. 检查 L2 缓存     │
+              │    l2.get(key)      │
+              └──────────┬──────────┘
+                         │
+                    ┌────┴────┐
+                    │  命中?  │
+                    └┬───────┬┘
+                     是       否
+                     ▼        ▼
+              ┌────────────┐ 返回 ErrKeyNotFound
+              │ 3. 回填 L1 │
+              │  l1.put()  │
+              └─────┬──────┘
+                    ▼
+                 返回值
+```
+
+**设计要点**:
+- L2 命中后必须回填到 L1，加速后续访问
+- 整个查询过程持有读锁，保证并发安全
+- 回填操作在持有读锁的情况下进行（lruCache 内部有独立锁）
+
+### 5.2 写入流程 - 双写模式（Write Through）
+
+```
+Put(key, value) [WriteThrough]:
+  ┌──────────────────────────┐
+  │ 1. 写入 L1 内存缓存      │
+  │    l1.put(key, value)    │
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ 2. 写入 L2 缓存          │
+  │    l2.put(key, value)    │
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ 3. 写入磁盘文件          │
+  │    writeToL2()           │
+  └──────────────────────────┘
+```
+
+**特点**:
+- 数据同步写入内存和磁盘，一致性最高
+- 写入性能受限于磁盘 I/O 速度
+- 适用于数据一致性要求高的场景
+
+### 5.3 写入流程 - 回写模式（Write Back）
+
+```
+Put(key, value) [WriteBack]:
+  ┌──────────────────────────┐
+  │ 1. 写入 L1 内存缓存      │
+  │    l1.put(key, value)    │
+  │    标记 Dirty = true     │
+  └──────────────────────────┘
+
+          异步定时刷盘:
+  ┌──────────────────────────┐
+  │ 遍历 L1 中所有 Dirty 条目│
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ 写入 L2 缓存和磁盘文件   │
+  │ 清除 Dirty 标记          │
+  └──────────────────────────┘
+```
+
+**触发刷盘的时机**:
+1. **定时刷盘**: 按 `WriteBackInterval` 配置的间隔自动刷盘（默认 5 秒）
+2. **淘汰触发**: 当 L1 淘汰 Dirty 条目时，先刷盘再淘汰
+3. **手动刷盘**: 调用 `Flush()` 方法立即刷盘
+4. **关闭触发**: 调用 `Close()` 方法时自动刷盘
+
+**特点**:
+- 写入操作仅操作内存，性能极高
+- 存在数据丢失风险（进程崩溃时未刷盘的 Dirty 数据会丢失）
+- 适用于写入频繁、可容忍少量数据丢失的场景
+
+### 5.4 淘汰流程
+
+```
+LRU 淘汰触发:
+  ┌──────────────────────────┐
+  │ 容量达到上限?            │
+  └──────────┬───────────────┘
+             │ 是
+             ▼
+  ┌──────────────────────────┐
+  │ 选择最近最少使用的条目   │
+  │ (orderList.Back())       │
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ 调用 onEvict 回调        │
+  │  - L1: 若 Dirty 则刷盘   │
+  │  - L2: 删除磁盘文件      │
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ 从缓存中移除条目         │
+  └──────────────────────────┘
+```
+
+**淘汰策略特性**:
+- L1 和 L2 独立配置容量和淘汰策略
+- L1 淘汰 Dirty 条目时会自动写入 L2
+- L2 淘汰时会删除对应的磁盘文件
+
+## 6. LRU 算法实现
+
+### 6.1 数据结构
+
+使用 `container/list` 维护访问顺序，`map` 提供 O(1) 查找：
+
+```
+items map[string]*list.Element
+        │
+        ▼
+    key1 ────► elem ────► CacheEntry{key1, ...}
+    key2 ────► elem ────► CacheEntry{key2, ...}
+                           ▲
+                           │
+orderList list.List:  Head ──► elem(key3) ──► elem(key2) ──► elem(key1) ◄── Tail
+                        最近使用                          最久未使用（淘汰候选）
+```
+
+### 6.2 核心操作
+
+**Get 操作**:
+1. 通过 map 查找元素（O(1)）
+2. 将元素移到链表头部（标记为最近使用）
+3. 返回值
+
+**Put 操作**:
+1. 若键已存在：更新值，移到链表头部
+2. 若键不存在：
+   - 创建新元素，插入链表头部
+   - 检查容量，若已满则淘汰链表尾部元素
+
+### 6.3 时间复杂度
+
+| 操作 | 时间复杂度 |
+|------|-----------|
+| Get | O(1) |
+| Put | O(1) |
+| Delete | O(1) |
+| Evict | O(1) |
+
+## 7. 并发安全设计
+
+### 7.1 锁层次结构
+
+```
+TieredCache.mu (RWMutex)
+    ├─ l1.mu (RWMutex)
+    └─ l2.mu (RWMutex)
+```
+
+### 7.2 锁策略
+
+| 操作 | TieredCache 锁 | l1/l2 锁 | 说明 |
+|------|---------------|----------|------|
+| Get | RLock | RLock + Lock | 级联查询时先加读锁，回填时升级 |
+| Put | Lock | Lock | 写入需要加写锁 |
+| Delete | Lock | Lock | 删除需要加写锁 |
+| Clear | Lock | Lock | 清空需要加写锁 |
+| Flush | RLock | RLock | 刷盘只需要读锁 |
+
+### 7.3 死锁避免
+
+- 严格按照 `TieredCache.mu` → `l1.mu` → `l2.mu` 的顺序加锁
+- 永远不反向获取锁
+- 回调函数（onEvict）在锁释放后执行，避免持有锁时执行耗时操作
+
+## 8. 使用示例
+
+### 8.1 基本使用 - 双写模式
+
+```go
+package main
+
+import (
+    "fmt"
+    "solocoder-go/internal/tieredcache"
+)
+
+func main() {
+    // 使用默认配置创建（双写模式）
+    tc, err := tieredcache.NewTieredCache()
+    if err != nil {
+        panic(err)
+    }
+    defer tc.Close()
+
+    // 写入数据
+    err = tc.Put("user:1:name", []byte("Alice"))
+    if err != nil {
+        panic(err)
+    }
+
+    // 读取数据
+    val, err := tc.Get("user:1:name")
+    if err != nil {
+        panic(err)
+    }
+    fmt.Println("Name:", string(val))
+
+    // 删除数据
+    err = tc.Delete("user:1:name")
+    if err != nil {
+        panic(err)
+    }
+
+    // 获取统计信息
+    fmt.Println("L1 count:", tc.L1Count())
+    fmt.Println("L2 count:", tc.L2Count())
+}
+```
+
+### 8.2 自定义配置 - 回写模式
+
+```go
+import "time"
+
+cfg := tieredcache.Config{
+    L1Config: tieredcache.CacheLevelConfig{
+        Capacity:       1000,
+        CapacityMode:   tieredcache.CapacityModeCount,
+        EvictionPolicy: tieredcache.EvictionPolicyLRU,
+    },
+    L2Config: tieredcache.CacheLevelConfig{
+        Capacity:       100 * 1024 * 1024, // 100MB
+        CapacityMode:   tieredcache.CapacityModeBytes,
+        EvictionPolicy: tieredcache.EvictionPolicyLRU,
+    },
+    WritePolicy:       tieredcache.WritePolicyWriteBack,
+    L2Dir:             "/var/cache/tiered",
+    WriteBackInterval: 10 * time.Second,
+}
+
+tc, err := tieredcache.NewTieredCacheWithConfig(cfg)
+if err != nil {
+    panic(err)
+}
+defer tc.Close()
+```
+
+### 8.3 容量模式 - 字节数限制
+
+```go
+cfg := tieredcache.Config{
+    L1Config: tieredcache.CacheLevelConfig{
+        Capacity:       64 * 1024 * 1024, // 64MB
+        CapacityMode:   tieredcache.CapacityModeBytes,
+        EvictionPolicy: tieredcache.EvictionPolicyLRU,
+    },
+    L2Config: tieredcache.CacheLevelConfig{
+        Capacity:       1024 * 1024 * 1024, // 1GB
+        CapacityMode:   tieredcache.CapacityModeBytes,
+        EvictionPolicy: tieredcache.EvictionPolicyLRU,
+    },
+    // ...
+}
+```
+
+### 8.4 手动刷盘（回写模式）
+
+```go
+// 写入大量数据
+for i := 0; i < 10000; i++ {
+    key := fmt.Sprintf("key:%d", i)
+    val := []byte(fmt.Sprintf("value:%d", i))
+    tc.Put(key, val)
+}
+
+// 强制刷盘，确保数据持久化
+err := tc.Flush()
+if err != nil {
+    panic(err)
+}
+fmt.Println("All dirty data flushed to disk")
+```
+
+### 8.5 并发使用
+
+```go
+var wg sync.WaitGroup
+
+// 10 个 goroutine 并发写入
+for i := 0; i < 10; i++ {
+    wg.Add(1)
+    go func(id int) {
+        defer wg.Done()
+        for j := 0; j < 1000; j++ {
+            key := fmt.Sprintf("worker:%d:%d", id, j)
+            val := []byte(fmt.Sprintf("value:%d", j))
+            tc.Put(key, val)
+        }
+    }(i)
+}
+
+// 20 个 goroutine 并发读取
+for i := 0; i < 20; i++ {
+    wg.Add(1)
+    go func(id int) {
+        defer wg.Done()
+        for j := 0; j < 500; j++ {
+            key := fmt.Sprintf("worker:%d:%d", id%10, j)
+            val, err := tc.Get(key)
+            if err == nil {
+                // process val
+            }
+        }
+    }(i)
+}
+
+wg.Wait()
+```
+
+### 8.6 清空缓存
+
+```go
+// 清空所有缓存数据（包括磁盘文件）
+err := tc.Clear()
+if err != nil {
+    panic(err)
+}
+
+fmt.Println("L1 count after clear:", tc.L1Count()) // 0
+fmt.Println("L2 count after clear:", tc.L2Count()) // 0
+```
+
+## 9. 性能特征
+
+### 9.1 访问性能
+
+| 场景 | 延迟 | 说明 |
+|------|------|------|
+| L1 命中 | 极快（纯内存） | O(1) 哈希查找 + 链表移动 |
+| L2 命中 | 中等（内存 + 回填） | L1 miss + L2 hit + L1 put |
+| L2 miss | 慢（磁盘 I/O） | L1 miss + L2 miss + 磁盘查找失败 |
+| 双写模式写入 | 慢（磁盘 I/O） | L1 put + L2 put + 磁盘写入 |
+| 回写模式写入 | 极快（纯内存） | 仅 L1 put + Dirty 标记 |
+
+### 9.2 并发性能
+
+- **读-读并发**: 完全并行，L1 和 L2 均支持并发读
+- **读-写并发**: 写操作阻塞读操作（TieredCache 级别的写锁）
+- **写-写并发**: 串行化执行
+
+### 9.3 内存开销
+
+- 每个条目额外开销约 100-150 字节（map 项 + list 元素 + CacheEntry 结构体）
+- 100 万条目约消耗 100-150MB 额外内存
+- 建议根据实际数据大小合理配置容量
+
+## 10. 注意事项与限制
+
+1. **数据序列化**: 值必须是 `[]byte` 类型，使用方需自行处理序列化/反序列化
+2. **回写模式数据丢失风险**: 进程崩溃时，未刷盘的 Dirty 数据会丢失
+3. **磁盘空间**: L2 缓存持久化到磁盘，需确保磁盘空间充足
+4. **键名限制**: 键名会被转换为安全的文件名，特殊字符会被转义
+5. **容量模式选择**: 
+   - 小对象建议使用 `CapacityModeCount`
+   - 大对象建议使用 `CapacityModeBytes`
+6. **关闭缓存**: 必须调用 `Close()` 方法释放资源，尤其是回写模式下确保数据刷盘
+7. **并发写入**: 虽然支持并发，但大量并发写入在双写模式下会受限于磁盘 I/O
+
+## 11. 默认配置
+
+```go
+func DefaultConfig() Config {
+    return Config{
+        L1Config: CacheLevelConfig{
+            Capacity:       1000,
+            CapacityMode:   CapacityModeCount,
+            EvictionPolicy: EvictionPolicyLRU,
+        },
+        L2Config: CacheLevelConfig{
+            Capacity:       10000,
+            CapacityMode:   CapacityModeCount,
+            EvictionPolicy: EvictionPolicyLRU,
+        },
+        WritePolicy:       WritePolicyWriteThrough,
+        L2Dir:             filepath.Join(os.TempDir(), "tieredcache"),
+        WriteBackInterval: 5 * time.Second,
+    }
+}
+```
