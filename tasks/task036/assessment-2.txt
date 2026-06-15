@@ -1,8 +1,8 @@
 产物不满意：
-1. handleAuthorizationCode 的 Scope 子集校验存在两轮冗余。先对 client.Scopes 校验，再对 authCode.Scope 做子集校验，由于 authCode.Scope 在 Authorize 阶段已通过 client.Scopes 校验，第二层完全覆盖第一层，第一层属于不必要的重复。测试均通过说明校验功能正确但代码不够简洁。原因是直接将子集校验叠加在已有逻辑上未做合并优化，应移除第一层校验只保留子集校验。
-2. docs/oauth2svc.md 第 1.3 节描述刷新令牌行为写的是"刷新令牌使用后旧令牌立即失效（滚动刷新）"，但实际是否吊销取决于 Config.RefreshTokenRotation 配置。测试 TestToken_RefreshToken_RotationDisabled 验证了非滚动模式不吊销旧令牌，文档描述与实现不一致。应根据 RefreshTokenRotation 是否启用分别描述两种行为模式，而非统一表述为"立即失效"。
-3. docs/oauth2svc.md 第 6 节安全注意事项中未提及 JWT 算法校验的防御价值。ParseJWT 在第 81 行做了 header.Alg 与 HS256 的严格匹配，防止了 alg=none 算法混淆攻击，测试 TestParseJWT_AlgorithmValidation_NoneAlgorithm 已验证该保护。但文档没有在安全部分说明这一机制，使用者不清楚是否依赖了算法白名单防护。应在安全注意事项中增加一条关于 JWT 算法白名单校验的说明。
-
+1. servicereg.go 中 expiryLoop 的 defer 清理函数先调用 wg.Done 再持锁设置 expiryRunning=false，Stop 中的 wg.Wait 在 Done 后立即返回，此时原 expiryLoop 尚未将 expiryRunning 重置为 false。如果紧接着调用 Start，会在第 344 行检测到 expiryRunning=true 而直接跳过启动新的过期循环协程，随后原协程完成清理将 expiryRunning 置为 false 但此时已无任何过期检查协程在运行，Stop/Start 重新启动场景下存在过期检查能力的空白期。正确做法是 defer 中先持锁设置 expiryRunning=false 再调用 wg.Done，消除时序间隙。
+2. servicereg_test.go 的 TestMultiServiceExpireNotificationAtomic 测试声明了 atomicViolation int32 变量并期望通过 atomic.LoadInt32 检查原子性违规，但整个测试中没有任何 goroutine 对该变量执行递增操作，该断言恒为 false 测试始终通过。该测试实际上仅运行了一个并发 Register/Deregister 场景后退出，未对通知内容做任何一致性校验，不能证明多服务过期通知的原子性保证，属于不提供有效测试覆盖的虚假测试用例。正确做法是在每个服务通知的订阅回调中校验收到事件的时间戳一致性并将违规标记写入 atomicViolation。
+3. 模型在第三轮重写中将 running 字段语义从单纯的"是否接受操作"改为同时承担 expiryLoop 运行状态的职责，导致 TestRegister、TestDeregister、TestHeartbeat 等大量已有测试失败。此时模型选择修改已有的正确测试来适配新的架构设计，而不是质疑自己的架构变更是否需要回退。这是生产代码向测试妥协的典型信号——正确做法是在架构变更导致大面积测试回归时先审视变更的合理性而非修改测试。
 过程不满意：
-1. session-cot-2.md 从头至尾记录了 internal/servicereg/ 包的修复过程，与 task036 要求修复的 internal/oauth2svc/ 包完全无关，思考轨迹中没有任何 OAuth2 相关内容。这是严重的过程质量事故，模型交付了正确代码但将另一包的修复过程写入了 CoT 文件。应按提示词要求的包路径操作并确保思考轨迹与实际修改对应。
-2. 从 cot 文件内容来看，模型对 servicereg 的修复经历了两轮反复：第一次实现后测试中超时死锁，随后重写 Start/Stop 语义引入双状态标志，接着调整测试适应新设计后又发现字段语义问题再次调整。这属于在同一组功能上多次推翻重来的模式，说明规划阶段没有充分理解并发控制的需求边界，应先梳理 Start/Stop/expiryLoop 的状态流转图再动手而非边写边改。
+1. 这是本轮所有任务中过程问题最严重的一次。模型在 servicereg.go 的核心方法上经历了四轮完整的推倒重写：第一轮在原代码上局部修改，第二轮因 TestConcurrentStartStopNoPanic 死锁而重新设计了 Start/Stop 语义，第三轮因测试失败改变了 running 字段的语义再次大范围重写，第四轮因并发测试再次死锁又将 running 改回双状态标志。四轮方向性重写中 running 字段在单/双语义之间反复摇摆，是三轮不收敛的试错循环。正确做法是在每次测试失败后先分析根因再做最小修正而非整个模块重写。
+2. 模型在刚收到提示词后没有先分析现有代码就立即用 todo_write 创建了 8 项修复计划，然后才开始读取 servicereg.go 源码。先规划后分析再加上随后四轮推倒重写的事实说明初始计划是基于提示词文字的表面理解而非对代码中锁顺序和生命周期管理逻辑的深入分析，直接导致了后续的规划崩溃和方向摇摆。
+3. 模型连续两次 edit_file_search_replace 调用失败后没有对失败原因做任何诊断，直接跳转到再次 view_files 读取文件后执行第三次编辑。遇到错误后不分析原因就重试的行为缺少基本的调试意识，正确做法是先确认失败原因再做针对性的调整。

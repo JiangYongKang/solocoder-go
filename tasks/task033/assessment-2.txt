@@ -1,11 +1,6 @@
-测试结果：go test ./internal/grpcsvc/ -v 共运行 77 个测试用例，全部通过，耗时 0.377 秒。
-
 产物不满意：
-1. serverStream 的 RecvMsg 方法从 recvCh 读取消息时使用了空白标识符接收，msg 参数未被填充任何数据，任何通过 Stream 接口调用 RecvMsg 都无法获取到实际的流数据。应将 recvCh 读出的值赋值给 msg 参数指向的变量，确保调用方能收到数据。
-2. NewStream 方法在应用 ConnectionTimeout 时调用 context.WithTimeout 创建了派生 context，但 cancel 函数被赋值给空白标识符从未调用。如果流在超时到达前就关闭了，context 内部的清理 goroutine 将一直驻留到自然过期才会释放。应将 cancel 保存在 stream.Close 中调用。
-3. serverStream 的 Send 方法在 grpcsvc.go 第 834 行实际从 sendCh 读取消息，语义是"接收服务端发来的消息"，但方法名 Send 给人的直觉是"向服务端发送消息"。SendMsg 向 sendCh 写入数据而 Send 从 sendCh 读取，两个命名方向相反的 API 在同一个 Stream 接口中共存，调用方在双向流场景下极易误用。应将两个方向的方法通过命名明确区分，例如将 Send 更名为 Receive 以避免混淆。
-4. Invoke 方法和 HandleStream 中都存在双层 goroutine 嵌套设计：外层 goroutine 内部再启动内层 goroutine 执行 handler。每调用一次 RPC 就启动两个 goroutine，大量并发时增加了调度压力和内存开销。可以用单层 goroutine 加 select 多路复用完成超时轮询和 handler 执行。
-
+1. grpcsvc.go 中 checkDeadline 的持续超时校验实现存在根本性缺陷：handler 在执行前通过 ctx.Done 启动一个监听 goroutine，但该 goroutine 仅能通过注册的 cancel 函数取消 handler 使用的 context，无法中断已经在执行的 handler goroutine 本身。handler goroutine 在 context 被取消后并不感知取消事件，仍然会执行完整个业务逻辑。提示词要求的是在 handler 执行过程中持续校验 deadline 并在超时后中断执行，而非仅取消 context。此外该方法中定义了一个从未被任何 goroutine 读取的 done channel 作为死代码残留，以及 handler goroutine 缺少 panic 恢复机制可能在异常时导致 goroutine 泄漏。
+2. grpcsvc.go 中 NewStream 方法在应用 ConnectionTimeout 时调用 context.WithTimeout 创建了带 cancel 函数的派生 context，但返回的 cancel 通过空白标识符 _ = cancel 被丢弃，从未被任何代码调用执行。这导致流的生命周期结束（如 stream.Close 被调用）后，context 内部的定时器 goroutine 不会被及时释放而会一直驻留到自然超时到期。在高并发场景下大量短生命周期流会累积大量未释放的 context goroutine 造成内存泄漏。正确做法是将 cancel 保存到 stream 的字段中并在 stream.Close 中调用。
 过程不满意：
-1. 模型在刚收到任务后没有先完整阅读现有代码的上下文就立即创建了 9 项子任务的 TodoList，然后才开始读取 grpcsvc.go 源码。正确的做法是先用 Grep 或 Read 定位所有受影响的代码区域，理解每个缺陷对应的函数实现后再制定修复计划。直接写 TodoList 导致计划的粒度与实际代码结构不匹配，后续表现为全量重写而非逐项最小修复。
-2. 模型选择了一次性全量重写 grpcsvc.go 和 grpcsvc_test.go 两个文件共计超过 1700 行，覆盖率远超提示词要求的 9 个修复点。这种大范围重写引入了新的代码问题，例如 RecvMsg 不处理 msg 参数、cancel 函数泄漏、双层 goroutine 嵌套等，这些缺陷原本在第一轮代码中并不存在。正确的做法是对每个提示词条目做定向的最小修改，保持原有模块的整体架构和接口设计风格不被破坏。
+1. 模型在刚收到提示词后没有先完整阅读 grpcsvc.go 的现有代码就直接用 todo_write 创建了 9 项修复计划，然后才开始读取源码。直接写 TodoList 是一种先规划后分析的反模式，导致模型对缺陷的理解停留在提示词的文字表层而非基于代码的实际状态。随后模型选择了一次性全量重写 grpcsvc.go 和 grpcsvc_test.go 两个文件而非针对提示词中的 7 个修复点做定向的最小修改，重写过程中引入了 done channel 死代码和 cancel 泄漏等原代码中不存在的新缺陷。
+2. 模型在重写后的调试过程中经历了典型的多轮试错循环：首次全量重写后 go test 出现 10 个测试失败，模型没有逐个分析失败原因就再次对核心逻辑进行了二次大范围重写，第二次重写后又出现了新的测试失败和编译错误。直至最终版本才使 77 个测试通过，但持续超时校验的 handler 中断能力和 context 清理泄漏两个本质问题并未在这三轮重写中被真正解决。正确的做法是每轮只针对一个失败用例做最小修改，并在修改后立即验证。

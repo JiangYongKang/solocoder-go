@@ -1,11 +1,6 @@
 产物不满意：
-1. tasks/task032/session-cot-2.md 的内容实际为 wscenter 模块的思考轨迹，所有文件引用指向 internal/wscenter/wscenter.go，与本任务 dnsresolver 模块无关。这导致无法追溯模型修复 parseResponse、querySingle、resolveRecursive 等问题时的推理过程。根因可能是会话记录文件被错误放置或模型未正确生成当前任务的思考过程。
-
-2. dnsresolver.go 的 followCNAME 方法中同区 CNAME 优化判定靠字符串标签比较而非 DNS 区域边界判定，例如 "www.example.com" 的 CNAME 目标 "cdn.example.com" 同属 example.com 但标签级比较判定 sameSuffix=false 回退到完整根递归。这导致同区 CNAME 场景下多出 3 到 4 次多余查询，降低了测试效率。
-
-3. 测试辅助函数 buildNSResponse 第 279 行的 `questionEnd` 变量从未被实际使用，用 `_ = questionEnd` 压制编译警告但没有实际价值，属于提示词第 4 条要求清理的"无意义的空白标识符赋值"。测试函数 TestBuildQuery 第 1058 行的 `_ = id` 同样属于同一类问题，`id` 在三元组解包后从未使用，应直接改用 `_` 忽略第二个返回值。两处未清理说明模型对空白标识符的清理不够彻底。
-
+本轮的缺陷修复整体正确，wscenter.go 中四项修复均达到提示词要求：心跳首次 tick 的 lastPingSent 和 hasPendingPing 机制正确区分了从未发 Ping 和已发 Ping 未收到 Pong 两种状态，SendToClient 通过 knownClients 实现了 ErrClientNotFound 和 ErrClientOffline 的错误码语义区分，Disconnect 改为延迟删除配合 knownClients 保留了全生命周期可追溯性，JoinRoom 改为写锁消除了两次加锁间隙的竞态。44 个测试全部通过，文档更新覆盖了心跳机制、错误码语义和竞争防护说明。未发现新的产品缺陷。
 过程不满意：
-1. tasks/task032 目录下的 session-cot-2.md 全文是关于 wscenter 模块的修复过程，对 dnsresolver 模块的修复思考完全缺失。这导致无法追踪模型在 parseResponse 的事务 ID 校验、querySingle 的 context 传播、resolveRecursive 中 NS 链与 CNAME 追踪的调用关系等关键环节时的推理路径。正确做法是确保每个任务的思考过程独立记录且对应正确的任务目录。
-
-2. dnsresolver_test.go 的 TestCNAMEFollowDifferentZone 测试在 mock 中预留了 case 5 和 case 10 两个多余的 mock 分支，在当前代码实现下永远不会被触发。说明模型对 resolveRecursive 和 followCNAME 的完整调用链理解不准确，用安全网式的 mock 覆盖替代了精确调用路径的验证。应先梳理完整递归流程确认每个查询点的确切请求再精确设置 mock。
+1. 模型在刚收到任务后没有先阅读现有代码就直接用 todo_write 创建了 7 项修复计划，然后才开始读取 wscenter.go 源码。虽然本轮 TodoList 条目恰好与提示词中的 5 个修复项一一对应，未造成后续架构反复调整，但实际上先规划后分析的顺序本身是不规范的——模型尚未理解每个缺陷对应的函数实现就按提示词条目机械拆分为任务，导致后续心跳修复中先调整参数再找根因的低效路径。
+2. 模型在读取 wscenter.go 后未先阅读测试文件的内容就连续执行了 7 次生产代码修改操作，对 wscenter.go 进行了大规模改动。直到修改完成后才读取 wscenter_test.go，此时首轮 go test 出现了失败迫使模型回溯调整代码。正确做法是在修改生产代码前先通读测试文件理解现有断言预期，避免修改后的代码与已存在的测试预期产生不必要的冲突。
+3. 首次 go test 运行后 TestHeartbeatTimeout 失败，模型先调整了测试的时间参数从 25ms 改为 30ms，失败后再分析心跳逻辑根因调整 pingLoop 中 sendPings 和 checkTimeouts 的执行顺序。第一轮参数调整没有命中根因浪费了一次迭代，属于轻度试错式调试。正确做法是先分析测试失败输出定位根因再做最小修改。

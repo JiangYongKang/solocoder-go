@@ -1,7 +1,6 @@
 产物不满意：
-1. TestConnPool_ConcurrentRemoveAndPut 测试中 for 循环变量 i 被 goroutine 闭包直接引用，所有 goroutine 共享同一个外层 i。Go 的闭包捕获的是变量引用，goroutine 执行时循环早已结束 i 固定为 numOps，100%3=1 永远不等于 0，导致 pool.Remove 分支从未被触发。该测试声称验证并发 Remove 和 Put 混合场景，实际上只跑了 Put 路径，Remove 被完全跳过。
-2. ConnPool.Get 方法中超时等待机制存在缺陷，当多个 goroutine 同时等待且 WaitTimeout>0 时，deadline goroutine 只广播一次就退出。如果广播时恰好只有一个连接可用，第一个 waiter 取走后其他被唤醒的 waiter 发现无空闲连接且池已满会重新进入 cond.Wait 永久阻塞。应每次进入内层 for 循环时重新计算剩余超时配合 time.After 做有超时的 cond.Wait，而非依赖一次性 goroutine 广播。
-3. ConnPool.Get 方法在扫描空闲连接过期时，对 expired 切片中的过期连接直接在持锁期间调用 pc.conn.Close()。TCP 连接的 Close 操作理论上可能阻塞（如等待对端确认），在持锁期间执行网络 IO 会阻塞整个连接池的 Get/Put/Remove 操作，降低了高并发下的吞吐能力。应将关闭操作移到解锁之后执行，与 reclaimIdle 的做法保持一致。
+1. rbac.go 的 CheckPermission 方法中在处理未分配角色的用户时新增了 len(roleIDs)==0 分支返回 ErrUserNotFound，但 GetUserRoles 在调用链中对不存在的用户已经返回了 ErrUserNotFound，上游调用链走到 CheckPermission 的 len(roleIDs)==0 分支前早就被中断，该分支在实际执行路径上永远不会被触发，属于修复旧死代码时引入的新死代码。应将用户不存在的判断统一放在 GetUserRoles 层而非在 CheckPermission 中重复校验。
+2. docs/rbac.md 文档更新中模型声称新增了 3.3 小节（拒绝原因格式说明）和 3.4 小节（用户不存在错误码使用指南）以及 API 标注，但在实际文档中这两小节并不存在。模型在 session-cot 中描述了对文档的大量新增内容但实际写入文件的远少于声称量，属于典型的文档更新幻觉虚报，导致标注人员无法确认文档是否完整反映了代码变更。
 过程不满意：
-1. 模型缺失 tcpproxy 模块第二轮的完整思考轨迹记录。tasks/task039/session-cot-2.md 文件中记录的是 RBAC 模块的修复过程而非 tcpproxy 模块，说明模型在保存会话轨迹时写错了文件路径，或是在执行任务时没有正确区分当前任务编号。这导致审查者无法追踪模型在 tcpproxy 缺陷修复中的决策链条和推理过程，降低了标注工作的可追溯性。
-2. 模型新增的 TestConnPool_ConcurrentRemoveAndPut 测试出现了循环变量捕获的经典错误，说明模型在编写 goroutine 闭包时没有执行基本的代码审查。Go 的 for-range 和 for i 循环中 goroutine 闭包捕获循环变量是高频踩坑点，模型在 2025 年后的大型语言模型中应当自动识别并规避此类模式。正确写法是用局部变量 `val := i` 在闭包外复制一份再使用。
+1. 与前面多个任务不同，本轮模型的行为模式有改进——先通过 grep 搜索了 ErrUserNotFound 在代码中的使用位置，再逐一读取相关文件确认每个调用点和影响范围，然后才开始制定修复计划。这种先分析后规划的顺序比之前各任务中先写 TodoList 再读代码的模式有明显进步，说明模型在不同的会话中可能表现出不一致的行为习惯。
+2. 模型在 docs/rbac.md 的更新中描述了对文档的大量修改细节（包含具体的小节编号、API 标注格式等），但这些修改在最终文件中不存在。这属于典型的幻觉与虚假完成——模型在回复中声称完成了文档更新但实际写入的内容与宣称的不匹配。正确做法是在文件写入后通过 Read 工具验证写入内容的正确性，或至少将宣称的修改与实际文件内容对齐。

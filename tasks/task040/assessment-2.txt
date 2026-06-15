@@ -1,6 +1,5 @@
 产物不满意：
-1. 模型在第 2 轮缺陷修复中完全未修改 wscenter 包的任何代码，session-cot-2.md 完整记录了模型在 internal/oauth2svc/ 下修复 OAuth2 授权服务问题的全过程。提示词要求修复的是心跳超时检测首次 tick 先检查超时再发送 Ping 导致客户端被误断连、SendToClient 无法区分从未连接和已断连、Disconnect 持锁删除后通知流程状态混乱、JoinRoom 两次加锁间隙被添加到僵尸房间这四个缺陷，并补充对应测试和文档。模型在 oauth2svc 上修复的三个问题完全不在 task040 的范围内，属于在错误目标上完成了一个无关任务。
-2. 原因是在 task040/ 目录下的 prompt-2.txt 文件内容被错误地写成了 oauth2svc 模块的修复需求而非 wscenter 模块的修复需求，模型依此执行。这导致即使 oauth2svc 的修复和测试全部通过，产出对 task040（wscenter）而言是零贡献。wscenter.go 中已有的 `knownClients` 机制、`hasPendingPing()` 零值防护、`JoinRoom` 写锁竞态保护等正确实现均来自 session 1 或其他来源，非本轮模型修改。
+本轮的缺陷修复全部正确，oauth2svc 包中三项修复均达到提示词要求：handleAuthorizationCode 在令牌端点新增了对请求 Scope 是否为授权码原始 Scope 子集的校验，阻止了用户仅授权 read 却通过令牌请求获取 write 权限的权限升级漏洞；handleRefreshToken 正确读取了 Config.RefreshTokenRotation 配置值控制是否执行滚动刷新，当配置为 false 时不吊销旧令牌且不返回新刷新令牌；ParseJWT 在签名验证前显式解码 header 并严格校验 alg 必须为 HS256，阻止了 alg=none 和 alg=RS256 等算法混淆攻击。新增的 20 个测试覆盖了 Scope 子集校验、RefreshTokenRotation 配置生效、JWT 算法白名单校验等场景，77 个测试全部通过。文档 docs/oauth2svc.md 已更新。未发现新的产品缺陷。
 过程不满意：
-1. 模型在第 2 轮收到 prompt-2.txt 后未经任何任务范围校验就直接在 oauth2svc 包上执行修复，session-cot-2.md 显示模型读取了 oauth2svc.go、jwt.go 等文件而非 wscenter 目录下的任何文件。虽然模型严格按 prompt 内容执行了这一行为本身是合规的，但它缺少对任务上下文和代码库范围的主动校验。合理的做法是在修复前先阅读 go.mod 和 internal/ 目录结构，确认当前要修复的模块与实际需要修改的代码包是否一致，发现 prompt 指向错误后停止执行并向用户反馈，而非盲目执行一份指向错误目标的需求。
-2. 模型完成 oauth2svc 修复后在回复中声称所有问题已修复完成并运行了 go test，但只在 oauth2svc 包上验证了 79 个测试通过，完全没有运行 go test ./internal/wscenter/ 验证 wscenter 是否正常。这属于本应关注的范围外执行，与标注规范中"只关注当前任务所在包的代码"的原则相悖。正确做法是确认任务归属后仅针对 wscenter 包做修改和验证，发现 prompt 与包名不匹配时应中断执行并向上反馈提示词错误。
+1. 模型在刚收到提示词后没有先阅读现有代码就用 todo_write 创建了 8 项修复计划，然后才开始用 view_files 读取 oauth2svc.go 和 jwt.go 源码分析现有实现状态。先规划后分析的行为模式与标注规范要求的分析先行原则相悖，虽然在本次任务中没有导致方向性偏离和反复重写，但这是因为本轮三个安全缺陷的修复路径比较直截了当——Scope 子集校验、配置读取、算法白名单三个点各自独立没有交叉依赖。在更复杂的修复任务中缺少代码分析的前置步骤可能会导致计划与实际情况严重脱节。
+2. 模型在 session-cot 的总结中声称 79 个测试用例全部通过，但实际 go test 输出显示为 77 个测试通过，存在 2 个测试数量的偏差。虽然不影响功能正确性评估，但这属于未核实 go test 精确输出而凭估计填写数字的行为。正确做法是在最终回复中引用实际的测试输出结果而非凭记忆估数。

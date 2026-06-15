@@ -1,7 +1,7 @@
 产物不满意：
-1. TestConsistentHash_AddServerMinimalImpact 和 TestConsistentHash_RemoveServerMinimalImpact 两处用 s, _ := ch.Next(key) 静默忽略错误返回值，若 Next 返回错误则零值地址被存入 mapping 后比较结果不可预测。应以 err != nil 时记录错误映射或跳过该 key 保证映射有效性。原因是未将错误返回值纳入路径判断。
-2. 提示词要求更新 docs/httplb.md 文档反映修补后的实现，但模型在 session 中未体现任何检查文档是否需要调整的判断步骤，例如从未执行读取 docs/httplb.md 文件与实际代码做对比来确定哪些描述需要补充。正确做法是先通读文档确认故障转移机制、状态机流转、线程安全设计和存储结构等描述是否与当前代码一致，再据实调整。
-
+1. dnsresolver.go 的 queryParallel 函数只在任一上游返回有效响应时触发提前返回和 cancel，当所有上游服务器均返回 RCODE 错误时（如全部返回 NXDOMAIN 或 SERVFAIL），循环不会提前退出而是等待最慢的那个 goroutine 完成所有 I/O 读取后才返回第一个错误。提示词要求 context 取消后各 goroutine 应及时退出以在高延迟网络下避免资源堆积，但当响应全都是错误时 querySingle 的 select 监听 ctx.Done 路径并未被触发，context 超时未起到预期作用。根因是 queryParallel 的结果收集逻辑缺少对"所有响应都是错误"场景的提前终止路径，应在收到第一个明确错误时就触发 cancel 并让其他 goroutine 尽快退出。
+2. dnsresolver.go 中新增的 followCNAME 函数在同区 CNAME 场景下如果复用当前权威服务器查询目标记录失败，会直接穿透到调用 resolveRecursive 走全量根递归解析。这导致一次暂时的网络抖动就能将 O(1) 的同区查询降级为 O(n) 的完整递归，与提示词要求不要重复构建整条 NS 委派链的优化目标矛盾。应区分"查询出错需要重试当前服务器"和"目标确实不存在目标记录"两种情况，对暂时性失败不应静默回退到全量递归。
+3. dnsresolver_test.go 的 buildNSResponse 辅助函数中第 221 行定义了 questionEnd := offset 变量，该变量在后续函数体中从未被实际使用，第 279 行仅用 _ = questionEnd 压制编译警告。这属于提示词第 4 条要求清理的迭代修改后残留代码，但模型在 grep 搜索时只匹配了 prompt 中列举的三个具体变量名而未对该函数做完整扫描，导致这一处同样的死代码未被清除。
 过程不满意：
-1. 这是致命的任务理解错误。session-cot-2.md 全部围绕 internal/dnsresolver/ 的 DNS 解析器缺陷修复展开，而当前任务要求修复 internal/httplb/ 的 HTTP 负载均衡器缺陷。模型第一步就读取了 dnsresolver.go 而非 httplb 包文件，说明未读取 prompt-2.txt 确认任务目标就选择了错误修复对象，整个会话实质是 task032 的修复而非 task034 的修复。
-2. 由于任务目标完全偏差，模型未对 httplb 包做任何代码变更或测试补充。虽然当前代码中已存在一致性哈希故障转移测试和通过的全部 45 个测试，但从 session-cot 中完全看不到任何与 httplb 相关的推理或修改行为。正确做法是读取对应任务的 prompt 确认目标包路径，检查指定包内的代码和测试，再执行修复操作。
+1. 模型在收到提示词后立即用 todo_write 创建了 8 项修复计划，之后才开始调用 view_files 读取源码。这违反了标注规范要求的先分析再规划的顺序。虽然模型后续通过 grep 正确定位了 buildQuery 和 parseResponse 的调用点再逐点修改，流程上没有出现严重的方向性反复，但先规划后分析的初始步骤在更复杂的修复任务中容易导致计划与代码实际情况脱节。
+2. TestCNAMEFollowDifferentZone 测试在编写后经历了两轮调试修正：第一版 mock 响应数量不足导致测试失败，模型通过添加调试输出来理解实际查询序列后重写了测试。虽然模型在这个循环中采用了先分析错误再修正的合理路径，但首次编写测试时没有充分计算递归解析所需的查询次数就确定了 mock 数量，说明对 resolveRecursive 和 followCNAME 的调用链深度理解不够精准，导致需要调试循环来补充测试覆盖。
