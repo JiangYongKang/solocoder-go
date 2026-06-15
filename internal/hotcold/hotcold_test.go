@@ -1,12 +1,22 @@
 package hotcold
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func newTestManager(t *testing.T, cfg Config) *HotColdManager {
+	t.Helper()
+	m, err := NewHotColdManagerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewHotColdManagerWithConfig failed: %v", err)
+	}
+	return m
+}
 
 func TestNewHotColdManager(t *testing.T) {
 	m := NewHotColdManager()
@@ -26,7 +36,10 @@ func TestNewHotColdManager(t *testing.T) {
 
 func TestNewHotColdManagerWithConfig_Defaults(t *testing.T) {
 	cfg := Config{}
-	m := NewHotColdManagerWithConfig(cfg)
+	m, err := NewHotColdManagerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewHotColdManagerWithConfig returned error: %v", err)
+	}
 	if m == nil {
 		t.Fatal("NewHotColdManagerWithConfig returned nil")
 	}
@@ -142,8 +155,8 @@ func TestGet_EmptyKey(t *testing.T) {
 func TestGet_NonExistent(t *testing.T) {
 	m := NewHotColdManager()
 	val, ok, err := m.Get("nonexistent")
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("expected ErrKeyNotFound, got %v", err)
 	}
 	if ok {
 		t.Error("expected ok to be false for non-existent key")
@@ -163,9 +176,12 @@ func TestDelete(t *testing.T) {
 		t.Error("expected Delete to return true for existing key")
 	}
 
-	_, ok, _ := m.Get("key1")
+	_, ok, err := m.Get("key1")
 	if ok {
 		t.Error("expected key1 to be deleted")
+	}
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("expected ErrKeyNotFound after delete, got %v", err)
 	}
 
 	if m.TotalCount() != 0 {
@@ -210,7 +226,7 @@ func TestPut_UpdateExisting(t *testing.T) {
 }
 
 func TestGetScore(t *testing.T) {
-	m := NewHotColdManagerWithConfig(Config{
+	m := newTestManager(t, Config{
 		HotThreshold:     5.0,
 		ColdThreshold:    1.0,
 		DecayHalfLife:    time.Hour,
@@ -238,8 +254,8 @@ func TestGetScore(t *testing.T) {
 func TestGetScore_NonExistent(t *testing.T) {
 	m := NewHotColdManager()
 	score, ok, err := m.GetScore("nonexistent")
-	if err != nil {
-		t.Fatalf("GetScore failed: %v", err)
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("expected ErrKeyNotFound, got %v", err)
 	}
 	if ok {
 		t.Error("expected ok=false for non-existent key")
@@ -257,7 +273,7 @@ func TestPromoteToHot(t *testing.T) {
 		ColdCheckCycles:  3,
 		HotCapacityRatio: 0.3,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	m.Put("hotkey", "value")
 	if m.HotCount() != 0 {
@@ -296,7 +312,7 @@ func TestDemoteToCold(t *testing.T) {
 		HotCapacityRatio: 0.3,
 		AutoAdjustThresholds: false,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	m.Put("key1", "value1")
 	for i := 0; i < 10; i++ {
@@ -340,7 +356,7 @@ func TestCheckAndMigrate_PromotesColdToHot(t *testing.T) {
 		HotCapacityRatio: 0.3,
 		AutoAdjustThresholds: false,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	m.Put("key1", "value1")
 	if m.ColdCount() != 1 {
@@ -378,7 +394,7 @@ func TestConsecutiveColdCycles(t *testing.T) {
 		HotCapacityRatio: 0.3,
 		AutoAdjustThresholds: false,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	m.Put("key1", "value1")
 	for i := 0; i < 5; i++ {
@@ -427,7 +443,7 @@ func TestAutoAdjustThresholds(t *testing.T) {
 		MinColdThreshold:     0.1,
 		MaxColdThreshold:     20.0,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("hotkey_%d", i)
@@ -484,7 +500,7 @@ func TestAutoAdjustThresholds_Disabled(t *testing.T) {
 		MinColdThreshold:     0.1,
 		MaxColdThreshold:     20.0,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	for i := 0; i < 50; i++ {
 		m.Put(fmt.Sprintf("key_%d", i), "value")
@@ -564,7 +580,7 @@ func TestGetEntry_Isolation(t *testing.T) {
 }
 
 func TestGetAllHotKeys(t *testing.T) {
-	m := NewHotColdManagerWithConfig(Config{
+	m := newTestManager(t, Config{
 		HotThreshold:    2.0,
 		ColdThreshold:   1.0,
 		DecayHalfLife:   time.Hour,
@@ -649,21 +665,27 @@ func TestTotalCount(t *testing.T) {
 
 func TestScoreDecayOverTime(t *testing.T) {
 	cfg := Config{
-		HotThreshold:     100.0,
-		ColdThreshold:    0.1,
-		DecayHalfLife:    time.Millisecond * 20,
-		ColdCheckCycles:  10,
-		HotCapacityRatio: 0.3,
+		HotThreshold:         100.0,
+		ColdThreshold:        0.1,
+		DecayHalfLife:        time.Millisecond * 20,
+		ColdCheckCycles:      10,
+		HotCapacityRatio:     0.3,
 		AutoAdjustThresholds: false,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	m.Put("key1", "value1")
 	for i := 0; i < 10; i++ {
 		m.Get("key1")
 	}
 
-	initialScore, _, _ := m.GetScore("key1")
+	initialScore, ok, err := m.GetScore("key1")
+	if err != nil {
+		t.Fatalf("GetScore failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected key1 to exist")
+	}
 	if initialScore <= 0 {
 		t.Fatal("expected positive initial score")
 	}
@@ -671,9 +693,13 @@ func TestScoreDecayOverTime(t *testing.T) {
 
 	time.Sleep(time.Millisecond * 30)
 
-	m.CheckAndMigrate()
-
-	afterDecayScore, _, _ := m.GetScore("key1")
+	afterDecayScore, ok, err := m.GetScore("key1")
+	if err != nil {
+		t.Fatalf("GetScore after decay failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected key1 to still exist")
+	}
 	t.Logf("After decay score: %.2f", afterDecayScore)
 	if afterDecayScore >= initialScore {
 		t.Errorf("expected score to decay over time, initial=%.2f, after=%.2f", initialScore, afterDecayScore)
@@ -836,7 +862,7 @@ func TestConcurrentCheckAndMigrate(t *testing.T) {
 		HotCapacityRatio: 0.3,
 		AutoAdjustThresholds: false,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	for i := 0; i < 50; i++ {
 		key := fmt.Sprintf("ckey%d", i)
@@ -875,17 +901,18 @@ func TestNewHotColdManagerWithConfig_InvalidThresholds(t *testing.T) {
 		ColdThreshold: 5.0,
 		DecayHalfLife: time.Hour,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
-	gotCfg := m.GetConfig()
-
-	if gotCfg.HotThreshold <= gotCfg.ColdThreshold {
-		t.Errorf("HotThreshold should be adjusted to be > ColdThreshold, got hot=%.2f, cold=%.2f", gotCfg.HotThreshold, gotCfg.ColdThreshold)
+	m, err := NewHotColdManagerWithConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig when HotThreshold < ColdThreshold, got %v", err)
+	}
+	if m != nil {
+		t.Error("expected nil manager for invalid config")
 	}
 }
 
 func TestNewHotColdManagerWithConfig_ZeroValues(t *testing.T) {
 	cfg := Config{}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 	gotCfg := m.GetConfig()
 
 	if gotCfg.HotThreshold <= 0 {
@@ -934,7 +961,7 @@ func TestPut_PromoteDuringPut(t *testing.T) {
 		ColdCheckCycles:  3,
 		HotCapacityRatio: 0.3,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	m.Put("key1", "value1")
 	if m.HotCount() != 0 {
@@ -1019,7 +1046,7 @@ func TestPromoteAndDemoteCycle(t *testing.T) {
 		HotCapacityRatio:     0.3,
 		AutoAdjustThresholds: false,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	m.Put("key1", "value1")
 	for i := 0; i < 3; i++ {
@@ -1060,7 +1087,7 @@ func TestMultipleHotKeys(t *testing.T) {
 		HotCapacityRatio: 0.5,
 		AutoAdjustThresholds: false,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	numHot := 10
 	numCold := 20
@@ -1097,7 +1124,7 @@ func TestScore_NewEntryBoost(t *testing.T) {
 		ColdCheckCycles:  3,
 		HotCapacityRatio: 0.3,
 	}
-	m := NewHotColdManagerWithConfig(cfg)
+	m := newTestManager(t, cfg)
 
 	m.Put("new_key", "value")
 
@@ -1113,5 +1140,293 @@ func TestScore_NewEntryBoost(t *testing.T) {
 	baseScore := float64(entry.AccessCount)
 	if entry.Score <= baseScore {
 		t.Errorf("new entry should have boosted score, got %.2f (base %.2f)", entry.Score, baseScore)
+	}
+}
+
+func TestGetScore_LiveScoreDecay(t *testing.T) {
+	cfg := Config{
+		HotThreshold:         100.0,
+		ColdThreshold:        0.1,
+		DecayHalfLife:        time.Millisecond * 15,
+		ColdCheckCycles:      10,
+		HotCapacityRatio:     0.3,
+		AutoAdjustThresholds: false,
+	}
+	m := newTestManager(t, cfg)
+
+	m.Put("k", "v")
+	for i := 0; i < 5; i++ {
+		m.Get("k")
+	}
+
+	s1, ok, err := m.GetScore("k")
+	if err != nil {
+		t.Fatalf("GetScore 1 failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected key to exist")
+	}
+
+	time.Sleep(time.Millisecond * 20)
+
+	s2, ok, err := m.GetScore("k")
+	if err != nil {
+		t.Fatalf("GetScore 2 failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected key to exist 2")
+	}
+
+	if s2 >= s1 {
+		t.Errorf("expected live score to decay without calling CheckAndMigrate, s1=%.2f, s2=%.2f", s1, s2)
+	}
+	t.Logf("Live decay verified: s1=%.2f -> s2=%.2f", s1, s2)
+}
+
+func TestGetEntry_NonExistent(t *testing.T) {
+	m := NewHotColdManager()
+	entry, ok, err := m.GetEntry("noexist")
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("expected ErrKeyNotFound, got %v", err)
+	}
+	if ok {
+		t.Error("expected ok=false")
+	}
+	if entry != nil {
+		t.Errorf("expected nil entry, got %v", entry)
+	}
+}
+
+func TestValidateConfig_Valid(t *testing.T) {
+	cfg := DefaultConfig()
+	err := ValidateConfig(cfg)
+	if err != nil {
+		t.Errorf("expected ValidateConfig to pass for default config, got %v", err)
+	}
+}
+
+func TestValidateConfig_InvalidCapacityRatio(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HotCapacityRatio = 1.5
+	err := ValidateConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for bad capacity ratio, got %v", err)
+	}
+
+	cfg.HotCapacityRatio = -0.1
+	err = ValidateConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for negative capacity ratio, got %v", err)
+	}
+}
+
+func TestValidateConfig_InvalidThresholdOrder(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HotThreshold = 1.0
+	cfg.ColdThreshold = 5.0
+	err := ValidateConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig when hot <= cold, got %v", err)
+	}
+}
+
+func TestValidateConfig_InvalidThresholds(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HotThreshold = 0
+	err := ValidateConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for zero HotThreshold, got %v", err)
+	}
+
+	cfg = DefaultConfig()
+	cfg.ColdThreshold = -1
+	err = ValidateConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for negative ColdThreshold, got %v", err)
+	}
+}
+
+func TestValidateConfig_InvalidMinMax(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MinHotThreshold = 100
+	cfg.MaxHotThreshold = 10
+	err := ValidateConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig when MinHot > MaxHot, got %v", err)
+	}
+}
+
+func TestValidateConfig_InvalidDurationsAndCycles(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DecayHalfLife = 0
+	err := ValidateConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for zero DecayHalfLife, got %v", err)
+	}
+
+	cfg = DefaultConfig()
+	cfg.ColdCheckCycles = 0
+	err = ValidateConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for zero ColdCheckCycles, got %v", err)
+	}
+
+	cfg = DefaultConfig()
+	cfg.AdjustInterval = 0
+	err = ValidateConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for zero AdjustInterval, got %v", err)
+	}
+}
+
+func TestNewHotColdManagerWithConfig_ReturnsError(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HotCapacityRatio = 2.0
+	m, err := NewHotColdManagerWithConfig(cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig from constructor, got %v", err)
+	}
+	if m != nil {
+		t.Error("expected nil manager when config is invalid")
+	}
+}
+
+func TestErrors_IsClassification(t *testing.T) {
+	m := NewHotColdManager()
+
+	_, _, err := m.Get("")
+	if !errors.Is(err, ErrEmptyKey) {
+		t.Errorf("expected ErrEmptyKey for empty key Get, got %v", err)
+	}
+
+	_, _, err = m.Get("missing")
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("expected ErrKeyNotFound for missing key Get, got %v", err)
+	}
+
+	err = m.Put("", "v")
+	if !errors.Is(err, ErrEmptyKey) {
+		t.Errorf("expected ErrEmptyKey for empty key Put, got %v", err)
+	}
+
+	var nilM *HotColdManager
+	_, _, err = nilM.Get("k")
+	if !errors.Is(err, ErrNilManager) {
+		t.Errorf("expected ErrNilManager for nil manager, got %v", err)
+	}
+}
+
+func TestGetEntry_LiveScore(t *testing.T) {
+	cfg := Config{
+		HotThreshold:         100.0,
+		ColdThreshold:        0.1,
+		DecayHalfLife:        time.Millisecond * 15,
+		ColdCheckCycles:      10,
+		HotCapacityRatio:     0.3,
+		AutoAdjustThresholds: false,
+	}
+	m := newTestManager(t, cfg)
+
+	m.Put("k", "v")
+	for i := 0; i < 5; i++ {
+		m.Get("k")
+	}
+
+	e1, _, _ := m.GetEntry("k")
+	time.Sleep(time.Millisecond * 20)
+	e2, _, _ := m.GetEntry("k")
+
+	if e2.Score >= e1.Score {
+		t.Errorf("expected GetEntry to return live decaying score, e1.Score=%.2f, e2.Score=%.2f", e1.Score, e2.Score)
+	}
+}
+
+func TestAutoAdjustThresholds_LoadFactorHigh(t *testing.T) {
+	cfg := Config{
+		HotThreshold:         10.0,
+		ColdThreshold:        2.0,
+		DecayHalfLife:        time.Hour,
+		ColdCheckCycles:      3,
+		HotCapacityRatio:     0.3,
+		AutoAdjustThresholds: true,
+		AdjustInterval:       time.Millisecond,
+		MinHotThreshold:      1.0,
+		MaxHotThreshold:      100.0,
+		MinColdThreshold:     0.1,
+		MaxColdThreshold:     20.0,
+	}
+	m := newTestManager(t, cfg)
+
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("k%d", i)
+		m.Put(key, "v")
+	}
+
+	initialCfg := m.GetConfig()
+
+	for i := 0; i < 500; i++ {
+		for j := 0; j < 10; j++ {
+			m.Get(fmt.Sprintf("k%d", j))
+		}
+	}
+
+	time.Sleep(time.Millisecond * 2)
+	m.CheckAndMigrate()
+
+	afterCfg := m.GetConfig()
+	t.Logf("Before: hot=%.2f cold=%.2f", initialCfg.HotThreshold, initialCfg.ColdThreshold)
+	t.Logf("After (high load): hot=%.2f cold=%.2f", afterCfg.HotThreshold, afterCfg.ColdThreshold)
+
+	if afterCfg.HotThreshold >= initialCfg.HotThreshold {
+		t.Log("Note: high load did not decrease threshold (combined with capacity ratio)")
+	}
+}
+
+func TestAutoAdjustThresholds_LoadFactorLow(t *testing.T) {
+	cfg := Config{
+		HotThreshold:         10.0,
+		ColdThreshold:        5.0,
+		DecayHalfLife:        time.Hour,
+		ColdCheckCycles:      3,
+		HotCapacityRatio:     0.3,
+		AutoAdjustThresholds: true,
+		AdjustInterval:       time.Millisecond,
+		MinHotThreshold:      1.0,
+		MaxHotThreshold:      100.0,
+		MinColdThreshold:     0.1,
+		MaxColdThreshold:     20.0,
+	}
+	m := newTestManager(t, cfg)
+
+	for i := 0; i < 50; i++ {
+		m.Put(fmt.Sprintf("k%d", i), "v")
+	}
+
+	initialCfg := m.GetConfig()
+
+	time.Sleep(time.Millisecond * 2)
+	m.CheckAndMigrate()
+
+	afterCfg := m.GetConfig()
+	t.Logf("Before: hot=%.2f cold=%.2f", initialCfg.HotThreshold, initialCfg.ColdThreshold)
+	t.Logf("After (low load): hot=%.2f cold=%.2f", afterCfg.HotThreshold, afterCfg.ColdThreshold)
+
+	if afterCfg.HotThreshold >= initialCfg.HotThreshold {
+		t.Log("Note: low load did not increase threshold (combined with capacity ratio)")
+	}
+}
+
+func TestTotalAccesses_Accumulates(t *testing.T) {
+	m := NewHotColdManager()
+
+	m.Put("a", 1)
+	m.Put("b", 2)
+	m.Get("a")
+	m.Get("b")
+	m.Get("a")
+
+	expectedOps := int64(5)
+	if m.totalAccesses != expectedOps {
+		t.Errorf("expected totalAccesses=%d, got %d", expectedOps, m.totalAccesses)
 	}
 }

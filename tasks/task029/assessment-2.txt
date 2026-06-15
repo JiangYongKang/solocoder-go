@@ -1,0 +1,6 @@
+产物不满意：
+1. NewHotColdManagerWithConfig 第 109-132 行的内联预校验与第 75-101 行的 ValidateConfig 形成双重校验路径，两者对同名字段的边界条件不一致。例如 HotCapacityRatio 内联校验用 `< 0`，ValidateConfig 用 `<= 0`，正确性完全依赖中间 134-166 行的零值自动填充弥合差异。修改一处忘记同步另一处就会引入校验漏洞。正确做法是将校验收敛到 ValidateConfig 单一入口，构造函数仅做零值填充后统一调用即可，不需要两套条件不一致的校验代码。
+2. TestAutoAdjustThresholds_LoadFactorLow 和 LoadFactorHigh 命名暗示分别验证低负载和高负载场景，但 AdjustInterval 设为 1ms 导致两者负载因子都远大于 2.0，均进入同一"高负载"分支。LoadFactorLow 的阈值从 10.00 变为 8.10，LoadFactorHigh 的从 10.00 变为 9.90，差异实际来自容量因子而非负载因子。两个测试的断言均包裹在 if 条件中仅用 t.Log 打印备注而非强制验证方向，负载因子维度覆盖形同虚设。应将 AdjustInterval 设为合理值，通过控制访问次数精确构造高低负载场景并做强断言。
+过程不满意：
+1. 模型收到提示词后第一步就在 session-cot-2.md 第 1 行直接用 todo_write 创建了 6 项子任务，然后才开始读取 hotcold.go。这种"先计划再理解"的模式违反标注规范——"不能刚收到任务就直接创建 TodoList，应先分析问题再规划"。导致后续计划中未预见 NewHotColdManagerWithConfig 返回 error 会引发测试文件大面积需批量替换和手动修复的连锁影响。
+2. 模型遇 TestNewHotColdManagerWithConfig_ReturnsError 失败后，将校验逻辑从"宽松容忍零值"改为"严格拒绝所有无效值"，但未评估对现有测试的连锁影响，随即导致 TestNewHotColdManagerWithConfig_InvalidThresholds 等多个测试失败。之后又反向将校验从严格改回宽松，出现两次方向完全相反的修改。这是试错式调试，两轮以上修改仍未收敛。正确做法是先分析错误原因和影响范围再最小修正。

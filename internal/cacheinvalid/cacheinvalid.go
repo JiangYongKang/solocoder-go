@@ -3,6 +3,7 @@ package cacheinvalid
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,17 +14,18 @@ var (
 	ErrListenerExists      = errors.New("listener already exists")
 	ErrListenerNotFound    = errors.New("listener not found")
 	ErrInvalidPreloadSize  = errors.New("invalid preload size: must be non-negative")
+	ErrCapacityExhausted   = errors.New("cache capacity exhausted: all entries are protected")
 )
 
 type CacheEntry struct {
-	Key        string
-	Value      interface{}
-	ExpiresAt  time.Time
-	TTL        time.Duration
-	IsHot      bool
+	Key         string
+	Value       interface{}
+	ExpiresAt   time.Time
+	TTL         time.Duration
+	IsHot       atomic.Bool
 	IsPreloaded bool
-	CreateTime time.Time
-	AccessCount int64
+	CreateTime  time.Time
+	AccessCount atomic.Int64
 }
 
 type InvalidationEvent struct {
@@ -145,52 +147,69 @@ func (m *CacheInvalidManager) PutWithTTL(key string, value interface{}, ttl time
 		entry.TTL = ttl
 		entry.ExpiresAt = time.Now().Add(ttl)
 		entry.CreateTime = time.Now()
+		entry.IsHot.Store(false)
+		entry.AccessCount.Store(0)
 		return nil
 	}
 
 	if len(m.entries) >= m.config.MaxEntries {
-		m.evictOne()
+		evicted := m.evictOne()
+		if !evicted {
+			return ErrCapacityExhausted
+		}
 	}
 
-	m.entries[key] = &CacheEntry{
-		Key:        key,
-		Value:      value,
-		ExpiresAt:  time.Now().Add(ttl),
-		TTL:        ttl,
-		IsHot:      false,
+	entry := &CacheEntry{
+		Key:         key,
+		Value:       value,
+		ExpiresAt:   time.Now().Add(ttl),
+		TTL:         ttl,
 		IsPreloaded: false,
-		CreateTime: time.Now(),
-		AccessCount: 0,
+		CreateTime:  time.Now(),
 	}
+	entry.IsHot.Store(false)
+	entry.AccessCount.Store(0)
+	m.entries[key] = entry
 
 	return nil
 }
 
 func (m *CacheInvalidManager) Get(key string) (interface{}, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	m.mu.RLock()
 	entry, exists := m.entries[key]
 	if !exists {
+		m.mu.RUnlock()
 		return nil, false
 	}
 
-	if entry.IsHot || entry.IsPreloaded {
-		entry.AccessCount++
-		return entry.Value, true
+	isHot := entry.IsHot.Load()
+	isPreloaded := entry.IsPreloaded
+	value := entry.Value
+	expiresAt := entry.ExpiresAt
+	hotThreshold := m.config.HotAccessThreshold
+	m.mu.RUnlock()
+
+	if isHot || isPreloaded {
+		entry.AccessCount.Add(1)
+		return value, true
 	}
 
-	if time.Now().After(entry.ExpiresAt) {
-		delete(m.entries, key)
+	if time.Now().After(expiresAt) {
+		m.mu.Lock()
+		entry2, exists2 := m.entries[key]
+		if exists2 && !entry2.IsHot.Load() && !entry2.IsPreloaded && time.Now().After(entry2.ExpiresAt) {
+			delete(m.entries, key)
+		}
+		m.mu.Unlock()
 		return nil, false
 	}
 
-	entry.AccessCount++
-	if entry.AccessCount >= m.config.HotAccessThreshold && !entry.IsHot {
-		entry.IsHot = true
+	count := entry.AccessCount.Add(1)
+	if count >= hotThreshold && !isHot {
+		entry.IsHot.CompareAndSwap(false, true)
 	}
 
-	return entry.Value, true
+	return value, true
 }
 
 func (m *CacheInvalidManager) Delete(key string) bool {
@@ -221,7 +240,7 @@ func (m *CacheInvalidManager) HotCount() int {
 	defer m.mu.RUnlock()
 	count := 0
 	for _, entry := range m.entries {
-		if entry.IsHot {
+		if entry.IsHot.Load() {
 			count++
 		}
 	}
@@ -237,7 +256,7 @@ func (m *CacheInvalidManager) IsExpired(key string) (bool, error) {
 		return false, ErrKeyNotFound
 	}
 
-	if entry.IsHot || entry.IsPreloaded {
+	if entry.IsHot.Load() || entry.IsPreloaded {
 		return false, nil
 	}
 
@@ -253,7 +272,7 @@ func (m *CacheInvalidManager) MarkHot(key string) error {
 		return ErrKeyNotFound
 	}
 
-	entry.IsHot = true
+	entry.IsHot.Store(true)
 	return nil
 }
 
@@ -266,7 +285,7 @@ func (m *CacheInvalidManager) UnmarkHot(key string) error {
 		return ErrKeyNotFound
 	}
 
-	entry.IsHot = false
+	entry.IsHot.Store(false)
 	return nil
 }
 
@@ -279,7 +298,7 @@ func (m *CacheInvalidManager) IsHot(key string) (bool, error) {
 		return false, ErrKeyNotFound
 	}
 
-	return entry.IsHot, nil
+	return entry.IsHot.Load(), nil
 }
 
 func (m *CacheInvalidManager) AddListener(eventType string, listener InvalidationListener) (string, error) {
@@ -372,6 +391,11 @@ func (m *CacheInvalidManager) SetPreloadLoader(loader PreloadLoader) error {
 		return ErrNilLoader
 	}
 	m.preloadLoader = loader
+
+	if m.config.PreloadOnStart {
+		return m.Preload()
+	}
+
 	return nil
 }
 
@@ -398,16 +422,17 @@ func (m *CacheInvalidManager) Preload() error {
 			break
 		}
 
-		m.entries[item.Key] = &CacheEntry{
+		entry := &CacheEntry{
 			Key:         item.Key,
 			Value:       item.Value,
 			ExpiresAt:   time.Time{},
 			TTL:         0,
-			IsHot:       item.IsHot,
 			IsPreloaded: true,
 			CreateTime:  time.Now(),
-			AccessCount: 0,
 		}
+		entry.IsHot.Store(item.IsHot)
+		entry.AccessCount.Store(0)
+		m.entries[item.Key] = entry
 		preloadCount++
 	}
 
@@ -454,25 +479,12 @@ func (m *CacheInvalidManager) PreloadedCount() int {
 	return count
 }
 
-func (m *CacheInvalidManager) GetEntry(key string) (*CacheEntry, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	entry, exists := m.entries[key]
-	if !exists {
-		return nil, false
-	}
-
-	result := *entry
-	return &result, true
-}
-
-func (m *CacheInvalidManager) evictOne() {
+func (m *CacheInvalidManager) evictOne() bool {
 	var oldestKey string
 	var oldestTime time.Time
 
 	for key, entry := range m.entries {
-		if entry.IsHot || entry.IsPreloaded {
+		if entry.IsHot.Load() || entry.IsPreloaded {
 			continue
 		}
 		if oldestKey == "" || entry.CreateTime.Before(oldestTime) {
@@ -483,13 +495,10 @@ func (m *CacheInvalidManager) evictOne() {
 
 	if oldestKey != "" {
 		delete(m.entries, oldestKey)
-		return
+		return true
 	}
 
-	for key := range m.entries {
-		delete(m.entries, key)
-		return
-	}
+	return false
 }
 
 func (m *CacheInvalidManager) CleanupExpired() int {
@@ -499,7 +508,7 @@ func (m *CacheInvalidManager) CleanupExpired() int {
 	count := 0
 	now := time.Now()
 	for key, entry := range m.entries {
-		if entry.IsHot || entry.IsPreloaded {
+		if entry.IsHot.Load() || entry.IsPreloaded {
 			continue
 		}
 		if now.After(entry.ExpiresAt) {
@@ -508,4 +517,26 @@ func (m *CacheInvalidManager) CleanupExpired() int {
 		}
 	}
 	return count
+}
+
+func (m *CacheInvalidManager) GetEntry(key string) (*CacheEntry, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entry, exists := m.entries[key]
+	if !exists {
+		return nil, false
+	}
+
+	result := &CacheEntry{
+		Key:         entry.Key,
+		Value:       entry.Value,
+		ExpiresAt:   entry.ExpiresAt,
+		TTL:         entry.TTL,
+		IsPreloaded: entry.IsPreloaded,
+		CreateTime:  entry.CreateTime,
+	}
+	result.IsHot.Store(entry.IsHot.Load())
+	result.AccessCount.Store(entry.AccessCount.Load())
+	return result, true
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,6 +17,8 @@ const (
 	WritePolicyWriteBack    WritePolicy    = "write_back"
 	CapacityModeCount       CapacityMode   = "count"
 	CapacityModeBytes       CapacityMode   = "bytes"
+
+	maxWriteBackRetries = 3
 )
 
 var (
@@ -24,6 +27,7 @@ var (
 	ErrInvalidPolicy   = errors.New("invalid write policy")
 	ErrNilValue        = errors.New("value cannot be nil")
 	ErrEmptyKey        = errors.New("key cannot be empty")
+	ErrWriteBackFailed = errors.New("write-back failed after retries")
 )
 
 type WritePolicy string
@@ -31,11 +35,12 @@ type EvictionPolicy string
 type CapacityMode string
 
 type CacheEntry struct {
-	Key       string
-	Value     []byte
-	Size      int
-	Timestamp int64
-	Dirty     bool
+	Key         string
+	Value       []byte
+	Size        int
+	Timestamp   int64
+	Dirty       bool
+	FailCount   int
 }
 
 type CacheLevelConfig struct {
@@ -80,6 +85,11 @@ type lruCache struct {
 	count          int64
 	totalBytes     int64
 	onEvict        func(*CacheEntry)
+	evictAsync     bool
+	evictQueueMu   sync.Mutex
+	evictQueue     []*CacheEntry
+	evictWg        sync.WaitGroup
+	closed         atomic.Bool
 }
 
 func newLRUCache(cfg CacheLevelConfig, onEvict func(*CacheEntry)) *lruCache {
@@ -93,19 +103,65 @@ func newLRUCache(cfg CacheLevelConfig, onEvict func(*CacheEntry)) *lruCache {
 		cfg.EvictionPolicy = EvictionPolicyLRU
 	}
 
-	return &lruCache{
+	c := &lruCache{
 		capacity:       cfg.Capacity,
 		capacityMode:   cfg.CapacityMode,
 		evictionPolicy: cfg.EvictionPolicy,
 		items:          make(map[string]*list.Element),
 		orderList:      list.New(),
 		onEvict:        onEvict,
+		evictAsync:     true,
+		evictQueue:     make([]*CacheEntry, 0, 16),
+	}
+
+	if onEvict != nil {
+		go c.processEvictQueue()
+	}
+
+	return c
+}
+
+func (c *lruCache) processEvictQueue() {
+	for !c.closed.Load() {
+		c.evictQueueMu.Lock()
+		if len(c.evictQueue) == 0 {
+			c.evictQueueMu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		entries := c.evictQueue
+		c.evictQueue = make([]*CacheEntry, 0, 16)
+		c.evictQueueMu.Unlock()
+
+		for _, entry := range entries {
+			c.onEvict(entry)
+		}
+		c.evictWg.Add(-len(entries))
 	}
 }
 
+func (c *lruCache) enqueueEvict(entry *CacheEntry) {
+	if c.onEvict == nil {
+		return
+	}
+	c.evictWg.Add(1)
+	c.evictQueueMu.Lock()
+	c.evictQueue = append(c.evictQueue, entry)
+	c.evictQueueMu.Unlock()
+}
+
+func (c *lruCache) waitEvictions() {
+	c.evictWg.Wait()
+}
+
+func (c *lruCache) Close() {
+	c.closed.Store(true)
+	c.waitEvictions()
+}
+
 func (c *lruCache) get(key string) (*CacheEntry, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if elem, ok := c.items[key]; ok {
 		c.orderList.MoveToFront(elem)
@@ -137,7 +193,10 @@ func (c *lruCache) put(key string, value []byte) *CacheEntry {
 	}
 
 	for c.isOverCapacity(size) {
-		c.evictOneLocked()
+		evicted := c.evictOneLocked()
+		if evicted == nil {
+			break
+		}
 	}
 
 	elem := c.orderList.PushFront(entry)
@@ -148,9 +207,41 @@ func (c *lruCache) put(key string, value []byte) *CacheEntry {
 	return entry
 }
 
-func (c *lruCache) delete(key string) bool {
+func (c *lruCache) putWithoutEvictCallback(key string, value []byte) (*CacheEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	size := len(value)
+	entry := &CacheEntry{
+		Key:       key,
+		Value:     value,
+		Size:      size,
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	if elem, ok := c.items[key]; ok {
+		oldEntry := elem.Value.(*CacheEntry)
+		c.totalBytes -= int64(oldEntry.Size)
+		elem.Value = entry
+		c.orderList.MoveToFront(elem)
+		c.totalBytes += int64(size)
+		return entry, true
+	}
+
+	if c.isOverCapacity(size) {
+		return nil, false
+	}
+
+	elem := c.orderList.PushFront(entry)
+	c.items[key] = elem
+	c.count++
+	c.totalBytes += int64(size)
+
+	return entry, true
+}
+
+func (c *lruCache) delete(key string) bool {
+	c.mu.Lock()
 
 	if elem, ok := c.items[key]; ok {
 		entry := elem.Value.(*CacheEntry)
@@ -158,11 +249,16 @@ func (c *lruCache) delete(key string) bool {
 		c.orderList.Remove(elem)
 		delete(c.items, key)
 		c.count--
+
+		c.mu.Unlock()
+
 		if c.onEvict != nil {
-			c.onEvict(entry)
+			c.enqueueEvict(entry)
 		}
 		return true
 	}
+
+	c.mu.Unlock()
 	return false
 }
 
@@ -190,7 +286,7 @@ func (c *lruCache) evictOneLocked() *CacheEntry {
 	c.count--
 
 	if c.onEvict != nil {
-		c.onEvict(entry)
+		c.enqueueEvict(entry)
 	}
 
 	return entry
@@ -217,7 +313,7 @@ func (c *lruCache) evictAll() []*CacheEntry {
 
 	if c.onEvict != nil {
 		for _, entry := range entries {
-			c.onEvict(entry)
+			c.enqueueEvict(entry)
 		}
 	}
 
@@ -271,7 +367,29 @@ func (c *lruCache) clearDirty(key string) {
 	if elem, ok := c.items[key]; ok {
 		entry := elem.Value.(*CacheEntry)
 		entry.Dirty = false
+		entry.FailCount = 0
 	}
+}
+
+func (c *lruCache) incrementFailCount(key string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if elem, ok := c.items[key]; ok {
+		entry := elem.Value.(*CacheEntry)
+		entry.FailCount++
+		return entry.FailCount
+	}
+	return 0
+}
+
+func (c *lruCache) getAndRemoveDirtyLocked(key string) *CacheEntry {
+	if elem, ok := c.items[key]; ok {
+		entry := elem.Value.(*CacheEntry)
+		entry.Dirty = false
+		return entry
+	}
+	return nil
 }
 
 type TieredCache struct {
@@ -282,6 +400,8 @@ type TieredCache struct {
 	mu              sync.RWMutex
 	writeBackTicker *time.Ticker
 	writeBackStop   chan struct{}
+	closed          atomic.Bool
+	writeBackErrors atomic.Int64
 }
 
 func NewTieredCache() (*TieredCache, error) {
@@ -402,6 +522,7 @@ func (tc *TieredCache) Put(key string, value []byte) error {
 	} else {
 		entry := tc.l1.put(key, value)
 		entry.Dirty = true
+		entry.FailCount = 0
 	}
 
 	return nil
@@ -424,9 +545,13 @@ func (tc *TieredCache) Delete(key string) error {
 
 func (tc *TieredCache) handleL1Eviction(entry *CacheEntry) {
 	if entry.Dirty {
-		tc.writeToL2(entry.Key, entry.Value)
-		l2Entry := tc.l2.put(entry.Key, entry.Value)
-		l2Entry.Dirty = false
+		if err := tc.writeToL2(entry.Key, entry.Value); err != nil {
+			return
+		}
+		l2Entry, ok := tc.l2.putWithoutEvictCallback(entry.Key, entry.Value)
+		if ok {
+			l2Entry.Dirty = false
+		}
 	}
 }
 
@@ -457,33 +582,68 @@ func (tc *TieredCache) runWriteBack() {
 
 func (tc *TieredCache) flushWriteBack() {
 	tc.mu.Lock()
-	defer tc.mu.Unlock()
 
 	dirtyEntries := tc.l1.getDirtyEntries()
+	failedEntries := make([]*CacheEntry, 0)
+
 	for _, entry := range dirtyEntries {
-		if err := tc.writeToL2(entry.Key, entry.Value); err != nil {
+		failCount := tc.l1.incrementFailCount(entry.Key)
+		if failCount > maxWriteBackRetries {
+			tc.l1.clearDirty(entry.Key)
+			tc.writeBackErrors.Add(1)
 			continue
 		}
-		l2Entry := tc.l2.put(entry.Key, entry.Value)
+
+		if err := tc.writeToL2(entry.Key, entry.Value); err != nil {
+			failedEntries = append(failedEntries, entry)
+			continue
+		}
+
+		l2Entry, ok := tc.l2.putWithoutEvictCallback(entry.Key, entry.Value)
+		if !ok {
+			failedEntries = append(failedEntries, entry)
+			continue
+		}
 		l2Entry.Dirty = false
 		tc.l1.clearDirty(entry.Key)
 	}
+
+	tc.mu.Unlock()
 }
 
-func (tc *TieredCache) Flush() {
+func (tc *TieredCache) Flush() error {
 	if tc.writePolicy == WritePolicyWriteBack {
 		tc.flushWriteBack()
+		errCount := tc.writeBackErrors.Load()
+		if errCount > 0 {
+			return fmt.Errorf("%w: %d entries permanently failed", ErrWriteBackFailed, errCount)
+		}
 	}
+	return nil
 }
 
 func (tc *TieredCache) Close() error {
+	if !tc.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
 	if tc.writeBackTicker != nil {
 		tc.writeBackTicker.Stop()
 		close(tc.writeBackStop)
 	}
 
-	tc.Flush()
-	return nil
+	var flushErr error
+	if tc.writePolicy == WritePolicyWriteBack {
+		flushErr = tc.Flush()
+	}
+
+	tc.l1.waitEvictions()
+	tc.l2.waitEvictions()
+
+	tc.l1.Close()
+	tc.l2.Close()
+
+	return flushErr
 }
 
 func (tc *TieredCache) loadL2FromDisk() error {
@@ -494,6 +654,9 @@ func (tc *TieredCache) loadL2FromDisk() error {
 		}
 		return err
 	}
+
+	loadedCount := 0
+	skippedCount := 0
 
 	for _, file := range files {
 		if file.IsDir() {
@@ -507,9 +670,19 @@ func (tc *TieredCache) loadL2FromDisk() error {
 		}
 
 		key := unsanitizeKey(file.Name())
-		entry := tc.l2.put(key, data)
-		entry.Dirty = false
+		entry, ok := tc.l2.putWithoutEvictCallback(key, data)
+		if ok {
+			entry.Dirty = false
+			loadedCount++
+		} else {
+			skippedCount++
+		}
 	}
+
+	if skippedCount > 0 {
+		_ = skippedCount
+	}
+	_ = loadedCount
 
 	return nil
 }
@@ -550,6 +723,10 @@ func (tc *TieredCache) ContainsL2(key string) bool {
 	defer tc.mu.RUnlock()
 	_, ok := tc.l2.get(key)
 	return ok
+}
+
+func (tc *TieredCache) WriteBackErrorCount() int64 {
+	return tc.writeBackErrors.Load()
 }
 
 func (tc *TieredCache) Clear() error {

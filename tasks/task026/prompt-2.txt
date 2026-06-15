@@ -1,0 +1,7 @@
+你实现的多级缓存架构模块存在一些问题，需要修复：
+1. lruCache 的 get 方法在获取读锁后调用 MoveToFront 修改链表指针，而 container/list 不是并发安全的。多个 goroutine 并发 Get 时因外层锁为读锁可并行，导致多个 MoveToFront 同时修改链表形成数据竞争。
+2. loadL2FromDisk 方法在 L2 容量不足时，逐条加载触发淘汰回调，而淘汰回调 handleL2Eviction 会调用 os.Remove 将磁盘文件永久删除，导致重启恢复过程反而丢失了比重启前更多的持久化数据。
+3. lruCache 的 delete 和 evictOneLocked 在持有互斥锁时同步调用回调执行磁盘删除，磁盘 I/O 在持锁状态下阻塞全部缓存读写操作。
+4. flushWriteBack 对 writeToL2 错误用 continue 静默跳过，失败条目的 Dirty 标记未被清除，导致每次刷盘都重试注定失败的条目形成死循环。
+5. 修复后运行 go test -race ./internal/tieredcache/ -v，需要让所有测试通过且无数据竞争。需要补充验证并发读写无数据竞争和磁盘恢复过程数据安全的测试用例。
+6. 在 docs/tieredcache.md 中更新模块需求文档，说明修复后的并发安全保证、淘汰回调的执行层级和回写失败的处理策略。

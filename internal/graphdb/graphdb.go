@@ -8,16 +8,17 @@ import (
 )
 
 var (
-	ErrNodeNotFound       = errors.New("node not found")
-	ErrNodeExists         = errors.New("node already exists")
-	ErrEdgeNotFound       = errors.New("edge not found")
-	ErrEdgeExists         = errors.New("edge already exists")
-	ErrSelfLoop           = errors.New("self-loop edge not allowed")
-	ErrNegativeWeight     = errors.New("negative edge weight not allowed")
-	ErrInvalidStartNode   = errors.New("invalid start node")
-	ErrInvalidEndNode     = errors.New("invalid end node")
+	ErrNodeNotFound        = errors.New("node not found")
+	ErrNodeExists          = errors.New("node already exists")
+	ErrEdgeNotFound        = errors.New("edge not found")
+	ErrEdgeExists          = errors.New("edge already exists")
+	ErrSelfLoop            = errors.New("self-loop edge not allowed")
+	ErrNegativeWeight      = errors.New("negative edge weight not allowed")
+	ErrInvalidStartNode    = errors.New("invalid start node")
+	ErrInvalidEndNode      = errors.New("invalid end node")
 	ErrMaxDepthNonPositive = errors.New("max depth must be positive")
-	ErrNoPath             = errors.New("no path exists between nodes")
+	ErrNoPath              = errors.New("no path exists between nodes")
+	ErrEmptyID             = errors.New("node ID must not be empty")
 )
 
 type Node struct {
@@ -31,11 +32,6 @@ type Edge struct {
 	Weight     float64
 	Label      string
 	Properties map[string]interface{}
-}
-
-type edgeItem struct {
-	edge   *Edge
-	sorted bool
 }
 
 type Graph struct {
@@ -64,7 +60,7 @@ func NewGraph() *Graph {
 
 func (g *Graph) AddNode(id string, properties map[string]interface{}) error {
 	if id == "" {
-		return ErrNodeNotFound
+		return ErrEmptyID
 	}
 
 	g.mu.Lock()
@@ -415,23 +411,34 @@ func (g *Graph) DFS(start string, maxDepth int) ([]string, error) {
 	visited := make(map[string]bool)
 	result := []string{}
 
-	var dfs func(nodeID string, depth int)
-	dfs = func(nodeID string, depth int) {
-		visited[nodeID] = true
-		result = append(result, nodeID)
+	type stackItem struct {
+		nodeID string
+		depth  int
+		index  int
+	}
 
-		if depth >= maxDepth {
-			return
+	stack := []stackItem{{nodeID: start, depth: 0, index: 0}}
+	visited[start] = true
+	result = append(result, start)
+
+	for len(stack) > 0 {
+		top := &stack[len(stack)-1]
+
+		if top.depth >= maxDepth || top.index >= len(g.outEdges[top.nodeID]) {
+			stack = stack[:len(stack)-1]
+			continue
 		}
 
-		for _, e := range g.outEdges[nodeID] {
-			if !visited[e.To] {
-				dfs(e.To, depth+1)
-			}
+		e := g.outEdges[top.nodeID][top.index]
+		top.index++
+
+		if !visited[e.To] {
+			visited[e.To] = true
+			result = append(result, e.To)
+			stack = append(stack, stackItem{nodeID: e.To, depth: top.depth + 1, index: 0})
 		}
 	}
 
-	dfs(start, 0)
 	return result, nil
 }
 

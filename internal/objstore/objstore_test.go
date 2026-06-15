@@ -24,7 +24,10 @@ func TestNewObjectStoreWithConfig(t *testing.T) {
 		CleanupBatchSize: 2,
 		CleanupInterval:  3,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 	if store == nil {
 		t.Fatal("NewObjectStoreWithConfig returned nil")
 	}
@@ -39,35 +42,48 @@ func TestNewObjectStoreWithConfig(t *testing.T) {
 	}
 }
 
-func TestNewObjectStoreWithConfig_Defaults(t *testing.T) {
-	cfg := Config{}
-	store := NewObjectStoreWithConfig(cfg)
-	if store.config.MaxVersions != 10 {
-		t.Errorf("expected default MaxVersions 10, got %d", store.config.MaxVersions)
+func TestNewObjectStoreWithConfig_InvalidMaxVersions(t *testing.T) {
+	cfg := Config{
+		MaxVersions:      0,
+		CleanupBatchSize: 1,
+		CleanupInterval:  1,
 	}
-	if store.config.CleanupBatchSize != 1 {
-		t.Errorf("expected default CleanupBatchSize 1, got %d", store.config.CleanupBatchSize)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != ErrInvalidMaxVersion {
+		t.Errorf("expected ErrInvalidMaxVersion, got %v", err)
 	}
-	if store.config.CleanupInterval != 1 {
-		t.Errorf("expected default CleanupInterval 1, got %d", store.config.CleanupInterval)
+	if store != nil {
+		t.Error("expected store to be nil for invalid config")
 	}
 }
 
-func TestNewObjectStoreWithConfig_Invalid(t *testing.T) {
+func TestNewObjectStoreWithConfig_InvalidBatchSize(t *testing.T) {
 	cfg := Config{
-		MaxVersions:      -1,
-		CleanupBatchSize: 0,
-		CleanupInterval:  -5,
+		MaxVersions:      10,
+		CleanupBatchSize: -1,
+		CleanupInterval:  1,
 	}
-	store := NewObjectStoreWithConfig(cfg)
-	if store.config.MaxVersions != 10 {
-		t.Errorf("expected MaxVersions to default to 10, got %d", store.config.MaxVersions)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != ErrInvalidBatchSize {
+		t.Errorf("expected ErrInvalidBatchSize, got %v", err)
 	}
-	if store.config.CleanupBatchSize != 1 {
-		t.Errorf("expected CleanupBatchSize to default to 1, got %d", store.config.CleanupBatchSize)
+	if store != nil {
+		t.Error("expected store to be nil for invalid config")
 	}
-	if store.config.CleanupInterval != 1 {
-		t.Errorf("expected CleanupInterval to default to 1, got %d", store.config.CleanupInterval)
+}
+
+func TestNewObjectStoreWithConfig_InvalidInterval(t *testing.T) {
+	cfg := Config{
+		MaxVersions:      10,
+		CleanupBatchSize: 1,
+		CleanupInterval:  0,
+	}
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != ErrInvalidCleanupInterval {
+		t.Errorf("expected ErrInvalidCleanupInterval, got %v", err)
+	}
+	if store != nil {
+		t.Error("expected store to be nil for invalid config")
 	}
 }
 
@@ -254,6 +270,35 @@ func TestGetVersion_Specific(t *testing.T) {
 	}
 }
 
+func TestGetVersion_BinarySearch_Large(t *testing.T) {
+	cfg := Config{
+		MaxVersions:      10000,
+		CleanupBatchSize: 1,
+		CleanupInterval:  100000,
+	}
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
+
+	numVersions := 1000
+	for i := 1; i <= numVersions; i++ {
+		store.Put("key1", []byte(fmt.Sprintf("value_%d", i)))
+	}
+
+	samples := []int{1, 2, 50, 500, 999, 1000}
+	for _, s := range samples {
+		data, err := store.GetVersion("key1", uint64(s))
+		if err != nil {
+			t.Fatalf("GetVersion(%d) failed: %v", s, err)
+		}
+		expected := []byte(fmt.Sprintf("value_%d", s))
+		if !bytes.Equal(data, expected) {
+			t.Errorf("version %d: expected %q, got %q", s, expected, data)
+		}
+	}
+}
+
 func TestGetVersion_NotFound(t *testing.T) {
 	store := NewObjectStore()
 
@@ -396,6 +441,36 @@ func TestRollback_ToLatestVersion(t *testing.T) {
 	data, _, _ := store.Get("key1")
 	if !bytes.Equal(data, []byte("v2")) {
 		t.Errorf("expected 'v2' after rollback to version 2, got %q", data)
+	}
+}
+
+func TestRollback_BinarySearch_Large(t *testing.T) {
+	cfg := Config{
+		MaxVersions:      10000,
+		CleanupBatchSize: 1,
+		CleanupInterval:  100000,
+	}
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
+
+	numVersions := 500
+	for i := 1; i <= numVersions; i++ {
+		store.Put("key1", []byte(fmt.Sprintf("value_%d", i)))
+	}
+
+	newVer, err := store.Rollback("key1", 250)
+	if err != nil {
+		t.Fatalf("Rollback to version 250 failed: %v", err)
+	}
+	if newVer != 501 {
+		t.Errorf("expected new version 501, got %d", newVer)
+	}
+
+	data, _, _ := store.Get("key1")
+	if !bytes.Equal(data, []byte("value_250")) {
+		t.Errorf("expected 'value_250' after rollback, got %q", data)
 	}
 }
 
@@ -581,7 +656,10 @@ func TestCleanup_AutoOnPut(t *testing.T) {
 		CleanupBatchSize: 1,
 		CleanupInterval:  1,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 
 	for i := 1; i <= 5; i++ {
 		store.Put("key1", []byte(fmt.Sprintf("v%d", i)))
@@ -607,7 +685,10 @@ func TestCleanup_BatchSize(t *testing.T) {
 		CleanupBatchSize: 2,
 		CleanupInterval:  10,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 
 	for i := 1; i <= 9; i++ {
 		store.Put("key1", []byte(fmt.Sprintf("v%d", i)))
@@ -646,7 +727,10 @@ func TestCleanup_BatchSizeLargerThanExcess(t *testing.T) {
 		CleanupBatchSize: 10,
 		CleanupInterval:  1,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 
 	for i := 1; i <= 5; i++ {
 		store.Put("key1", []byte(fmt.Sprintf("v%d", i)))
@@ -664,7 +748,10 @@ func TestCleanupAll(t *testing.T) {
 		CleanupBatchSize: 10,
 		CleanupInterval:  100,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 
 	for k := 0; k < 3; k++ {
 		key := fmt.Sprintf("key%d", k)
@@ -695,40 +782,34 @@ func TestCleanupAll(t *testing.T) {
 	}
 }
 
-func TestCleanupAll_MultipleBatches(t *testing.T) {
+func TestCleanupAll_AllExcessAtOnce(t *testing.T) {
 	cfg := Config{
 		MaxVersions:      2,
 		CleanupBatchSize: 1,
 		CleanupInterval:  100,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 
-	for i := 1; i <= 6; i++ {
+	for i := 1; i <= 10; i++ {
 		store.Put("key1", []byte(fmt.Sprintf("v%d", i)))
 	}
 
 	count, _ := store.VersionCount("key1")
-	if count != 6 {
-		t.Errorf("expected 6 versions before CleanupAll, got %d", count)
+	if count != 10 {
+		t.Errorf("expected 10 versions before CleanupAll, got %d", count)
 	}
 
 	cleaned := store.CleanupAll()
-	if cleaned != 1 {
-		t.Errorf("expected 1 version cleaned in first batch, got %d", cleaned)
+	if cleaned != 8 {
+		t.Errorf("expected 8 versions cleaned (10 - 2) in one call, got %d", cleaned)
 	}
-
-	count, _ = store.VersionCount("key1")
-	if count != 5 {
-		t.Errorf("expected 5 versions after first CleanupAll batch, got %d", count)
-	}
-
-	store.CleanupAll()
-	store.CleanupAll()
-	store.CleanupAll()
 
 	count, _ = store.VersionCount("key1")
 	if count != 2 {
-		t.Errorf("expected 2 versions after multiple CleanupAll calls, got %d", count)
+		t.Errorf("expected 2 versions after single CleanupAll call, got %d", count)
 	}
 }
 
@@ -738,7 +819,10 @@ func TestCleanup_WithRollback(t *testing.T) {
 		CleanupBatchSize: 1,
 		CleanupInterval:  1,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 
 	store.Put("key1", []byte("v1"))
 	store.Put("key1", []byte("v2"))
@@ -767,7 +851,10 @@ func TestCleanup_NoCleanupNeeded(t *testing.T) {
 		CleanupBatchSize: 1,
 		CleanupInterval:  1,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 
 	for i := 1; i <= 5; i++ {
 		store.Put("key1", []byte(fmt.Sprintf("v%d", i)))
@@ -790,7 +877,10 @@ func TestCleanupInterval(t *testing.T) {
 		CleanupBatchSize: 3,
 		CleanupInterval:  5,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 
 	for i := 1; i <= 5; i++ {
 		store.Put("key1", []byte(fmt.Sprintf("v%d", i)))
@@ -924,7 +1014,10 @@ func TestConcurrentRollback(t *testing.T) {
 		CleanupBatchSize: 1,
 		CleanupInterval:  1,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 
 	for i := 1; i <= 5; i++ {
 		store.Put("key1", []byte(fmt.Sprintf("v%d", i)))
@@ -988,7 +1081,10 @@ func TestConcurrentCleanup(t *testing.T) {
 		CleanupBatchSize: 1,
 		CleanupInterval:  3,
 	}
-	store := NewObjectStoreWithConfig(cfg)
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
 
 	var wg sync.WaitGroup
 	numGoroutines := 10
@@ -1100,6 +1196,9 @@ func TestErrors_Values(t *testing.T) {
 	if ErrInvalidBatchSize == nil {
 		t.Error("ErrInvalidBatchSize should not be nil")
 	}
+	if ErrInvalidCleanupInterval == nil {
+		t.Error("ErrInvalidCleanupInterval should not be nil")
+	}
 }
 
 func TestPut_LargeData(t *testing.T) {
@@ -1174,5 +1273,53 @@ func TestRollback_VersionsPreserved(t *testing.T) {
 	}
 	if !bytes.Equal(v2, []byte("second")) {
 		t.Error("version 2 should still be 'second' after rollback")
+	}
+}
+
+func TestFindVersion_BinarySearch_Various(t *testing.T) {
+	cfg := Config{
+		MaxVersions:      1000,
+		CleanupBatchSize: 1,
+		CleanupInterval:  1000,
+	}
+	store, err := NewObjectStoreWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewObjectStoreWithConfig failed: %v", err)
+	}
+
+	for i := 1; i <= 100; i++ {
+		store.Put("key1", []byte(fmt.Sprintf("val_%d", i)))
+	}
+
+	testCases := []struct {
+		target  uint64
+		found   bool
+	}{
+		{0, false},
+		{1, true},
+		{50, true},
+		{100, true},
+		{101, false},
+		{999, false},
+	}
+
+	for _, tc := range testCases {
+		data, err := store.GetVersion("key1", tc.target)
+		if tc.found {
+			if err != nil {
+				t.Errorf("GetVersion(%d): expected to find, got error %v", tc.target, err)
+			}
+			expected := []byte(fmt.Sprintf("val_%d", tc.target))
+			if !bytes.Equal(data, expected) {
+				t.Errorf("GetVersion(%d): expected %q, got %q", tc.target, expected, data)
+			}
+		} else {
+			if err != ErrVersionNotFound {
+				t.Errorf("GetVersion(%d): expected ErrVersionNotFound, got %v", tc.target, err)
+			}
+			if data != nil {
+				t.Errorf("GetVersion(%d): expected nil data, got %v", tc.target, data)
+			}
+		}
 	}
 }

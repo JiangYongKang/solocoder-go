@@ -63,7 +63,7 @@ func (m *mockSource) Fetch(ctx context.Context, cursor *Cursor, batchSize int) (
 		}
 	}
 
-	startIdx := int(cursor.LastOffset)
+	startIdx := m.findStartIdx(cursor)
 	if startIdx >= len(m.records) {
 		return &Batch{Records: nil}, nil
 	}
@@ -86,13 +86,58 @@ func (m *mockSource) Fetch(ctx context.Context, cursor *Cursor, batchSize int) (
 	return batch, nil
 }
 
-func (m *mockSource) Count(_ context.Context, _ *Cursor) (int64, error) {
+func (m *mockSource) findStartIdx(cursor *Cursor) int {
+	if cursor == nil {
+		return 0
+	}
+
+	switch cursor.Mode {
+	case IncrementalModeFull:
+		return int(cursor.LastOffset)
+
+	case IncrementalModeTimestamp:
+		if cursor.LastValue == nil {
+			return 0
+		}
+		lastTs, ok := cursor.LastValue.(time.Time)
+		if !ok {
+			return 0
+		}
+		for i, r := range m.records {
+			if r.Timestamp.After(lastTs) {
+				return i
+			}
+		}
+		return len(m.records)
+
+	case IncrementalModeID:
+		if cursor.LastValue == nil {
+			return 0
+		}
+		lastID, ok := cursor.LastValue.(int64)
+		if !ok {
+			return 0
+		}
+		for i, r := range m.records {
+			if r.SeqID > lastID {
+				return i
+			}
+		}
+		return len(m.records)
+
+	default:
+		return 0
+	}
+}
+
+func (m *mockSource) Count(_ context.Context, cursor *Cursor) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.countErr != nil {
 		return 0, m.countErr
 	}
-	return int64(len(m.records)), nil
+	startIdx := m.findStartIdx(cursor)
+	return int64(len(m.records) - startIdx), nil
 }
 
 func (m *mockSource) Close(_ context.Context) error {
@@ -586,18 +631,31 @@ func TestRun_IncrementalID(t *testing.T) {
 }
 
 func TestRun_CheckpointResume(t *testing.T) {
+	t.Run("FullMode_LastOffset", func(t *testing.T) {
+		testCheckpointResume(t, IncrementalModeFull, "offset")
+	})
+	t.Run("IDMode_LastValue", func(t *testing.T) {
+		testCheckpointResume(t, IncrementalModeID, "id")
+	})
+	t.Run("TimestampMode_LastValue", func(t *testing.T) {
+		testCheckpointResume(t, IncrementalModeTimestamp, "ts")
+	})
+}
+
+func testCheckpointResume(t *testing.T, mode IncrementalMode, field string) {
 	store := NewMemoryCheckpointStore()
 	total := 100
 	batchSize := 10
+	stopAtBatch := int64(5)
 
 	src1 := newMockSource(total)
+	src1.fetchDelay = 2 * time.Millisecond
 	tgt1 := newMockTarget()
-	halfProcessed := false
-	src1.fetchDelay = 0
 
 	cfg := Config{
 		BatchSize:        batchSize,
-		IncrementalMode:  IncrementalModeFull,
+		IncrementalMode:  mode,
+		IncrementalField: field,
 		EnableCheckpoint: true,
 		MaxRetryPerBatch: 0,
 		ProgressInterval: 0,
@@ -605,24 +663,23 @@ func TestRun_CheckpointResume(t *testing.T) {
 	}
 	p1, _ := NewPipeline(cfg, src1, tgt1, store)
 
-	ctx1, cancel1 := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
 	go func() {
-		for {
-			if p1.GetBatches() >= 5 {
-				if !halfProcessed {
-					halfProcessed = true
-					cancel1()
-				}
-				return
-			}
-			time.Sleep(1 * time.Millisecond)
-			if p1.Status() != PipelineStatusRunning {
-				return
-			}
-		}
+		runDone <- p1.Run(context.Background())
 	}()
 
-	_ = p1.Run(ctx1)
+	for {
+		if p1.GetBatches() >= stopAtBatch {
+			p1.Stop()
+			break
+		}
+		time.Sleep(500 * time.Microsecond)
+		if p1.Status() != PipelineStatusRunning {
+			break
+		}
+	}
+
+	_ = <-runDone
 
 	cursorAfterFirst, _ := store.Load(context.Background())
 	if cursorAfterFirst == nil {
@@ -632,36 +689,64 @@ func TestRun_CheckpointResume(t *testing.T) {
 	if firstWritten == 0 {
 		t.Fatal("expected some records written in first run")
 	}
+	t.Logf("[mode=%v] First run: written=%d, batches=%d, cursor.LastOffset=%d, LastValue=%v",
+		mode, firstWritten, p1.GetBatches(), cursorAfterFirst.LastOffset, cursorAfterFirst.LastValue)
 
+	src2 := newMockSource(total)
 	tgt2 := newMockTarget()
-
-	loadedCursor, _ := store.Load(context.Background())
-	t.Logf("Checkpoint: LastOffset=%d, writtenInFirst=%d", loadedCursor.LastOffset, firstWritten)
-
-	src2Copy := newMockSource(total)
-	src2Copy.records = src2Copy.records[loadedCursor.LastOffset:]
 	tgt2.written = tgt1.GetWritten()
 
-	src3 := &mockSource{
-		records:  src2Copy.records,
-		fetchIdx: 0,
-	}
-
-	p3, _ := NewPipeline(cfg, src3, tgt2, store)
-	err := p3.Run(context.Background())
+	p2, _ := NewPipeline(cfg, src2, tgt2, store)
+	err := p2.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Resume run failed: %v", err)
 	}
 
 	totalWritten := tgt2.WrittenCount()
 	if totalWritten != total {
-		t.Errorf("expected total %d written after resume, got %d (first: %d, resume: %d)",
-			total, totalWritten, firstWritten, totalWritten-firstWritten)
+		t.Errorf("[mode=%v] expected total %d written after resume, got %d (first: %d, resume: %d)",
+			mode, total, totalWritten, firstWritten, totalWritten-firstWritten)
+	}
+
+	written := tgt2.GetWritten()
+	idSeen := make(map[string]bool)
+	for i, r := range written {
+		if idSeen[r.ID] {
+			t.Errorf("[mode=%v] duplicate record found at idx %d: %s", mode, i, r.ID)
+		}
+		idSeen[r.ID] = true
+		expectedID := fmt.Sprintf("rec-%d", i)
+		if r.ID != expectedID {
+			t.Errorf("[mode=%v] record %d: expected ID=%s, got %s", mode, i, expectedID, r.ID)
+		}
+	}
+	if len(idSeen) != total {
+		t.Errorf("[mode=%v] expected %d unique records, got %d", mode, total, len(idSeen))
 	}
 
 	finalCursor, _ := store.Load(context.Background())
 	if finalCursor.LastOffset != int64(total) {
-		t.Errorf("expected final LastOffset=%d, got %d", total, finalCursor.LastOffset)
+		t.Errorf("[mode=%v] expected final LastOffset=%d, got %d", mode, total, finalCursor.LastOffset)
+	}
+
+	switch mode {
+	case IncrementalModeID:
+		lastID, ok := finalCursor.LastValue.(int64)
+		if !ok {
+			t.Fatalf("[ID mode] expected int64 LastValue, got %T", finalCursor.LastValue)
+		}
+		if lastID != int64(total) {
+			t.Errorf("[ID mode] expected final LastValue=%d, got %d", total, lastID)
+		}
+	case IncrementalModeTimestamp:
+		lastTs, ok := finalCursor.LastValue.(time.Time)
+		if !ok {
+			t.Fatalf("[Timestamp mode] expected time.Time LastValue, got %T", finalCursor.LastValue)
+		}
+		expectedTs := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(total-1) * time.Minute)
+		if !lastTs.Equal(expectedTs) {
+			t.Errorf("[Timestamp mode] expected final LastValue=%v, got %v", expectedTs, lastTs)
+		}
 	}
 }
 

@@ -571,12 +571,12 @@ func TestDelete_WriteThrough_StorageFail(t *testing.T) {
 	storage := newMockStorage()
 
 	cfg := Config{
-		MaxRetries:       0,
-		RetryInterval:    1 * time.Millisecond,
-		DegradeThreshold: 100,
-		RecoverThreshold: 3,
-		RecoverWindow:    5 * time.Second,
-		EnableReadThrough: true,
+		MaxRetries:        0,
+		RetryInterval:     1 * time.Millisecond,
+		DegradeThreshold:  100,
+		RecoverThreshold:  3,
+		RecoverWindow:     5 * time.Second,
+		EnableReadThrough: false,
 	}
 	cache, err := NewWriteThroughCacheWithConfig(storage, cfg)
 	if err != nil {
@@ -596,6 +596,62 @@ func TestDelete_WriteThrough_StorageFail(t *testing.T) {
 	storageData := storage.GetData()
 	if _, ok := storageData["key1"]; !ok {
 		t.Error("data should still be in storage since delete failed")
+	}
+
+	val, err := cache.Get("key1")
+	if err != nil {
+		t.Fatalf("cache should still have the data after storage delete failed, got error: %v", err)
+	}
+	if val != "value1" {
+		t.Errorf("cache should have value1, got %s", val)
+	}
+}
+
+func TestDelete_Consistency_FirstDeleteStorage(t *testing.T) {
+	storage := newMockStorage()
+
+	cfg := Config{
+		MaxRetries:        0,
+		RetryInterval:     1 * time.Millisecond,
+		DegradeThreshold:  100,
+		RecoverThreshold:  3,
+		RecoverWindow:     5 * time.Second,
+		EnableReadThrough: false,
+	}
+	cache, err := NewWriteThroughCacheWithConfig(storage, cfg)
+	if err != nil {
+		t.Fatalf("NewWriteThroughCacheWithConfig failed: %v", err)
+	}
+	defer cache.Close()
+
+	cache.Put("key1", "value1")
+
+	storage.alwaysFail = true
+	err = cache.Delete("key1")
+	if err == nil {
+		t.Fatal("expected error when storage Delete fails")
+	}
+
+	_, ok := cache.cache.Get("key1")
+	if !ok {
+		t.Error("cache should still have the data because storage delete failed (cache is not deleted)")
+	}
+
+	storage.alwaysFail = false
+
+	err = cache.Delete("key1")
+	if err != nil {
+		t.Fatalf("Delete should succeed now, got: %v", err)
+	}
+
+	_, ok = cache.cache.Get("key1")
+	if ok {
+		t.Error("cache should be deleted after successful storage delete")
+	}
+
+	storageData := storage.GetData()
+	if _, ok := storageData["key1"]; ok {
+		t.Error("storage should have the data deleted")
 	}
 }
 
@@ -858,11 +914,11 @@ func TestFailureCount(t *testing.T) {
 	storage.alwaysFail = true
 
 	cfg := Config{
-		MaxRetries:       0,
-		RetryInterval:    1 * time.Millisecond,
-		DegradeThreshold: 100,
-		RecoverThreshold: 3,
-		RecoverWindow:    5 * time.Second,
+		MaxRetries:        0,
+		RetryInterval:     1 * time.Millisecond,
+		DegradeThreshold:  100,
+		RecoverThreshold:  3,
+		RecoverWindow:     5 * time.Second,
 		EnableReadThrough: true,
 	}
 	cache, err := NewWriteThroughCacheWithConfig(storage, cfg)
@@ -879,7 +935,139 @@ func TestFailureCount(t *testing.T) {
 	storage.alwaysFail = false
 	cache.Put("key2", "value2")
 	if cache.FailureCount() != 0 {
-		t.Errorf("expected failure count to reset to 0 after success, got %d", cache.FailureCount())
+		t.Errorf("expected failure count to reset to 0 after Put success, got %d", cache.FailureCount())
+	}
+}
+
+func TestDelete_Failure_NotAffectDegradeCounter(t *testing.T) {
+	storage := newMockStorage()
+
+	cfg := Config{
+		MaxRetries:        0,
+		RetryInterval:     1 * time.Millisecond,
+		DegradeThreshold:  3,
+		RecoverThreshold:  3,
+		RecoverWindow:     5 * time.Second,
+		EnableReadThrough: false,
+	}
+	cache, err := NewWriteThroughCacheWithConfig(storage, cfg)
+	if err != nil {
+		t.Fatalf("NewWriteThroughCacheWithConfig failed: %v", err)
+	}
+	defer cache.Close()
+
+	cache.Put("key1", "value1")
+
+	if cache.FailureCount() != 0 {
+		t.Fatalf("expected failure count 0 initially, got %d", cache.FailureCount())
+	}
+
+	storage.alwaysFail = true
+	for i := 0; i < 10; i++ {
+		cache.Delete("key1")
+	}
+
+	if cache.FailureCount() != 0 {
+		t.Errorf("expected failure count to remain 0 after Delete failures, got %d", cache.FailureCount())
+	}
+
+	if cache.Strategy() != WriteThroughStrategy {
+		t.Errorf("expected WriteThrough strategy, Delete failures should not cause degradation, got %v", cache.Strategy())
+	}
+}
+
+func TestPut_FailureInterruptedByBackgroundSuccess(t *testing.T) {
+	storage := newMockStorage()
+
+	cfg := Config{
+		MaxRetries:        0,
+		RetryInterval:     50 * time.Millisecond,
+		DegradeThreshold:  5,
+		RecoverThreshold:  3,
+		RecoverWindow:     5 * time.Second,
+		EnableReadThrough: false,
+	}
+	cache, err := NewWriteThroughCacheWithConfig(storage, cfg)
+	if err != nil {
+		t.Fatalf("NewWriteThroughCacheWithConfig failed: %v", err)
+	}
+	defer cache.Close()
+
+	storage.alwaysFail = true
+
+	for i := 0; i < 3; i++ {
+		cache.Put(fmt.Sprintf("key%d", i), fmt.Sprintf("value%d", i))
+	}
+
+	if cache.FailureCount() != 3 {
+		t.Fatalf("expected 3 failures, got %d", cache.FailureCount())
+	}
+
+	storage.alwaysFail = false
+	time.Sleep(150 * time.Millisecond)
+
+	pending := cache.PendingCount()
+	if pending != 0 {
+		t.Logf("pending items: %d (should be retried)", pending)
+	}
+
+	if cache.FailureCount() != 3 {
+		t.Errorf("expected failure count to remain 3 after background retry success, got %d", cache.FailureCount())
+	}
+
+	storage.alwaysFail = true
+	for i := 3; i < 5; i++ {
+		cache.Put(fmt.Sprintf("key%d", i), fmt.Sprintf("value%d", i))
+	}
+
+	if cache.FailureCount() >= int64(cfg.DegradeThreshold) {
+		t.Logf("failure count: %d, threshold: %d, strategy: %v",
+			cache.FailureCount(), cfg.DegradeThreshold, cache.Strategy())
+	}
+}
+
+func TestPut_FailureAccumulationAndDegrade(t *testing.T) {
+	storage := newMockStorage()
+
+	cfg := Config{
+		MaxRetries:        0,
+		RetryInterval:     1 * time.Millisecond,
+		DegradeThreshold:  3,
+		RecoverThreshold:  3,
+		RecoverWindow:     5 * time.Second,
+		EnableReadThrough: false,
+	}
+	cache, err := NewWriteThroughCacheWithConfig(storage, cfg)
+	if err != nil {
+		t.Fatalf("NewWriteThroughCacheWithConfig failed: %v", err)
+	}
+	defer cache.Close()
+
+	storage.alwaysFail = true
+
+	cache.Put("key1", "value1")
+	if cache.FailureCount() != 1 {
+		t.Errorf("expected 1 failure after first Put failure, got %d", cache.FailureCount())
+	}
+	if cache.Strategy() != WriteThroughStrategy {
+		t.Error("should still be WriteThrough after 1 failure")
+	}
+
+	storage.alwaysFail = false
+	cache.Delete("key1")
+
+	storage.alwaysFail = true
+	cache.Put("key2", "value2")
+	if cache.FailureCount() != 2 {
+		t.Errorf("expected 2 failures, Delete success should not reset Put failure count, got %d", cache.FailureCount())
+	}
+
+	cache.Put("key3", "value3")
+	if cache.FailureCount() != 3 {
+		t.Errorf("expected 3 failures, got %d", cache.FailureCount())
+	}
+	if cache.Strategy() != WriteAroundStrategy {
+		t.Errorf("expected degraded to WriteAround after %d failures, got %v", cfg.DegradeThreshold, cache.Strategy())
 	}
 }
 

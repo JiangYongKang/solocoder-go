@@ -1,6 +1,7 @@
 package graphdb
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -55,8 +56,8 @@ func TestAddNode(t *testing.T) {
 func TestAddNode_EmptyID(t *testing.T) {
 	g := NewGraph()
 	err := g.AddNode("", nil)
-	if err != ErrNodeNotFound {
-		t.Errorf("expected ErrNodeNotFound, got %v", err)
+	if err != ErrEmptyID {
+		t.Errorf("expected ErrEmptyID, got %v", err)
 	}
 }
 
@@ -791,5 +792,58 @@ func TestAddEdge_ZeroWeight(t *testing.T) {
 	err := g.AddEdge("A", "B", 0, "", nil)
 	if err != nil {
 		t.Errorf("zero weight should be allowed, got %v", err)
+	}
+}
+
+func TestDFS_DeepGraphNoPanic(t *testing.T) {
+	g := NewGraph()
+	depth := 10000
+
+	for i := 0; i <= depth; i++ {
+		id := fmt.Sprintf("n%d", i)
+		g.AddNode(id, nil)
+	}
+	for i := 0; i < depth; i++ {
+		from := fmt.Sprintf("n%d", i)
+		to := fmt.Sprintf("n%d", i+1)
+		g.AddEdge(from, to, 1, "", nil)
+	}
+
+	result, err := g.DFS("n0", depth+1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result) != depth+1 {
+		t.Errorf("expected %d nodes, got %d", depth+1, len(result))
+	}
+	if result[0] != "n0" {
+		t.Errorf("expected first node n0, got %s", result[0])
+	}
+	if result[len(result)-1] != fmt.Sprintf("n%d", depth) {
+		t.Errorf("expected last node n%d, got %s", depth, result[len(result)-1])
+	}
+}
+
+func TestDFS_DeepGraphWithMaxDepth(t *testing.T) {
+	g := NewGraph()
+	totalDepth := 5000
+	maxDepth := 100
+
+	for i := 0; i <= totalDepth; i++ {
+		id := fmt.Sprintf("n%d", i)
+		g.AddNode(id, nil)
+	}
+	for i := 0; i < totalDepth; i++ {
+		from := fmt.Sprintf("n%d", i)
+		to := fmt.Sprintf("n%d", i+1)
+		g.AddEdge(from, to, 1, "", nil)
+	}
+
+	result, err := g.DFS("n0", maxDepth)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result) != maxDepth+1 {
+		t.Errorf("expected %d nodes with max depth %d, got %d", maxDepth+1, maxDepth, len(result))
 	}
 }

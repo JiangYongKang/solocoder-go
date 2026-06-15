@@ -140,7 +140,8 @@ func (r *Registry) Range(from, to int) []*Migration {
 	var result []*Migration
 	for _, v := range r.versions {
 		if v >= from && v <= to {
-			result = append(result, r.migrations[v])
+			m := *r.migrations[v]
+			result = append(result, &m)
 		}
 	}
 	return result
@@ -410,10 +411,18 @@ func (m *Migrator) Rollback(targetVersion int) ([]int, error) {
 }
 
 func (m *Migrator) rollbackInternal(targetVersion int) ([]int, error) {
-	current, err := m.CurrentVersion()
+	applied, err := m.getAppliedVersions()
 	if err != nil {
 		return nil, err
 	}
+
+	var current int
+	for v := range applied {
+		if v > current {
+			current = v
+		}
+	}
+
 	if targetVersion > current {
 		return nil, fmt.Errorf("%w: target %d > current %d", ErrRollbackTarget, targetVersion, current)
 	}
@@ -427,6 +436,9 @@ func (m *Migrator) rollbackInternal(targetVersion int) ([]int, error) {
 		mig := allMigrations[i]
 		if mig.Version <= targetVersion {
 			break
+		}
+		if _, ok := applied[mig.Version]; !ok {
+			continue
 		}
 		if mig.DownSQL == "" {
 			return rolledBack, fmt.Errorf("schemamig: migration %d has no down SQL", mig.Version)

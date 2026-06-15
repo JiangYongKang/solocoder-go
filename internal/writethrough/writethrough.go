@@ -201,11 +201,11 @@ func (wtc *WriteThroughCache) putWriteThrough(key string, value string) error {
 
 	err := wtc.tryWriteStorage(key, value)
 	if err == nil {
-		wtc.recordSuccess()
+		wtc.recordSuccess(true)
 		return nil
 	}
 
-	wtc.recordFailure()
+	wtc.recordFailure(true)
 	wtc.addPending(key, value)
 
 	if wtc.shouldDegrade() {
@@ -218,11 +218,11 @@ func (wtc *WriteThroughCache) putWriteThrough(key string, value string) error {
 func (wtc *WriteThroughCache) putWriteAround(key string, value string) error {
 	err := wtc.storage.Put(key, value)
 	if err != nil {
-		wtc.recordFailure()
+		wtc.recordFailure(true)
 		return err
 	}
 
-	wtc.recordSuccess()
+	wtc.recordSuccess(true)
 
 	if wtc.shouldRecover() {
 		wtc.recoverToWriteThrough()
@@ -252,23 +252,22 @@ func (wtc *WriteThroughCache) Delete(key string) error {
 	if strategy == WriteAroundStrategy {
 		err := wtc.storage.Delete(key)
 		if err != nil {
-			wtc.recordFailure()
+			wtc.recordFailure(false)
 			return err
 		}
-		wtc.recordSuccess()
+		wtc.recordSuccess(false)
 		wtc.cache.Delete(key)
 		return nil
 	}
 
-	wtc.cache.Delete(key)
-
 	err := wtc.storage.Delete(key)
 	if err != nil {
-		wtc.recordFailure()
+		wtc.recordFailure(false)
 		return err
 	}
 
-	wtc.recordSuccess()
+	wtc.cache.Delete(key)
+	wtc.recordSuccess(false)
 	return nil
 }
 
@@ -335,13 +334,14 @@ func (wtc *WriteThroughCache) processPendingRetries() {
 	for _, item := range readyItems {
 		err := wtc.storage.Put(item.key, item.value)
 		if err == nil {
-			wtc.recordSuccess()
+			wtc.recordSuccess(false)
 			wtc.cache.Put(item.key, item.value)
 
 			if wtc.shouldRecover() {
 				wtc.recoverToWriteThrough()
 			}
 		} else {
+			wtc.recordFailure(false)
 			item.retryCnt++
 			if item.retryCnt < wtc.config.MaxRetries {
 				item.nextTry = time.Now().Add(wtc.config.RetryInterval)
@@ -353,8 +353,10 @@ func (wtc *WriteThroughCache) processPendingRetries() {
 	}
 }
 
-func (wtc *WriteThroughCache) recordSuccess() {
-	wtc.failureCnt.Store(0)
+func (wtc *WriteThroughCache) recordSuccess(foreground bool) {
+	if foreground {
+		wtc.failureCnt.Store(0)
+	}
 	wtc.successCnt.Add(1)
 	wtc.mu.Lock()
 	wtc.lastSuccess = time.Now()
@@ -376,8 +378,10 @@ func (wtc *WriteThroughCache) recordSuccess() {
 	wtc.recoverySuccess = wtc.recoverySuccess[:valid]
 }
 
-func (wtc *WriteThroughCache) recordFailure() {
-	wtc.failureCnt.Add(1)
+func (wtc *WriteThroughCache) recordFailure(foreground bool) {
+	if foreground {
+		wtc.failureCnt.Add(1)
+	}
 	wtc.successCnt.Store(0)
 	wtc.mu.Lock()
 	wtc.lastFail = time.Now()

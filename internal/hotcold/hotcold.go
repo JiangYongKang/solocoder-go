@@ -63,59 +63,119 @@ func DefaultConfig() Config {
 }
 
 type HotColdManager struct {
-	mu             sync.RWMutex
-	hotStore       map[string]*DataEntry
-	coldStore      map[string]*DataEntry
-	cfg            Config
-	lastAdjustTime time.Time
-	totalAccesses  int64
+	mu                sync.RWMutex
+	hotStore          map[string]*DataEntry
+	coldStore         map[string]*DataEntry
+	cfg               Config
+	lastAdjustTime    time.Time
+	totalAccesses     int64
+	accessesLastEpoch int64
+}
+
+func ValidateConfig(cfg Config) error {
+	if cfg.HotCapacityRatio <= 0 || cfg.HotCapacityRatio >= 1 {
+		return ErrInvalidConfig
+	}
+	if cfg.MinHotThreshold <= 0 || cfg.MaxHotThreshold <= cfg.MinHotThreshold {
+		return ErrInvalidConfig
+	}
+	if cfg.MinColdThreshold <= 0 || cfg.MaxColdThreshold <= cfg.MinColdThreshold {
+		return ErrInvalidConfig
+	}
+	if cfg.HotThreshold <= 0 || cfg.ColdThreshold <= 0 {
+		return ErrInvalidConfig
+	}
+	if cfg.HotThreshold <= cfg.ColdThreshold {
+		return ErrInvalidConfig
+	}
+	if cfg.DecayHalfLife <= 0 {
+		return ErrInvalidConfig
+	}
+	if cfg.ColdCheckCycles <= 0 {
+		return ErrInvalidConfig
+	}
+	if cfg.AdjustInterval <= 0 {
+		return ErrInvalidConfig
+	}
+	return nil
 }
 
 func NewHotColdManager() *HotColdManager {
-	return NewHotColdManagerWithConfig(DefaultConfig())
+	m, _ := NewHotColdManagerWithConfig(DefaultConfig())
+	return m
 }
 
-func NewHotColdManagerWithConfig(cfg Config) *HotColdManager {
-	if cfg.HotThreshold <= 0 {
+func NewHotColdManagerWithConfig(cfg Config) (*HotColdManager, error) {
+	if cfg.HotCapacityRatio < 0 || cfg.HotCapacityRatio >= 1 {
+		return nil, ErrInvalidConfig
+	}
+	if cfg.MinHotThreshold < 0 || (cfg.MinHotThreshold > 0 && cfg.MaxHotThreshold > 0 && cfg.MaxHotThreshold <= cfg.MinHotThreshold) {
+		return nil, ErrInvalidConfig
+	}
+	if cfg.MinColdThreshold < 0 || (cfg.MinColdThreshold > 0 && cfg.MaxColdThreshold > 0 && cfg.MaxColdThreshold <= cfg.MinColdThreshold) {
+		return nil, ErrInvalidConfig
+	}
+	if cfg.HotThreshold < 0 || cfg.ColdThreshold < 0 {
+		return nil, ErrInvalidConfig
+	}
+	if cfg.HotThreshold > 0 && cfg.ColdThreshold > 0 && cfg.HotThreshold <= cfg.ColdThreshold {
+		return nil, ErrInvalidConfig
+	}
+	if cfg.DecayHalfLife < 0 {
+		return nil, ErrInvalidConfig
+	}
+	if cfg.ColdCheckCycles < 0 {
+		return nil, ErrInvalidConfig
+	}
+	if cfg.AdjustInterval < 0 {
+		return nil, ErrInvalidConfig
+	}
+
+	if cfg.HotThreshold == 0 {
 		cfg.HotThreshold = 10.0
 	}
-	if cfg.ColdThreshold <= 0 {
+	if cfg.ColdThreshold == 0 {
 		cfg.ColdThreshold = 2.0
 	}
 	if cfg.HotThreshold <= cfg.ColdThreshold {
 		cfg.HotThreshold = cfg.ColdThreshold * 5
 	}
-	if cfg.DecayHalfLife <= 0 {
+	if cfg.DecayHalfLife == 0 {
 		cfg.DecayHalfLife = time.Hour
 	}
-	if cfg.ColdCheckCycles <= 0 {
+	if cfg.ColdCheckCycles == 0 {
 		cfg.ColdCheckCycles = 3
 	}
-	if cfg.HotCapacityRatio <= 0 || cfg.HotCapacityRatio >= 1 {
+	if cfg.HotCapacityRatio == 0 {
 		cfg.HotCapacityRatio = 0.3
 	}
-	if cfg.AdjustInterval <= 0 {
+	if cfg.AdjustInterval == 0 {
 		cfg.AdjustInterval = 5 * time.Minute
 	}
-	if cfg.MinHotThreshold <= 0 {
+	if cfg.MinHotThreshold == 0 {
 		cfg.MinHotThreshold = 5.0
 	}
-	if cfg.MaxHotThreshold <= cfg.MinHotThreshold {
+	if cfg.MaxHotThreshold == 0 {
 		cfg.MaxHotThreshold = cfg.MinHotThreshold * 10
 	}
-	if cfg.MinColdThreshold <= 0 {
+	if cfg.MinColdThreshold == 0 {
 		cfg.MinColdThreshold = 0.5
 	}
-	if cfg.MaxColdThreshold <= cfg.MinColdThreshold {
+	if cfg.MaxColdThreshold == 0 {
 		cfg.MaxColdThreshold = cfg.MinColdThreshold * 20
 	}
 
-	return &HotColdManager{
-		hotStore:       make(map[string]*DataEntry),
-		coldStore:      make(map[string]*DataEntry),
-		cfg:            cfg,
-		lastAdjustTime: time.Now(),
+	if err := ValidateConfig(cfg); err != nil {
+		return nil, err
 	}
+
+	return &HotColdManager{
+		hotStore:          make(map[string]*DataEntry),
+		coldStore:         make(map[string]*DataEntry),
+		cfg:               cfg,
+		lastAdjustTime:    time.Now(),
+		accessesLastEpoch: 0,
+	}, nil
 }
 
 func (m *HotColdManager) calculateScore(entry *DataEntry, now time.Time) float64 {
@@ -149,6 +209,7 @@ func (m *HotColdManager) Put(key string, value interface{}) error {
 	defer m.mu.Unlock()
 
 	now := time.Now()
+	m.totalAccesses++
 
 	if entry, ok := m.hotStore[key]; ok {
 		entry.Value = value
@@ -172,19 +233,17 @@ func (m *HotColdManager) Put(key string, value interface{}) error {
 	}
 
 	entry := &DataEntry{
-		Key:               key,
-		Value:             value,
-		AccessCount:       1,
-		LastAccessTime:    now,
-		CreatedAt:         now,
-		Tier:              TierCold,
+		Key:                   key,
+		Value:                 value,
+		AccessCount:           1,
+		LastAccessTime:        now,
+		CreatedAt:             now,
+		Tier:                  TierCold,
 		ConsecutiveColdCycles: 0,
-		Score:             0,
+		Score:                 0,
 	}
 	entry.Score = m.calculateScore(entry, now)
 	m.coldStore[key] = entry
-
-	m.totalAccesses++
 
 	return nil
 }
@@ -224,7 +283,7 @@ func (m *HotColdManager) Get(key string) (interface{}, bool, error) {
 		return entry.Value, true, nil
 	}
 
-	return nil, false, nil
+	return nil, false, ErrKeyNotFound
 }
 
 func (m *HotColdManager) GetScore(key string) (float64, bool, error) {
@@ -238,14 +297,18 @@ func (m *HotColdManager) GetScore(key string) (float64, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	now := time.Now()
+
 	if entry, ok := m.hotStore[key]; ok {
-		return entry.Score, true, nil
+		liveScore := m.calculateScore(entry, now)
+		return liveScore, true, nil
 	}
 	if entry, ok := m.coldStore[key]; ok {
-		return entry.Score, true, nil
+		liveScore := m.calculateScore(entry, now)
+		return liveScore, true, nil
 	}
 
-	return 0, false, nil
+	return 0, false, ErrKeyNotFound
 }
 
 func (m *HotColdManager) Delete(key string) bool {
@@ -338,7 +401,30 @@ func (m *HotColdManager) autoAdjustThresholds(now time.Time) {
 		adjustFactor = 1.1
 	} else if hotRatio < targetRatio*0.9 {
 		adjustFactor = 0.9
-	} else {
+	}
+
+	accessesInEpoch := m.totalAccesses - m.accessesLastEpoch
+	m.accessesLastEpoch = m.totalAccesses
+
+	intervalSec := m.cfg.AdjustInterval.Seconds()
+	if intervalSec <= 0 {
+		intervalSec = 1.0
+	}
+	accessRate := float64(accessesInEpoch) / intervalSec
+
+	expectedBaseRate := float64(totalCount) * 0.5
+	loadFactor := 1.0
+	if expectedBaseRate > 0 {
+		loadFactor = accessRate / expectedBaseRate
+	}
+
+	if loadFactor > 2.0 {
+		adjustFactor *= 0.9
+	} else if loadFactor < 0.5 {
+		adjustFactor *= 1.1
+	}
+
+	if adjustFactor == 1.0 {
 		m.lastAdjustTime = now
 		return
 	}
@@ -414,13 +500,19 @@ func (m *HotColdManager) GetEntry(key string) (*DataEntry, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	now := time.Now()
+
 	if entry, ok := m.hotStore[key]; ok {
-		return copyEntry(entry), true, nil
+		cp := copyEntry(entry)
+		cp.Score = m.calculateScore(entry, now)
+		return cp, true, nil
 	}
 	if entry, ok := m.coldStore[key]; ok {
-		return copyEntry(entry), true, nil
+		cp := copyEntry(entry)
+		cp.Score = m.calculateScore(entry, now)
+		return cp, true, nil
 	}
-	return nil, false, nil
+	return nil, false, ErrKeyNotFound
 }
 
 func copyEntry(entry *DataEntry) *DataEntry {

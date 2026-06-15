@@ -2,17 +2,19 @@ package objstore
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"time"
 )
 
 var (
-	ErrKeyNotFound       = errors.New("key not found")
-	ErrVersionNotFound   = errors.New("version not found")
-	ErrInvalidMaxVersion = errors.New("invalid max versions: must be positive")
-	ErrNilData           = errors.New("nil data")
-	ErrEmptyKey          = errors.New("empty key")
-	ErrInvalidBatchSize  = errors.New("invalid cleanup batch size: must be positive")
+	ErrKeyNotFound            = errors.New("key not found")
+	ErrVersionNotFound        = errors.New("version not found")
+	ErrInvalidMaxVersion      = errors.New("invalid max versions: must be positive")
+	ErrNilData                = errors.New("nil data")
+	ErrEmptyKey               = errors.New("empty key")
+	ErrInvalidBatchSize       = errors.New("invalid cleanup batch size: must be positive")
+	ErrInvalidCleanupInterval = errors.New("invalid cleanup interval: must be positive")
 )
 
 type ObjectVersion struct {
@@ -33,9 +35,9 @@ type Config struct {
 }
 
 type ObjectStore struct {
-	mu             sync.RWMutex
-	objects        map[string][]*ObjectVersion
-	config         Config
+	mu              sync.RWMutex
+	objects         map[string][]*ObjectVersion
+	config          Config
 	opsSinceCleanup int
 }
 
@@ -48,24 +50,25 @@ func DefaultConfig() Config {
 }
 
 func NewObjectStore() *ObjectStore {
-	return NewObjectStoreWithConfig(DefaultConfig())
+	store, _ := NewObjectStoreWithConfig(DefaultConfig())
+	return store
 }
 
-func NewObjectStoreWithConfig(cfg Config) *ObjectStore {
+func NewObjectStoreWithConfig(cfg Config) (*ObjectStore, error) {
 	if cfg.MaxVersions <= 0 {
-		cfg.MaxVersions = 10
+		return nil, ErrInvalidMaxVersion
 	}
 	if cfg.CleanupBatchSize <= 0 {
-		cfg.CleanupBatchSize = 1
+		return nil, ErrInvalidBatchSize
 	}
 	if cfg.CleanupInterval <= 0 {
-		cfg.CleanupInterval = 1
+		return nil, ErrInvalidCleanupInterval
 	}
 
 	return &ObjectStore{
 		objects: make(map[string][]*ObjectVersion),
 		config:  cfg,
-	}
+	}, nil
 }
 
 func (s *ObjectStore) Put(key string, data []byte) (uint64, error) {
@@ -135,15 +138,14 @@ func (s *ObjectStore) GetVersion(key string, version uint64) ([]byte, error) {
 		return nil, ErrKeyNotFound
 	}
 
-	for _, v := range versions {
-		if v.Version == version {
-			data := make([]byte, len(v.Data))
-			copy(data, v.Data)
-			return data, nil
-		}
+	v := s.findVersionLocked(versions, version)
+	if v == nil {
+		return nil, ErrVersionNotFound
 	}
 
-	return nil, ErrVersionNotFound
+	data := make([]byte, len(v.Data))
+	copy(data, v.Data)
+	return data, nil
 }
 
 func (s *ObjectStore) ListVersions(key string) ([]VersionInfo, error) {
@@ -183,15 +185,8 @@ func (s *ObjectStore) Rollback(key string, version uint64) (uint64, error) {
 		return 0, ErrKeyNotFound
 	}
 
-	var targetData []byte
-	for _, v := range versions {
-		if v.Version == version {
-			targetData = v.Data
-			break
-		}
-	}
-
-	if targetData == nil {
+	target := s.findVersionLocked(versions, version)
+	if target == nil {
 		return 0, ErrVersionNotFound
 	}
 
@@ -200,10 +195,10 @@ func (s *ObjectStore) Rollback(key string, version uint64) (uint64, error) {
 
 	ov := &ObjectVersion{
 		Version:   newVersion,
-		Data:      make([]byte, len(targetData)),
+		Data:      make([]byte, len(target.Data)),
 		CreatedAt: time.Now(),
 	}
-	copy(ov.Data, targetData)
+	copy(ov.Data, target.Data)
 
 	versions = append(versions, ov)
 	s.objects[key] = versions
@@ -258,11 +253,21 @@ func (s *ObjectStore) CleanupAll() int {
 
 	totalCleaned := 0
 	for key := range s.objects {
-		totalCleaned += s.cleanupKeyLocked(key, s.config.CleanupBatchSize)
+		totalCleaned += s.cleanupKeyAllLocked(key)
 	}
 	s.opsSinceCleanup = 0
 
 	return totalCleaned
+}
+
+func (s *ObjectStore) findVersionLocked(versions []*ObjectVersion, target uint64) *ObjectVersion {
+	idx := sort.Search(len(versions), func(i int) bool {
+		return versions[i].Version >= target
+	})
+	if idx < len(versions) && versions[idx].Version == target {
+		return versions[idx]
+	}
+	return nil
 }
 
 func (s *ObjectStore) maybeCleanupLocked() {
@@ -270,9 +275,8 @@ func (s *ObjectStore) maybeCleanupLocked() {
 		return
 	}
 
-	totalCleaned := 0
 	for key := range s.objects {
-		totalCleaned += s.cleanupKeyLocked(key, s.config.CleanupBatchSize)
+		s.cleanupKeyLocked(key, s.config.CleanupBatchSize)
 	}
 
 	s.opsSinceCleanup = 0
@@ -292,4 +296,15 @@ func (s *ObjectStore) cleanupKeyLocked(key string, batchSize int) int {
 
 	s.objects[key] = versions[cleanCount:]
 	return cleanCount
+}
+
+func (s *ObjectStore) cleanupKeyAllLocked(key string) int {
+	versions := s.objects[key]
+	if len(versions) <= s.config.MaxVersions {
+		return 0
+	}
+
+	excess := len(versions) - s.config.MaxVersions
+	s.objects[key] = versions[excess:]
+	return excess
 }

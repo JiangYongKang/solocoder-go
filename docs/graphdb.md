@@ -138,22 +138,34 @@ BFS(start, maxDepth):
 
 ### 5.2 DFS（深度优先搜索）
 
-使用递归实现，尽可能深入：
+使用显式栈迭代实现，尽可能深入，避免栈溢出：
 
 ```
 DFS(start, maxDepth):
   visited = {}
   result = []
-  dfs(node, depth):
-    mark visited
-    add to result
-    if depth >= maxDepth: return
-    for each out-edge of node:
-      if neighbor not visited:
-        dfs(neighbor, depth+1)
-  dfs(start, 0)
+  stack = [(node=start, depth=0, index=0)]
+  mark visited[start] = true
+  add start to result
+
+  while stack not empty:
+    top = stack.top()
+    if top.depth >= maxDepth or top.index >= outEdges[top.node].length:
+      pop stack
+      continue
+
+    edge = outEdges[top.node][top.index]
+    top.index++
+
+    if edge.To not visited:
+      mark visited[edge.To] = true
+      add edge.To to result
+      push (edge.To, depth+1, index=0) onto stack
+
   return result
 ```
+
+**安全性保证**: DFS 使用显式栈迭代实现，而非递归调用，因此不受 Go 运行时栈深度限制。即使遍历深度达数万层的长链图，也不会触发栈溢出 panic。
 
 ### 5.3 深度限制
 
@@ -316,7 +328,8 @@ fmt.Println(node2.Properties["name"])  // 仍为原始值
 
 | 错误变量 | 含义 | 触发场景 |
 |----------|------|----------|
-| `ErrNodeNotFound` | 节点不存在 | 查询、删除不存在的节点；空 ID 添加节点 |
+| `ErrEmptyID` | 节点 ID 不能为空 | AddNode 传入空字符串 ID（参数格式错误） |
+| `ErrNodeNotFound` | 图中不存在该节点 | GetNode、RemoveNode、BFS/DFS 起始节点等场景，节点 ID 格式合法但图中不存在 |
 | `ErrNodeExists` | 节点已存在 | 重复添加相同 ID 的节点 |
 | `ErrEdgeNotFound` | 边不存在 | 删除、查询不存在的边 |
 | `ErrEdgeExists` | 边已存在 | 重复添加同一起点和终点的边 |
@@ -353,6 +366,6 @@ fmt.Println(node2.Properties["name"])  // 仍为原始值
 2. **不支持负权边**: Dijkstra 算法要求边权重非负，模块在 AddEdge 时已校验
 3. **不支持多边**: 同一对 (from, to) 之间只能存在一条边，重复添加返回 ErrEdgeExists
 4. **不支持自环**: from == to 的边被禁止
-5. **节点 ID 约束**: 空字符串 ID 不被允许
+5. **节点 ID 约束**: 空字符串 ID 不被允许，AddNode 传入空 ID 返回 ErrEmptyID（参数非法），与 ErrNodeNotFound（节点不存在）语义不同
 6. **懒排序写锁**: GetOutEdges / GetInEdges 使用写锁，高并发读场景下可能成为瓶颈
-7. **DFS 递归深度**: DFS 使用递归实现，极深的图可能触发栈溢出，此时建议使用 BFS 或增大 maxDepth 限制
+7. **DFS 栈安全**: DFS 使用显式栈迭代实现，不受 Go 运行时栈深度限制，即使数万层深度的长链图也不会触发栈溢出 panic

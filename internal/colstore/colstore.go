@@ -3,6 +3,7 @@ package colstore
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 )
 
@@ -33,27 +34,34 @@ const (
 type Value interface{}
 
 type Predicate struct {
-	Column   string
-	Op       Operator
-	Value    Value
-	Values   []Value
+	Column string
+	Op     Operator
+	Value  Value
+	Values []Value
 }
 
 type Column struct {
-	name       string
-	dict       map[Value]int
-	reverseDict []Value
-	data       []int
-	mu         sync.RWMutex
+	name              string
+	dictEnabled       bool
+	dict              map[Value]int
+	reverseDict       []Value
+	encodedData       []int
+	rawData           []Value
 }
 
-func newColumn(name string) *Column {
-	return &Column{
+func newColumn(name string, dictEnabled bool) *Column {
+	c := &Column{
 		name:        name,
-		dict:        make(map[Value]int),
-		reverseDict: make([]Value, 0),
-		data:        make([]int, 0),
+		dictEnabled: dictEnabled,
 	}
+	if dictEnabled {
+		c.dict = make(map[Value]int)
+		c.reverseDict = make([]Value, 0)
+		c.encodedData = make([]int, 0)
+	} else {
+		c.rawData = make([]Value, 0)
+	}
+	return c
 }
 
 func (c *Column) getName() string {
@@ -78,45 +86,47 @@ func (c *Column) decode(idx int) Value {
 }
 
 func (c *Column) appendValues(values []Value) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, v := range values {
-		c.data = append(c.data, c.encode(v))
+	if c.dictEnabled {
+		for _, v := range values {
+			c.encodedData = append(c.encodedData, c.encode(v))
+		}
+	} else {
+		c.rawData = append(c.rawData, values...)
 	}
 }
 
 func (c *Column) length() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.data)
+	if c.dictEnabled {
+		return len(c.encodedData)
+	}
+	return len(c.rawData)
 }
 
 func (c *Column) getValueAt(rowIdx int) Value {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if rowIdx < 0 || rowIdx >= len(c.data) {
+	if c.dictEnabled {
+		if rowIdx < 0 || rowIdx >= len(c.encodedData) {
+			return nil
+		}
+		return c.decode(c.encodedData[rowIdx])
+	}
+	if rowIdx < 0 || rowIdx >= len(c.rawData) {
 		return nil
 	}
-	return c.decode(c.data[rowIdx])
+	return c.rawData[rowIdx]
 }
 
 func (c *Column) getValuesAt(rows []int) []Value {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	result := make([]Value, len(rows))
 	for i, r := range rows {
-		if r < 0 || r >= len(c.data) {
-			result[i] = nil
-		} else {
-			result[i] = c.decode(c.data[r])
-		}
+		result[i] = c.getValueAt(r)
 	}
 	return result
 }
 
 func (c *Column) dictionarySize() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	if !c.dictEnabled {
+		return 0
+	}
 	return len(c.reverseDict)
 }
 
@@ -125,18 +135,19 @@ type Row struct {
 }
 
 type QueryResult struct {
-	Rows        []*Row
-	Columns     []string
+	Rows         []*Row
+	Columns      []string
 	TotalScanned int
 	TotalMatched int
 }
 
 type ColumnStore struct {
-	columns map[string]*Column
-	colOrder []string
-	rowCount int
-	mu       sync.RWMutex
-	closed   bool
+	columns       map[string]*Column
+	colOrder      []string
+	rowCount      int
+	mu            sync.RWMutex
+	closed        bool
+	dictEnabled   bool
 }
 
 type Config struct {
@@ -155,9 +166,10 @@ func NewColumnStore() *ColumnStore {
 
 func NewColumnStoreWithConfig(cfg Config) *ColumnStore {
 	return &ColumnStore{
-		columns:  make(map[string]*Column),
-		colOrder: make([]string, 0),
-		rowCount: 0,
+		columns:     make(map[string]*Column),
+		colOrder:    make([]string, 0),
+		rowCount:    0,
+		dictEnabled: cfg.DictionaryEnabled,
 	}
 }
 
@@ -196,7 +208,7 @@ func (cs *ColumnStore) Write(batch []ColumnBatch) error {
 	for _, cb := range batch {
 		col, exists := cs.columns[cb.Name]
 		if !exists {
-			col = newColumn(cb.Name)
+			col = newColumn(cb.Name, cs.dictEnabled)
 			cs.columns[cb.Name] = col
 			cs.colOrder = append(cs.colOrder, cb.Name)
 		}
@@ -348,6 +360,19 @@ func compareValues(a, b Value) int {
 		return 1
 	}
 
+	ta := reflect.TypeOf(a)
+	tb := reflect.TypeOf(b)
+	if ta != tb {
+		if (ta.Kind() == reflect.Int || ta.Kind() == reflect.Float64) &&
+			(tb.Kind() == reflect.Int || tb.Kind() == reflect.Float64) {
+		} else {
+			if ta.String() < tb.String() {
+				return -1
+			}
+			return 1
+		}
+	}
+
 	switch av := a.(type) {
 	case int:
 		switch bv := b.(type) {
@@ -404,15 +429,7 @@ func compareValues(a, b Value) int {
 			return 0
 		}
 	}
-
-	as := fmt.Sprintf("%v", a)
-	bs := fmt.Sprintf("%v", b)
-	if as < bs {
-		return -1
-	} else if as > bs {
-		return 1
-	}
-	return 0
+	return 1
 }
 
 func (cs *ColumnStore) Close() {
@@ -449,4 +466,10 @@ func (cs *ColumnStore) DictionarySize(column string) (int, error) {
 		return 0, fmt.Errorf("%w: %s", ErrColumnNotFound, column)
 	}
 	return col.dictionarySize(), nil
+}
+
+func (cs *ColumnStore) IsDictionaryEnabled() bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cs.dictEnabled
 }

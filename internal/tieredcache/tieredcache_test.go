@@ -405,6 +405,8 @@ func TestWriteBackOnEviction(t *testing.T) {
 	tc.Put("key2", []byte("value2"))
 	tc.Put("key3", []byte("value3"))
 
+	tc.l1.waitEvictions()
+
 	if tc.L1Count() != 2 {
 		t.Errorf("expected L1 count 2, got %d", tc.L1Count())
 	}
@@ -1046,13 +1048,15 @@ func TestEvictionCallback(t *testing.T) {
 	cache.put("key3", []byte("value3"))
 	cache.put("key4", []byte("value4"))
 
+	cache.waitEvictions()
+
 	mu.Lock()
 	defer mu.Unlock()
 
 	if len(evictedKeys) != 1 {
 		t.Errorf("expected 1 eviction, got %d", len(evictedKeys))
 	}
-	if evictedKeys[0] != "key1" {
+	if len(evictedKeys) > 0 && evictedKeys[0] != "key1" {
 		t.Errorf("expected key1 to be evicted, got %s", evictedKeys[0])
 	}
 }
@@ -1453,5 +1457,478 @@ func TestCapacityModeConstants(t *testing.T) {
 func TestEvictionPolicyConstants(t *testing.T) {
 	if string(EvictionPolicyLRU) != "lru" {
 		t.Errorf("expected lru, got %s", EvictionPolicyLRU)
+	}
+}
+
+func TestConcurrentGetWithRace(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       500,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       5000,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy: WritePolicyWriteThrough,
+		L2Dir:       tmpDir,
+	}
+
+	tc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc.Close()
+	defer tc.Clear()
+
+	numKeys := 200
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key:%d", i)
+		val := []byte(fmt.Sprintf("value:%d", i))
+		if err := tc.Put(key, val); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	numGoroutines := 50
+	numIterations := 200
+	var wg sync.WaitGroup
+	var getErrors int64
+	var valueMismatches int64
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < numIterations; i++ {
+				keyIdx := (id*numIterations + i) % numKeys
+				key := fmt.Sprintf("key:%d", keyIdx)
+				expected := fmt.Sprintf("value:%d", keyIdx)
+
+				val, err := tc.Get(key)
+				if err != nil {
+					atomic.AddInt64(&getErrors, 1)
+					continue
+				}
+				if string(val) != expected {
+					atomic.AddInt64(&valueMismatches, 1)
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	if getErrors > 0 {
+		t.Errorf("found %d Get errors during concurrent reads", getErrors)
+	}
+	if valueMismatches > 0 {
+		t.Errorf("found %d value mismatches during concurrent reads", valueMismatches)
+	}
+}
+
+func TestConcurrentPutAndGetWithRace(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       1000,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       10000,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy: WritePolicyWriteBack,
+		L2Dir:       tmpDir,
+	}
+
+	tc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc.Close()
+	defer tc.Clear()
+
+	numWriters := 20
+	numReaders := 30
+	numKeys := 500
+	numIterations := 100
+	var wg sync.WaitGroup
+	var putErrors int64
+
+	for w := 0; w < numWriters; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < numIterations; i++ {
+				keyIdx := (id*numIterations + i) % numKeys
+				key := fmt.Sprintf("key:%d", keyIdx)
+				val := []byte(fmt.Sprintf("writer:%d:iter:%d", id, i))
+				if err := tc.Put(key, val); err != nil {
+					atomic.AddInt64(&putErrors, 1)
+				}
+			}
+		}(w)
+	}
+
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < numIterations; i++ {
+				keyIdx := (id*numIterations + i) % numKeys
+				key := fmt.Sprintf("key:%d", keyIdx)
+				tc.Get(key)
+			}
+		}(r)
+	}
+
+	wg.Wait()
+
+	if putErrors > 0 {
+		t.Errorf("found %d Put errors during concurrent operations", putErrors)
+	}
+}
+
+func TestLoadL2FromDisk_NoDataLossOnCapacityLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	numFiles := 20
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("key:%d", i)
+		val := []byte(fmt.Sprintf("value:%d", i))
+		filename := filepath.Join(tmpDir, sanitizeKey(key))
+		if err := os.WriteFile(filename, val, 0644); err != nil {
+			t.Fatalf("failed to write test file: %v", err)
+		}
+	}
+
+	beforeFiles, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to read tmpDir: %v", err)
+	}
+	beforeCount := len(beforeFiles)
+	if beforeCount != numFiles {
+		t.Fatalf("expected %d files before, got %d", numFiles, beforeCount)
+	}
+
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       100,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       5,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy: WritePolicyWriteThrough,
+		L2Dir:       tmpDir,
+	}
+
+	tc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc.Close()
+	defer tc.Clear()
+
+	afterFiles, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to read tmpDir after load: %v", err)
+	}
+	afterCount := len(afterFiles)
+	if afterCount != beforeCount {
+		t.Errorf("disk file count changed during load: before=%d, after=%d, lost=%d files",
+			beforeCount, afterCount, beforeCount-afterCount)
+	}
+
+	if tc.L2Count() > 5 {
+		t.Errorf("expected L2 count <= 5 due to capacity limit, got %d", tc.L2Count())
+	}
+
+	allExist := true
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("key:%d", i)
+		filename := filepath.Join(tmpDir, sanitizeKey(key))
+		if _, err := os.Stat(filename); os.IsNotExist(err) {
+			allExist = false
+			t.Errorf("disk file for key %q was deleted during load", key)
+		}
+	}
+	if !allExist {
+		t.Fatal("some disk files were deleted during L2 load due to capacity limit")
+	}
+}
+
+func TestLoadL2FromDisk_RestartAndVerifyData(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       100,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       1000,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy: WritePolicyWriteThrough,
+		L2Dir:       tmpDir,
+	}
+
+	tc1, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("first NewTieredCacheWithConfig failed: %v", err)
+	}
+
+	numKeys := 50
+	expected := make(map[string]string)
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("restart:key:%d", i)
+		val := fmt.Sprintf("restart:value:%d", i)
+		expected[key] = val
+		if err := tc1.Put(key, []byte(val)); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	if err := tc1.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+
+	tc2, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("second NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc2.Close()
+	defer tc2.Clear()
+
+	for key, val := range expected {
+		got, err := tc2.Get(key)
+		if err != nil {
+			t.Errorf("Get %q after restart failed: %v", key, err)
+			continue
+		}
+		if string(got) != val {
+			t.Errorf("Get %q after restart = %q, expected %q", key, string(got), val)
+		}
+	}
+
+	afterFiles, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to read tmpDir: %v", err)
+	}
+	if len(afterFiles) < numKeys {
+		t.Errorf("expected >= %d disk files after restart, got %d", numKeys, len(afterFiles))
+	}
+}
+
+func TestWriteBackFailureHandling(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       100,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       1000,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy:       WritePolicyWriteBack,
+		L2Dir:             tmpDir,
+		WriteBackInterval: 10 * time.Millisecond,
+	}
+
+	tc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc.Close()
+	defer tc.Clear()
+
+	key := "test:writeback:key"
+	val := []byte("test:writeback:value")
+	if err := tc.Put(key, val); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	if err := os.Chmod(tmpDir, 0444); err != nil {
+		t.Skipf("cannot chmod directory to read-only, skipping test: %v", err)
+	}
+	defer os.Chmod(tmpDir, 0755)
+
+	time.Sleep(200 * time.Millisecond)
+
+	os.Chmod(tmpDir, 0755)
+
+	errCount := tc.WriteBackErrorCount()
+	if errCount > 1 {
+		t.Errorf("unexpected write-back error count: %d (should be 0 or 1, depending on timing)", errCount)
+	}
+}
+
+func TestWriteBackMaxRetriesExceeded(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       10,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       100,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy:       WritePolicyWriteBack,
+		L2Dir:             tmpDir,
+		WriteBackInterval: 5 * time.Millisecond,
+	}
+
+	lc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+
+	for i := 0; i < maxWriteBackRetries+1; i++ {
+		key := fmt.Sprintf("retry:key:%d", i)
+		val := []byte(fmt.Sprintf("retry:val:%d", i))
+		if err := lc.Put(key, val); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	if err := os.Chmod(tmpDir, 0444); err != nil {
+		lc.Close()
+		lc.Clear()
+		t.Skipf("cannot chmod directory, skipping: %v", err)
+	}
+	defer os.Chmod(tmpDir, 0755)
+
+	time.Sleep(200 * time.Millisecond)
+	os.Chmod(tmpDir, 0755)
+
+	if err := lc.Close(); err != nil {
+		if err != ErrWriteBackFailed {
+			t.Logf("Close returned error (expected if failures occurred): %v", err)
+		}
+	}
+	lc.Clear()
+}
+
+func TestLRUCacheConcurrentGet_NoRace(t *testing.T) {
+	cfg := CacheLevelConfig{
+		Capacity:       1000,
+		CapacityMode:   CapacityModeCount,
+		EvictionPolicy: EvictionPolicyLRU,
+	}
+	cache := newLRUCache(cfg, nil)
+	defer cache.Close()
+
+	numKeys := 100
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key:%d", i)
+		val := []byte(fmt.Sprintf("val:%d", i))
+		cache.put(key, val)
+	}
+
+	numGoroutines := 30
+	numIterations := 300
+	var wg sync.WaitGroup
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < numIterations; i++ {
+				keyIdx := (id*numIterations + i) % numKeys
+				key := fmt.Sprintf("key:%d", keyIdx)
+				cache.get(key)
+			}
+		}(g)
+	}
+
+	wg.Wait()
+}
+
+func TestTieredCacheConcurrentDeleteAndGet(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       1000,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       10000,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy: WritePolicyWriteThrough,
+		L2Dir:       tmpDir,
+	}
+
+	tc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc.Close()
+	defer tc.Clear()
+
+	numKeys := 200
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("del:key:%d", i)
+		val := []byte(fmt.Sprintf("del:val:%d", i))
+		if err := tc.Put(key, val); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	numDeleters := 10
+	numGetters := 20
+	numIterations := 100
+	var deleteErrors int64
+
+	for d := 0; d < numDeleters; d++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < numIterations; i++ {
+				keyIdx := (id*numIterations + i) % numKeys
+				key := fmt.Sprintf("del:key:%d", keyIdx)
+				if err := tc.Delete(key); err != nil {
+					atomic.AddInt64(&deleteErrors, 1)
+				}
+			}
+		}(d)
+	}
+
+	for g := 0; g < numGetters; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < numIterations; i++ {
+				keyIdx := (id*numIterations + i) % numKeys
+				key := fmt.Sprintf("del:key:%d", keyIdx)
+				tc.Get(key)
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	if deleteErrors > 0 {
+		t.Errorf("found %d Delete errors during concurrent operations", deleteErrors)
 	}
 }

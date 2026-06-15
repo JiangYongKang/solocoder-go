@@ -142,6 +142,7 @@ type CacheLevelConfig struct {
 | `ErrInvalidPolicy` | 无效策略 | 配置了未支持的写入策略 |
 | `ErrNilValue` | 值为空 | Put 操作传入 nil 值 |
 | `ErrEmptyKey` | 键为空 | 操作传入空字符串键 |
+| `ErrWriteBackFailed` | 回写失败 | 回写模式下超过最大重试次数后仍有永久失败条目 |
 
 ## 5. 数据流转路径
 
@@ -323,17 +324,207 @@ TieredCache.mu (RWMutex)
 
 | 操作 | TieredCache 锁 | l1/l2 锁 | 说明 |
 |------|---------------|----------|------|
-| Get | RLock | RLock + Lock | 级联查询时先加读锁，回填时升级 |
+| Get | RLock | **Lock** | **所有 lruCache.get() 使用写锁保护链表修改（MoveToFront） |
 | Put | Lock | Lock | 写入需要加写锁 |
 | Delete | Lock | Lock | 删除需要加写锁 |
 | Clear | Lock | Lock | 清空需要加写锁 |
-| Flush | RLock | RLock | 刷盘只需要读锁 |
+| Flush | Lock | Lock | 刷盘需要加写锁 |
 
-### 7.3 死锁避免
+### 7.3 LRU Get 操作的并发安全保证
+
+**问题背景**：
+`lruCache.get()` 需要调用 `container/list.MoveToFront()` 修改链表指针，而 `container/list` 本身不是并发安全的。即使外层使用读锁允许并发 Get，多个 `MoveToFront` 同时修改链表会形成数据竞争。
+
+**修复方案**：
+将 `lruCache.get()` 从 `RLock/RUnlock` 改为 `Lock/Unlock`，确保链表修改的独占访问。
+
+```go
+// 修复前：存在数据竞争
+func (c *lruCache) get(key string) (*CacheEntry, bool) {
+    c.mu.RLock()   // 读锁，多个 goroutine 可并行
+    defer c.mu.RUnlock()
+    if elem, ok := c.items[key]; ok {
+        c.orderList.MoveToFront(elem)  // ❌ 并发修改链表，数据竞争
+        ...
+    }
+}
+
+// 修复后：无数据竞争
+func (c *lruCache) get(key string) (*CacheEntry, bool) {
+    c.mu.Lock()    // 写锁，独占访问
+    defer c.mu.Unlock()
+    if elem, ok := c.items[key]; ok {
+        c.orderList.MoveToFront(elem)  // ✅ 安全的链表修改
+        ...
+    }
+}
+```
+
+**性能权衡**：虽然 Get 操作使用写锁会降低读并发度，但这是保证数据正确性的必要代价。实际场景中，L1 缓存命中率通常较高，链表操作是纳秒级，性能影响可控。
+
+### 7.4 死锁避免
 
 - 严格按照 `TieredCache.mu` → `l1.mu` → `l2.mu` 的顺序加锁
 - 永远不反向获取锁
-- 回调函数（onEvict）在锁释放后执行，避免持有锁时执行耗时操作
+- 回调函数（onEvict）通过异步队列执行，不在持锁时执行磁盘 I/O
+
+### 7.5 淘汰回调的执行层级
+
+#### 问题背景
+
+原始实现中，淘汰回调（onEvict）在持有 lruCache 互斥锁时同步执行：
+- 磁盘 I/O（os.Remove、os.WriteFile）在持锁状态下阻塞全部缓存读写操作
+- 长时间持锁导致系统吞吐量急剧下降
+
+#### 修复方案：异步回调队列
+
+```
+淘汰触发:
+  ┌──────────────────────────┐
+  │ 1. 持有锁，从缓存中│
+  │    移除条目             │
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ 2. 加入 evictQueue │
+  │    (enqueueEvict())│
+  └──────────┬───────────────┘
+             │ 释放锁
+             ▼
+  ┌──────────────────────────┐
+  │ 3. 独立后台协程     │
+  │    processEvictQueue() │
+  │    异步执行 onEvict │
+  └──────────────────────────┘
+```
+
+**关键实现**：
+- `evictQueue`: 淘汰条目的缓冲队列
+- `evictQueueMu`: 队列的互斥保护
+- `evictWg`: 待处理条目的 WaitGroup
+- `processEvictQueue()`: 独立 goroutine 消费队列
+- `waitEvictions()`: 等待所有排队的淘汰处理完成
+- `Close()`: 关闭时标记并等待队列清空
+
+**保证语义**：
+- 缓存数据结构的修改与回调的磁盘 I/O 完全解耦
+- 持锁时间从毫秒级降至纳秒级
+- Close/Flush 时通过 `waitEvictions()` 确保回调完成
+
+### 7.6 回写失败的处理策略
+
+#### 问题背景
+
+原始 `flushWriteBack()` 对 `writeToL2` 错误用 `continue` 静默跳过：
+- 失败条目的 Dirty 标记未被清除
+- 每次刷盘都重试注定失败的条目，形成死循环
+
+#### 修复方案：有限重试 + 永久失败标记
+
+**失败处理流程**：
+
+```
+flushWriteBack 处理每个 Dirty 条目:
+  ┌──────────────────────────┐
+  │ 1. incrementFailCount()   │
+  │    失败计数 +1        │
+  └──────────┬───────────────┘
+             │
+        ┌────┴────────────┐
+        │ FailCount > 3? │
+        └┬───────────────┬┘
+         是               否
+         ▼                ▼
+  ┌──────────────┐   ┌────────────────┐
+  │ 清除 Dirty  │   │ 执行 writeToL2│
+  │ 标记         │   └────────┬───────┘
+  │ writeBackErrors │            │
+  │ 计数器 +1   │       ┌────┴────┐
+  └──────────────┘       │ 成功?    │
+                           └┬────────┬┘
+                            是        否
+                            ▼         ▼
+                     ┌───────────┐  保留 Dirty，
+                     │ 写入 L2 │  下次重试
+                     │ 清除 Dirty│
+                     └───────────┘
+```
+
+**核心实现**：
+```go
+const maxWriteBackRetries = 3
+
+type CacheEntry struct {
+    Key       string
+    Value     []byte
+    Dirty     bool
+    FailCount int  // 新增：失败计数
+}
+
+// 每次刷盘前先递增失败计数
+failCount := tc.l1.incrementFailCount(entry.Key)
+if failCount > maxWriteBackRetries {
+    tc.l1.clearDirty(entry.Key)       // 清除 Dirty，停止重试
+    tc.writeBackErrors.Add(1)            // 记录永久失败
+    continue
+}
+```
+
+**对外暴露**：
+- `ErrWriteBackFailed`: 永久失败的错误类型
+- `Flush()` 返回错误包含失败数量
+- `WriteBackErrorCount()` 查询永久失败计数
+
+### 7.7 磁盘恢复过程的数据安全
+
+#### 问题背景
+
+原始 `loadL2FromDisk()` 在 L2 容量不足时，逐条加载触发淘汰回调，回调中 `os.Remove` 将磁盘文件永久删除，导致重启恢复过程反而丢失了比重启前更多的持久化数据。
+
+#### 修复方案：加载时禁用淘汰删除
+
+使用 `putWithoutEvictCallback()` 方法：
+
+```go
+// 加载时使用的特殊 put 方法：
+// - 容量不足时不触发淘汰
+// - 不执行任何磁盘删除回调
+// - 返回 (nil, false) 表示容量不足，跳过该条目
+func (c *lruCache) putWithoutEvictCallback(key string, value []byte) (*CacheEntry, bool)
+```
+
+**加载流程保证**：
+
+```
+loadL2FromDisk:
+  ┌──────────────────────────────┐
+  │ 遍历磁盘文件              │
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ putWithoutEvictCallback│
+  │  容量足够?            │
+  └┬──────────────────┬┘
+    是                  否
+    ▼                   ▼
+  加载到内存         跳过加载，
+  （不删除磁盘文件   保留磁盘文件
+```
+
+**数据安全保证**：
+- 磁盘文件在任何情况下都不会被加载过程删除
+- L2 容量不足只影响内存中可加载的条目数量
+- 未加载到内存的文件仍在磁盘上，后续 LRU 淘汰腾出空间后仍可访问
+
+### 7.8 并发一致性保证
+
+| 场景 | 一致性保证 |
+|------|-----------|
+| 并发 Get | 写锁保护链表，无数据竞争 |
+| 并发 Get + Put | TieredCache 写锁阻塞所有读 |
+| 淘汰回调 | 异步队列执行，不阻塞缓存操作 |
+| 回写失败 | 有限重试后永久失败标记 |
+| 重启加载 | 不删除磁盘文件，保证数据安全 |
 
 ## 8. 使用示例
 

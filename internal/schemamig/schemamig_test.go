@@ -1425,3 +1425,185 @@ func TestMigrationLock_DefaultTables(t *testing.T) {
 		t.Errorf("DefaultLockTable = %q, want %q", DefaultLockTable, "schema_migration_lock")
 	}
 }
+
+func TestMigrator_Rollback_PartiallyAppliedMigrations(t *testing.T) {
+	exec := newMockExecutor()
+	reg := NewRegistry()
+	reg.MustRegister(&Migration{Version: 1, Description: "v1", UpSQL: "CREATE TABLE t1", DownSQL: "DROP TABLE t1"})
+	reg.MustRegister(&Migration{Version: 2, Description: "v2", UpSQL: "CREATE TABLE t2", DownSQL: "DROP TABLE t2"})
+	reg.MustRegister(&Migration{Version: 3, Description: "v3", UpSQL: "CREATE TABLE t3", DownSQL: "DROP TABLE t3"})
+	reg.MustRegister(&Migration{Version: 4, Description: "v4", UpSQL: "CREATE TABLE t4", DownSQL: "DROP TABLE t4"})
+	reg.MustRegister(&Migration{Version: 5, Description: "v5", UpSQL: "CREATE TABLE t5", DownSQL: "DROP TABLE t5"})
+
+	m, _ := NewMigrator(reg, exec)
+
+	_, _ = m.UpTo(3)
+
+	current, _ := m.CurrentVersion()
+	if current != 3 {
+		t.Fatalf("CurrentVersion() after UpTo(3) = %d, want 3", current)
+	}
+
+	exec.mu.Lock()
+	exec.execLog = nil
+	exec.mu.Unlock()
+
+	rolledBack, err := m.Rollback(1)
+	if err != nil {
+		t.Fatalf("Rollback(1) error = %v", err)
+	}
+
+	if len(rolledBack) != 2 {
+		t.Fatalf("Rollback(1) rolled back %d, want 2", len(rolledBack))
+	}
+	if rolledBack[0] != 3 || rolledBack[1] != 2 {
+		t.Errorf("Rollback(1) versions = %v, want [3, 2]", rolledBack)
+	}
+
+	exec.mu.Lock()
+
+	for _, record := range exec.execLog {
+		if containsPattern(record.query, "DROP TABLE") {
+			if containsPattern(record.query, "t4") || containsPattern(record.query, "t5") {
+				t.Errorf("should not rollback v4 or v5, but executed: %s", record.query)
+			}
+		}
+	}
+	exec.mu.Unlock()
+
+	current, _ = m.CurrentVersion()
+	if current != 1 {
+		t.Errorf("CurrentVersion() after rollback = %d, want 1", current)
+	}
+}
+
+func TestMigrator_Rollback_PartiallyApplied_SkipUnapplied(t *testing.T) {
+	exec := newMockExecutor()
+	reg := NewRegistry()
+	reg.MustRegister(&Migration{Version: 1, Description: "v1", UpSQL: "SQL1", DownSQL: "DOWN1"})
+	reg.MustRegister(&Migration{Version: 2, Description: "v2", UpSQL: "SQL2", DownSQL: "DOWN2"})
+	reg.MustRegister(&Migration{Version: 3, Description: "v3", UpSQL: "SQL3", DownSQL: "DOWN3"})
+	reg.MustRegister(&Migration{Version: 4, Description: "v4", UpSQL: "SQL4", DownSQL: "DOWN4"})
+	reg.MustRegister(&Migration{Version: 5, Description: "v5", UpSQL: "SQL5", DownSQL: "DOWN5"})
+
+	m, _ := NewMigrator(reg, exec)
+
+	_, _ = m.UpTo(2)
+
+	exec.mu.Lock()
+	exec.execLog = nil
+	exec.mu.Unlock()
+
+	rolledBack, err := m.Rollback(0)
+	if err != nil {
+		t.Fatalf("Rollback(0) error = %v", err)
+	}
+
+	if len(rolledBack) != 2 {
+		t.Fatalf("Rollback(0) rolled back %d, want 2", len(rolledBack))
+	}
+	if rolledBack[0] != 2 || rolledBack[1] != 1 {
+		t.Errorf("Rollback(0) versions = %v, want [2, 1]", rolledBack)
+	}
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+
+	downCount := 0
+	for _, record := range exec.execLog {
+		if containsPattern(record.query, "DOWN") {
+			downCount++
+			if containsPattern(record.query, "DOWN3") || containsPattern(record.query, "DOWN4") || containsPattern(record.query, "DOWN5") {
+				t.Errorf("should not execute DOWN3/4/5, but executed: %s", record.query)
+			}
+		}
+	}
+	if downCount != 2 {
+		t.Errorf("executed %d DOWN SQL statements, want 2", downCount)
+	}
+}
+
+func TestRegistry_RangeReturnsCopy(t *testing.T) {
+	r := NewRegistry()
+	r.MustRegister(&Migration{Version: 1, Description: "v1", UpSQL: "SQL1"})
+	r.MustRegister(&Migration{Version: 2, Description: "v2", UpSQL: "SQL2"})
+	r.MustRegister(&Migration{Version: 3, Description: "v3", UpSQL: "SQL3"})
+
+	rng := r.Range(1, 2)
+	if len(rng) != 2 {
+		t.Fatalf("Range(1,2) length = %d, want 2", len(rng))
+	}
+
+	rng[0].Description = "MODIFIED"
+	rng[1].UpSQL = "MODIFIED_SQL"
+
+	all := r.All()
+	if all[0].Description == "MODIFIED" {
+		t.Error("Range() should return a copy, but modification affected registry")
+	}
+	if all[1].UpSQL == "MODIFIED_SQL" {
+		t.Error("Range() should return a copy, but modification affected registry")
+	}
+}
+
+func TestMigrator_Rollback_UnappliedVersionsIgnored(t *testing.T) {
+	exec := newMockExecutor()
+	reg := NewRegistry()
+	reg.MustRegister(&Migration{Version: 1, Description: "v1", UpSQL: "UP1", DownSQL: "DOWN1"})
+	reg.MustRegister(&Migration{Version: 2, Description: "v2", UpSQL: "UP2", DownSQL: "DOWN2"})
+	reg.MustRegister(&Migration{Version: 3, Description: "v3", UpSQL: "UP3", DownSQL: "DOWN3"})
+	reg.MustRegister(&Migration{Version: 4, Description: "v4", UpSQL: "UP4", DownSQL: "DOWN4"})
+
+	m, _ := NewMigrator(reg, exec)
+
+	_, _ = m.UpTo(1)
+
+	current, _ := m.CurrentVersion()
+	if current != 1 {
+		t.Fatalf("CurrentVersion() = %d, want 1", current)
+	}
+
+	rolledBack, err := m.Rollback(1)
+	if err != nil {
+		t.Fatalf("Rollback(1) error = %v", err)
+	}
+	if len(rolledBack) != 0 {
+		t.Errorf("Rollback(1) when current=1 should roll back 0, got %d", len(rolledBack))
+	}
+
+	_, err = m.Rollback(0)
+	if err != nil {
+		t.Fatalf("Rollback(0) error = %v", err)
+	}
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+
+	for _, record := range exec.execLog {
+		if containsPattern(record.query, "DOWN2") || containsPattern(record.query, "DOWN3") || containsPattern(record.query, "DOWN4") {
+			t.Errorf("should not execute DOWN for unapplied migrations, but got: %s", record.query)
+		}
+	}
+}
+
+func TestMigrator_Rollback_NoDownSQLOnlyForApplied(t *testing.T) {
+	exec := newMockExecutor()
+	reg := NewRegistry()
+	reg.MustRegister(&Migration{Version: 1, Description: "v1", UpSQL: "UP1", DownSQL: "DOWN1"})
+	reg.MustRegister(&Migration{Version: 2, Description: "v2", UpSQL: "UP2", DownSQL: ""})
+	reg.MustRegister(&Migration{Version: 3, Description: "v3", UpSQL: "UP3", DownSQL: "DOWN3"})
+
+	m, _ := NewMigrator(reg, exec)
+
+	_, _ = m.UpTo(1)
+
+	_, err := m.Rollback(0)
+	if err != nil {
+		t.Fatalf("Rollback(0) error = %v", err)
+	}
+
+	current, _ := m.CurrentVersion()
+	if current != 0 {
+		t.Errorf("CurrentVersion() = %d, want 0", current)
+	}
+}

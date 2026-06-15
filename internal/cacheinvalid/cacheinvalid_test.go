@@ -995,14 +995,14 @@ func TestCacheEntryFields(t *testing.T) {
 	if entry.TTL != 2*time.Minute {
 		t.Errorf("expected TTL 2m, got %v", entry.TTL)
 	}
-	if entry.IsHot {
+	if entry.IsHot.Load() {
 		t.Error("expected IsHot false")
 	}
 	if entry.IsPreloaded {
 		t.Error("expected IsPreloaded false")
 	}
-	if entry.AccessCount != 0 {
-		t.Errorf("expected AccessCount 0, got %d", entry.AccessCount)
+	if entry.AccessCount.Load() != 0 {
+		t.Errorf("expected AccessCount 0, got %d", entry.AccessCount.Load())
 	}
 	if entry.CreateTime.IsZero() {
 		t.Error("expected CreateTime to be set")
@@ -1129,5 +1129,318 @@ func TestUnmarkPreloadedStartsTTL(t *testing.T) {
 	expired, _ := mgr.IsExpired("p1")
 	if expired {
 		t.Error("expected unmarked preloaded entry to not be immediately expired")
+	}
+}
+
+func TestAllProtectedEntriesEvictionFails(t *testing.T) {
+	cfg := Config{
+		DefaultTTL: 1 * time.Minute,
+		MaxEntries: 2,
+	}
+	mgr := NewCacheInvalidManagerWithConfig(cfg)
+
+	mgr.Put("hot1", "value1")
+	mgr.MarkHot("hot1")
+	mgr.Put("hot2", "value2")
+	mgr.MarkHot("hot2")
+
+	if mgr.Count() != 2 {
+		t.Fatalf("expected 2 entries, got %d", mgr.Count())
+	}
+
+	err := mgr.Put("newkey", "value3")
+	if !errors.Is(err, ErrCapacityExhausted) {
+		t.Errorf("expected ErrCapacityExhausted, got %v", err)
+	}
+
+	if mgr.Count() != 2 {
+		t.Errorf("expected 2 entries (protected entries should not be evicted), got %d", mgr.Count())
+	}
+
+	_, ok1 := mgr.Get("hot1")
+	_, ok2 := mgr.Get("hot2")
+	if !ok1 || !ok2 {
+		t.Error("expected both protected entries to still exist")
+	}
+}
+
+func TestAllPreloadedEntriesEvictionFails(t *testing.T) {
+	cfg := Config{
+		DefaultTTL:  1 * time.Minute,
+		MaxEntries:  2,
+		PreloadSize: 2,
+	}
+	mgr := NewCacheInvalidManagerWithConfig(cfg)
+
+	items := []CacheItem{
+		{Key: "p1", Value: "v1", IsHot: false},
+		{Key: "p2", Value: "v2", IsHot: false},
+	}
+	loader := func() ([]CacheItem, error) {
+		return items, nil
+	}
+	mgr.SetPreloadLoader(loader)
+	mgr.Preload()
+
+	if mgr.Count() != 2 {
+		t.Fatalf("expected 2 preloaded entries, got %d", mgr.Count())
+	}
+
+	err := mgr.Put("newkey", "value3")
+	if !errors.Is(err, ErrCapacityExhausted) {
+		t.Errorf("expected ErrCapacityExhausted, got %v", err)
+	}
+
+	if mgr.Count() != 2 {
+		t.Errorf("expected 2 entries (preloaded entries should not be evicted), got %d", mgr.Count())
+	}
+}
+
+func TestPreloadOnStartAutoTrigger(t *testing.T) {
+	cfg := Config{
+		DefaultTTL:     1 * time.Minute,
+		MaxEntries:     100,
+		PreloadSize:    10,
+		PreloadOnStart: true,
+	}
+	mgr := NewCacheInvalidManagerWithConfig(cfg)
+
+	items := []CacheItem{
+		{Key: "auto1", Value: "v1", IsHot: true},
+		{Key: "auto2", Value: "v2", IsHot: false},
+		{Key: "auto3", Value: "v3", IsHot: true},
+	}
+
+	loadCalled := false
+	loader := func() ([]CacheItem, error) {
+		loadCalled = true
+		return items, nil
+	}
+
+	err := mgr.SetPreloadLoader(loader)
+	if err != nil {
+		t.Fatalf("SetPreloadLoader failed: %v", err)
+	}
+
+	if !loadCalled {
+		t.Error("expected preload to be triggered automatically when PreloadOnStart is true")
+	}
+
+	if mgr.PreloadedCount() != 3 {
+		t.Errorf("expected 3 preloaded entries, got %d", mgr.PreloadedCount())
+	}
+
+	if mgr.HotCount() != 2 {
+		t.Errorf("expected 2 hot entries, got %d", mgr.HotCount())
+	}
+}
+
+func TestPreloadOnStartFalseDoesNotAutoTrigger(t *testing.T) {
+	cfg := Config{
+		DefaultTTL:     1 * time.Minute,
+		MaxEntries:     100,
+		PreloadSize:    10,
+		PreloadOnStart: false,
+	}
+	mgr := NewCacheInvalidManagerWithConfig(cfg)
+
+	loadCalled := false
+	loader := func() ([]CacheItem, error) {
+		loadCalled = true
+		return []CacheItem{}, nil
+	}
+
+	err := mgr.SetPreloadLoader(loader)
+	if err != nil {
+		t.Fatalf("SetPreloadLoader failed: %v", err)
+	}
+
+	if loadCalled {
+		t.Error("expected preload NOT to be triggered when PreloadOnStart is false")
+	}
+
+	if mgr.PreloadedCount() != 0 {
+		t.Errorf("expected 0 preloaded entries, got %d", mgr.PreloadedCount())
+	}
+}
+
+func TestPreloadOnStartWithLoaderError(t *testing.T) {
+	cfg := Config{
+		DefaultTTL:     1 * time.Minute,
+		MaxEntries:     100,
+		PreloadSize:    10,
+		PreloadOnStart: true,
+	}
+	mgr := NewCacheInvalidManagerWithConfig(cfg)
+
+	expectedErr := errors.New("preload failed")
+	loader := func() ([]CacheItem, error) {
+		return nil, expectedErr
+	}
+
+	err := mgr.SetPreloadLoader(loader)
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("expected preload error to propagate, got %v", err)
+	}
+}
+
+func TestConcurrentReadPerformance(t *testing.T) {
+	mgr := NewCacheInvalidManager()
+
+	for i := 0; i < 100; i++ {
+		mgr.Put("key-"+itoa(i), "value-"+itoa(i))
+	}
+
+	var wg sync.WaitGroup
+	numGoroutines := 50
+	readsPerGoroutine := 1000
+
+	start := time.Now()
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < readsPerGoroutine; j++ {
+				key := "key-" + itoa(j%100)
+				mgr.Get(key)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	totalReads := numGoroutines * readsPerGoroutine
+	t.Logf("Completed %d reads in %v (%.0f reads/sec)", totalReads, elapsed, float64(totalReads)/elapsed.Seconds())
+
+	if elapsed > 5*time.Second {
+		t.Errorf("concurrent reads took too long: %v", elapsed)
+	}
+}
+
+func TestConcurrentReadWithWrite(t *testing.T) {
+	mgr := NewCacheInvalidManager()
+
+	mgr.Put("shared-key", "initial-value")
+
+	var wg sync.WaitGroup
+	readGoroutines := 20
+	writeGoroutines := 2
+	opsPerGoroutine := 500
+
+	var readErrors int32
+	var writeErrors int32
+
+	for i := 0; i < readGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < opsPerGoroutine; j++ {
+				_, ok := mgr.Get("shared-key")
+				if !ok {
+					atomic.AddInt32(&readErrors, 1)
+				}
+				time.Sleep(time.Microsecond)
+			}
+		}()
+	}
+
+	for i := 0; i < writeGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < opsPerGoroutine; j++ {
+				err := mgr.Put("key-"+itoa(id*opsPerGoroutine+j), "value")
+				if err != nil {
+					atomic.AddInt32(&writeErrors, 1)
+				}
+				time.Sleep(time.Microsecond)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	if readErrors > 0 {
+		t.Errorf("got %d read errors", readErrors)
+	}
+	if writeErrors > 0 {
+		t.Errorf("got %d write errors", writeErrors)
+	}
+}
+
+func TestCapacityExhaustedError(t *testing.T) {
+	cfg := Config{
+		DefaultTTL: 1 * time.Minute,
+		MaxEntries: 1,
+	}
+	mgr := NewCacheInvalidManagerWithConfig(cfg)
+
+	mgr.Put("hot1", "value1")
+	mgr.MarkHot("hot1")
+
+	err := mgr.Put("key2", "value2")
+	if err == nil {
+		t.Fatal("expected error when capacity is exhausted with all protected entries")
+	}
+	if !errors.Is(err, ErrCapacityExhausted) {
+		t.Errorf("expected ErrCapacityExhausted, got %v", err)
+	}
+
+	errMsg := err.Error()
+	if errMsg == "" {
+		t.Error("expected non-empty error message")
+	}
+}
+
+func TestMixedProtectionEviction(t *testing.T) {
+	cfg := Config{
+		DefaultTTL: 1 * time.Minute,
+		MaxEntries: 3,
+	}
+	mgr := NewCacheInvalidManagerWithConfig(cfg)
+
+	mgr.Put("hot1", "value1")
+	mgr.MarkHot("hot1")
+	mgr.Put("normal1", "value2")
+	mgr.Put("normal2", "value3")
+
+	err := mgr.Put("newkey", "value4")
+	if err != nil {
+		t.Fatalf("expected successful Put with eviction of normal entry, got error: %v", err)
+	}
+
+	if mgr.Count() != 3 {
+		t.Errorf("expected 3 entries after eviction, got %d", mgr.Count())
+	}
+
+	_, ok := mgr.Get("hot1")
+	if !ok {
+		t.Error("expected hot entry to be protected from eviction")
+	}
+}
+
+func TestGetEntryReturnsCopy(t *testing.T) {
+	mgr := NewCacheInvalidManager()
+
+	mgr.Put("key1", "value1")
+
+	entry1, ok1 := mgr.GetEntry("key1")
+	if !ok1 {
+		t.Fatal("expected to get entry")
+	}
+
+	entry2, ok2 := mgr.GetEntry("key1")
+	if !ok2 {
+		t.Fatal("expected to get entry")
+	}
+
+	if entry1 == entry2 {
+		t.Error("expected GetEntry to return different copies")
+	}
+
+	if entry1.Key != entry2.Key {
+		t.Error("expected entries to have same key")
 	}
 }

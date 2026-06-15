@@ -16,7 +16,9 @@ ObjStore 是一个支持版本控制的内存对象存储模块，专为需要�
 | 版本回滚 | 将指定键的数据回滚到任意历史版本（创建新版本） |
 | 过期清理 | 配置最大保留版本数，超过阈值时自动清理最旧版本 |
 | 清理策略 | 可配置清理触发间隔和每次清理的批次大小 |
+| 强制清理 | `CleanupAll()` 一次性清理所有超出上限的旧版本 |
 | 对象删除 | 删除整个键及其所有历史版本 |
+| 配置验证 | 构造时验证配置参数有效性，无效配置返回明确错误 |
 
 ## 3. 核心结构体与职责
 
@@ -26,9 +28,9 @@ ObjStore 是一个支持版本控制的内存对象存储模块，专为需要�
 
 ```go
 type ObjectStore struct {
-    mu             sync.RWMutex
-    objects        map[string][]*ObjectVersion
-    config         Config
+    mu              sync.RWMutex
+    objects         map[string][]*ObjectVersion
+    config          Config
     opsSinceCleanup int
 }
 ```
@@ -38,6 +40,7 @@ type ObjectStore struct {
 - 通过 `sync.RWMutex` 保护并发访问
 - 维护版本计数器和清理触发计数
 - 协调整个存储的版本管理和清理策略
+- 提供高效的二分查找版本定位
 
 ### 3.2 ObjectVersion
 
@@ -87,11 +90,13 @@ type Config struct {
 
 **配置项说明**:
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| MaxVersions | 10 | 每个键最大保留的版本数 |
-| CleanupBatchSize | 1 | 每次清理操作移除的旧版本数量 |
-| CleanupInterval | 1 | 每隔多少次写入操作触发一次清理 |
+| 配置项 | 默认值 | 约束 | 说明 |
+|--------|--------|------|------|
+| MaxVersions | 10 | 必须 > 0 | 每个键最大保留的版本数 |
+| CleanupBatchSize | 1 | 必须 > 0 | 自动清理每次移除的旧版本数量 |
+| CleanupInterval | 1 | 必须 > 0 | 每隔多少次写入操作触发一次自动清理 |
+
+**重要**: 所有配置参数必须为正数，`NewObjectStoreWithConfig` 会在构造时进行严格验证，无效配置将返回相应的错误。
 
 ## 4. 对象生命周期
 
@@ -138,7 +143,28 @@ type Config struct {
 - 版本号一旦分配永不复用，即使旧版本被清理
 - 版本号单调递增，保证历史可追溯
 
-### 4.3 版本清理策略
+### 4.3 版本查找策略
+
+由于版本切片始终按版本号升序排列，`GetVersion` 和 `Rollback` 方法使用**二分查找**（`sort.Search`）来定位指定版本号：
+
+```go
+func (s *ObjectStore) findVersionLocked(versions []*ObjectVersion, target uint64) *ObjectVersion {
+    idx := sort.Search(len(versions), func(i int) bool {
+        return versions[i].Version >= target
+    })
+    if idx < len(versions) && versions[idx].Version == target {
+        return versions[idx]
+    }
+    return nil
+}
+```
+
+**算法优势**:
+- 时间复杂度从 O(n) 降至 O(log n)
+- 版本数量越大，性能提升越明显
+- 即使旧版本被清理导致版本号不连续，二分查找依然有效
+
+### 4.4 版本清理策略
 
 清理机制支持灵活配置，平衡内存占用和清理开销：
 
@@ -147,16 +173,22 @@ type Config struct {
 - 值为 N：每 N 次写入后检查一次（减少清理开销）
 - 适用于写入频繁、对清理实时性要求不高的场景
 
-**清理批次** (`CleanupBatchSize`):
-- 每次清理最多移除的旧版本数量
+**自动清理批次** (`CleanupBatchSize`):
+- 每次自动清理最多移除的旧版本数量
 - 防止单次清理操作耗时过长
 - 当超出版本数少于批次大小时，仅清理超出部分
 
-### 4.4 回滚机制
+**强制清理** (`CleanupAll()`):
+- 与自动清理不同，`CleanupAll()` 一次性清理所有键的所有超出版本
+- 不受 `CleanupBatchSize` 限制
+- 调用一次即可确保所有键的版本数不超过 `MaxVersions`
+- 适用于需要立即回收内存的场景
+
+### 4.5 回滚机制
 
 回滚操作**不修改历史版本**，而是创建一个新版本：
 
-1. 查找目标历史版本的数据
+1. 通过二分查找定位目标历史版本
 2. 创建一个新版本号，复制目标版本的数据
 3. 将新版本追加到版本列表末尾
 4. 触发清理检查（与普通写入相同）
@@ -176,11 +208,11 @@ type Config struct {
 |------|--------|------|
 | Put | 写锁 | 修改版本列表 |
 | Get | 读锁 | 读取最新版本 |
-| GetVersion | 读锁 | 读取指定版本 |
+| GetVersion | 读锁 | 读取指定版本（二分查找） |
 | ListVersions | 读锁 | 读取版本列表 |
-| Rollback | 写锁 | 添加新版本 |
+| Rollback | 写锁 | 查找目标版本 + 添加新版本 |
 | Delete | 写锁 | 删除键及其版本 |
-| CleanupAll | 写锁 | 执行清理操作 |
+| CleanupAll | 写锁 | 执行全量清理操作 |
 | Count | 读锁 | 统计键数量 |
 | VersionCount | 读锁 | 统计版本数量 |
 
@@ -228,10 +260,21 @@ func main() {
 ```go
 cfg := objstore.Config{
     MaxVersions:      50,    // 每个键保留 50 个版本
-    CleanupBatchSize: 5,     // 每次清理 5 个旧版本
-    CleanupInterval:  10,    // 每 10 次写入触发一次清理
+    CleanupBatchSize: 5,     // 每次自动清理 5 个旧版本
+    CleanupInterval:  10,    // 每 10 次写入触发一次自动清理
 }
-store := objstore.NewObjectStoreWithConfig(cfg)
+store, err := objstore.NewObjectStoreWithConfig(cfg)
+if err != nil {
+    // 处理无效配置
+    if errors.Is(err, objstore.ErrInvalidMaxVersion) {
+        fmt.Println("MaxVersions must be positive")
+    } else if errors.Is(err, objstore.ErrInvalidBatchSize) {
+        fmt.Println("CleanupBatchSize must be positive")
+    } else if errors.Is(err, objstore.ErrInvalidCleanupInterval) {
+        fmt.Println("CleanupInterval must be positive")
+    }
+    panic(err)
+}
 ```
 
 ### 6.3 版本管理
@@ -283,7 +326,10 @@ cfg := objstore.Config{
     CleanupBatchSize: 1,
     CleanupInterval:  1,
 }
-store := objstore.NewObjectStoreWithConfig(cfg)
+store, err := objstore.NewObjectStoreWithConfig(cfg)
+if err != nil {
+    panic(err)
+}
 
 for i := 1; i <= 10; i++ {
     store.Put("metric:cpu", []byte(fmt.Sprintf("value_%d", i)))
@@ -297,28 +343,32 @@ fmt.Printf("Oldest kept version: %d\n", versions[0].Version) // 8
 fmt.Printf("Newest version: %d\n", versions[len(versions)-1].Version) // 10
 ```
 
-### 6.6 手动清理
+### 6.6 强制全量清理
 
 ```go
 cfg := objstore.Config{
     MaxVersions:      5,
     CleanupBatchSize: 2,
-    CleanupInterval:  100, // 不自动触发清理
+    CleanupInterval:  100, // 禁用自动触发清理
 }
-store := objstore.NewObjectStoreWithConfig(cfg)
+store, err := objstore.NewObjectStoreWithConfig(cfg)
+if err != nil {
+    panic(err)
+}
 
 for i := 0; i < 20; i++ {
     store.Put("key1", []byte(fmt.Sprintf("v%d", i)))
 }
 
 count, _ := store.VersionCount("key1")
-fmt.Println("Before manual cleanup:", count) // 20
+fmt.Println("Before CleanupAll:", count) // 20
 
+// CleanupAll 一次性清理所有超出版本，不受 CleanupBatchSize 限制
 cleaned := store.CleanupAll()
-fmt.Println("Cleaned versions:", cleaned) // 2 (按批次清理)
+fmt.Println("Cleaned versions:", cleaned) // 15 (20 - 5)
 
 count, _ = store.VersionCount("key1")
-fmt.Println("After cleanup:", count) // 18
+fmt.Println("After CleanupAll:", count) // 5
 ```
 
 ### 6.7 并发使用
@@ -351,8 +401,26 @@ fmt.Println("Total keys:", store.Count())
 | `ErrVersionNotFound` | 版本不存在 | GetVersion、Rollback 时指定版本号不存在 |
 | `ErrEmptyKey` | 键为空 | 所有接受 key 参数的方法传入空字符串 |
 | `ErrNilData` | 数据为 nil | Put 时传入 nil 数据 |
-| `ErrInvalidMaxVersion` | 最大版本数无效 | 预留错误，当前使用默认值替代 |
-| `ErrInvalidBatchSize` | 清理批次大小无效 | 预留错误，当前使用默认值替代 |
+| `ErrInvalidMaxVersion` | 最大版本数无效 | NewObjectStoreWithConfig 时 MaxVersions <= 0 |
+| `ErrInvalidBatchSize` | 清理批次大小无效 | NewObjectStoreWithConfig 时 CleanupBatchSize <= 0 |
+| `ErrInvalidCleanupInterval` | 清理间隔无效 | NewObjectStoreWithConfig 时 CleanupInterval <= 0 |
+
+**错误处理示例**:
+```go
+store, err := objstore.NewObjectStoreWithConfig(cfg)
+if err != nil {
+    switch {
+    case errors.Is(err, objstore.ErrInvalidMaxVersion):
+        // 处理无效的 MaxVersions
+    case errors.Is(err, objstore.ErrInvalidBatchSize):
+        // 处理无效的 CleanupBatchSize
+    case errors.Is(err, objstore.ErrInvalidCleanupInterval):
+        // 处理无效的 CleanupInterval
+    default:
+        // 其他错误
+    }
+}
+```
 
 ## 8. 性能特征
 
@@ -360,13 +428,14 @@ fmt.Println("Total keys:", store.Count())
 
 | 操作 | 时间复杂度 | 说明 |
 |------|-----------|------|
-| Put | O(n) | 版本号计算 O(1)，清理操作涉及切片截断 |
+| Put | O(k*b) | k 为键数，b 为清理批次大小 |
 | Get | O(1) | 直接访问最新版本 |
-| GetVersion | O(n) | 线性查找指定版本 |
+| GetVersion | O(log n) | 二分查找指定版本 |
 | ListVersions | O(n) | 复制版本元信息列表 |
-| Rollback | O(n) | 查找目标版本 + 创建新版本 |
+| Rollback | O(log n) | 二分查找目标版本 + 创建新版本 |
 | Delete | O(1) | Map 删除操作 |
-| CleanupAll | O(k*b) | k 为键数，b 为批次大小 |
+| CleanupAll | O(k*n) | k 为键数，一次性清理所有超出版本 |
+| findVersionLocked | O(log n) | 内部二分查找实现 |
 
 ### 8.2 并发性能
 
@@ -385,8 +454,11 @@ fmt.Println("Total keys:", store.Count())
 
 1. **纯内存存储**: 数据仅存在于内存中，进程退出即丢失
 2. **单全局锁**: 大并发写入场景下可能成为瓶颈，可考虑分段锁优化
-3. **版本查找**: GetVersion 为线性查找，版本数量大时可能影响性能
+3. **版本查找**: GetVersion 采用二分查找 O(log n)，即使版本号不连续也能高效工作
 4. **深拷贝开销**: 所有数据进出都进行深拷贝，大对象有额外开销
-5. **清理粒度**: 清理按全局操作计数触发，不是按每个键独立计数
+5. **清理粒度**: 自动清理按全局操作计数触发，不是按每个键独立计数
 6. **回滚不可逆**: 回滚操作创建新版本，旧版本仍保留（除非被清理）
 7. **空数据支持**: 支持写入空字节切片 (`[]byte{}`)，但不支持 nil
+8. **配置验证**: NewObjectStoreWithConfig 会严格验证配置，无效配置返回明确错误，不再静默替换
+9. **CleanupAll 语义**: 该方法一次性清理所有超出版本，与自动清理的批次机制不同，调用后无需重复调用
+10. **版本号不连续**: 旧版本被清理后版本号可能不连续，但二分查找不受影响

@@ -91,7 +91,7 @@ type Registry struct {
 - `Versions() []int`：返回所有已注册的版本号（有序副本）
 - `All() []*Migration`：返回所有已注册的迁移脚本（按版本号升序，返回副本）
 - `Validate() error`：校验版本号是否从 1 开始且连续无间隔
-- `Range(from, to int) []*Migration`：返回指定版本范围内的迁移脚本
+- `Range(from, to int) []*Migration`：返回指定版本范围内的迁移脚本（返回副本，不暴露内部指针）
 
 ---
 
@@ -242,16 +242,21 @@ Migrator.Rollback(targetVersion) 调用
   lock.Acquire() ── 获取迁移锁
       │
       ▼
-  CurrentVersion() ── 获取当前最高版本号
+  getAppliedVersions() ── 查询所有已应用的版本
       │
       ▼
-  targetVersion > currentVersion？──是──► 返回 ErrRollbackTarget
+  计算 current = max(已应用版本号)
+      │
+      ▼
+  targetVersion > current？──是──► 返回 ErrRollbackTarget
       │否
       ▼
-  targetVersion == currentVersion？──是──► 返回空列表（无需回滚）
+  targetVersion == current？──是──► 返回空列表（无需回滚）
       │否
       ▼
   逆序遍历迁移脚本（从最高版本到 targetVersion+1）：
+      │
+      ├─ 版本已应用？──否──► 跳过（不执行未应用版本的回滚）
       │
       ├─ DownSQL 为空？──是──► 返回错误
       │
@@ -344,6 +349,44 @@ CREATE TABLE IF NOT EXISTS schema_migration_lock (
 ### TryAcquire 带超时重试
 
 `TryAcquire(timeout)` 方法在指定超时时间内反复尝试获取锁，每次尝试间隔 50ms。如果锁被其他进程持有但在超时内释放，则可以成功获取；否则返回 `ErrLockTimeout`。
+
+---
+
+## 回滚安全性保证
+
+### 已应用版本检查
+
+回滚操作在执行前会通过 `getAppliedVersions()` 查询所有已应用的迁移版本，在逆序遍历迁移脚本时，对每个版本都会先检查其是否真的已被应用。只有已应用的迁移才会执行回滚 SQL，未应用的迁移会被跳过。
+
+**安全保障场景**：
+- 如果注册中心包含版本 1-5，但仅通过 `UpTo(3)` 执行了前 3 版
+- 调用 `Rollback(1)` 时，只会回滚版本 3 和 2
+- 版本 4 和 5 由于从未被应用过，会被安全跳过，不会执行它们的回滚 SQL
+- 即使某个未应用版本的 `DownSQL` 为空，也不会触发错误
+
+**修复前的问题**：修复前的实现会遍历所有注册的迁移脚本，只要版本号大于目标版本就执行回滚，可能对从未应用过的版本执行回滚 SQL，导致错误或数据丢失。
+
+### DownSQL 检查
+
+对于已应用的迁移，如果其 `DownSQL` 为空，回滚会立即返回错误，已回滚的版本保持已回滚状态。
+
+---
+
+## 指针返回策略
+
+为了防止调用者意外修改注册中心内部数据，`Registry` 的所有查询方法均返回数据副本，而非内部原始指针：
+
+| 方法 | 返回值 | 策略 |
+|------|--------|------|
+| `All()` | `[]*Migration` | 每个元素均为值拷贝后创建的新指针 |
+| `Range(from, to)` | `[]*Migration` | 每个元素均为值拷贝后创建的新指针 |
+| `Versions()` | `[]int` | 返回切片副本 |
+| `Get(version)` | `(*Migration, bool)` | 返回原始指针（用于需要精确匹配的场景，调用者不应修改） |
+
+**修改 `All()` 和 `Range()` 返回值的影响**：
+- 调用者通过返回的指针修改 `Migration` 字段不会影响注册中心内部数据
+- 保证了注册中心数据的不可变性和线程安全性
+- 轻微的性能开销（每次查询都需要复制结构体），对于迁移脚本这种小规模数据可以忽略
 
 ---
 
@@ -480,3 +523,5 @@ if err := registry.Validate(); err != nil {
 | 锁释放保证 | Up 后释放、Rollback 后释放、Up 出错后释放 |
 | 边界条件 | 单条迁移、版本号乱序注册、部分执行后继续执行 |
 | 默认值 | 默认表名、默认锁超时时间 |
+| **部分应用回滚** | **注册5个版本仅应用前3个的回滚、注册5个版本仅应用前2个回滚到0、未应用版本的DownSQL为空不报错** |
+| **指针安全** | **Range 返回副本不影响内部数据** |

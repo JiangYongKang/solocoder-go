@@ -1,0 +1,6 @@
+你实现的图数据存储引擎模块存在一些问题，需要修复：
+1. graphdb.go 中定义了 edgeItem 结构体，包含 edge 指针和 sorted 布尔字段，但该类型在整个文件中从未被引用使用，属于设计变更后遗留的废弃代码。
+2. AddNode 方法在收到空字符串 ID 参数时返回 ErrNodeNotFound，而空 ID 属于参数格式无效错误，与 RemoveNode 和 GetNode 等方法中 ErrNodeNotFound 代表"图中不存在该节点"的语义完全混淆，调用方无法区分是传入了非法 ID 还是图中确实没有该节点。
+3. DFS 方法使用递归闭包实现深度优先遍历，用户可能传入极大 maxDepth 表达"不限制深度"，若长链图的深度超过 Go 运行时栈配额会导致 panic 而非返回可控错误。
+4. 修复后运行 go test ./internal/graphdb/ -v，需要让所有测试通过。需要补充验证深层图 DFS 不 panic 的测试用例。
+5. 在 docs/graphdb.md 中更新模块需求文档，说明修复后的错误语义和 DFS 遍历安全性保证。

@@ -1,0 +1,5 @@
+你实现的数据迁移管道模块存在一些问题，需要修复：
+1. 测试文件中的 mockSource.Fetch 方法仅使用 cursor.LastOffset 做切片分页，完全忽略 cursor.Mode 和 cursor.LastValue 两个增量过滤字段。增量迁移模式下 Source 应根据 LastValue 过滤记录而非依赖 LastOffset 分页，导致增量迁移的核心过滤行为未被测试覆盖。
+2. TestRun_CheckpointResume 测试在验证断点续传时通过手动切片截断源端数据来模拟断点位置，而非让 mockSource 在 Fetch 方法中根据传入的 Cursor 参数自行定位读取起点，跳过了 Source 是否遵守 Cursor 契约的关键验证。
+3. 修复后运行 go test ./internal/datapipe/ -v，需要让所有测试通过。需要让 mockSource 真正实现增量模式下的数据过滤，并在断点续传测试中通过 Cursor 字段驱动 Source 定位而非手动切片。
+4. 在 docs/datapipe.md 中更新模块需求文档，说明修复后 Source 接口对 Cursor 的遵守约定和增量过滤的实现机制。

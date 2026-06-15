@@ -1081,3 +1081,324 @@ func TestQueryResultStructure(t *testing.T) {
 		t.Errorf("expected y=100, got %v", result.Rows[0].Values["y"])
 	}
 }
+
+func TestDictionaryEnabled_Default(t *testing.T) {
+	cs := NewColumnStore()
+	if !cs.IsDictionaryEnabled() {
+		t.Error("expected dictionary to be enabled by default")
+	}
+}
+
+func TestDictionaryEnabled_ExplicitTrue(t *testing.T) {
+	cs := NewColumnStoreWithConfig(Config{DictionaryEnabled: true})
+	if !cs.IsDictionaryEnabled() {
+		t.Error("expected dictionary to be enabled when configured true")
+	}
+
+	repeatedValues := make([]Value, 100)
+	for i := range repeatedValues {
+		repeatedValues[i] = "same_value"
+	}
+	ids := make([]Value, 100)
+	for i := range ids {
+		ids[i] = i
+	}
+
+	cs.Write([]ColumnBatch{
+		{Name: "id", Values: ids},
+		{Name: "val", Values: repeatedValues},
+	})
+
+	dictSize, err := cs.DictionarySize("val")
+	if err != nil {
+		t.Fatalf("DictionarySize failed: %v", err)
+	}
+	if dictSize != 1 {
+		t.Errorf("expected dictionary size 1 (all same value), got %d", dictSize)
+	}
+
+	result, err := cs.Read([]string{"val"})
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	for i, row := range result.Rows {
+		if row.Values["val"] != "same_value" {
+			t.Errorf("row %d: expected 'same_value', got %v", i, row.Values["val"])
+		}
+	}
+}
+
+func TestDictionaryEnabled_ExplicitFalse(t *testing.T) {
+	cs := NewColumnStoreWithConfig(Config{DictionaryEnabled: false})
+	if cs.IsDictionaryEnabled() {
+		t.Error("expected dictionary to be disabled when configured false")
+	}
+
+	repeatedValues := make([]Value, 100)
+	for i := range repeatedValues {
+		repeatedValues[i] = "same_value"
+	}
+	ids := make([]Value, 100)
+	for i := range ids {
+		ids[i] = i
+	}
+
+	cs.Write([]ColumnBatch{
+		{Name: "id", Values: ids},
+		{Name: "val", Values: repeatedValues},
+	})
+
+	dictSize, err := cs.DictionarySize("val")
+	if err != nil {
+		t.Fatalf("DictionarySize failed: %v", err)
+	}
+	if dictSize != 0 {
+		t.Errorf("expected dictionary size 0 when disabled, got %d", dictSize)
+	}
+
+	result, err := cs.Read([]string{"val"})
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if len(result.Rows) != 100 {
+		t.Fatalf("expected 100 rows, got %d", len(result.Rows))
+	}
+	for i, row := range result.Rows {
+		if row.Values["val"] != "same_value" {
+			t.Errorf("row %d: expected 'same_value', got %v", i, row.Values["val"])
+		}
+	}
+}
+
+func TestDictionaryDisabled_AllUniqueValues(t *testing.T) {
+	cs := NewColumnStoreWithConfig(Config{DictionaryEnabled: false})
+
+	n := 50
+	ids := make([]Value, n)
+	names := make([]Value, n)
+	for i := 0; i < n; i++ {
+		ids[i] = i
+		names[i] = fmt.Sprintf("unique_name_%d", i)
+	}
+
+	cs.Write([]ColumnBatch{
+		{Name: "id", Values: ids},
+		{Name: "name", Values: names},
+	})
+
+	dictSize, err := cs.DictionarySize("name")
+	if err != nil {
+		t.Fatalf("DictionarySize failed: %v", err)
+	}
+	if dictSize != 0 {
+		t.Errorf("expected dictionary size 0 when disabled, got %d", dictSize)
+	}
+
+	result, err := cs.Read([]string{"id", "name"})
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	for i, row := range result.Rows {
+		if row.Values["id"] != i {
+			t.Errorf("row %d: expected id=%d, got %v", i, i, row.Values["id"])
+		}
+		expectedName := fmt.Sprintf("unique_name_%d", i)
+		if row.Values["name"] != expectedName {
+			t.Errorf("row %d: expected name=%s, got %v", i, expectedName, row.Values["name"])
+		}
+	}
+}
+
+func TestDictionaryDisabled_WithFilter(t *testing.T) {
+	cs := NewColumnStoreWithConfig(Config{DictionaryEnabled: false})
+
+	batch := []ColumnBatch{
+		{Name: "id", Values: []Value{1, 2, 3, 4, 5}},
+		{Name: "status", Values: []Value{"active", "inactive", "active", "pending", "active"}},
+	}
+	cs.Write(batch)
+
+	predicates := []*Predicate{
+		{Column: "status", Op: OpEq, Value: "active"},
+	}
+
+	result, err := cs.ReadWithFilter([]string{"id", "status"}, predicates)
+	if err != nil {
+		t.Fatalf("ReadWithFilter failed: %v", err)
+	}
+
+	if result.TotalMatched != 3 {
+		t.Errorf("expected 3 matches, got %d", result.TotalMatched)
+	}
+	expectedIds := []Value{1, 3, 5}
+	for i, row := range result.Rows {
+		if row.Values["id"] != expectedIds[i] {
+			t.Errorf("row %d: expected id=%v, got %v", i, expectedIds[i], row.Values["id"])
+		}
+		if row.Values["status"] != "active" {
+			t.Errorf("row %d: expected status=active, got %v", i, row.Values["status"])
+		}
+	}
+}
+
+func TestCompareValues_TypeMismatch_IntString(t *testing.T) {
+	result := compareValues(1, "1")
+	if result == 0 {
+		t.Error("int(1) and string(\"1\") should NOT be equal (type mismatch)")
+	}
+
+	result = compareValues("1", 1)
+	if result == 0 {
+		t.Error("string(\"1\") and int(1) should NOT be equal (type mismatch)")
+	}
+}
+
+func TestCompareValues_TypeMismatch_BoolInt(t *testing.T) {
+	result := compareValues(true, 1)
+	if result == 0 {
+		t.Error("bool(true) and int(1) should NOT be equal (type mismatch)")
+	}
+
+	result = compareValues(false, 0)
+	if result == 0 {
+		t.Error("bool(false) and int(0) should NOT be equal (type mismatch)")
+	}
+}
+
+func TestCompareValues_TypeMismatch_StringBool(t *testing.T) {
+	result := compareValues("true", true)
+	if result == 0 {
+		t.Error("string(\"true\") and bool(true) should NOT be equal (type mismatch)")
+	}
+
+	result = compareValues("false", false)
+	if result == 0 {
+		t.Error("string(\"false\") and bool(false) should NOT be equal (type mismatch)")
+	}
+}
+
+func TestCompareValues_TypeMismatch_FloatString(t *testing.T) {
+	result := compareValues(1.0, "1.0")
+	if result == 0 {
+		t.Error("float64(1.0) and string(\"1.0\") should NOT be equal (type mismatch)")
+	}
+}
+
+func TestPredicate_TypeMismatch_NoFalsePositive(t *testing.T) {
+	cs := NewColumnStore()
+	batch := []ColumnBatch{
+		{Name: "id", Values: []Value{1, 2, 3}},
+		{Name: "code", Values: []Value{100, 200, 300}},
+	}
+	cs.Write(batch)
+
+	predicates := []*Predicate{
+		{Column: "code", Op: OpEq, Value: "100"},
+	}
+
+	result, err := cs.ReadWithFilter([]string{"id", "code"}, predicates)
+	if err != nil {
+		t.Fatalf("ReadWithFilter failed: %v", err)
+	}
+
+	if result.TotalMatched != 0 {
+		t.Errorf("expected 0 matches (int vs string type mismatch), got %d", result.TotalMatched)
+	}
+}
+
+func TestPredicate_TypeMismatch_Neq(t *testing.T) {
+	cs := NewColumnStore()
+	batch := []ColumnBatch{
+		{Name: "id", Values: []Value{1, 2, 3}},
+		{Name: "val", Values: []Value{10, 20, 30}},
+	}
+	cs.Write(batch)
+
+	predicates := []*Predicate{
+		{Column: "val", Op: OpNeq, Value: "10"},
+	}
+
+	result, err := cs.ReadWithFilter([]string{"id", "val"}, predicates)
+	if err != nil {
+		t.Fatalf("ReadWithFilter failed: %v", err)
+	}
+
+	if result.TotalMatched != 3 {
+		t.Errorf("expected 3 matches (all differ from string type), got %d", result.TotalMatched)
+	}
+}
+
+func TestPredicate_TypeMismatch_InOperator(t *testing.T) {
+	cs := NewColumnStore()
+	batch := []ColumnBatch{
+		{Name: "id", Values: []Value{1, 2, 3}},
+		{Name: "tag", Values: []Value{"a", "b", "c"}},
+	}
+	cs.Write(batch)
+
+	predicates := []*Predicate{
+		{Column: "tag", Op: OpIn, Values: []Value{1, 2, 3}},
+	}
+
+	result, err := cs.ReadWithFilter([]string{"id"}, predicates)
+	if err != nil {
+		t.Fatalf("ReadWithFilter failed: %v", err)
+	}
+
+	if result.TotalMatched != 0 {
+		t.Errorf("expected 0 matches (string column vs int list type mismatch), got %d", result.TotalMatched)
+	}
+}
+
+func TestPredicate_TypeMismatch_NotInOperator(t *testing.T) {
+	cs := NewColumnStore()
+	batch := []ColumnBatch{
+		{Name: "id", Values: []Value{1, 2, 3}},
+		{Name: "tag", Values: []Value{"a", "b", "c"}},
+	}
+	cs.Write(batch)
+
+	predicates := []*Predicate{
+		{Column: "tag", Op: OpNotIn, Values: []Value{1, 2, 3}},
+	}
+
+	result, err := cs.ReadWithFilter([]string{"id"}, predicates)
+	if err != nil {
+		t.Fatalf("ReadWithFilter failed: %v", err)
+	}
+
+	if result.TotalMatched != 3 {
+		t.Errorf("expected 3 matches (all not in int list due to type mismatch), got %d", result.TotalMatched)
+	}
+}
+
+func TestCompareValues_TypeMismatch_OrderingDeterministic(t *testing.T) {
+	r1 := compareValues(1, "a")
+	r2 := compareValues(1, "a")
+	if r1 != r2 {
+		t.Error("type mismatch comparison should be deterministic")
+	}
+	if r1 == 0 {
+		t.Error("different types should never compare equal")
+	}
+
+	r3 := compareValues("a", 1)
+	if r3 == r1 {
+		t.Error("type mismatch ordering should be antisymmetric: compare(a,b) should not equal compare(b,a)")
+	}
+}
+
+func TestCompareValues_IntFloatMixed(t *testing.T) {
+	if compareValues(1, 1.0) != 0 {
+		t.Error("int(1) and float64(1.0) should be equal")
+	}
+	if compareValues(1.0, 1) != 0 {
+		t.Error("float64(1.0) and int(1) should be equal")
+	}
+	if compareValues(2, 1.5) <= 0 {
+		t.Error("int(2) should be greater than float64(1.5)")
+	}
+	if compareValues(1.5, 2) >= 0 {
+		t.Error("float64(1.5) should be less than int(2)")
+	}
+}

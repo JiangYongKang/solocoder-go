@@ -131,6 +131,136 @@ type Source interface {
 | Count | 统计 cursor 之后的剩余记录数（用于进度显示，失败不影响迁移） |
 | Close | 释放源端资源（迁移结束时自动调用） |
 
+#### 2.6.1 Source 对 Cursor 的契约约定（强制）
+
+Source 的 **Fetch** 和 **Count** 方法必须严格遵守以下 Cursor 契约，这是断点续传和增量迁移正确工作的核心保证：
+
+| 模式 | 起点定位规则 | LastValue 类型 | 行为描述 |
+|------|-------------|---------------|----------|
+| **Full 全量** | 使用 `cursor.LastOffset` 作为起始索引 | `nil`（不使用） | 跳过前 LastOffset 条记录，从第 LastOffset+1 条开始读取 |
+| **Timestamp 时间戳** | 使用 `cursor.LastValue` 作为时间戳阈值 | `time.Time` | 只返回 `Record.Timestamp > cursor.LastValue` 的记录，**不使用** LastOffset 分页 |
+| **ID 递增** | 使用 `cursor.LastValue` 作为 ID 阈值 | `int64` | 只返回 `Record.SeqID > cursor.LastValue` 的记录，**不使用** LastOffset 分页 |
+
+> **重要**：Cursor 传 nil 时，视为全新迁移（未保存过断点），所有模式均从第 0 条开始读取。
+
+#### 2.6.2 增量过滤的参考实现机制
+
+以下为 Source 实现 Fetch 时的标准逻辑（伪代码）：
+
+```go
+func (s *SourceImpl) Fetch(ctx context.Context, cursor *Cursor, batchSize int) (*Batch, error) {
+    startIdx := findStartIndex(cursor)
+    if startIdx >= len(s.data) {
+        return &Batch{Records: nil}, nil // 空 Batch 表示读完
+    }
+    endIdx := min(startIdx+batchSize, len(s.data))
+    records := s.data[startIdx:endIdx]
+    return buildBatch(records), nil
+}
+
+func (s *SourceImpl) findStartIndex(cursor *Cursor) int {
+    if cursor == nil {
+        return 0 // 全新迁移
+    }
+    switch cursor.Mode {
+    case IncrementalModeFull:
+        return int(cursor.LastOffset)
+    case IncrementalModeTimestamp:
+        if cursor.LastValue == nil {
+            return 0
+        }
+        lastTs := cursor.LastValue.(time.Time)
+        // 线性扫描或利用索引，找到第一条 Timestamp > lastTs 的记录
+        for i, r := range s.data {
+            if r.Timestamp.After(lastTs) {
+                return i
+            }
+        }
+        return len(s.data)
+    case IncrementalModeID:
+        if cursor.LastValue == nil {
+            return 0
+        }
+        lastID := cursor.LastValue.(int64)
+        // 线性扫描或利用索引，找到第一条 SeqID > lastID 的记录
+        for i, r := range s.data {
+            if r.SeqID > lastID {
+                return i
+            }
+        }
+        return len(s.data)
+    }
+    return 0
+}
+
+func (s *SourceImpl) Count(ctx context.Context, cursor *Cursor) (int64, error) {
+    startIdx := findStartIndex(cursor)
+    return int64(len(s.data) - startIdx), nil
+}
+```
+
+#### 2.6.3 Batch 字段填充规范
+
+Fetch 返回的 Batch 对象必须正确填充以下字段（Pipeline 依赖这些字段更新 Cursor）：
+
+| 字段 | 填充时机 | 来源 |
+|------|---------|------|
+| `Records` | 始终 | 本批次读取的记录切片 |
+| `FirstSeq` / `LastSeq` | `len(Records) > 0` | 第一条/最后一条记录的 `SeqID` |
+| `StartTs` / `EndTs` | `len(Records) > 0` | 第一条/最后一条记录的 `Timestamp` |
+| `ID` | **由 Pipeline 自动填充** | 调用方无需设置，Pipeline 内部按自增序列填充 |
+
+#### 2.6.4 典型模式下的断点续传工作流程
+
+以 ID 增量模式 + 断点恢复为例，展示 Cursor 在 Source 与 Pipeline 之间的传递闭环：
+
+```
+[首次迁移，共 100 条，batchSize=10]
+
+  第 1 批次: Fetch(cursor=nil)
+     ↓
+  Source.findStartIndex(nil) → 0, 返回 rec-0..rec-9
+     ↓
+  Pipeline: 写入成功 → 更新 Cursor
+     cursor.LastValue = 9 (batch.LastSeq)
+     cursor.LastOffset = 10
+     调用 CheckpointStore.Save(cursor)
+
+  第 5 批次: Fetch(cursor{LastValue=39, LastOffset=40})
+     ↓
+  Source.findStartIndex: 找到 SeqID > 39 的第 1 条 → rec-40
+     返回 rec-40..rec-49
+     ↓
+  用户调用 Stop()，迁移暂停，cursor 已持久化
+     cursor.LastValue = 49, cursor.LastOffset = 50
+
+[断点恢复，重启迁移]
+
+  Pipeline: 从 CheckpointStore.Load() 得到 cursor
+     cursor.LastValue = 49, cursor.LastOffset = 50
+
+  第 6 批次: Fetch(cursor{LastValue=49, LastOffset=50})
+     ↓
+  Source.findStartIndex: SeqID > 49 → rec-50
+     ⚠️ 注意：此处忽略 LastOffset=50，只根据 LastValue=49 定位！
+     返回 rec-50..rec-59
+     ↓
+  继续迁移直到全部完成（rec-50 到 rec-99）
+```
+
+> **契约要点**：在 Timestamp/ID 模式下，Source **必须优先使用 LastValue** 定位，而非 LastOffset。LastOffset 在这些模式下仅作为统计用途，不作为分页依据。只有 Full 全量模式才使用 LastOffset 作为切片起点。
+
+#### 2.6.5 Source 实现错误后果
+
+若 Source 实现违反上述契约，将导致以下问题：
+
+| 违反情形 | 后果 |
+|---------|------|
+| ID 模式下使用 LastOffset 而非 LastValue 定位 | 断点恢复后可能重复读取或漏读记录（尤其当源端数据发生插入/删除导致偏移变化时） |
+| Timestamp 模式下使用 `>=` 而非 `>` 比较 | 最后一条记录会被重复读取，导致目标端出现重复 |
+| 空 Batch 返回 nil 而非 `&Batch{Records: nil}` | Pipeline 将视为 Fetch 返回 nil 批次，触发 `fetch batch failed` 错误 |
+| Count 返回全部记录数而非 cursor 之后的剩余数 | 进度百分比计算错误（重启后进度从 0% 重算而非从断点处继续） |
+
 ### 2.7 Target
 
 ```go

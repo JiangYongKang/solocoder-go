@@ -1,0 +1,6 @@
+你实现的带版本控制的对象存储模块存在一些问题，需要修复：
+1. objstore.go 中声明了 ErrInvalidMaxVersion 和 ErrInvalidBatchSize 两个错误变量，但 NewObjectStoreWithConfig 在接收到无效配置参数时直接静默替换为默认值而不是返回错误。调用方无法感知配置被修正，引用这两个错误变量做错误匹配永远不会命中。
+2. CleanupAll 方法名暗示一次性清理全部超出版本数上限的旧版本，但实际每次调用只对每个键清理最多 CleanupBatchSize 个版本。调用方按方法名理解并调用一次后认为数据已清理完毕，后续写入可能因存量版本仍超限而触发意外清理。
+3. GetVersion 和 Rollback 方法通过 for range 线性遍历版本切片查找指定版本号，而版本切片始终按版本号升序排列，未利用已排序特性优化查找效率。
+4. 修复后运行 go test ./internal/objstore/ -v，需要让所有测试通过。
+5. 在 docs/objstore.md 中更新模块需求文档，说明修复后的版本查找策略和清理方法语义。

@@ -1,0 +1,7 @@
+你实现的 Write-Through 缓存策略模块存在一些问题，需要修复：
+1. Delete 方法在 WriteThrough 策略下先清空缓存再删除存储，当存储删除失败时缓存已被清空但存储中数据仍存在，造成缓存与存储数据不一致。后续 Get 通过读穿透回填数据掩盖了删除失败的真相。
+2. docs/writethrough.md 文档在 Write-Through 写入流程图中间截断，缺失 Write-Around 策略说明、从正常到降级再到恢复的完整状态流转描述和使用示例代码，提示词第 7 条需求未满足。
+3. Delete 方法在存储删除失败时也调用了 recordFailure 递增降级计数器，但提示词要求降级仅由"底层存储连续写入失败"触发，Delete 失败不应计入降级决策，否则可能导致系统错误切换到 Write-Around 模式。
+4. recordSuccess 方法无条件将 failureCnt 重置为零，包括后台重试成功时也会触发重置。后台重试偶尔成功会打断前台连续失败计数的连续性，导致实际累积失败远超阈值却迟迟不能触发降级。
+5. 修复后运行 go test ./internal/writethrough/ -v，需要让所有测试通过。需要补充验证 Delete 一致性保证和降级计数器只受 Put 失败影响的测试用例。
+6. 在 docs/writethrough.md 中补全文档，说明修复后的 Delete 一致性策略和降级计数器的精确触发条件。
