@@ -1,0 +1,7 @@
+产物不满意：
+1. oauth2svc.go 的 handleAuthorizationCode 方法在令牌端点的 Scope 校验中仅检查了请求 Scope 是否属于客户端允许范围，遗漏了校验请求 Scope 是否为授权码原始 Scope 子集的关键步骤。例如客户端范围含 read、write、profile，授权码仅授权 read，令牌请求传入 write 却能成功获取写权限令牌，超出了用户实际授权范围。违反了 OAuth2 RFC 6749 中"令牌请求的 Scope 不得包含资源所有者未授予的任何 Scope"的规定，导致权限升级漏洞。根因是令牌端点的 Scope 校验逻辑不完整，对比同文件内 handleRefreshToken 方法已正确实现了对原始 Scope 的子集校验，应在此处叠加校验请求 Scope 属于客户端范围且是授权码 Scope 的子集。
+2. types.go 中 Config 结构体定义了 RefreshTokenRotation 字段并在 DefaultConfig 中默认设为 true，但 oauth2svc.go 的 handleRefreshToken 方法完全未读取该配置，始终无条件吊销旧刷新令牌并签发新令牌。这导致配置与实现不一致，如果调用方将 RefreshTokenRotation 设为 false，实际行为仍是滚动刷新，无法满足禁用滚动刷新的需求。提示词明确要求"刷新令牌可配置是否允许滚动刷新"，根因是定义了配置项但遗漏在业务逻辑中加入条件分支，正确做法是在 handleRefreshToken 中根据 RefreshTokenRotation 字段决定是否吊销旧令牌以及是否返回同一刷新令牌。
+3. jwt.go 的 ParseJWT 函数解析 JWT 时仅将 header 作为签名输入的一部分参与验签，但未解码 header 以显式校验声明的算法 alg 是否与预期的 HS256 一致。虽然修改 header 会破坏签名使验证失败，但跳过算法显式校验削弱了纵深防御，如果未来引入多算法支持，缺少此校验可能导致算法混淆攻击。这是 JWT 自实现的安全常见缺失，应在 ParseJWT 中解析 header JSON 后立即检查 alg 字段是否为 HS256，不匹配则返回 ErrInvalidToken。
+过程不满意：
+1. 模型在刚收到提示词后未经任何需求分析或代码库探索就直接调用 todo_write 创建了 10 步子任务计划，之后才去阅读 gateway/auth.go、gateway/types.go 等项目现有代码。这违反了应先分析再规划的原则，导致计划粒度的划分与实际模块边界缺乏对应关系，随后在尝试 go get github.com/golang-jwt/jwt/v5 时遭遇网络失败才发现项目无外部网络访问，不得不改为自实现 JWT。如果先探索项目环境和技术约束再制定计划，可一开始就采用自实现方案，避免无效的外部依赖安装尝试。
+2. 模型在 types.go 中定义了 RefreshTokenRotation 配置字段并赋予默认值 true，但在 oauth2svc.go 整个实现过程中从未在 handleRefreshToken 方法中读取该字段，始终执行无条件滚动刷新。这说明模型在架构设计阶段考虑了可配置性但具体编码时遗忘将配置项接入业务逻辑，导致代码中存在死配置字段。虽然测试全部通过，但测试只验证了默认滚动刷新行为，没有覆盖 RefreshTokenRotation 为 false 的场景。正确的做法是在完成全部代码后逐个核对每个配置项是否在业务逻辑中得到实际引用，确保设计与实现一致。

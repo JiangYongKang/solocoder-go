@@ -1,0 +1,15 @@
+产物不满意：
+1. wscenter.go 的心跳超时逻辑与默认配置存在时序不匹配，默认 PingInterval=30s、PongTimeout=10s 下，pingLoop 在首次 tick（连接后 30s）同时调用 sendPings 和 checkTimeouts，checkTimeouts 用阈值为 `now-PongTimeout` 判定 lastPong（初始化为连接时间，已过去 30s > 10s 阈值）超时，客户端在从未收到任何 Ping 消息的情况下就被 Disconnect 断连。根因是 checkTimeouts 未区分"尚未发送过 Ping"与"已发 Ping 未收到 Pong"两种状态，应在首次 sendPings 执行后才开始超时检查，或将 lastPong 初始化为连接时间加一个 PongTimeout 宽限期。
+
+2. wscenter.go 的 SendToClient 方法对目标客户端 toExists 为 false（从未连接过）的情况返回 ErrClientOffline，将"客户端从未注册"与"客户端已连接后断开"两种不同语义统一用同一个错误码表示。调用方无法区分目标客户端是尚未连接还是曾连接现已断线，错误信息失去诊断价值。提示词第 3 条要求"目标客户端不在线时返回发送失败状态"，虽未指定具体错误码，但语义混淆属于设计缺陷。toExists==false 时应返回 ErrClientNotFound 与发送方不存在的处理保持一致。
+
+3. wscenter.go 的 Disconnect 方法在持有 ws.mu 锁时调用 delete(ws.clients, clientID) 立即从全局 map 移除客户端，导致断连后 SendToClient 查找该发送方时命中 fromExists 为 false 分支返回 ErrClientNotFound，调用方无法区分"发送方从未连接"和"发送方已断连"。测试 TestSendToClientDisconnectedSender 被修改为期望 ErrClientNotFound 以适配代码行为而非修正代码，属于测试向代码妥协。Disconnect 应先标记客户端为断连状态但延迟从 ws.clients 删除，允许后续查询仍能找到该客户端。
+
+4. wscenter.go 的 JoinRoom 方法在 ws.mu.RLock 内查找到 room 后立即释放读锁，之后才调用 room.addClient。在两次加锁间隙，另一个协程可通过 LeaveRoom 或 Disconnect 使该房间变空并触发的自动销毁，导致客户端被添加到已从全局 rooms map 中删除的僵尸房间对象。后续 GetRoomClients 返回 ErrRoomNotFound 但客户端实际持有该房间引用，造成房间状态不一致。应在持有 ws.mu 锁期间完成房间查找与客户端添加，或将自动销毁改为延迟回收并检查引用计数。
+
+过程不满意：
+1. 模型在收到提示词后尚未阅读项目结构、go.mod 或任何现有代码，就直接用 todo_write 创建了 5 项子任务计划，之后才开始查看 internal 目录和 pubsub/broker.go 等学习代码风格。这违反了标注规范中"不能刚收到任务时就创建 TodoList，应先分析问题再规划"的原则，导致初始计划粒度与实际模块需求脱节。正确做法是先分析需求文档和项目代码骨架，理清模块职责边界后再制定执行计划。
+
+2. 模型在三处测试失败后选择了修改测试以适配代码行为而非修复代码缺陷：TestSendToClientDisconnectedSender 将期望值从离线改为未找到以配合 Disconnect 立即删除客户端的逻辑；TestDisconnectFromMultipleRooms 修改测试逻辑以适应"房间不会因单个客户端离开而销毁"的现实；TestBroadcastToRoomWithSendFailure 用缓冲区满替代 sendErr 方案绕过异步写循环 sendErr 不在 BroadcastToRoom 路径生效的验证难点。这不是测试驱动开发，而是测试向代码妥协的反模式，三次修改掩盖了代码行为与预期之间的偏差。正确做法是先分析失败原因是否指向产品代码缺陷，再决定是修复代码还是调整测试。
+
+3. 模型对 wscenter_test.go 进行了多轮零散编辑，每次 view_files 重复查看同一测试文件后仅做小范围修改，包括对 TestBroadcastToRoom 添加 sleep+clearMessages 解决 join 通知干扰、对 TestBroadcastToRoomWithTimeout 调整期望值、对 TestDisconnectFromMultipleRooms 逐个修改验证逻辑等。期间未一次性收集所有失败用例的完整输出、归纳根因后再统一规划修改策略，而是反复查看同一文件并小块修补，体现出低效的试错式编辑模式。正确做法是先汇总所有测试失败信息，分析根因并按优先级统一规划修改方案。

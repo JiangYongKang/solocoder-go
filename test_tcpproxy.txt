@@ -1,0 +1,43 @@
+﻿=== RUN   TestEncodeDecodeFrame
+=== RUN   TestEncodeDecodeFrame/DATA_frame_with_payload
+=== RUN   TestEncodeDecodeFrame/SYNC_frame_no_payload
+=== RUN   TestEncodeDecodeFrame/FIN_frame
+=== RUN   TestEncodeDecodeFrame/RST_frame
+=== RUN   TestEncodeDecodeFrame/HEARTBEAT_frame
+=== RUN   TestEncodeDecodeFrame/nil_frame
+--- PASS: TestEncodeDecodeFrame (0.00s)
+    --- PASS: TestEncodeDecodeFrame/DATA_frame_with_payload (0.00s)
+    --- PASS: TestEncodeDecodeFrame/SYNC_frame_no_payload (0.00s)
+    --- PASS: TestEncodeDecodeFrame/FIN_frame (0.00s)
+    --- PASS: TestEncodeDecodeFrame/RST_frame (0.00s)
+    --- PASS: TestEncodeDecodeFrame/HEARTBEAT_frame (0.00s)
+    --- PASS: TestEncodeDecodeFrame/nil_frame (0.00s)
+=== RUN   TestDecodeFrame_ShortHeader
+--- PASS: TestDecodeFrame_ShortHeader (0.00s)
+=== RUN   TestDecodeFrame_ShortPayload
+--- PASS: TestDecodeFrame_ShortPayload (0.00s)
+=== RUN   TestMuxConn_NewStreamAndCommunicate
+--- PASS: TestMuxConn_NewStreamAndCommunicate (0.20s)
+=== RUN   TestMuxConn_MultipleStreams
+--- FAIL: TestMuxConn_MultipleStreams (0.15s)
+panic: close of closed channel [recovered, repanicked]
+
+goroutine 34 [running]:
+testing.tRunner.func1.2({0x721b20, 0x75a8b0})
+	C:/Users/vince/.go/src/testing/testing.go:1974 +0x291
+testing.tRunner.func1()
+	C:/Users/vince/.go/src/testing/testing.go:1977 +0x3f0
+panic({0x721b20, 0x75a8b0})
+	C:/Users/vince/.go/src/runtime/panic.go:860 +0xfe
+solocoder-go/internal/tcpproxy.(*MuxConn).cleanupOnError(0x41200a0)
+	C:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/tcpproxy/tcpproxy.go:251 +0xca
+solocoder-go/internal/tcpproxy.(*MuxConn).Close(0x41200a0)
+	C:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/tcpproxy/tcpproxy.go:337 +0x1f
+solocoder-go/internal/tcpproxy.TestMuxConn_MultipleStreams(0x411a008)
+	C:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/tcpproxy/tcpproxy_test.go:255 +0x300
+testing.tRunner(0x411a008, 0x759488)
+	C:/Users/vince/.go/src/testing/testing.go:2036 +0xc2
+created by testing.(*T).Run in goroutine 1
+	C:/Users/vince/.go/src/testing/testing.go:2101 +0x4d0
+FAIL	solocoder-go/internal/tcpproxy	0.600s
+FAIL
