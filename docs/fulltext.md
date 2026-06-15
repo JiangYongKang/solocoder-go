@@ -709,15 +709,42 @@ wg.Wait()
 - 仅通过 `Search` 间接验证可能遗漏索引泄露：`Search` 在计算 TF 时会再次检查 docs map 中是否存在该文档，即使倒排索引中残留了被删文档的 Posting，也会因文档已从 docs 中删除而被跳过，从而掩盖索引泄露问题
 - 直接检查倒排索引内部状态（`HasTerm`、`GetPostingList`、`GetTermCount`）可以发现 docs map 删除但索引未清理的不一致状态
 
-### 13.3 DeleteDocument 原子性测试保证
+### 13.3 DeleteDocument 原子性与读写一致性测试保证
 
-删除操作的原子性通过以下机制保障：
+删除操作的完整性通过**写侧原子性**和**读写互斥**双重机制保障，测试从多个维度交叉验证：
 
-**代码层面**:
+---
+
+#### 代码层面保障
+
+**写操作原子性**（防止写操作中间状态被看到）:
 - `invertedIndex.RemoveDocument()` 和 `delete(e.docs, docID)` 在同一个 `Engine.mu.Lock()` 保护范围内执行
-- 固定执行顺序：先清理索引 → 再删 docs，确保搜索时看到的状态是一致的
+- 固定执行顺序：先清理索引 → 再删 docs
 
-**测试层面**:
-- `TestDeleteDocument_SearchAfterDelete`: 验证删除后搜索结果正确排除被删文档
-- `TestDeleteDocument_InvertedIndexCleanup`: 验证删除后索引内部状态正确
-- 两组测试分别从外部行为和内部状态两个维度确保删除操作的完整性
+**读操作一致性**（防止搜索看到不一致快照）:
+- `SearchWithLanguage` / `SearchPhraseWithLanguage` 在整个读取+计算周期内持有 `Engine.mu.RLock()`
+- 与写操作的 `Engine.mu.Lock()` 形成全局读写互斥
+- 锁顺序全局一致：所有操作均按「Engine.mu → InvertedIndex.mu」顺序获取，避免死锁
+
+---
+
+#### 测试层面验证
+
+| 测试用例 | 验证维度 | 验证目标 |
+|---------|---------|---------|
+| `TestDeleteDocument_SearchAfterDelete` | 外部行为（搜索结果） | 删除后搜索正确排除被删文档，评分正确反映新文档集 |
+| `TestDeleteDocument_InvertedIndexCleanup` | 内部状态（索引完整性） | 独有词项从 index map 移除、共享词项 PostingList 长度正确减少、词项总数精确 |
+| `TestInvertedIndex_RemoveDocument_UniqueTerms` | 单元级（独立索引） | RemoveDocument 对独有词项的清理逻辑正确 |
+| `TestInvertedIndex_RemoveDocument_SharedTerms` | 单元级（独立索引） | RemoveDocument 对共享/独有混合词项的清理逻辑正确 |
+| `TestConcurrent_AddAndSearch` | 集成级（并发） | 并发添加与搜索同时进行时无崩溃、无数据损坏 |
+| `TestConcurrent_Search` | 集成级（并发） | 多 goroutine 并发搜索结果数量正确、无竞态崩溃 |
+| `TestConcurrent_PhraseSearch` | 集成级（并发） | 多 goroutine 并发短语搜索结果正确 |
+
+---
+
+#### 验证原理
+
+倒排索引清理必须通过直接检查内部状态验证，不能仅依赖搜索结果间接推断：
+- 搜索计算 TF 时会二次检查 `docs` map 是否存在该文档
+- 如果 RemoveDocument 有遗漏（索引残留被删文档），搜索仍会因文档已从 docs 删除而跳过，**掩盖索引泄露问题**
+- 直接检查 `HasTerm()`、`GetPostingList()`、`GetTermCount()` 可发现 docs 与 invertedIndex 之间的不一致状态
