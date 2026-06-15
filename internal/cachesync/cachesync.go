@@ -97,6 +97,12 @@ type pendingLock struct {
 	statusMu   sync.RWMutex
 }
 
+func assertStatusTransitionValid(oldStatus, newStatus pendingLockStatus) {
+	if oldStatus != pendingLockStatusPending {
+		panic(fmt.Sprintf("cachesync: invalid pendingLock status transition: %d -> %d (only Pending can transition to other states)", oldStatus, newStatus))
+	}
+}
+
 type VersionRejectEvent struct {
 	Key          string
 	LocalVersion uint64
@@ -106,6 +112,8 @@ type VersionRejectEvent struct {
 }
 
 type VersionRejectHandler func(event VersionRejectEvent)
+
+const releaseMarkTTL = 5 * time.Second
 
 type releaseMark struct {
 	timestamp time.Time
@@ -504,6 +512,13 @@ func (n *Node) handleMessage(msg *Message) {
 }
 
 func (n *Node) handleLockGranted(msg *Message) {
+	//
+	// 注意：本函数的正确性依赖于 pendingLock 状态机的单向转换不变式：
+	// Pending -> Succeeded 或 Pending -> Failed，状态一旦变更不可回退。
+	// 因此在写入 grantedBy 前后两次读取 status 即可覆盖所有竞态场景，
+	// 不存在"第一次读是 Pending，写入后变成 Failed，再变回 Pending"的可能。
+	// 该不变式由 assertStatusTransitionValid 在状态转换处强制执行。
+	//
 	n.pendingLockMu.Lock()
 	pl, ok := n.pendingLocks[msg.Key]
 	n.pendingLockMu.Unlock()
@@ -662,7 +677,7 @@ func (n *Node) handleLockAcquire(msg *Message) {
 			LockHolder: li.holder,
 			Timestamp:  time.Now(),
 		}
-		_ = n.cluster.unicast(n.ID, msg.FromNodeID, denyMsg)
+		_ = n.cluster.reliableUnicast(n.ID, msg.FromNodeID, denyMsg)
 		return
 	}
 
@@ -678,7 +693,7 @@ func (n *Node) handleLockAcquire(msg *Message) {
 		Key:        msg.Key,
 		Timestamp:  time.Now(),
 	}
-	_ = n.cluster.unicast(n.ID, msg.FromNodeID, grantMsg)
+	_ = n.cluster.reliableUnicast(n.ID, msg.FromNodeID, grantMsg)
 }
 
 func (n *Node) cleanupExpiredReleaseMarks() {
@@ -711,7 +726,7 @@ func (n *Node) handleLockRelease(msg *Message) {
 	if !ok || !msg.Timestamp.Before(existing.timestamp) {
 		n.releaseMarks[msg.Key][msg.FromNodeID] = &releaseMark{
 			timestamp: msg.Timestamp,
-			expiresAt: time.Now().Add(5 * time.Second),
+			expiresAt: msg.Timestamp.Add(releaseMarkTTL),
 		}
 	}
 }
@@ -866,13 +881,10 @@ func (c *Cluster) reliableBroadcast(fromNodeID string, msg *Message) {
 	}
 	c.nodesMu.RUnlock()
 
-	var wg sync.WaitGroup
 	for _, node := range nodes {
 		msgCopy := *msg
 		msgCopy.ToNodeID = node.ID
-		wg.Add(1)
-		go func(n *Node, m Message) {
-			defer wg.Done()
+		func(n *Node, m Message) {
 			defer func() { recover() }()
 			retries := 5
 			retryDelay := 20 * time.Millisecond
@@ -890,7 +902,6 @@ func (c *Cluster) reliableBroadcast(fromNodeID string, msg *Message) {
 			}
 		}(node, msgCopy)
 	}
-	wg.Wait()
 }
 
 func (n *Node) rollbackLock(key string, pl *pendingLock) {
@@ -919,6 +930,7 @@ func (n *Node) rollbackLock(key string, pl *pendingLock) {
 
 func (n *Node) startRollbackWatcher(key string, pl *pendingLock, watchWindow time.Duration) {
 	pl.statusMu.Lock()
+	assertStatusTransitionValid(pl.status, pendingLockStatusFailed)
 	pl.status = pendingLockStatusFailed
 	pl.statusMu.Unlock()
 
@@ -938,21 +950,6 @@ func (n *Node) Lock(key string, timeout time.Duration) (string, error) {
 	if timeout <= 0 {
 		timeout = n.cluster.cfg.LockTimeout
 	}
-
-	result, err := n.tryLock(key, timeout)
-	if err == nil {
-		return result, nil
-	}
-
-	if errors.Is(err, ErrLockTimeout) {
-		time.Sleep(50 * time.Millisecond)
-		return n.tryLock(key, timeout)
-	}
-
-	return "", err
-}
-
-func (n *Node) tryLock(key string, timeout time.Duration) (string, error) {
 	n.cluster.nodesMu.RLock()
 	peerCount := len(n.cluster.nodes) - 1
 	n.cluster.nodesMu.RUnlock()
@@ -1026,6 +1023,7 @@ func (n *Node) tryLock(key string, timeout time.Duration) (string, error) {
 			grantCount++
 			if grantCount >= requiredGrants {
 				pl.statusMu.Lock()
+				assertStatusTransitionValid(pl.status, pendingLockStatusSucceeded)
 				pl.status = pendingLockStatusSucceeded
 				pl.statusMu.Unlock()
 

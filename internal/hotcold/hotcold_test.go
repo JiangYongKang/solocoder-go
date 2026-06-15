@@ -895,18 +895,25 @@ func TestConcurrentCheckAndMigrate(t *testing.T) {
 	}
 }
 
-func TestNewHotColdManagerWithConfig_InvalidThresholds(t *testing.T) {
+func TestNewHotColdManagerWithConfig_AutoFixThresholdOrder(t *testing.T) {
 	cfg := Config{
 		HotThreshold:  1.0,
 		ColdThreshold: 5.0,
 		DecayHalfLife: time.Hour,
 	}
 	m, err := NewHotColdManagerWithConfig(cfg)
-	if !errors.Is(err, ErrInvalidConfig) {
-		t.Errorf("expected ErrInvalidConfig when HotThreshold < ColdThreshold, got %v", err)
+	if err != nil {
+		t.Fatalf("expected no error when HotThreshold < ColdThreshold (auto-fix), got %v", err)
 	}
-	if m != nil {
-		t.Error("expected nil manager for invalid config")
+	if m == nil {
+		t.Fatal("expected non-nil manager after auto-fix")
+	}
+	gotCfg := m.GetConfig()
+	if gotCfg.HotThreshold <= gotCfg.ColdThreshold {
+		t.Errorf("expected HotThreshold > ColdThreshold after auto-fix, got hot=%.2f, cold=%.2f", gotCfg.HotThreshold, gotCfg.ColdThreshold)
+	}
+	if gotCfg.HotThreshold != 25.0 {
+		t.Errorf("expected HotThreshold to be auto-fixed to ColdThreshold*5=25.0, got %.2f", gotCfg.HotThreshold)
 	}
 }
 
@@ -1368,8 +1375,7 @@ func TestAutoAdjustThresholds_LoadFactorHigh(t *testing.T) {
 	}
 
 	initialCfg := m.GetConfig()
-	initialHot := m.HotCount()
-	t.Logf("Before adjust: hotCount=%d, coldCount=%d, hotRatio=%.2f", initialHot, m.ColdCount(), float64(initialHot)/float64(m.TotalCount()))
+	t.Logf("Before adjust: hotCount=%d, coldCount=%d, hotRatio=%.2f", m.HotCount(), m.ColdCount(), float64(m.HotCount())/float64(m.TotalCount()))
 
 	time.Sleep(150 * time.Millisecond)
 	m.CheckAndMigrate()

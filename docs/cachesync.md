@@ -616,18 +616,19 @@ handleLockAcquire:
   - 定期清理过期的释放标记
 ```
 
-#### 4.2.4 Lock 自动重试
+#### 4.2.4 状态机不变式与断言
 
-Lock 方法内置一次快速重试，应对消息延迟等边缘情况：
+pendingLock 状态机遵循单向转换不变式，由断言函数强制保证：
 
+```go
+func assertStatusTransitionValid(oldStatus, newStatus pendingLockStatus)
 ```
-Lock(key, timeout):
-  1. 第一次尝试 tryLock()
-  2. 若成功则直接返回
-  3. 若因锁被持有而失败 → 等待 50ms
-  4. 第二次尝试 tryLock()
-  5. 返回第二次结果
-```
+
+**不变式约束**：
+- 仅允许 `Pending → Succeeded` 或 `Pending → Failed`
+- 状态一旦变更不可回退（Succeeded/Failed 为终态）
+- 该约束在所有状态转换点通过断言强制执行
+- handleLockGranted 的双重检查模式正确性依赖于此不变式
 
 #### 4.2.5 死锁诊断与可靠性
 
@@ -635,9 +636,8 @@ Lock(key, timeout):
 - 锁获取失败时，错误信息包含 `held by {nodeID}`
 - 支持锁自动超时释放，防止节点崩溃导致的永久死锁
 - 回滚机制避免了"半锁定"状态导致的后续请求被错误拒绝
-- 可靠消息传递确保回滚释放消息到达目标节点
-- 释放标记机制应对消息乱序导致的残留锁
-- 自动重试机制应对低概率的时序竞态
+- 可靠消息传递确保锁授予/拒绝/释放等关键协议消息到达目标节点
+- 释放标记机制应对消息乱序导致的残留锁，统一使用消息 Timestamp 作为时间源
 
 ### 4.3 消息传递机制与容错策略
 
@@ -651,7 +651,8 @@ func (c *Cluster) broadcast(fromNodeID string, msg *Message)
 ```
 - 向除发送节点外的所有其他节点发送消息
 - 非阻塞发送，channel 满则静默丢弃
-- 用于：更新通知、无效化消息、锁获取请求
+- 串行发送，保证各节点接收顺序与发送顺序一致
+- 用于：更新通知、无效化消息、锁获取请求、正常锁释放通知
 
 **单播（Unicast）**：
 ```go
@@ -659,11 +660,11 @@ func (c *Cluster) unicast(fromNodeID, toNodeID string, msg *Message) error
 ```
 - 向单个指定节点发送消息
 - 非阻塞发送，channel 满则返回 `ErrMessageDropped` 错误
-- 用于：锁授予响应、锁拒绝响应、对账请求/响应
+- 用于：对账请求/响应等非关键路径消息
 
 #### 4.3.2 可靠消息传递
 
-针对关键消息（如锁释放）提供可靠传递保障：
+针对锁协议中的关键消息提供可靠传递保障，**所有关键协议消息的可靠性统一在协议层解决**，不在上层 API 做重试容错：
 
 **可靠单播（Reliable Unicast）**：
 ```go
@@ -671,31 +672,49 @@ func (c *Cluster) reliableUnicast(fromNodeID, toNodeID string, msg *Message) err
 ```
 - 带超时重试的阻塞发送，保障关键消息到达
 - 重试 5 次，单次超时 50ms，重试间隔 20ms
-- 用于：回滚时向已知授权节点发送释放消息
+- 用于：锁授予响应、锁拒绝响应、回滚时向已知授权节点发送释放消息、防御性回滚释放消息
 
 **可靠广播（Reliable Broadcast）**：
 ```go
 func (c *Cluster) reliableBroadcast(fromNodeID string, msg *Message)
 ```
 - 每个目标节点独立重试的广播机制
-- 并发发送，使用 WaitGroup 等待所有节点完成
+- **串行发送**，按节点顺序逐个可靠传递，保证因果顺序由发送端串行化
 - 每个节点重试 5 次，单次超时 100ms
 - 用于：回滚时的兜底释放消息，覆盖 Grant 消息丢失的节点
 
-#### 4.3.3 消息传递容错策略
+#### 4.3.3 消息传递可靠性分级策略
 
-不同类型消息采用不同可靠性级别：
+不同类型消息采用不同可靠性级别，核心原则是：**协议层关键消息必须可靠传递，非关键消息可依赖兜底机制**。
 
 | 消息类型 | 传递方式 | 可靠性级别 | 原因 |
 |---------|---------|-----------|------|
-| 更新通知 | 普通广播 | 低 | 定期对账可兜底，丢消息影响小 |
-| 无效化消息 | 普通广播 | 低 | 对账可补齐，最终一致 |
-| 锁获取请求 | 普通广播 | 中 | 请求者超时可重试 |
-| 锁授予/拒绝 | 普通单播 | 中 | 请求者超时可重试 |
-| 锁释放（正常） | 普通广播 | 中 | TTL 自然过期兜底 |
-| 锁释放（回滚） | 可靠单播+可靠广播 | 高 | 防止残留锁导致后续请求失败 |
+| 更新通知 (MsgUpdateNotify) | 普通广播 | 低 | 定期对账可兜底，丢消息影响小，最终一致保证 |
+| 无效化消息 (MsgInvalidate) | 普通广播 | 低 | 对账可补齐，最终一致保证 |
+| 锁获取请求 (MsgLockAcquire) | 普通广播 | 中 | 请求者有超时机制，超时可由调用方决定是否重试 |
+| 锁授予响应 (MsgLockGranted) | **可靠单播** | **高** | Grant 丢失会导致请求者不知道该节点已授权，回滚时遗漏释放 |
+| 锁拒绝响应 (MsgLockDenied) | **可靠单播** | **高** | Deny 丢失会导致请求者一直等待直到超时，降低效率 |
+| 正常锁释放 (MsgLockRelease) | 普通广播 | 中 | TTL 自然过期兜底，即使丢失也不会永久残留 |
+| 回滚锁释放 (MsgLockRelease) | **可靠单播+可靠广播** | **最高** | 回滚失败会导致残留锁，后续所有请求被错误拒绝 |
+| 对账请求/响应 | 普通单播 | 低 | 对账是周期性的，本次丢失下次可恢复 |
 
-#### 4.3.4 消息丢弃模拟
+#### 4.3.4 释放标记（Tombstone）时间源一致性
+
+释放标记机制统一使用**消息自带的 Timestamp** 作为唯一时间源，避免双重时间源问题：
+
+```go
+type releaseMark struct {
+    timestamp time.Time  // 来自 Release 消息的 Timestamp（发送端设置）
+    expiresAt time.Time  // 基于 timestamp + releaseMarkTTL 计算，同源
+}
+```
+
+**设计原则**：
+- `timestamp` 和 `expiresAt` 均基于发送端的 `msg.Timestamp` 计算
+- 不存在发送端时间与接收端时间混用导致的判断矛盾
+- `cleanupExpiredReleaseMarks` 仅做垃圾回收，不参与因果顺序判断
+
+#### 4.3.5 消息丢弃模拟
 
 ```go
 func (c *Cluster) SetMessageDropRate(rate float64)
@@ -703,7 +722,7 @@ func (c *Cluster) SetMessageDropRate(rate float64)
 - `rate` 范围 [0.0, 1.0]，0.0 表示不丢弃，1.0 表示全部丢弃
 - 用于测试网络分区或消息丢失场景下的最终一致性
 - 基于时间戳取模实现伪随机丢弃，满足测试需求
-- 仅影响普通消息传递，可靠消息传递不受影响
+- 仅影响普通消息传递，可靠消息传递（reliableUnicast/reliableBroadcast）不受影响
 
 ### 4.4 对账修复算法
 

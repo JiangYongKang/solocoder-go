@@ -1,0 +1,4 @@
+你实现的冷热数据分离检测器模块在上一轮修复后存在一些问题，需要修复：
+1. NewHotColdManagerWithConfig 在删除重复校验逻辑时，把 HotThreshold <= ColdThreshold 的自动修正逻辑一并删除了。原先当用户传入的 HotThreshold 不大于 ColdThreshold 时会自动将 HotThreshold 设为 ColdThreshold 的 5 倍，现在这段修正逻辑已不存在，传入不合法的阈值对会直接通过校验但语义不正确。
+2. 高负载测试 TestAutoAdjustThresholds_LoadFactorHigh 中声明了 initialHot 变量并赋值为 m.HotCount() 的返回值，但该变量在后续代码中从未被使用，属于无效代码。
+3. 修复后运行 go test ./internal/hotcold/ -v，需要让所有测试通过。

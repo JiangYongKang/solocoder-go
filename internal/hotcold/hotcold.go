@@ -136,6 +136,9 @@ func NewHotColdManagerWithConfig(cfg Config) (*HotColdManager, error) {
 	if cfg.MaxColdThreshold == 0 {
 		cfg.MaxColdThreshold = cfg.MinColdThreshold * 20
 	}
+	if cfg.HotThreshold <= cfg.ColdThreshold {
+		cfg.HotThreshold = cfg.ColdThreshold * 5
+	}
 
 	if err := ValidateConfig(cfg); err != nil {
 		return nil, err

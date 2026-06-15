@@ -147,16 +147,17 @@ func NewHotColdManager() *HotColdManager
 func NewHotColdManagerWithConfig(cfg Config) (*HotColdManager, error)
 ```
 
-**处理流程**（先填充默认值，再统一校验）:
+**处理流程**（先填充默认值 → 自动修正不合理值 → 统一校验）:
 
 ```
 1. 对零值字段自动填充默认值（如 HotThreshold==0 → 10.0）
-2. 调用 ValidateConfig(cfg) 统一校验所有字段
-3. 校验失败 → 返回 (nil, ErrInvalidConfig)
-4. 校验成功 → 创建并返回管理器实例
+2. 阈值顺序自动修正：若 HotThreshold <= ColdThreshold，则 HotThreshold = ColdThreshold × 5
+3. 调用 ValidateConfig(cfg) 统一校验所有字段
+4. 校验失败 → 返回 (nil, ErrInvalidConfig)
+5. 校验成功 → 创建并返回管理器实例
 ```
 
-> **设计原则**: 构造函数内部**不包含**独立的内联校验逻辑，所有校验规则统一在 `ValidateConfig` 中维护。修改校验规则只需改 `ValidateConfig` 一处，不会出现两套规则不一致的漏洞。
+> **设计原则**: 构造函数内部**不包含**独立的内联校验逻辑，所有校验规则统一在 `ValidateConfig` 中维护。修改校验规则只需改 `ValidateConfig` 一处，不会出现两套规则不一致的漏洞。构造函数只负责自动填充和修正，最终合法性由 `ValidateConfig` 判定。
 
 ### 4.3 ValidateConfig
 
