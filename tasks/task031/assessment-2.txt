@@ -1,10 +1,10 @@
 产物不满意：
-1. apiver.go 中第 149 到 152 行定义的 VersionedHandler 结构体包含了 Version 和 http.HandlerFunc 两个字段，但在整个代码库中从未被任何位置引用或实例化。RegisterHandler 方法直接接收 Version 和 http.HandlerFunc 两个独立参数，并未使用该结构体作为统一入参。apiver_test.go 中虽然有 TestVersionedHandler_Struct 为其编写了单测，但这属于为死代码编写的自指测试，无法提供任何实际价值。这个结构体应被视为冗余的残留定义，建议删除以避免给后续维护者造成代码理解上的困惑。
-2. ServeHTTP 方法在相同的作用域内对 GetRequestConverter 执行了两次语义等价但相互独立的调用。第 378 行仅检查转换器是否存在并立即丢弃返回值，然后第 387 行通过 convertRequest 内部再次调用了 GetRequestConverter 进行第二次查找和调用。这不仅造成了不必要的性能浪费，更关键的是两次查找之间存在时间窗口，如果另一个 goroutine 在该窗口内并发删除了该转换器，convertRequest 会返回 ErrConverterNotFound 导致本应正常降级处理的请求被转换为 HTTP 500 错误，违背了提示词要求实现优雅降级的设计意图。
-3. HeaderVersionExtractor 的 TestHeaderVersionExtractor_ExtractVersion 测试中包含了输入为 "v2024.1" 期望结果为 version=v2024.1 且 found=true 的测试用例，虽然提取器本身只做字符串提取不做格式校验所以测试逻辑本身无误，但 IsValidVersion 函数判定 "v2024.1" 为非法版本格式（违反了 `^v\d+$` 规则），这个测试用例和命名没能跟后续集成到 ExtractVersion 时的统一校验逻辑对齐，容易让阅读者误以为 "v2024.1" 也是受支持的有效版本格式。
+1. apiver.go 中定义的 VersionedHandler 结构体在整个代码库中从未被引用。RegisterHandler 直接接收独立参数而非该结构体。apiver_test.go 中的 TestVersionedHandler_Struct 是为死代码编写的自指测试，无实际价值。应删除此冗余结构体以避免维护困惑。
+2. ServeHTTP 方法对 GetRequestConverter 执行了两次独立调用：先检查是否存在并丢弃返回值，再通过 convertRequest 内部二次查找调用。两次查找之间存在时间窗口，并发删除时 convertRequest 返回 ErrConverterNotFound 导致本该降级的请求变成 HTTP 500，违背了优雅降级的设计意图。
+3. HeaderVersionExtractor 的测试中包含输入 "v2024.1" 期望 found=true 的用例，但 IsValidVersion 判定其为非法格式（违反 `^v\d+$` 规则），测试用例未与后续统一校验逻辑对齐，容易误以为 "v2024.1" 是有效版本格式。
 4. docs/apiver.md 第 335 行中使用了 "两者都缺失" 的表述来描述 "请求转换器和响应转换器都缺失时自动优雅降级" 的场景，但实际代码中对两种转换器缺失的处理逻辑截然不同：请求转换器缺失时降级调用旧版本处理器，而响应转换器缺失时则返回 HTTP 500 错误（因为旧版本客户端不应接收新版本格式的响应）。文档将这两种行为混合在同一个 "两者都缺失" 的条目下，没有区分场景分别说明各自的处理结果，读者容易误解为两种缺失都走降级路径。
-5. responseCapture 的 WriteHeader 实现只记录了 statusCode 但没有检查是否已调用过 WriteHeader，如果 handler 在同一个请求中对 WriteHeader 调用了多次，只有最后一次调用会覆盖之前的 statusCode。但标准 http.ResponseWriter 规范要求 WriteHeader 只能调用一次，多次调用应被忽略。虽然当前单测未触发此边界，但如果 handler 意外调用多次 WriteHeader，会导致响应状态码被错误地覆盖为后续值。
+5. responseCapture 的 WriteHeader 只记录 statusCode 但未检查幂等性，handler 多次调用时只有最后一次生效。标准规范要求 WriteHeader 多次调用应被忽略，当前单测未触发此边界但若 handler 意外多次调用会导致状态码被错误覆盖。
 
 过程不满意：
-1. session-cot-2.md 中记录的全部工具调用序列（包括 todo_write、view_files、Write、run_command、edit_file_search_replace）均明确指向 internal/tcpproxy/ 包的 TCP 反向代理模块，所有文件路径、方法名称和修复目标（如 handleStream、ConnPool.Get、IPHashBalancer 的死锁修复等）均与 internal/apiver/ 包的 API 版本化路由模块无任何关联。这意味着本轮 apiver 缺陷修复的完整思考轨迹和决策路径在 cot 文件中缺失，标注人员完全无法通过 cot 文件追溯模型在修复六个具体问题时的推理是否合理、是否充分理解了每个 Bug 的根因、是否遵循了最小修复原则。
-2. 从 session-cot-2.md 可见模型在接收到提示词后没有先读取现有代码来分析问题上下文，而是直接调用 todo_write 创建了 8 项子任务计划，完成规划后才开始读取目标文件。这与规则要求的 "先分析问题再规划" 顺序相悖，正确的做法应是先通过阅读代码理解模块结构和当前 Bug 的具体表现，梳理出问题的优先级和依赖关系后再制定执行计划。由于 cot 文件实际记录的不是 apiver 而是 tcpproxy 的修复过程，这一先规划后分析的问题在 apiver 修复中是否同样存在已无法从现有材料中确认，但 cot 文件呈现的行为模式已经呈现出不规范的决策习惯。
+1. session-cot-2.md 中记录的全部工具调用均指向 internal/tcpproxy/ 包而非 internal/apiver/ 包，所有文件路径和方法名称都与 apiver 模块无关。这意味着 apiver 缺陷修复的完整思考轨迹在 cot 文件中缺失，标注人员无法追溯模型修复六个问题时的推理是否合理。
+2. 从 cot 文件可见模型收到提示词后未先分析代码就直接创建了 8 项计划，完成规划后才读取目标文件，与"先分析问题再规划"的规范相悖。正确做法应先阅读代码理解模块结构再制定计划。cot 文件实际记录的不是 apiver 的修复过程，这一不规范行为在 apiver 修复中是否同样存在已无法确认。

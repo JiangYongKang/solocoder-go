@@ -1,8 +1,8 @@
 产物不满意：
-1. handleAuthorizationCode 的 Scope 子集校验逻辑本身正确，但存在两轮冗余校验。第 168 行先对 client.Scopes 做一次校验，第 172 到 184 行再对 authCode.Scope 做子集校验，由于 authCode.Scope 在 Authorize 阶段已经通过 client.Scopes 校验，第二层校验完全覆盖了第一层，第一层属于不必要的重复检查。测试用例 TestToken_AuthorizationCode_ScopeSubsetValidation 和 TestToken_AuthorizationCode_ScopeSubset_PartialOverlap 均通过，说明校验功能正确但代码不够简洁。原因是直接将子集校验叠加在已有逻辑上而未做合并优化，应将第 168 到 170 行移除，只保留子集校验即可。
-2. docs/oauth2svc.md 第 1.3 节描述刷新令牌行为时写的是"刷新令牌使用后旧令牌立即失效（滚动刷新）"，但实际上是否吊销旧令牌取决于 Config.RefreshTokenRotation 的配置值，当该字段为 false 时旧令牌不会被吊销。测试 TestToken_RefreshToken_RotationDisabled 验证了这一行为，说明文档描述与实现不完全一致。应当根据 RefreshTokenRotation 是否启用分别描述两种行为模式，而非统一表述为"立即失效"。
+1. handleAuthorizationCode 的 Scope 子集校验存在两轮冗余。先对 client.Scopes 校验，再对 authCode.Scope 做子集校验，由于 authCode.Scope 在 Authorize 阶段已通过 client.Scopes 校验，第二层完全覆盖第一层，第一层属于不必要的重复。测试均通过说明校验功能正确但代码不够简洁。原因是直接将子集校验叠加在已有逻辑上未做合并优化，应移除第一层校验只保留子集校验。
+2. docs/oauth2svc.md 第 1.3 节描述刷新令牌行为写的是"刷新令牌使用后旧令牌立即失效（滚动刷新）"，但实际是否吊销取决于 Config.RefreshTokenRotation 配置。测试 TestToken_RefreshToken_RotationDisabled 验证了非滚动模式不吊销旧令牌，文档描述与实现不一致。应根据 RefreshTokenRotation 是否启用分别描述两种行为模式，而非统一表述为"立即失效"。
 3. docs/oauth2svc.md 第 6 节安全注意事项中未提及 JWT 算法校验的防御价值。ParseJWT 在第 81 行做了 header.Alg 与 HS256 的严格匹配，防止了 alg=none 算法混淆攻击，测试 TestParseJWT_AlgorithmValidation_NoneAlgorithm 已验证该保护。但文档没有在安全部分说明这一机制，使用者不清楚是否依赖了算法白名单防护。应在安全注意事项中增加一条关于 JWT 算法白名单校验的说明。
 
 过程不满意：
-1. 模型思考过程文档 session-cot-2.md 从头至尾全部记录了 internal/servicereg/ 包的 Register、Deregister、expiryLoop、Start/Stop 并发修复等内容，与 task036 要求修复的 internal/oauth2svc/ 包完全无关。整个思考轨迹中完全没有出现 oauth2svc.go、jwt.go 或 handleAuthorizationCode 等任何与 OAuth2 授权服务模块相关的内容。这是一个严重的过程质量事故，模型交付了正确的 oauth2svc 代码但将另一个包的修复过程写入了当前任务的 CoT 文件中。正确做法是按照提示词要求的包路径操作，或者至少确保思考轨迹与实际修改的代码文件对应。
-2. 从 session-cot-2.md 的内容来看，模型内部对 servicereg 的修复经历了两轮反复：第一次实现后在 TestConcurrentStartStopNoPanic 测试中超时死锁，随后重写 Start/Stop 语义引入双状态标志，接着调整测试以适应新设计，又发现 running 字段的语义问题再次调整设计。这种在同一组功能上多次推翻重来的模式说明模型在规划阶段没有充分理解并发控制的需求边界，应该先梳理 Start/Stop/expiryLoop 的状态流转图再动手，而非边写边改。
+1. session-cot-2.md 从头至尾记录了 internal/servicereg/ 包的修复过程，与 task036 要求修复的 internal/oauth2svc/ 包完全无关，思考轨迹中没有任何 OAuth2 相关内容。这是严重的过程质量事故，模型交付了正确代码但将另一包的修复过程写入了 CoT 文件。应按提示词要求的包路径操作并确保思考轨迹与实际修改对应。
+2. 从 cot 文件内容来看，模型对 servicereg 的修复经历了两轮反复：第一次实现后测试中超时死锁，随后重写 Start/Stop 语义引入双状态标志，接着调整测试适应新设计后又发现字段语义问题再次调整。这属于在同一组功能上多次推翻重来的模式，说明规划阶段没有充分理解并发控制的需求边界，应先梳理 Start/Stop/expiryLoop 的状态流转图再动手而非边写边改。

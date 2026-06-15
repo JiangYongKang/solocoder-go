@@ -1,5 +1,5 @@
 产物不满意：
-1. docs/idempotent.md Section 8 测试覆盖表中明确声明"共 50 个测试用例"，但实际运行 go test ./internal/idempotent/ -v 输出仅有 48 个 PASS。模型在修复前拥有 45 个已有测试函数，本轮新增了 TestMiddleware_SideEffectHandlerNotCalledTwice、TestMiddleware_StopAfterHandlerExecuted_UsesRecordedResponse 和 TestMiddleware_HandlerNotExecuted_Stop_Returns503 三个降级路径测试，累计应为 48 个而非文档中声称的 50 个。文档中的测试数量是给后续标注人员和维护者看的参照指标，数字不准确会降低文档可信度并造成误导。应通过 go test -v 输出的 PASS 行逐一核对后再填写测试覆盖统计。
+1. docs/idempotent.md 第 8 节测试覆盖表声明"共 50 个测试用例"，但实际 go test -v 输出仅 48 个 PASS。模型修复前有 45 个测试，本轮新增 3 个降级路径测试，累计应为 48 而非文档声称的 50。文档数字不准确会降低可信度并造成误导。应通过 go test -v 的 PASS 行逐一核对后再填写测试覆盖统计。
 
 过程不满意：
-1. 模型在思考过程中先运行 go test 并正确报告了修复前的 45 个测试通过，但在新增 3 个降级路径测试后更新 docs/idempotent.md 时，未重新执行 go test 来核实最终测试数量，直接从 45 跳到 50 写入总结和文档。从 session-cot 记录可见，模型全程只在新增测试之前运行了一次 go test，之后的 45 和 50 两个数字均来自主观判断而非测试输出验证，导致文档数字与实际情况（48 个 PASS）不符。这属于未核实数据就写入交付产物，正确做法是在文档更新完成后重新运行 go test -v，通过核对 PASS 行总数来确保文档中的测试计数与运行结果严格一致。
+1. 模型在新增 3 个测试后更新文档时，未重新执行 go test 核实最终测试数量，直接从 45 跳到 50 写入总结和文档。从 cot 记录可见全程只在新增测试前运行了一次 go test，之后数字均来自主观判断而非测试输出验证，导致文档数字与实际 48 个 PASS 不符。这属于未核实数据就写入交付产物，应在文档更新完成后重新运行 go test -v 确保测试计数与运行结果一致。

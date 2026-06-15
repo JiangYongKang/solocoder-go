@@ -1,7 +1,7 @@
 产物不满意：
-1. TestConsistentHash_AddServerMinimalImpact 和 TestConsistentHash_RemoveServerMinimalImpact 两处用 s, _ := ch.Next(key) 静默忽略错误返回值，如果未来变更导致 Next 返回错误则 Zero 值的 s 地址被存入 mapping 后的比较结果不可预测，无助于故障发现。应以 err != nil 时记录错误映射或跳过该 key 的方式保证映射数据的有效性。原因是在测试辅助阶段未将错误返回值纳入路径判断。
+1. TestConsistentHash_AddServerMinimalImpact 和 TestConsistentHash_RemoveServerMinimalImpact 两处用 s, _ := ch.Next(key) 静默忽略错误返回值，若 Next 返回错误则零值地址被存入 mapping 后比较结果不可预测。应以 err != nil 时记录错误映射或跳过该 key 保证映射有效性。原因是未将错误返回值纳入路径判断。
 2. 提示词要求更新 docs/httplb.md 文档反映修补后的实现，但模型在 session 中未体现任何检查文档是否需要调整的判断步骤，例如从未执行读取 docs/httplb.md 文件与实际代码做对比来确定哪些描述需要补充。正确做法是先通读文档确认故障转移机制、状态机流转、线程安全设计和存储结构等描述是否与当前代码一致，再据实调整。
 
 过程不满意：
-1. 这是致命的任务理解错误。session-cot-2.md 全部围绕 internal/dnsresolver/ 的 DNS 解析器缺陷修复展开，包括 RCODE 校验、事务 ID 验证、context 取消传播和 CNAME 追踪优化，而当前任务要求修复的是 internal/httplb/ 下 HTTP 负载均衡器的缺陷。模型第一步就读取了 dnsresolver.go 和 dnsresolver_test.go 而非 httplb 包的任一文件，说明模型未读取 prompt-2.txt 确认任务目标就擅自选择了一个错误的修复对象，整个会话的产物实质是 task032 的修复而非 task034 的修复。
+1. 这是致命的任务理解错误。session-cot-2.md 全部围绕 internal/dnsresolver/ 的 DNS 解析器缺陷修复展开，而当前任务要求修复 internal/httplb/ 的 HTTP 负载均衡器缺陷。模型第一步就读取了 dnsresolver.go 而非 httplb 包文件，说明未读取 prompt-2.txt 确认任务目标就选择了错误修复对象，整个会话实质是 task032 的修复而非 task034 的修复。
 2. 由于任务目标完全偏差，模型未对 httplb 包做任何代码变更或测试补充。虽然当前代码中已存在一致性哈希故障转移测试和通过的全部 45 个测试，但从 session-cot 中完全看不到任何与 httplb 相关的推理或修改行为。正确做法是读取对应任务的 prompt 确认目标包路径，检查指定包内的代码和测试，再执行修复操作。

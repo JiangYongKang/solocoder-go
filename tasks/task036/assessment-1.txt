@@ -1,11 +1,11 @@
 产物不满意：
-1. servicereg.go 的 Start 方法在 r.running 为 true 的分支中，先执行 r.mu.Unlock() 释放锁，之后才调用 r.wg.Add(1) 启动新的 expiryLoop goroutine。如果此时间窗口内并发调用了 Stop 方法，Stop 中的 r.wg.Wait() 会在 Add(1) 之前返回（此时 WaitGroup 计数器为 0），而后续新 goroutine 中的 wg.Done() 会在已完成的 WaitGroup 上执行，违反 sync.WaitGroup 的契约——"计数器归零后的正增量必须在下次 Wait 之前发生"。现有 TestStartAlreadyRunning 测试未覆盖并发 Start 和 Stop 的交叉场景，因此未能暴露此数据竞争。正确做法是将 wg.Add(1) 移到 r.mu.Unlock() 之前，确保在持锁期间完成计数器的增量。
+1. servicereg.go 的 Start 方法在 r.running 为 true 时先释放锁再调用 wg.Add(1) 启动 expiryLoop。若此窗口内并发 Stop，Stop 中 wg.Wait() 会在 Add 之前返回而新 goroutine 中 wg.Done() 在已完成 WaitGroup 上执行，违反契约。TestStartAlreadyRunning 未覆盖此交叉场景。应将 wg.Add(1) 移到 r.mu.Unlock() 之前。
 
-2. notifySubscribersLocked 方法的命名约定与实现行为存在矛盾："Locked" 后缀在 Go 社区约定中暗示"调用者必须持有锁且方法执行期间锁不会被释放"，但该方法内部执行了 r.mu.Unlock() 和 r.mu.Lock() 的解锁-重新加锁操作。该模式在 expireInstances 中被调用时问题更为突出——expireInstances 遍历 changed map 为每个发生变更的服务调用 notifySubscribersLocked，每发送一个服务的通知就经历一次解锁-重新加锁循环，导致多个服务之间的过期通知不是原子的。在第一次通知释放锁的间隙中，其他 goroutine 可能为尚未通知的服务注册新实例，使得后续该服务的"过期"通知中包含这些不应出现的实例，破坏了通知语义的一致性。应移除方法名中的 "Locked" 后缀并明确文档化其锁语义。
+2. notifySubscribersLocked 方法的命名与实现矛盾："Locked" 后缀暗示持锁且不释放，但该方法内部执行了解锁-重新加锁。在 expireInstances 中每发送一个服务通知就经历一次解锁-重新加锁，多服务通知不是原子的。第一次通知释放锁时其他 goroutine 可能注册新实例，使后续服务的"过期"通知包含不应出现的实例。应移除方法名中 "Locked" 后缀并明确锁语义。
 
-3. expireInstances 方法在遍历完所有实例并标记 changed 服务后，对每个 changed 中的服务调用 notifySubscribersLocked 发送过期通知。notifySubscribersLocked 在解锁后重新读取 r.instances[serviceName] 来构建事件中的实例列表，而非使用 expireInstances 扫描时遗留的实例状态。当 changed 中包含两个以上服务时，第一个服务的通知释放锁后、第二个服务的通知发送前，可能有新的实例注册到第二个服务中。此时第二个服务的 expire 事件会错误地携带刚注册的新实例，而新实例并未过期，订阅者收到一个包含活跃实例的"过期"通知。应在 expireInstances 扫描阶段就为每个受影响的缓存一份过期前的实例快照，通知时使用快照而非重新查询当前状态。
+3. expireInstances 方法对每个 changed 服务调用 notifySubscribersLocked 发送过期通知。该方法在解锁后重新读取 r.instances[serviceName] 构建事件中的实例列表而非使用扫描时的实例状态。当 changed 包含多个服务时，第一个服务的通知释放锁后可能有新实例注册到第二个服务中，此时第二个服务的 expire 事件错误地携带刚注册的新实例。应在扫描阶段为每个受影响的服务缓存过期前的实例快照，通知时使用快照而非重新查询。
 
 过程不满意：
-1. 模型在收到提示词后第一步就通过 todo_write 创建了 9 项子任务计划，之后才开始用 view_folder 和 file_search 探索项目目录结构，再查看 go.mod 和 pubsub、eventbus 等现有模块代码。这种"先计划后分析"的顺序与标注规范中"应先分析需求文档和代码骨架再制定执行计划"的要求相反。虽然最终计划与实际实现基本吻合，但开头的任务分解缺乏对项目模块边界和现有代码风格的了解作为支撑，本质上是一种形式化的流程动作而非经过充分思考的产物。正确做法是先阅读 go.mod 确认模块路径、查看现有 internal 包的组织方式和代码风格，理清本次任务的包职责范围后再制定执行计划。
+1. 模型在收到提示词后第一步就通过 todo_write 创建了 9 项子任务计划，之后才探索项目目录结构和查看现有模块代码。这种"先计划后分析"的顺序与"应先分析需求文档和代码骨架再制定执行计划"的要求相反。虽然最终计划与实现基本吻合，但开头的任务分解缺乏对项目模块边界的了解作为支撑，本质上是一种形式化流程。应先阅读 go.mod 确认模块路径、查看现有包的组织方式再制定计划。
 
-2. 模型在编写完测试代码后首次运行 go test，遇到三个测试用例失败和一个编译错误（未使用的变量 err）。模型修复变量问题后第二次运行仍有三个失败，此时模型直接对测试文件进行了多处编辑而没有在思考过程中展示对失败输出信息的逐条阅读和分析。虽然对 TestHeartbeat、TestExpireOnlyTimedOut 和 TestExpireInstancesWhenStopped 三个用例的判断最终正确，但对 TestExpireInstancesWhenStopped 的第一次字符串替换编辑失败了，说明模型没有先精确定位失败的具体行号和断言值再做最小修改。更严重的是，这一轮修复引入了新的编译错误（err 变量未声明），表明模型修改后未做编译验证就运行测试，直到测试失败才回头处理。这属于试错式调试的迹象，正确做法是先完整阅读每个失败用例的报错信息、逐一分析根因，然后对每个出错点做定向的最小修改并在每次修改后至少确认代码能够编译通过。
+2. 模型编写完测试代码后首次运行 go test 遇到三个失败和一个编译错误。修复变量问题后第二次运行仍有三个失败，此时模型直接对测试文件多处编辑而没有在思考过程中展示对失败输出的逐条分析。修复过程中引入了新的编译错误（err 变量未声明），说明修改后未做编译验证就运行测试。这属于试错式调试，应先完整阅读每个失败用例的报错信息逐一分析根因，然后对每个出错点做定向最小修改并在每次修改后至少确认编译通过。

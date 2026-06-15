@@ -1,7 +1,7 @@
 产物不满意：
-1. rbac.go 中定义了 ErrUserNotFound 错误变量但整个模块中从未被任何方法引用返回，是明确的死代码。文档 rbac.md 中为该错误列出了触发场景"用户不存在"，但代码中没有任何逻辑分支会抛出此错误。例如 CheckPermission 方法在处理从未被分配角色的用户时返回的是 `"user xxx has no roles assigned"` 而不是 ErrUserNotFound，GetUserRoles 对不存在的用户也直接返回空列表而非错误。这导致文档与实际行为不一致，且引入了一个永远不会被外部调用者匹配的哨兵错误，违反了 Go 代码的整洁原则。应删除未使用的 ErrUserNotFound 定义，或在 CheckPermission 等需要区分"用户不存在"与"用户无角色"的场景中实际使用该错误。
+1. rbac.go 中定义了 ErrUserNotFound 错误变量但整个模块中从未被引用返回，是明确的死代码。文档为该错误列出了触发场景"用户不存在"，但代码中 CheckPermission 对待从未分配角色的用户返回字符串而非 ErrUserNotFound，GetUserRoles 对不存在的用户直接返回空列表。这导致文档与实现不一致，应删除未使用的定义或在需要区分"用户不存在"与"用户无角色"的场景中实际使用该错误。
 
-2. CheckPermission 方法在用户没有所需权限时生成的拒绝原因包含冗余信息。代码中 `fmt.Sprintf("user %s does not have permission %s (required %s:%s)", userID, requested.String(), resource, action)` 会把 `requested.String()` 已经输出的 `article:delete` 在末尾用 `(required article:delete)` 再重复一次，实际输出形如 `"user alice does not have permission article:delete (required article:delete)"`。`requested.String()` 调用是多余的，它和 `(required %s:%s)` 传达了相同的信息，只保留其一即可。这是一个细节上的代码质量问题，说明模型在字符串格式化时没有审视信息密度和重复性。
+2. CheckPermission 拒绝原因包含冗余：requested.String() 已输出 article:delete，末尾 (required article:delete) 又重复一次。输出如 "user alice does not have permission article:delete (required article:delete)"。两者传达相同信息，只保留其一即可。
 
 过程不满意：
-1. 模型在收到提示词后先后查看了项目根目录、go.mod 以及 eventbus 包的代码风格，然后就直接创建了 9 项子任务的 TodoList 并开始编码。虽然参照已有代码风格是良好实践，但模型在整个过程中没有对提示词的 8 条需求做任何深度分析——没有拆解每条需求的核心逻辑、没有预判可能出现的边界条件（如权限去重、角色名称唯一性校验的并发安全、拒绝原因在不同拒绝路径下的信息完整度）、也没有梳理各需求之间的依赖关系。这种"看两眼就写代码"的行为模式导致最终出现了 ErrUserNotFound 定义后从未使用的死代码问题——模型在规划阶段列出了错误类型但未在设计时明确每个错误的触发条件，写完了又未通过 go vet 或系统性检查来验证所有定义是否都有对应调用路径。正确做法应是先用几句话理清每个需求的输入输出和边界条件，再规划待实现的类型和方法，最后编码。
+1. 模型查看了项目目录和 go.mod 后直接创建了 9 项 TodoList 开始编码，但未对 8 条需求做深度分析——没拆解核心逻辑、没预判边界条件（权限去重、并发安全、信息完整度）、没梳理依赖关系。这导致 ErrUserNotFound 定义后从未使用，模型规划阶段列出错误类型但未明确触发条件，写完未用 go vet 检查。应先理清输入输出和边界条件再规划再编码。

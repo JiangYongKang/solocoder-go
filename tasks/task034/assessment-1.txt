@@ -1,13 +1,13 @@
 产物不满意：
-1. parseResponse 函数在解析 DNS 响应头部的 flags 和 id 字段后立即用 `_ = id` 和 `_ = flags` 将其丢弃，完全没有校验 RCODE 响应码和事务 ID 是否匹配。当上游 DNS 服务器返回 NXDOMAIN（域名不存在）或 SERVFAIL（服务器失败）时，解析器仍然将其当作包含有效记录的响应处理，后续 filterRecords 在空响应上直接返回 ErrNoRecordsFound，丢失了真实的 DNS 级错误语义。同时 buildQuery 生成的随机事务 ID 也从未与响应 ID 做比对，UDP 环境下可能错误接受不属于本次查询的响应包。正确做法是在 parseResponse 返回的 DNSResponse 中保留 flags 字段并在调用方检查 RCODE，或返回专门的 NXDOMAIN 错误。
+1. parseResponse 函数用 `_ = id` 和 `_ = flags` 丢弃响应头字段，完全未校验 RCODE 和事务 ID。当上游返回 NXDOMAIN 或 SERVFAIL 时解析器仍当作有效响应处理，丢失真实错误语义。buildQuery 生成的 ID 也未与响应 ID 对比，UDP 下可能接受它包的响应。应在 parseResponse 中保留 flags 并在调用方检查 RCODE。
 
-2. querySingle 函数签名声明了 ctx context.Context 参数但函数体内完全不使用这个 context，实际通过 r.nowFunc().Add(r.cfg.QueryTimeout) 独立设置连接超时。这导致 queryParallel 中创建的超时 context（含 defer cancel）形同虚设——当第一个有效响应返回后 queryParallel 立即 return 并调用 cancel，但各 goroutine 内的 querySingle 并不感知 context 取消，继续执行 UDP 读写直到各自的 QueryTimeout 到期才退出。在高延迟网络或大量服务器配置下这会导致 goroutine 泄漏和网络资源浪费，正确做法是在 querySingle 内部 select 监听 ctx.Done() 或在 dialUDP/conn.SetDeadline 中使用 ctx 派生的 deadline。
+2. querySingle 声明 ctx 参数但函数体完全不使用，实际独立设置超时。这导致 queryParallel 中创建的超时 context 形同虚设：首响应返回后调用 cancel，但 querySingle 不感知继续执行直到各自超时到期。高延迟下导致 goroutine 泄漏。应在 querySingle 内部 select 监听 ctx.Done() 或使用 ctx 派生的 deadline。
 
-3. resolveRecursive 中 CNAME 追踪部分在处理 CNAME 时调用 r.resolveRecursive(cname, qtype, depth+1)，这触发了 resolveRecursive 内部的完整递归链重建——从根服务器开始逐级重新解析 NS 委派。当前权威服务器已经确认了该域名的 CNAME 指向，重复构建从根到当前域名的整条 NS 链是冗余的，而且一旦某级委派因网络问题不可达就会导致 CNAME 追踪失败，而实际上当前服务器可能同时知道 CNAME 目标域名的 A 记录。正确做法是在 resolveRecursive 中增加转发模式，或直接在 CNAME 处理分支中先尝试用当前 authoritative servers 直接查询 CNAME 目标再回退到从根开始的重解析。
+3. resolveRecursive 的 CNAME 追踪调用 r.resolveRecursive(cname, qtype, depth+1) 触发了从根服务器开始的完整 NS 委派链重建。当前权威服务器已确认 CNAME 指向，重建整条 NS 链是冗余的，且某级委派不可达就会导致追踪失败。应在 CNAME 分支中先尝试用当前 authoritative servers 直接查询 CNAME 目标再回退到从根重解析。
 
 过程不满意：
 1. 模型在收到提示词后的第一行动是调用 todo_write 创建了 5 项子任务计划，之后才开始阅读 go.mod、cacheinvalid.go 和 connpool.go 等已有模块以了解项目代码风格。这是标注规范中明确指出的反模式——在未分析需求文档和代码骨架的情况下直接制定计划，导致计划的粒度划分可能与实际模块边界不匹配。正确做法是先理解提示词中的功能需求，梳理包结构和现有代码的编码规范，然后再规划各子任务的执行顺序和依赖关系。
 
-2. decodeName 函数的 DNS 域名指针偏移计算经历了至少三轮修复：初次实现时未正确处理压缩指针跳转后的偏移量追踪，第一轮修复后仍然在指针场景下返回错误的 endOffset，第二轮和第三轮修复才逐步引入 jumped 标记和正确的偏移更新逻辑。每次发现失败后模型直接调用 edit_file_search_replace 修改 decodeName 而不先阅读测试失败信息中的具体偏移值差异来精确定位问题，这种试错式调试导致同一函数被反复修改多轮。正确做法是先运行 `go test -run "TestDecodeName" -v` 获取实际输出与期望值的差异，再用差异反推代码中哪一步的偏移计算错误，然后只做一次精准修正。
+2. decodeName 函数的 DNS 域名指针偏移计算经历了至少三轮修复：初版未正确处理压缩指针跳转后的偏移量追踪，后续修复才逐步引入 jumped 标记和正确的偏移更新逻辑。每次失败后模型直接修改代码而不先阅读测试失败信息中的具体偏移值差异来精确定位，这种试错式调试导致同一函数反复修改多轮。应先运行测试获取期望值与实际输出差异，再用差异反推错误然后一次性精准修正。
 
-3. 模型在工具调用的回复文本中使用了英文表述如"Let me also fix..."，这违反了项目要求的纯中文输出规范。同时代码中存在多处无意义的空白标识符赋值（`_ = id`，`_ = flags`，`_ = name`），其中 `_ = name` 出现在 parseRR 函数中但 name 变量实际上已经被赋值给 rr.Name，这条语句是之前 name 未被使用时留下的残留代码，说明模型在迭代修改后未进行清理，代码整洁度不足。正确做法是在代码修改完成后统一检查并移除这些无用的占位符赋值。
+3. 模型在工具调用的回复文本中使用英文表述如 "Let me also fix..."，违反纯中文输出规范。同时代码中多处无意义空白标识符赋值 `_ = id`、`_ = flags`，其中 `_ = name` 是残留代码，说明模型迭代修改后未清理，代码整洁度不足。应在完成后统一检查并移除这些无用占位符。
