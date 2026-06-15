@@ -426,6 +426,92 @@ idleTimeoutLoop（ticker = IdleTimeout/2）
 - `Stream.readCh` 的关闭使用独立的 `chCloseOnce`，与 `closeOnce` 分离避免双重关闭
 - 连接池的广播（Broadcast）总是先修改状态后释放锁，防止唤醒后立即再次阻塞
 
+### 6.1 并发安全保证策略
+
+本节详细说明各组件在并发场景下的安全保证机制，涵盖已修复的竞态窗口和资源管理缺陷。
+
+#### 6.1.1 连接池 Remove/Put 双重操作防护
+
+**问题**：`handleStream` 中，当客户端到上游的转发协程 `s.Read` 返回错误时，会调用 `pool.Remove` 移除上游连接。但 `defer upstreamConn.Close()` 随后又会调用 `pool.Put` 归还同一连接。两次操作分别对 `activeCount` 减 1，导致计数出现负数，已关闭的连接被放回空闲列表。
+
+**修复**：
+- `poolConn` 新增 `removed atomic.Bool` 标志位
+- `pool.Remove` 首次调用时 `removed.Swap(true)` 返回 false，正常执行 activeCount-- 和关闭；再次调用时 Swap 返回 true，直接跳过
+- `pool.Put` 在 `activeCount--` 后检查 `pc.removed.Load()`，若为 true 则直接返回，不再将连接放回空闲列表
+- `pooledConn.Close` 同时检查 `idle` 和 `removed` 标志，任一为 true 均跳过归还
+
+```
+时序：Remove 先于 Close
+  goroutine A: pool.Remove(pc) → removed=true, activeCount=0
+  goroutine B: pooledConn.Close() → pool.Put(pc) → removed=true → 跳过归还
+  结果：activeCount=0, idleList 不受污染 ✓
+```
+
+#### 6.1.2 ConnPool.Get 空闲连接过期扫描安全
+
+**问题**：原实现在 for 循环中检测到空闲连接超时后，先解锁关闭连接再重新加锁。锁释放期间 `reclaimIdle` 或 `Put` 可能修改 `idleList` 长度，导致循环索引越界。
+
+**修复**：将过期检测、有效连接筛选和连接选取全部在单次持锁内完成：
+1. 从尾到头遍历 idleList，将过期连接收集到 `expired` 切片，将有效连接紧凑排列到 `idleList[:validIdx]`
+2. 在有效连接中选取最尾部的连接作为 `selected`
+3. 从 idleList 中移除 selected 并调整 activeCount
+4. 解锁后关闭过期连接
+
+整个过程中，idleList 的修改完全在锁内完成，不会出现中途解锁导致的索引失效。
+
+#### 6.1.3 IPHashBalancer 与 HealthChecker 锁顺序一致性
+
+**问题**：原 `GetUpstream` 在持有 balancer 的 RLock 时调用 `hc.GetHealthyUpstreams()`（获取 hc 的 RLock），而 `onChange` 回调路径是 `hc.Lock` → `balancer.Lock`，两条路径锁顺序不一致，存在 ABBA 死锁风险。
+
+**修复**：
+- 新增 `getHealthyUpstreamsSnapshot()` 方法，先获取健康列表快照，再操作 balancer 自身的锁
+- `GetUpstream` 调用快照方法获取 healthy 列表后，才进入 balancer 的 RLock/Lock 区域
+- 保证锁顺序始终为：先释放 hc 锁，再获取 balancer 锁，不存在嵌套持锁
+
+```
+修复前锁顺序：
+  路径1: RLock(balancer) → RLock(hc)        // GetUpstream
+  路径2: Lock(hc) → Lock(balancer)           // onChange 回调
+  → ABBA 死锁风险
+
+修复后锁顺序：
+  路径1: RLock(hc) → Unlock(hc) → RLock(balancer)  // GetUpstream (先拿快照，再操作 balancer)
+  路径2: Lock(hc) → Unlock(hc) → Lock(balancer)     // onChange 回调 (hc.Unlock 在 defer 中，回调在锁内调用)
+  → 同方向，无死锁风险
+```
+
+#### 6.1.4 handleFin/handleRst 原子化流操作
+
+**问题**：原 `handleFin` 和 `handleRst` 采用 check-then-act 模式：先 RLock 检查流是否存在，再 Lock 执行操作。两个方法并发处理同一 StreamID 时，可能在 RLock 释放后、Lock 获取前被另一个方法抢先处理，导致对已删除的流重复操作。
+
+**修复**：
+- `handleFin` 改为全程持写锁（Lock），在锁内完成：检查流存在 → 设置 finRecv → 条件删除 → 设置 closed → 关闭 readCh
+- `handleRst` 保持全程持写锁（Lock），在锁内完成：检查流存在 → 删除流 → 设置 closed → 关闭 readCh
+- 两个方法对同一 StreamID 的操作完全串行化，消除竞态窗口
+- `chCloseOnce.Do` 作为最后防线，即使两者对同一流操作也不会 panic
+
+#### 6.1.5 HealthChecker.checkOne 上下文一致性验证
+
+**问题**：`checkOne` 在 RLock 读取 uh.upstream 指针后释放锁执行探测，然后在 Lock 中重新查找 uh。如果上游在两次加锁之间被删除后以相同地址重新添加，uh 指向的是新的 `upstreamHealth` 对象，但 failCount/passCount 可能继承旧实例的状态。
+
+**修复**：在 Lock 内重新获取 uh 后，增加指针一致性校验：
+```go
+uh, ok = hc.upstreams[addr]
+if !ok { return }
+if uh.upstream != upstream { return }  // upstream 是 RLock 阶段保存的指针
+```
+如果 `uh.upstream` 与 RLock 阶段保存的指针不一致，说明上游已被替换，跳过本次更新。新的 upstreamHealth 对象从零开始计数，不会继承旧状态。
+
+#### 6.1.6 handleStream 协程退出与连接归还
+
+**问题**：原 `handleStream` 使用 `defer upstreamConn.Close()` 在函数返回时归还连接，但 `wg.Wait()` 等待两个双向拷贝协程退出。当代理关闭导致流端 Read 返回 EOF 时，stream→upstream 协程退出，但 upstream→stream 协程可能阻塞在 `upstreamConn.Read()` 上，wg.Wait 永远不返回。
+
+**修复**：
+- 移除 `defer upstreamConn.Close()`，改为在 `wg.Wait()` 之后显式调用 `upstreamConn.Close()`
+- 引入 `closeUpstream` 函数（由 `sync.Once` 保护），任一方向退出时调用 `upstreamConn.SetDeadline(time.Now())`
+- SetDeadline 强制阻塞的 Read/Write 立即返回 deadline 错误，使另一方向协程也能退出
+- 两个协程都退出后 `wg.Wait()` 返回，`upstreamConn.Close()` 正确归还连接到池中
+
 ## 7. 使用示例
 
 ### 7.1 基础使用 - 启动反向代理
@@ -591,17 +677,34 @@ for _, u := range hc.GetHealthyUpstreams() {
 | 连接池 | 借还复用、MaxConns 限流、超时返回、空闲回收、并发安全、双关归还 | TestConnPool_GetAndPut, TestConnPool_MaxConns, TestConnPool_IdleTimeout, TestConnPool_ConcurrentAccess |
 | 负载均衡 | 哈希一致性、粘性映射、不健康绕行、空上游异常、并发哈希、分布均匀性 | TestIPHashBalancer_HashConsistency, TestIPHashBalancer_StickySession, TestIPHashBalancer_Concurrency, TestIPHashBalancer_DifferentIPs |
 | 端到端 | 配置校验、启停生命周期、完整 Echo 请求链路、大数据分片传输 | TestNewTCPProxy_Validation, TestTCPProxy_StartStop, TestTCPProxy_EndToEnd, TestStream_ReadLargeData |
+| 并发安全 | Remove/Put 双重计数、Remove 幂等、连接归还竞态、空闲过期索引、死锁探测、FIN/RST 竞态、计数器重置 | 见下方详细列表 |
+
+**并发安全专项测试**：
+
+| 测试函数 | 验证目标 |
+|----------|----------|
+| TestConnPool_RemoveThenCloseNoNegativeCount | Remove 后 Close 不导致 activeCount 负数 |
+| TestConnPool_RemoveIdempotent | 多次 Remove 同一连接 activeCount 只减一次 |
+| TestConnPool_PutAfterRemovedNoReturnToIdle | Remove 后 Put 不将已关闭连接放回空闲列表 |
+| TestConnPool_ConcurrentRemoveAndPut | 并发 Remove+Put 不出现负计数或脏连接 |
+| TestConnPool_GetIdleExpiryNoIndexPanic | 空闲过期并发 Get 不触发索引越界 panic |
+| TestIPHashBalancer_NoDeadlockWithHealthChecker | HC onChange 回调与 GetUpstream 并发不死锁 |
+| TestMuxConcurrentFinAndRst | 同一 StreamID 的 FIN/RST 并发到达不 panic |
+| TestHealthChecker_RemoveAndReaddResetsCounters | 删除重加后计数器从零开始，不继承旧状态 |
+| TestConnPool_ConcurrentGetWithIdleExpiry | 极短空闲超时 + 高并发 Get/Put 不出现计数异常 |
 
 **并发测试设计要点**：
 - `TestConnPool_ConcurrentAccess`：20 协程 × 50 次借还循环，验证 Mutex + Cond 的正确性
 - `TestIPHashBalancer_Concurrency`：100 协程 × 100 次查询，验证 RLock→Lock 升级无竞争
+- `TestIPHashBalancer_NoDeadlockWithHealthChecker`：HC checkLoop 持续运行 + 100 次 GetUpstream 交替，5 秒超时检测死锁
+- `TestMuxConcurrentFinAndRst`：10 轮试验，每轮对同一 Stream 并发写 FIN 和 RST 帧
 
 ## 9. 文件结构
 
 ```
 internal/tcpproxy/
 ├── tcpproxy.go       # 所有核心实现（帧/流/Mux/健康/池/均衡/代理）
-└── tcpproxy_test.go  # 单元测试（36 个用例，覆盖正常/边界/异常）
+└── tcpproxy_test.go  # 单元测试（45 个用例，覆盖正常/边界/异常/并发安全）
 
 docs/
 └── tcpproxy.md       # 本文档

@@ -7,10 +7,12 @@ import (
 )
 
 var (
-	ErrServerExists    = errors.New("httplb: server already exists")
-	ErrServerNotFound  = errors.New("httplb: server not found")
-	ErrNoHealthyServer = errors.New("httplb: no healthy backend servers available")
-	ErrInvalidWeight   = errors.New("httplb: invalid weight, must be positive")
+	ErrServerExists       = errors.New("httplb: server already exists")
+	ErrServerNotFound     = errors.New("httplb: server not found")
+	ErrNoHealthyServer    = errors.New("httplb: no healthy backend servers available")
+	ErrInvalidWeight      = errors.New("httplb: invalid weight, must be positive")
+	ErrServerHasConns     = errors.New("httplb: server still has active connections")
+	ErrServerNotDraining  = errors.New("httplb: server is not in draining state, call DrainServer first")
 )
 
 type ServerStatus int
@@ -84,6 +86,12 @@ func (s *BackendServer) MarkUp() {
 	s.status = StatusUp
 }
 
+func (s *BackendServer) IsDraining() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.status == StatusDraining
+}
+
 type ServerPool struct {
 	servers map[string]*BackendServer
 	order   []string
@@ -119,8 +127,17 @@ func (sp *ServerPool) RemoveServer(address string) error {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 
-	if _, exists := sp.servers[address]; !exists {
+	s, exists := sp.servers[address]
+	if !exists {
 		return ErrServerNotFound
+	}
+
+	if !s.IsDraining() {
+		return ErrServerNotDraining
+	}
+
+	if s.ActiveConn() > 0 {
+		return ErrServerHasConns
 	}
 
 	delete(sp.servers, address)

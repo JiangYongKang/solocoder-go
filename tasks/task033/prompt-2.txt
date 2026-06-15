@@ -1,0 +1,10 @@
+你实现的 gRPC 服务框架模块存在一些功能缺失和设计问题，需要修复：
+1. checkDeadline 函数只在单一时间点判断 deadline 是否过期，未在处理过程中持续校验剩余超时时间。Invoke 的 handler 包装只在调用前做一次检查，若 handler 内有长时间阻塞操作，deadline 过期后框架无法感知和中断，不符合提示词中"持续校验"的要求。
+2. PutRecv 方法仅定义在具体类型 *serverStream 上，未暴露在 Stream 接口中。测试通过类型断言绕开接口调用，但真实调用方通过 Stream 接口无法向 recvCh 写入数据，导致客户端流式和双向流式两种 RPC 模式无法正常工作。
+3. ServiceDesc 的 HandlerType 和 Metadata 字段被定义后从未被任何逻辑使用，RegisterService 接收后直接忽略，GetService 也不返回这两个字段，构成虚假的 API 表面积。
+4. ServerStream 和 ClientStream 接口仅内嵌 Stream 接口未添加任何额外方法，三个接口完全等价。拦截器签名的 ServerStream 参数未带来类型安全增益。
+5. ServerOptions 的 MaxConcurrentStreams 和 ConnectionTimeout 字段被定义和初始化后在整个框架中从未被读取使用，服务器行为完全不受配置控制。
+6. newContextWithStream 函数和 streamKey 类型定义后从未被任何代码调用，SetHeader 函数依赖该机制但永远收到空值，是空操作。
+7. 修复以上问题后，需要为该模块补充相关场景的单元测试，特别是超时传播持续校验、客户端流式调用的接口完整性、ServerOptions 生效验证等用例。
+8. 运行 go test ./internal/grpcsvc/ -v，需要让所有测试通过。
+9. 在 docs/grpcsvc.md 中更新模块需求文档。

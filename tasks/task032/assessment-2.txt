@@ -1,0 +1,11 @@
+产物不满意：
+1. tasks/task032/session-cot-2.md 的内容实际为 wscenter 模块的思考轨迹，而非本任务 dnsresolver 模块的思考过程。文件中所有文件引用指向 internal/wscenter/wscenter.go，工作摘要也全部关于 WebSocket 连接中心的心跳修复和错误码改进。这导致该文件对本任务完全无效，无法追溯模型在修复 parseResponse、querySingle、resolveRecursive 等问题时的推理过程。根因可能是会话记录文件被错误放置，或模型未正确生成当前任务的思考过程。
+
+2. dnsresolver.go 的 followCNAME 方法中同区 CNAME 优化判定靠字符串标签比较而非 DNS 区域边界判定，例如"www.example.com"的 CNAME 目标"cdn.example.com"虽然同属 example.com 区域，但标签级比较发现"cdn"不等于"www"后判定 sameSuffix=false，回退到完整的根递归解析。这导致同区 CNAME 场景下多出 3 到 4 次多余的 DNS 查询，降低了 TestCNAMEFollowSameZoneEfficiency 测试的效率预期。
+
+3. 测试辅助函数 buildNSResponse 第 279 行的 `questionEnd` 变量从未被实际使用，用 `_ = questionEnd` 压制编译警告但没有实际价值，属于提示词第 4 条要求清理的"无意义的空白标识符赋值"。测试函数 TestBuildQuery 第 1058 行的 `_ = id` 同样属于同一类问题，`id` 在三元组解包后从未使用，应直接改用 `_` 忽略第二个返回值。两处未清理说明模型对空白标识符的清理不够彻底。
+
+过程不满意：
+1. tasks/task032 目录下的 session-cot-2.md 全文是关于 wscenter 模块的修复过程，对 dnsresolver 模块的修复思考完全缺失。无论此文件是被错误放置还是模型未正确生成该任务的思考轨迹，都导致无法追踪模型在处理 parseResponse 的事务 ID 校验设计考量、querySingle 的 context 传播时序决策、resolveRecursive 中 NS 链与 CNAME 追踪的调用关系等关键环节时的推理路径。正确做法是确保每个任务的思考过程独立记录且对应正确的任务目录。
+
+2. dnsresolver_test.go 中 TestCNAMEFollowDifferentZone 测试在 mock 中预留了 case 5 和 case 10 两个多余的 mock 分支，分别返回了不会再被命中的 CNAME 响应和 A 记录响应。这些分支在当前代码实现下永远不会被触发，说明模型在编写测试时对 resolveRecursive 和 followCNAME 的完整调用链理解不够准确，用安全网式的 mock 覆盖替代了对精确调用路径的验证。正确做法是先梳理完整的递归流程确认每个查询点的确切请求再精确设置 mock 返回值。

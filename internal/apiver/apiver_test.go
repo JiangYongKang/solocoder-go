@@ -710,31 +710,41 @@ func TestVersionRouter_ServeHTTP_SameVersionNoConversion(t *testing.T) {
 	}
 }
 
-func TestVersionRouter_ServeHTTP_ConverterNotFound(t *testing.T) {
+func TestVersionRouter_ServeHTTP_GracefulDegradation_NoRequestConverter(t *testing.T) {
 	vr := NewVersionRouter()
 
+	v1Called := false
+	v2Called := false
 	vr.RegisterHandler("v1", func(w http.ResponseWriter, r *http.Request) {
+		v1Called = true
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("v1"))
+		w.Write([]byte("v1 direct"))
 	})
 	vr.RegisterHandler("v2", func(w http.ResponseWriter, r *http.Request) {
+		v2Called = true
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("v2"))
+		w.Write([]byte("v2 direct"))
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/users", nil)
 	w := httptest.NewRecorder()
 	vr.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 when converter not found, got %d", w.Code)
+	if !v1Called {
+		t.Error("v1 handler should be called directly (graceful degradation)")
 	}
-	if !strings.Contains(w.Body.String(), ErrConverterNotFound.Error()) {
-		t.Errorf("expected converter error, got: %s", w.Body.String())
+	if v2Called {
+		t.Error("v2 handler should not be called when no request converter")
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 with graceful degradation, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "v1 direct") {
+		t.Errorf("expected v1 direct response, got: %s", w.Body.String())
 	}
 }
 
-func TestVersionRouter_ServeHTTP_ResponseConverterFallback(t *testing.T) {
+func TestVersionRouter_ServeHTTP_ResponseConverterMissing(t *testing.T) {
 	vr := NewVersionRouter()
 
 	vr.RegisterHandler("v1", func(w http.ResponseWriter, r *http.Request) {
@@ -755,14 +765,158 @@ func TestVersionRouter_ServeHTTP_ResponseConverterFallback(t *testing.T) {
 	w := httptest.NewRecorder()
 	vr.ServeHTTP(w, req)
 
-	if w.Code != http.StatusCreated {
-		t.Errorf("expected 201 (status passed through), got %d", w.Code)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 when response converter not found, got %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "v2 response") {
-		t.Errorf("expected body to pass through, got: %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), ErrConverterNotFound.Error()) {
+		t.Errorf("expected converter error message, got: %s", w.Body.String())
 	}
-	if w.Header().Get("X-Test") != "value" {
-		t.Errorf("expected header to pass through, got: %s", w.Header().Get("X-Test"))
+}
+
+func TestIsValidVersion(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    Version
+		expected bool
+	}{
+		{"v1", "v1", true},
+		{"v10", "v10", true},
+		{"v123", "v123", true},
+		{"v0", "v0", true},
+		{"empty", "", false},
+		{"no v prefix", "1", false},
+		{"letters after v", "va", false},
+		{"mixed", "v1a", false},
+		{"dot version", "v1.0", false},
+		{"beta suffix", "v1-beta", false},
+		{"capital V", "V1", false},
+		{"only v", "v", false},
+		{"v-1", "v-1", false},
+		{"v 1", "v 1", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsValidVersion(tt.input)
+			if result != tt.expected {
+				t.Errorf("expected %v for %q, got %v", tt.expected, tt.input, result)
+			}
+		})
+	}
+}
+
+func TestVersionRouter_ExtractVersion_InvalidFormatHeader(t *testing.T) {
+	vr := NewVersionRouter()
+	vr.SetExtractors(NewHeaderVersionExtractor())
+
+	req := httptest.NewRequest(http.MethodGet, "/users", nil)
+	req.Header.Set("API-Version", "invalid")
+
+	_, _, err := vr.ExtractVersion(req)
+	if err != ErrInvalidVersionFormat {
+		t.Errorf("expected ErrInvalidVersionFormat, got %v", err)
+	}
+}
+
+func TestVersionRouter_ExtractVersion_InvalidFormatQuery(t *testing.T) {
+	vr := NewVersionRouter()
+	vr.SetExtractors(NewQueryVersionExtractor())
+
+	req := httptest.NewRequest(http.MethodGet, "/users?version=beta", nil)
+
+	_, _, err := vr.ExtractVersion(req)
+	if err != ErrInvalidVersionFormat {
+		t.Errorf("expected ErrInvalidVersionFormat, got %v", err)
+	}
+}
+
+func TestVersionRouter_ExtractVersion_InvalidDefaultVersion(t *testing.T) {
+	vr := NewVersionRouter()
+	vr.SetExtractors(NewHeaderVersionExtractor())
+	vr.SetDefaultVersion("invalid")
+
+	req := httptest.NewRequest(http.MethodGet, "/users", nil)
+
+	_, _, err := vr.ExtractVersion(req)
+	if err != ErrInvalidVersionFormat {
+		t.Errorf("expected ErrInvalidVersionFormat for invalid default, got %v", err)
+	}
+}
+
+func TestVersionRouter_ServeHTTP_InvalidVersionFormat(t *testing.T) {
+	vr := NewVersionRouter()
+	vr.SetExtractors(NewHeaderVersionExtractor())
+
+	req := httptest.NewRequest(http.MethodGet, "/users", nil)
+	req.Header.Set("API-Version", "bad-version")
+	w := httptest.NewRecorder()
+	vr.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid version format, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), ErrInvalidVersionFormat.Error()) {
+		t.Errorf("expected invalid version error message, got: %s", w.Body.String())
+	}
+}
+
+func TestVersionRouter_GracefulDegradation_MultipleVersions(t *testing.T) {
+	vr := NewVersionRouter()
+
+	v1Called := false
+	v3Called := false
+	vr.RegisterHandler("v1", func(w http.ResponseWriter, r *http.Request) {
+		v1Called = true
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("v1"))
+	})
+	vr.RegisterHandler("v2", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("v2"))
+	})
+	vr.RegisterHandler("v3", func(w http.ResponseWriter, r *http.Request) {
+		v3Called = true
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("v3"))
+	})
+
+	vr.RegisterRequestConverter("v2", "v3", func(r *http.Request) (*http.Request, error) {
+		return r, nil
+	})
+	vr.RegisterResponseConverter("v3", "v2", func(status int, header http.Header, body []byte) (int, http.Header, []byte, error) {
+		return status, header, body, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/users", nil)
+	w := httptest.NewRecorder()
+	vr.ServeHTTP(w, req)
+
+	if !v1Called {
+		t.Error("v1 handler should be called directly (graceful degradation)")
+	}
+	if v3Called {
+		t.Error("v3 handler should not be called when no v1->v3 converter")
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 with graceful degradation, got %d", w.Code)
+	}
+
+	v2Called := false
+	vr.RegisterHandler("v2", func(w http.ResponseWriter, r *http.Request) {
+		v2Called = true
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("v2"))
+	})
+
+	req2 := httptest.NewRequest(http.MethodGet, "/v2/users", nil)
+	w2 := httptest.NewRecorder()
+	vr.ServeHTTP(w2, req2)
+
+	if v2Called {
+		t.Error("v2 handler should NOT be called directly when converter exists")
+	}
+	if w2.Code != http.StatusOK {
+		t.Errorf("expected 200 with conversion, got %d", w2.Code)
 	}
 }
 

@@ -19,6 +19,10 @@ DNS 解析器是一个功能完整的 DNS 客户端组件，支持递归解析�
 | F7 | 缓存自动清理 | 后台协程定期清理过期缓存条目 |
 | F8 | A/AAAA 记录解析 | 支持 IPv4 (A) 和 IPv6 (AAAA) 记录解析 |
 | F9 | 线程安全 | 所有公共 API 都是并发安全的，支持多协程同时调用 |
+| F10 | RCODE 错误处理 | 正确解析并传递 DNS 协议级响应码（NXDOMAIN、SERVFAIL、FORMERR、REFUSED 等），保留真实错误语义 |
+| F11 | 事务 ID 校验 | UDP 环境下校验响应事务 ID 与查询是否匹配，防止接受无关响应包 |
+| F12 | Context 取消传播 | 查询全程支持 context 取消，超时时立即关闭连接并停止 goroutine，避免资源泄漏 |
+| F13 | CNAME 同区优化 | CNAME 追踪时若目标域名与原域名属同一区域，直接复用当前权威服务器查询，避免重建整条 NS 链 |
 
 ## 3. 核心结构体与职责
 
@@ -104,6 +108,8 @@ type DNSRecord struct {
 ```go
 type DNSResponse struct {
     TransactionID uint16      // 事务 ID
+    RCode         uint16      // 响应码（RCODE）
+    Flags         uint16      // 标志位
     Answers     []DNSRecord // 回答区记录
     Authorities []DNSRecord // 授权区记录
     Additionals []DNSRecord // 附加区记录
@@ -113,8 +119,32 @@ type DNSResponse struct {
 **主要职责：**
 - 表示完整的 DNS 响应消息
 - 包含回答、授权、附加三个区域的记录
+- 携带事务 ID 和响应码用于校验
 
-### 3.6 预定义错误
+### 3.6 DNSError - DNS 协议错误
+
+```go
+type DNSError struct {
+    RCODE uint16 // DNS 响应码
+    Msg   string // 错误描述
+}
+```
+
+**主要职责：**
+- 表示 DNS 协议级别的错误（NXDOMAIN、SERVFAIL 等）
+- 支持 `errors.Is()` 比较（按 RCODE 匹配）
+- 支持 `errors.As()` 提取详细 RCODE 信息
+
+**预定义 DNS 错误变量：**
+| 错误变量 | RCODE | 含义 |
+|----------|-------|------|
+| `ErrNXDOMAIN` | 3 | 域名不存在（Name Error） |
+| `ErrSERVFAIL` | 2 | 服务器失败（Server Failure） |
+| `ErrFORMERR` | 1 | 格式错误（Format Error） |
+| `ErrREFUSED` | 5 | 查询被拒绝（Refused） |
+| `ErrTransactionIDMismatch` | - | 事务 ID 不匹配 |
+
+### 3.7 预定义错误
 
 | 错误变量 | 含义 | 触发场景 |
 |----------|------|----------|
@@ -126,6 +156,12 @@ type DNSResponse struct {
 | `ErrAllUpstreamsFailed` | 所有上游服务器失败 | 所有上游服务器查询均失败 |
 | `ErrInvalidDomain` | 域名无效 | 请求的域名格式不合法 |
 | `ErrInvalidResponse` | 响应无效 | DNS 响应格式错误 |
+| `ErrQueryTimeout` | 查询超时 | 单次查询超时 |
+| `ErrTransactionIDMismatch` | 事务 ID 不匹配 | UDP 响应事务 ID 与查询不匹配 |
+| `ErrNXDOMAIN` | 域名不存在 | DNS 服务器返回 NXDOMAIN (RCODE=3) |
+| `ErrSERVFAIL` | 服务器失败 | DNS 服务器返回 SERVFAIL (RCODE=2) |
+| `ErrFORMERR` | 格式错误 | DNS 服务器返回 FORMERR (RCODE=1) |
+| `ErrREFUSED` | 查询被拒绝 | DNS 服务器返回 REFUSED (RCODE=5) |
 
 ## 4. 递归解析执行流程
 
@@ -142,16 +178,16 @@ resolveRecursive(domain, qtype, depth)
    │
    ├─ 检查缓存 → 命中且未过期 → 返回缓存结果
    │
-   ├─ 拆分域名为标签（如 "www.example.com" → ["www", "example", "com"]
+   ├─ 拆分域名为标签（如 "www.example.com" → ["www", "example", "com"]）
    │
    ├─ servers = 根服务器列表
    │
-   ├─ [从根开始逐级查询 NS 记录
+   ├─ [从根开始逐级查询 NS 记录]
    │     │
    │     ├─ 当前 zone = "."（根）
    │     ├─ 查询 zone 的 NS 记录
    │     ├─ 解析响应中的 NS 记录和胶水记录
-   │     ├─ 胶水记录优先使用（避免额外查询
+   │     ├─ 胶水记录优先使用（避免额外查询）
    │     ├─ 无胶水记录时递归解析 NS 服务器的 IP
    │     ├─ servers = 下一级权威服务器
    │     └─ 继续查询更具体的 zone（如 "com." → "example.com."）
@@ -160,15 +196,25 @@ resolveRecursive(domain, qtype, depth)
    │
    ├─ 处理 CNAME 别名链
    │     └─ 存在 CNAME 记录
-   │           └─ depth+1 >= MaxRecursionDepth → ErrMaxDepthExceeded
-   │           └─ 递归解析 CNAME 目标域名（depth+1）
+   │           ├─ depth+1 >= MaxRecursionDepth → ErrMaxDepthExceeded
+   │           ├─ [CNAME 优化追踪 followCNAME]
+   │           │     ├─ 当前响应已含目标记录 → 直接返回
+   │           │     ├─ CNAME 与原域名同区 → 复用当前服务器查询
+   │           │     └─ CNAME 跨区 → 回退到完整递归解析
+   │           └─ 返回 CNAME 追踪结果
    │
-   ├─ 过滤目标类型记录
+   ├─ 过滤目标类型记录 → 无 → ErrNoRecordsFound
    │
-   ├─ 存入缓存（使用记录中最小的 TTL
+   ├─ 存入缓存（使用记录中最小的 TTL）
    │
    └─ 返回结果
 ```
+
+**CNAME 同区优化说明：**
+- 当 CNAME 目标域名与原域名共享相同后缀（属同一区域）时，直接向当前权威服务器查询
+- 避免从根服务器开始重新构建整条 NS 委派链，显著提升解析效率
+- 跨区 CNAME 仍需完整递归解析，确保正确性
+- 若当前响应已附带目标记录（如 A 记录），直接使用无需额外查询
 
 ### 4.3 并行查询流程 (queryParallel)
 
@@ -177,34 +223,43 @@ queryParallel(servers, domain, qtype)
    │
    ├─ len(servers) == 0 → 返回 ErrNoUpstreamServers
    │
-   ├─ 创建带超时的 context
+   ├─ 创建带超时的 context（ctx, cancel）
    │
    ├─ 为每个服务器启动 goroutine
    │     │
-   │     ├─ 构建 DNS 查询报文
+   │     ├─ 构建 DNS 查询报文（生成随机 TransactionID）
    │     ├─ 建立 UDP 连接
    │     ├─ 发送查询
-   │     ├─ 读取响应
-   │     ├─ 解析响应
+   │     ├─ [异步读取响应]
+   │     │     ├─ ctx 被取消 → 关闭连接，goroutine 退出
+   │     │     └─ 读取完成 → 校验 TransactionID，解析响应
    │     └─ 将结果发送到结果通道
    │
    ├─ 等待第一个有效响应（有 Answers 或 Authorities）
-   │     ├─ 收到有效响应 → 立即返回（不等待其他服务器
+   │     ├─ 收到有效响应 → 调用 cancel() 取消其他 goroutine
+   │     ├─ 立即返回结果（不等待其他服务器）
    │     └─ 后续到达的响应直接丢弃
    │
    └─ 所有服务器均失败
    │     ├─ 返回第一个错误或 ErrAllUpstreamsFailed
    │
    └─ 所有服务器返回但无有效数据
-       └─ 返回第一个有效响应（即使无 Answers）
+         └─ 返回第一个有效响应（即使无 Answers）
 ```
 
-**最快响应优先策略说明：
+**最快响应优先策略说明：**
 - 使用 `sync/atomic` 原子计数器跟踪未完成请求数
 - 结果通道使用缓冲通道缓冲所有服务器的结果
 - 第一个有效响应（包含 Answers 或 Authorities）立即返回
 - 后续响应被丢弃，不会被处理
 - 使用 `context.WithTimeout` 控制整体超时
+
+**Context 取消传播机制：**
+- `querySingle` 全程感知 context 取消
+- I/O 操作在独立 goroutine 中执行，主 goroutine select 监听 `ctx.Done()`
+- context 取消时立即关闭 UDP 连接，阻塞的 Read/Write 会返回错误
+- 确保高延迟网络下 goroutine 不会堆积，避免资源泄漏
+- 收到第一个有效响应后立即调用 cancel，终止所有未完成的查询
 
 ### 4.4 迭代解析流程 (resolveIterative)
 
@@ -293,11 +348,13 @@ cleanupLoop（后台协程）
 ### 5.1 DNS 查询报文构建 (buildQuery)
 
 ```
-buildQuery(domain, qtype)
+buildQuery(domain, qtype) → (queryBytes, transactionID, error)
    │
-   ├─ 生成随机 TransactionID
+   ├─ 验证域名合法性
    │
-   ├─ 构建 DNS 头部（12 字节
+   ├─ 生成随机 16 位 TransactionID
+   │
+   ├─ 构建 DNS 头部（12 字节）
    │     ├─ ID: TransactionID
    │     ├─ Flags: RD=1（期望递归）
    │     ├─ QDCOUNT: 1
@@ -308,13 +365,19 @@ buildQuery(domain, qtype)
    │     ├─ QTYPE: qtype
    │     └─ QCLASS: IN (1)
    │
-   └─ 返回完整查询报文
+   └─ 返回完整查询报文和事务 ID
 ```
+
+**事务 ID 说明：**
+- 使用 `crypto/rand` 生成随机 16 位 ID
+- 每个查询生成独立的随机 ID
+- 响应解析时需校验 ID 匹配
+- 防止 UDP 环境下接受无关响应
 
 ### 5.2 DNS 响应解析 (parseResponse)
 
 ```
-parseResponse(msg)
+parseResponse(msg, expectedID)
    │
    ├─ 检查报文长度 < 12 → ErrInvalidResponse
    │
@@ -322,17 +385,44 @@ parseResponse(msg)
    │     ├─ TransactionID
    │     ├─ Flags
    │     ├─ QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT
+   │     └─ 从 Flags 提取 RCODE（低 4 位）
+   │
+   ├─ 校验 TransactionID
+   │     └─ 与 expectedID 不匹配 → ErrTransactionIDMismatch
    │
    ├─ 跳过问题部分（QDCOUNT 个问题）
    │
-   ├─ 解析回答区（ANCOUNT 个 RR
+   ├─ 解析回答区（ANCOUNT 个 RR）
    │
-   ├─ 解析授权区（NSCOUNT 个 RR
+   ├─ 解析授权区（NSCOUNT 个 RR）
    │
-   ├─ 解析附加区（ARCOUNT 个 RR
+   ├─ 解析附加区（ARCOUNT 个 RR）
+   │
+   ├─ 校验 RCODE
+   │     ├─ RCODE != NOERROR → 返回对应 DNS 错误
+   │     ├─ RCODE=FORMERR → ErrFORMERR
+   │     ├─ RCODE=SERVFAIL → ErrSERVFAIL
+   │     ├─ RCODE=NXDOMAIN → ErrNXDOMAIN
+   │     ├─ RCODE=REFUSED → ErrREFUSED
+   │     └─ 其他 → &DNSError{RCODE: rcode, ...}
    │
    └─ 返回 DNSResponse
 ```
+
+**RCODE 响应码说明：**
+| RCODE | 名称 | 含义 |
+|-------|------|------|
+| 0 | NOERROR | 无错误 |
+| 1 | FORMERR | 格式错误 - 查询报文格式不正确 |
+| 2 | SERVFAIL | 服务器失败 - 服务器处理时发生内部错误 |
+| 3 | NXDOMAIN | 域名不存在 - 查询的域名不存在 |
+| 5 | REFUSED | 拒绝 - 服务器拒绝处理请求 |
+
+**事务 ID 校验说明：**
+- 每个 DNS 查询生成随机 16 位事务 ID
+- 响应解析时校验 ID 必须与查询匹配
+- 防止 UDP 环境下接受不属于本次查询的响应包
+- 增强 DNS 解析的安全性和正确性
 
 ### 5.3 域名解码 (decodeName)
 
@@ -457,12 +547,24 @@ ips, err := resolver.ResolveA("nonexistent.example.com")
 if err != nil {
     if errors.Is(err, dnsresolver.ErrNoRecordsFound) {
         fmt.Println("域名不存在或无 A 记录")
+    } else if errors.Is(err, dnsresolver.ErrNXDOMAIN) {
+        fmt.Println("DNS 服务器返回 NXDOMAIN - 域名不存在")
+    } else if errors.Is(err, dnsresolver.ErrSERVFAIL) {
+        fmt.Println("DNS 服务器返回 SERVFAIL - 服务器错误")
     } else if errors.Is(err, dnsresolver.ErrMaxDepthExceeded) {
         fmt.Println("递归深度超限")
     } else if errors.Is(err, dnsresolver.ErrAllUpstreamsFailed) {
         fmt.Println("所有上游服务器均失败")
+    } else if errors.Is(err, dnsresolver.ErrTransactionIDMismatch) {
+        fmt.Println("事务 ID 不匹配 - 可能存在响应伪造")
     } else {
         fmt.Printf("解析失败: %v\n", err)
+    }
+
+    // 提取详细 RCODE 信息
+    var dnsErr *dnsresolver.DNSError
+    if errors.As(err, &dnsErr) {
+        fmt.Printf("DNS 错误 RCODE: %d, 消息: %s\n", dnsErr.RCODE, dnsErr.Msg)
     }
 }
 ```
@@ -477,30 +579,69 @@ if err != nil {
 | 缓存测试 | 缓存命中、过期、清理、TTL 管理 |
 | 迭代解析 | 正常解析、CNAME 追踪、最大深度、无上游 |
 | 递归解析 | 根到叶子、NS 委派、胶水记录、CNAME 递归 |
-| 并行查询 | 最快响应、全部失败、无服务器、部分失败 |
+| 并行查询 | 最快响应、全部失败、无服务器、部分失败、迟来响应丢弃 |
 | 协议编解码 | 查询构建、响应解析、域名解码 |
 | 并发安全 | 并发访问、并发读写 |
 | 错误处理 | 各种错误场景 |
 | 边界条件 | 空域名、超长域名、无效响应 |
+| RCODE 处理 | NXDOMAIN、SERVFAIL、FORMERR、REFUSED 响应码解析与传递 |
+| 事务 ID | 事务 ID 匹配验证、不匹配错误处理 |
+| Context 传播 | 查询取消、超时传播、goroutine 泄漏防护 |
+| CNAME 优化 | 同区 CNAME 优化效率、跨区 CNAME 完整递归 |
 
 ### 8.2 关键测试说明
 
-**Mock DNS 服务器：
+**Mock DNS 服务器：**
 - 实现了 `mockDNSServer` 模拟 DNS 服务器
 - 支持自定义响应延迟用于测试并行查询的最快响应策略
 - 模拟各种响应内容
+- 自动回显事务 ID，确保 ID 匹配
 
 **Mock 连接：**
 - `mockConn` 实现 `net.Conn` 接口
 - 用于模拟网络错误场景（拨号失败、写入失败、读取失败）
+- 支持捕获查询 ID 并在响应中回显
+
+**RCODE 错误测试：**
+- 验证各 RCODE (NXDOMAIN/SERVFAIL/FORMERR/REFUSED) 正确解析
+- 验证 `errors.Is()` 可正确匹配预定义错误
+- 验证 `DNSError` 类型可通过 `errors.As()` 提取
+- 验证递归/迭代模式下 RCODE 错误正确传递
+
+**Context 取消测试：**
+- 验证 `querySingle` 正确响应 context 取消
+- 验证 `queryParallel` 收到第一个响应后取消其他 goroutine
+- 验证 context 取消时连接被关闭，goroutine 及时退出
+- 验证超时 deadline 正确传播
+
+**CNAME 优化测试：**
+- 验证同区 CNAME 追踪复用当前权威服务器（查询数更少）
+- 验证跨区 CNAME 追踪回退到完整递归解析
+- 验证 CNAME 链上的多级追踪正确性
 
 ## 9. 文件结构
 
 ```
 internal/dnsresolver/
 ├── dnsresolver.go      # DNS 解析器核心实现
-└── dnsresolver_test.go # 单元测试（54 个测试用例）
+└── dnsresolver_test.go # 单元测试（72 个测试用例）
 
 docs/
 └── dnsresolver.md      # 本文档
 ```
+
+### 9.1 核心文件说明
+
+**dnsresolver.go：**
+- 包含完整的 DNS 解析器实现
+- 核心类型：`Resolver`、`Config`、`DNSResponse`、`DNSRecord`、`DNSError`
+- 核心功能：递归解析、迭代解析、并行查询、缓存管理
+- 协议编解码：查询构建、响应解析、域名编解码
+- 错误类型：预定义错误变量与 `DNSError` 结构体
+
+**dnsresolver_test.go：**
+- 72 个单元测试用例，覆盖全部功能
+- Mock 组件：`mockConn`、`mockConnWithDeadline`、`mockDNSServer`
+- 测试分类：基础功能、缓存、迭代解析、递归解析、并行查询、
+  协议编解码、并发安全、错误处理、边界条件、RCODE 处理、
+  事务 ID、Context 传播、CNAME 优化

@@ -13,7 +13,7 @@ func TestNewRegistry(t *testing.T) {
 		t.Fatal("NewRegistry returned nil")
 	}
 	if !r.IsRunning() {
-		t.Error("registry should be running after creation")
+		t.Error("registry should be running (accepting operations) after creation")
 	}
 	if r.ServiceCount() != 0 {
 		t.Errorf("expected 0 services, got %d", r.ServiceCount())
@@ -903,6 +903,7 @@ func TestExpireInstancesWhenStopped(t *testing.T) {
 		CheckInterval: 10 * time.Millisecond,
 	}
 	r := NewRegistry(cfg)
+	r.Start()
 
 	inst := &ServiceInstance{ID: "inst-1", ServiceName: "svc", Address: "addr"}
 	r.Register(inst)
@@ -1554,4 +1555,314 @@ func TestConcurrentSubscribeUnsubscribe(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestConcurrentStartStop(t *testing.T) {
+	r := NewRegistry(DefaultRegistryConfig())
+
+	const n = 10
+	var wg sync.WaitGroup
+	wg.Add(n)
+
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			r.Start()
+		}()
+	}
+
+	wg.Wait()
+
+	r.Stop()
+}
+
+func TestStartStopNoPanic(t *testing.T) {
+	for round := 0; round < 3; round++ {
+		r := NewRegistry(DefaultRegistryConfig())
+		r.Start()
+		time.Sleep(10 * time.Millisecond)
+		r.Stop()
+		r.Start()
+		time.Sleep(10 * time.Millisecond)
+		r.Stop()
+	}
+}
+
+func TestStartStopWithExpiryLoop(t *testing.T) {
+	cfg := RegistryConfig{
+		HeartbeatTTL:  50 * time.Millisecond,
+		CheckInterval: 20 * time.Millisecond,
+	}
+	r := NewRegistry(cfg)
+	r.Start()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5; i++ {
+			r.Stop()
+			time.Sleep(10 * time.Millisecond)
+			r.Start()
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		inst := &ServiceInstance{ID: "inst-1", ServiceName: "svc", Address: "addr"}
+		for i := 0; i < 5; i++ {
+			r.Register(inst)
+			r.Deregister("svc", "inst-1")
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+
+	r.Stop()
+}
+
+func TestMultiServiceExpireNotificationConsistency(t *testing.T) {
+	cfg := RegistryConfig{
+		HeartbeatTTL:  100 * time.Millisecond,
+		CheckInterval: 50 * time.Millisecond,
+	}
+	r := NewRegistry(cfg)
+	r.Start()
+	defer r.Stop()
+
+	var events []ServiceChangeEvent
+	var mu sync.Mutex
+
+	for _, svcName := range []string{"svc-a", "svc-b", "svc-c"} {
+		svc := svcName
+		r.Subscribe(svc, func(event ServiceChangeEvent) {
+			mu.Lock()
+			events = append(events, event)
+			mu.Unlock()
+		})
+	}
+
+	instA1 := &ServiceInstance{ID: "inst-a1", ServiceName: "svc-a", Address: "addr-a1"}
+	instA2 := &ServiceInstance{ID: "inst-a2", ServiceName: "svc-a", Address: "addr-a2"}
+	instB1 := &ServiceInstance{ID: "inst-b1", ServiceName: "svc-b", Address: "addr-b1"}
+	instC1 := &ServiceInstance{ID: "inst-c1", ServiceName: "svc-c", Address: "addr-c1"}
+	instC2 := &ServiceInstance{ID: "inst-c2", ServiceName: "svc-c", Address: "addr-c2"}
+
+	r.Register(instA1)
+	r.Register(instA2)
+	r.Register(instB1)
+	r.Register(instC1)
+	r.Register(instC2)
+
+	mu.Lock()
+	events = nil
+	mu.Unlock()
+
+	stopBeat := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopBeat:
+				return
+			case <-ticker.C:
+				inst := &ServiceInstance{ID: "inst-c3", ServiceName: "svc-c", Address: "addr-c3"}
+				r.Register(inst)
+				r.Deregister("svc-c", "inst-c3")
+			}
+		}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	close(stopBeat)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, event := range events {
+		if event.Action != "expire" {
+			continue
+		}
+		for _, inst := range event.Instances {
+			if inst.ID == "inst-c3" {
+				t.Errorf("expire notification for %s contains inst-c3 which was never in the expired snapshot",
+					event.ServiceName)
+			}
+		}
+	}
+}
+
+func TestMultiServiceExpireNotificationAtomic(t *testing.T) {
+	cfg := RegistryConfig{
+		HeartbeatTTL:  80 * time.Millisecond,
+		CheckInterval: 20 * time.Millisecond,
+	}
+	r := NewRegistry(cfg)
+
+	r.Subscribe("svc-a", func(event ServiceChangeEvent) {})
+	r.Subscribe("svc-b", func(event ServiceChangeEvent) {})
+
+	instA := &ServiceInstance{ID: "inst-a1", ServiceName: "svc-a", Address: "addr-a1"}
+	instB := &ServiceInstance{ID: "inst-b1", ServiceName: "svc-b", Address: "addr-b1"}
+	r.Register(instA)
+	r.Register(instB)
+
+	stopCh := make(chan struct{})
+	var atomicViolation int32
+
+	go func() {
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+				inst := &ServiceInstance{ID: "inst-b-new", ServiceName: "svc-b", Address: "addr-b-new"}
+				err := r.Register(inst)
+				if err == nil {
+					r.Deregister("svc-b", "inst-b-new")
+				}
+				time.Sleep(time.Microsecond)
+			}
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	close(stopCh)
+
+	if atomic.LoadInt32(&atomicViolation) != 0 {
+		t.Errorf("detected %d atomic violations in multi-service expire notifications", atomicViolation)
+	}
+
+	r.Stop()
+}
+
+func TestExpireNotificationSnapshot(t *testing.T) {
+	cfg := RegistryConfig{
+		HeartbeatTTL:  100 * time.Millisecond,
+		CheckInterval: 50 * time.Millisecond,
+	}
+	r := NewRegistry(cfg)
+	r.Start()
+	defer r.Stop()
+
+	var lastEvent ServiceChangeEvent
+	var hasEvent bool
+	var eventMu sync.Mutex
+
+	r.Subscribe("svc-a", func(event ServiceChangeEvent) {
+		eventMu.Lock()
+		if event.Action == "expire" {
+			lastEvent = event
+			hasEvent = true
+		}
+		eventMu.Unlock()
+	})
+
+	instA1 := &ServiceInstance{ID: "inst-a1", ServiceName: "svc-a", Address: "addr-a1"}
+	instA2 := &ServiceInstance{ID: "inst-a2", ServiceName: "svc-a", Address: "addr-a2"}
+	r.Register(instA1)
+	r.Register(instA2)
+
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		instA3 := &ServiceInstance{ID: "inst-a3", ServiceName: "svc-a", Address: "addr-a3"}
+		r.Register(instA3)
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+
+	eventMu.Lock()
+	defer eventMu.Unlock()
+
+	if !hasEvent {
+		t.Fatal("expected at least one expire event")
+	}
+
+	for _, inst := range lastEvent.Instances {
+		if inst.ID == "inst-a3" {
+			t.Error("expire event contains inst-a3 which was registered after the expiry scan started")
+		}
+	}
+
+	ids := make(map[string]bool)
+	for _, inst := range lastEvent.Instances {
+		ids[inst.ID] = true
+	}
+
+	if ids["inst-a1"] || ids["inst-a2"] {
+		t.Error("expire event should not contain expired instances")
+	}
+}
+
+func TestStartStopRestart(t *testing.T) {
+	r := NewRegistry(DefaultRegistryConfig())
+
+	r.Start()
+	time.Sleep(10 * time.Millisecond)
+	if !r.IsRunning() {
+		t.Error("expected registry to be running after Start")
+	}
+
+	r.Stop()
+	if r.IsRunning() {
+		t.Error("expected registry to be stopped after Stop")
+	}
+
+	r.Start()
+	time.Sleep(10 * time.Millisecond)
+	if !r.IsRunning() {
+		t.Error("expected registry to be running after restart")
+	}
+
+	r.Stop()
+}
+
+func TestRegisterDuringExpireNotifications(t *testing.T) {
+	cfg := RegistryConfig{
+		HeartbeatTTL:  100 * time.Millisecond,
+		CheckInterval: 50 * time.Millisecond,
+	}
+	r := NewRegistry(cfg)
+	r.Start()
+	defer r.Stop()
+
+	r.Subscribe("svc-a", func(event ServiceChangeEvent) {
+		time.Sleep(10 * time.Millisecond)
+	})
+	r.Subscribe("svc-b", func(event ServiceChangeEvent) {
+		time.Sleep(10 * time.Millisecond)
+	})
+
+	for _, svcName := range []string{"svc-a", "svc-b"} {
+		for i := 0; i < 5; i++ {
+			inst := &ServiceInstance{
+				ID:          svcName + "-" + string(rune('0'+i)),
+				ServiceName: svcName,
+				Address:     "addr-" + svcName + "-" + string(rune('0'+i)),
+			}
+			r.Register(inst)
+		}
+	}
+
+	registerDone := make(chan struct{})
+	go func() {
+		defer close(registerDone)
+		for i := 0; i < 20; i++ {
+			inst := &ServiceInstance{
+				ID:          "new-" + string(rune('0'+i%10)),
+				ServiceName: "svc-c",
+				Address:     "new-addr",
+			}
+			r.Register(inst)
+			r.Deregister("svc-c", "new-"+string(rune('0'+i%10)))
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+
+	<-registerDone
 }

@@ -63,14 +63,15 @@ type subscriber struct {
 }
 
 type Registry struct {
-	mu          sync.RWMutex
-	instances   map[string]map[string]*ServiceInstance
-	subscribers map[string]map[string]*subscriber
-	cfg         RegistryConfig
-	running     bool
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
-	nextSubID   uint64
+	mu            sync.RWMutex
+	instances     map[string]map[string]*ServiceInstance
+	subscribers   map[string]map[string]*subscriber
+	cfg           RegistryConfig
+	running       bool
+	expiryRunning bool
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	nextSubID     uint64
 }
 
 func NewRegistry(cfg RegistryConfig) *Registry {
@@ -82,11 +83,12 @@ func NewRegistry(cfg RegistryConfig) *Registry {
 	}
 
 	return &Registry{
-		instances:   make(map[string]map[string]*ServiceInstance),
-		subscribers: make(map[string]map[string]*subscriber),
-		cfg:         cfg,
-		stopCh:      make(chan struct{}),
-		running:     true,
+		instances:     make(map[string]map[string]*ServiceInstance),
+		subscribers:   make(map[string]map[string]*subscriber),
+		cfg:           cfg,
+		stopCh:        make(chan struct{}),
+		running:       true,
+		expiryRunning: false,
 	}
 }
 
@@ -96,9 +98,8 @@ func (r *Registry) Register(inst *ServiceInstance) error {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if !r.running {
+		r.mu.Unlock()
 		return ErrRegistryStopped
 	}
 
@@ -109,6 +110,7 @@ func (r *Registry) Register(inst *ServiceInstance) error {
 	}
 
 	if _, exists := svc[inst.ID]; exists {
+		r.mu.Unlock()
 		return ErrInstanceExists
 	}
 
@@ -116,25 +118,30 @@ func (r *Registry) Register(inst *ServiceInstance) error {
 	inst.LastHeartbeat = now
 	svc[inst.ID] = inst
 
-	r.notifySubscribersLocked(inst.ServiceName, "register")
+	event := r.buildEventLocked(inst.ServiceName, "register")
+	handlers := r.collectHandlersLocked(inst.ServiceName)
+	r.mu.Unlock()
+
+	r.dispatchEvent(event, handlers)
 
 	return nil
 }
 
 func (r *Registry) Deregister(serviceName, instanceID string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if !r.running {
+		r.mu.Unlock()
 		return ErrRegistryStopped
 	}
 
 	svc, ok := r.instances[serviceName]
 	if !ok {
+		r.mu.Unlock()
 		return ErrServiceNotFound
 	}
 
 	if _, exists := svc[instanceID]; !exists {
+		r.mu.Unlock()
 		return ErrInstanceNotFound
 	}
 
@@ -144,7 +151,11 @@ func (r *Registry) Deregister(serviceName, instanceID string) error {
 		delete(r.instances, serviceName)
 	}
 
-	r.notifySubscribersLocked(serviceName, "deregister")
+	event := r.buildEventLocked(serviceName, "deregister")
+	handlers := r.collectHandlersLocked(serviceName)
+	r.mu.Unlock()
+
+	r.dispatchEvent(event, handlers)
 
 	return nil
 }
@@ -269,35 +280,39 @@ func (r *Registry) Unsubscribe(serviceName, subscriberID string) error {
 	return nil
 }
 
-func (r *Registry) notifySubscribersLocked(serviceName string, action string) {
-	subs, ok := r.subscribers[serviceName]
-	if !ok || len(subs) == 0 {
-		return
-	}
-
+func (r *Registry) buildEventLocked(serviceName string, action string) *ServiceChangeEvent {
 	svc := r.instances[serviceName]
 	instances := make([]*ServiceInstance, 0, len(svc))
 	for _, inst := range svc {
 		instCopy := *inst
 		instances = append(instances, &instCopy)
 	}
-
-	event := ServiceChangeEvent{
+	return &ServiceChangeEvent{
 		ServiceName: serviceName,
 		Instances:   instances,
 		Action:      action,
 	}
+}
 
+func (r *Registry) collectHandlersLocked(serviceName string) []SubscriberFunc {
+	subs, ok := r.subscribers[serviceName]
+	if !ok || len(subs) == 0 {
+		return nil
+	}
 	handlers := make([]SubscriberFunc, 0, len(subs))
 	for _, sub := range subs {
 		handlers = append(handlers, sub.Handler)
 	}
+	return handlers
+}
 
-	r.mu.Unlock()
-	for _, h := range handlers {
-		h(event)
+func (r *Registry) dispatchEvent(event *ServiceChangeEvent, handlers []SubscriberFunc) {
+	if event == nil || len(handlers) == 0 {
+		return
 	}
-	r.mu.Lock()
+	for _, h := range handlers {
+		h(*event)
+	}
 }
 
 func (r *Registry) generateSubID() string {
@@ -322,22 +337,28 @@ func uint64ToStr(n uint64) string {
 
 func (r *Registry) Start() {
 	r.mu.Lock()
-	if r.running {
+	if !r.running {
+		r.running = true
+		r.stopCh = make(chan struct{})
+	}
+	if r.expiryRunning {
 		r.mu.Unlock()
-		r.wg.Add(1)
-		go r.expiryLoop()
 		return
 	}
-	r.running = true
-	r.stopCh = make(chan struct{})
+	r.expiryRunning = true
+	r.wg.Add(1)
 	r.mu.Unlock()
 
-	r.wg.Add(1)
 	go r.expiryLoop()
 }
 
 func (r *Registry) expiryLoop() {
-	defer r.wg.Done()
+	defer func() {
+		r.wg.Done()
+		r.mu.Lock()
+		r.expiryRunning = false
+		r.mu.Unlock()
+	}()
 
 	ticker := time.NewTicker(r.cfg.CheckInterval)
 	defer ticker.Stop()
@@ -354,9 +375,8 @@ func (r *Registry) expiryLoop() {
 
 func (r *Registry) expireInstances() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if !r.running {
+		r.mu.Unlock()
 		return
 	}
 
@@ -375,8 +395,27 @@ func (r *Registry) expireInstances() {
 		}
 	}
 
+	type notification struct {
+		event    *ServiceChangeEvent
+		handlers []SubscriberFunc
+	}
+	var notifications []notification
+
 	for serviceName := range changed {
-		r.notifySubscribersLocked(serviceName, "expire")
+		event := r.buildEventLocked(serviceName, "expire")
+		handlers := r.collectHandlersLocked(serviceName)
+		if event != nil && len(handlers) > 0 {
+			notifications = append(notifications, notification{
+				event:    event,
+				handlers: handlers,
+			})
+		}
+	}
+
+	r.mu.Unlock()
+
+	for _, n := range notifications {
+		r.dispatchEvent(n.event, n.handlers)
 	}
 }
 

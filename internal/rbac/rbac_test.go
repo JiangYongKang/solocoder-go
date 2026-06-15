@@ -3,6 +3,7 @@ package rbac
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -584,12 +585,9 @@ func TestRevokeRole(t *testing.T) {
 		t.Errorf("expected 0 users after revoke, got %d", rbac.UserCount())
 	}
 
-	roles, err := rbac.GetUserRoles("user1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(roles) != 0 {
-		t.Errorf("expected 0 roles after revoke, got %d", len(roles))
+	_, err = rbac.GetUserRoles("user1")
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound after revoking all roles, got %v", err)
 	}
 }
 
@@ -625,15 +623,12 @@ func TestGetUserRoles(t *testing.T) {
 	}
 }
 
-func TestGetUserRolesNoRoles(t *testing.T) {
+func TestGetUserRolesUserNotFound(t *testing.T) {
 	rbac := NewRBAC()
 
-	roles, err := rbac.GetUserRoles("user1")
-	if err != nil {
-		t.Fatalf("GetUserRoles failed: %v", err)
-	}
-	if len(roles) != 0 {
-		t.Errorf("expected 0 roles, got %d", len(roles))
+	_, err := rbac.GetUserRoles("user1")
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound, got %v", err)
 	}
 }
 
@@ -664,15 +659,12 @@ func TestGetUserPermissions(t *testing.T) {
 	}
 }
 
-func TestGetUserPermissionsNoRoles(t *testing.T) {
+func TestGetUserPermissionsUserNotFound(t *testing.T) {
 	rbac := NewRBAC()
 
-	perms, err := rbac.GetUserPermissions("user1")
-	if err != nil {
-		t.Fatalf("GetUserPermissions failed: %v", err)
-	}
-	if len(perms) != 0 {
-		t.Errorf("expected 0 permissions, got %d", len(perms))
+	_, err := rbac.GetUserPermissions("user1")
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound, got %v", err)
 	}
 }
 
@@ -722,17 +714,17 @@ func TestCheckPermissionAllowed(t *testing.T) {
 	}
 }
 
-func TestCheckPermissionDeniedNoRoles(t *testing.T) {
+func TestCheckPermissionDeniedUserNotFound(t *testing.T) {
 	rbac := NewRBAC()
 
 	rbac.RegisterPermission("article", "read")
 
 	decision := rbac.CheckPermission("user1", "article", "read")
 	if decision.Allowed {
-		t.Error("expected permission to be denied for user with no roles")
+		t.Error("expected permission to be denied for non-existent user")
 	}
-	if decision.Reason == "" {
-		t.Error("expected denial reason should not be empty")
+	if decision.Reason != ErrUserNotFound.Error() {
+		t.Errorf("expected reason to be %q, got %q", ErrUserNotFound.Error(), decision.Reason)
 	}
 }
 
@@ -1372,5 +1364,115 @@ func TestGetUserPermissionsSorted(t *testing.T) {
 	}
 	if perms[2].Resource != "zebra" || perms[2].Action != "z" {
 		t.Errorf("expected third zebra:z")
+	}
+}
+
+func TestGetUserWithRolesUserNotFound(t *testing.T) {
+	rbac := NewRBAC()
+
+	_, err := rbac.GetUserWithRoles("nonexistent")
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("expected ErrUserNotFound, got %v", err)
+	}
+}
+
+func TestCheckPermissionDeniedReasonFormatNoDuplicate(t *testing.T) {
+	rbac := NewRBAC()
+
+	rbac.CreateRole("viewer", "访客", "desc")
+	rbac.RegisterPermission("article", "read")
+	rbac.RegisterPermission("article", "delete")
+	rbac.GrantPermission("viewer", "article", "read")
+	rbac.AssignRole("user1", "viewer")
+
+	decision := rbac.CheckPermission("user1", "article", "delete")
+	if decision.Allowed {
+		t.Fatal("expected permission to be denied")
+	}
+
+	expected := "user user1 does not have permission article:delete"
+	if decision.Reason != expected {
+		t.Errorf("expected reason %q, got %q", expected, decision.Reason)
+	}
+
+	permStr := "article:delete"
+	count := strings.Count(decision.Reason, permStr)
+	if count != 1 {
+		t.Errorf("expected permission string to appear exactly once, appeared %d times in: %s", count, decision.Reason)
+	}
+}
+
+func TestCheckPermissionDeniedNotRegisteredReasonFormat(t *testing.T) {
+	rbac := NewRBAC()
+
+	rbac.CreateRole("admin", "管理员", "desc")
+	rbac.AssignRole("user1", "admin")
+
+	decision := rbac.CheckPermission("user1", "unknown", "action")
+	if decision.Allowed {
+		t.Fatal("expected permission to be denied for unregistered permission")
+	}
+
+	expected := "permission unknown:action is not registered"
+	if decision.Reason != expected {
+		t.Errorf("expected reason %q, got %q", expected, decision.Reason)
+	}
+}
+
+func TestCheckPermissionUserNotFoundVsNoPermission(t *testing.T) {
+	rbac := NewRBAC()
+
+	rbac.CreateRole("viewer", "访客", "desc")
+	rbac.RegisterPermission("article", "read")
+	rbac.RegisterPermission("article", "write")
+	rbac.GrantPermission("viewer", "article", "read")
+	rbac.AssignRole("existing_user", "viewer")
+
+	decision1 := rbac.CheckPermission("nonexistent_user", "article", "read")
+	if decision1.Allowed {
+		t.Error("expected nonexistent user to be denied")
+	}
+	if decision1.Reason != ErrUserNotFound.Error() {
+		t.Errorf("expected ErrUserNotFound reason for nonexistent user, got %q", decision1.Reason)
+	}
+
+	decision2 := rbac.CheckPermission("existing_user", "article", "write")
+	if decision2.Allowed {
+		t.Error("expected existing user without permission to be denied")
+	}
+	if decision2.Reason == ErrUserNotFound.Error() {
+		t.Error("should not return user not found for existing user without permission")
+	}
+	expectedReason := "user existing_user does not have permission article:write"
+	if decision2.Reason != expectedReason {
+		t.Errorf("expected reason %q, got %q", expectedReason, decision2.Reason)
+	}
+}
+
+func TestErrUserNotFoundIsUsed(t *testing.T) {
+	rbac := NewRBAC()
+
+	_, err := rbac.GetUserRoles("u1")
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("GetUserRoles: expected ErrUserNotFound, got %v", err)
+	}
+
+	_, err = rbac.GetUserPermissions("u1")
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("GetUserPermissions: expected ErrUserNotFound, got %v", err)
+	}
+
+	_, err = rbac.GetUserWithRoles("u1")
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("GetUserWithRoles: expected ErrUserNotFound, got %v", err)
+	}
+
+	rbac.RegisterPermission("res", "act")
+	decision := rbac.CheckPermission("u1", "res", "act")
+	if decision.Allowed {
+		t.Error("CheckPermission: expected denied for nonexistent user")
+	}
+	if decision.Reason != ErrUserNotFound.Error() {
+		t.Errorf("CheckPermission: expected reason %q, got %q", ErrUserNotFound.Error(), decision.Reason)
 	}
 }

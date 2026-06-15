@@ -1,0 +1,7 @@
+你实现的 OAuth2 授权服务模块存在一些安全缺陷和配置失效问题，需要修复：
+1. handleAuthorizationCode 方法在令牌端点仅校验了请求 Scope 是否在客户端允许范围内，遗漏了校验请求 Scope 是否为授权码原始 Scope 子集的关键步骤。当用户仅授权 read 而令牌请求传入 write 时，write 权限也能成功获取，超出了用户实际授权范围，存在权限升级漏洞。同一文件内 handleRefreshToken 已正确实现了子集校验，两处逻辑不一致。
+2. Config 结构体中定义了 RefreshTokenRotation 字段并默认设为 true，但 handleRefreshToken 方法完全未读取该配置，始终无条件执行滚动刷新。无论配置如何设置，刷新令牌使用后旧令牌始终被吊销并签发新令牌，无法满足禁用滚动刷新的需求。
+3. ParseJWT 函数解析 JWT 时仅将 header 作为签名输入参与验签，但未解码 header 显式校验声明的算法 alg 是否与预期的 HS256 一致，缺少此校验削弱了纵深防御。
+4. 修复以上问题后，需要为该模块补充 Scope 子集校验、RefreshTokenRotation 配置生效验证、JWT 算法校验的单元测试。
+5. 运行 go test ./internal/oauth2svc/ -v，需要让所有测试通过。
+6. 在 docs/oauth2svc.md 中更新模块需求文档。

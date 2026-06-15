@@ -1,0 +1,9 @@
+产物不满意：
+1. idempotent.go 的 Middleware 方法在 Execute 返回非 ErrIdempotentStopped 的错误时通过 next.ServeHTTP(w, r) 将请求降级为直接转发下游处理器，但此时下游客器已通过 responseRecorder 执行过一次，如果该处理器存在副作用（如写入数据库或调用外部 API），就会导致同一请求被重复处理两次。虽然当前代码路径下 Execute 不会返回其他错误，但这个降级模式的设计放大了潜在风险。正确做法是记录一条警告日志后直接返回 500，避免二次执行。
+
+2. idempotent_test.go 的 TestConcurrent_ExecuteAndClean、TestExecute_StopDuringHandler_WaitingRequestsReturnError 等测试用例在多个子协程中通过 t.Errorf 报告测试失败，虽然 Go 1.20 后 testing 包支持跨协程调用 Errorf，但这使得测试失败信息无法被 subtests 精确关联，在 -race 无法运行的 windows/386 平台上进一步削弱了并发安全性验证的可靠性。正确做法是使用 channel 收集子协程中的错误后统一在主协程中调用 t.Error。
+
+过程不满意：
+1. 模型在 tasks/task035/session-cot-2.md 中完整记录了关于 httplb 模块（internal/httplb/）一致性哈希故障转移和 RemoveServer 安全移除的思考过程，但 task035 的分工模块是 idempotent（internal/idempotent/），两个模块的修复需求完全不同。session-cot-2.md 中没有任何一行涉及幂等键响应头缓存、Stop 状态下等待请求的错误通知这些本应修复的内容。这属于严重的目标理解偏差，模型在生成思考轨迹时可能混淆了当前上下文，或者将之前任务的输出错误地写入了当前会话的任务目录中。正确做法是在每轮编码开始前确认当前任务的模块路径和提示词需求，确保思考过程和代码修改范围与当前任务完全对应。
+
+2. 模型的思考轨迹中先用 todo_write 创建了 7 项修复计划，然后才开始查看 httplb 目录下的文件。虽然最终完成了对 httplb 的五项修复，但从任务目录 task035 来看这全部属于另一个模块的工作，说明模型在制定任务拆解方案时没有首先确认当前模块的命名空间和文件位置。正确做法是在接收提示词后先通过读取 go.mod 和目录结构确定当前 module 的包路径，验证 internal/idempotent/ 是否存在，再制定针对 idempotent 模块的修复计划。

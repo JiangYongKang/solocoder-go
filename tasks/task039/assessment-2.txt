@@ -1,0 +1,7 @@
+产物不满意：
+1. TestConnPool_ConcurrentRemoveAndPut 测试函数中 for 循环变量 i 被 goroutine 闭包直接引用，所有 goroutine 共享同一个外层 i。Go 的闭包捕获的是变量引用而非副本，goroutine 执行到 if i%3==0 时循环早已结束，i 的值固定为 numOps（100），100%3=1 永远不等于 0，导致 pool.Remove 分支在整个测试执行期间从未被触发。该测试的函数名声称验证并发 Remove 和 Put 的混合场景，但实际上只跑了 Put 路径，Remove 被视为覆盖。
+2. ConnPool.Get 方法中超时等待机制存在缺陷，当多个 goroutine 同时等待且 WaitTimeout>0 时，deadline goroutine 只广播一次就退出。如果广播时恰好只有一个连接可用，拿到锁的第一个 waiter 取走连接后，其他被唤醒的 waiter 检查发现没有任何空闲连接且连接池已满，会重新进入 cond.Wait 永久阻塞。正确做法是每次进入内层 for 循环时重新计算剩余超时并配合 time.After 做有超时的 cond.Wait，而非依赖一次性后台 goroutine 广播。
+3. ConnPool.Get 方法在扫描空闲连接过期时，对 expired 切片中的过期连接直接在持锁期间调用 pc.conn.Close()。TCP 连接的 Close 操作理论上可能阻塞（如等待对端确认），在持锁期间执行网络 IO 会阻塞整个连接池的 Get/Put/Remove 操作，降低了高并发下的吞吐能力。应将关闭操作移到解锁之后执行，与 reclaimIdle 的做法保持一致。
+过程不满意：
+1. 模型缺失 tcpproxy 模块第二轮的完整思考轨迹记录。tasks/task039/session-cot-2.md 文件中记录的是 RBAC 模块的修复过程而非 tcpproxy 模块，说明模型在保存会话轨迹时写错了文件路径，或是在执行任务时没有正确区分当前任务编号。这导致审查者无法追踪模型在 tcpproxy 缺陷修复中的决策链条和推理过程，降低了标注工作的可追溯性。
+2. 模型新增的 TestConnPool_ConcurrentRemoveAndPut 测试出现了循环变量捕获的经典错误，说明模型在编写 goroutine 闭包时没有执行基本的代码审查。Go 的 for-range 和 for i 循环中 goroutine 闭包捕获循环变量是高频踩坑点，模型在 2025 年后的大型语言模型中应当自动识别并规避此类模式。正确写法是用局部变量 `val := i` 在闭包外复制一份再使用。

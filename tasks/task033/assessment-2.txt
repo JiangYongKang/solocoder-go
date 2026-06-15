@@ -1,0 +1,11 @@
+测试结果：go test ./internal/grpcsvc/ -v 共运行 77 个测试用例，全部通过，耗时 0.377 秒。
+
+产物不满意：
+1. serverStream 的 RecvMsg 方法在 grpcsvc.go 第 795 行从 recvCh 读取消息时使用了空白标识符接收，传入的 msg 参数未被填充任何数据。任何通过 Stream 接口调用 RecvMsg 的代码都无法获取到实际的流数据内容。正确的做法应将 recvCh 读出的值赋值给 msg 参数指向的变量，或者至少让 RecvMsg 和 Recv 的语义一致，确保调用方能收到数据而非仅收到一个 nil 返回。
+2. NewStream 方法在 grpcsvc.go 第 551 到 555 行应用 ConnectionTimeout 时调用 context.WithTimeout 创建了带取消函数的派生 context，但返回的 cancel 函数被赋值给了空白标识符 _ = cancel，从未被调用执行。如果流在上层设置的超时到达之前就关闭了，该 context 内部的清理 goroutine 将一直驻留到自然超时过期才会释放。正确的做法应将 cancel 保存并在 stream.Close 中调用，或至少 defer cancel。
+3. serverStream 的 Send 方法在 grpcsvc.go 第 834 行实际从 sendCh 读取消息，语义是"接收服务端发来的消息"，但方法名 Send 给人的直觉是"向服务端发送消息"。SendMsg 向 sendCh 写入数据而 Send 从 sendCh 读取，两个命名方向相反的 API 在同一个 Stream 接口中共存，调用方在双向流场景下极易误用。应将两个方向的方法通过命名明确区分，例如将 Send 更名为 Receive 以避免混淆。
+4. Invoke 方法内部的 handler 包装函数在 grpcsvc.go 第 462 行启动了一个外层 goroutine，该 goroutine 内部又在第 475 行启动了第二个内层 goroutine 来执行实际 handler。这个双层 goroutine 嵌套设计在 Invoke 中存在且在 HandleStream 第 623 和第 636 行同样重复出现。每调用一次 RPC 就启动两个 goroutine，在大量并发请求场景下不必要地增加了调度压力和内存开销，完全可以用单层 goroutine 加 select 多路复用完成超时轮询和 handler 执行。
+
+过程不满意：
+1. 模型在刚收到任务后没有先完整阅读现有代码的上下文就立即创建了 9 项子任务的 TodoList，然后才开始读取 grpcsvc.go 源码。正确的做法是先用 Grep 或 Read 定位所有受影响的代码区域，理解每个缺陷对应的函数实现后再制定修复计划。直接写 TodoList 导致计划的粒度与实际代码结构不匹配，后续表现为全量重写而非逐项最小修复。
+2. 模型选择了一次性全量重写 grpcsvc.go 和 grpcsvc_test.go 两个文件共计超过 1700 行，覆盖率远超提示词要求的 9 个修复点。这种大范围重写引入了新的代码问题，例如 RecvMsg 不处理 msg 参数、cancel 函数泄漏、双层 goroutine 嵌套等，这些缺陷原本在第一轮代码中并不存在。正确的做法是对每个提示词条目做定向的最小修改，保持原有模块的整体架构和接口设计风格不被破坏。

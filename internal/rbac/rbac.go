@@ -436,7 +436,7 @@ func (r *RBAC) GetUserRoles(userID string) ([]Role, error) {
 
 	roleIDs, exists := r.userRoles[userID]
 	if !exists {
-		return []Role{}, nil
+		return nil, ErrUserNotFound
 	}
 
 	roles := make([]Role, 0, len(roleIDs))
@@ -463,7 +463,7 @@ func (r *RBAC) GetUserPermissions(userID string) ([]Permission, error) {
 
 	roleIDs, exists := r.userRoles[userID]
 	if !exists {
-		return []Permission{}, nil
+		return nil, ErrUserNotFound
 	}
 
 	permSet := make(map[Permission]bool)
@@ -536,7 +536,13 @@ func (r *RBAC) CheckPermission(userID, resource, action string) Decision {
 	}
 
 	roleIDs, exists := r.userRoles[userID]
-	if !exists || len(roleIDs) == 0 {
+	if !exists {
+		return Decision{
+			Allowed: false,
+			Reason:  ErrUserNotFound.Error(),
+		}
+	}
+	if len(roleIDs) == 0 {
 		return Decision{
 			Allowed: false,
 			Reason:  fmt.Sprintf("user %s has no roles assigned", userID),
@@ -553,10 +559,7 @@ func (r *RBAC) CheckPermission(userID, resource, action string) Decision {
 
 	return Decision{
 		Allowed: false,
-		Reason: fmt.Sprintf(
-			"user %s does not have permission %s (required %s:%s)",
-			userID, requested.String(), resource, action,
-		),
+		Reason:  fmt.Sprintf("user %s does not have permission %s", userID, requested.String()),
 	}
 }
 

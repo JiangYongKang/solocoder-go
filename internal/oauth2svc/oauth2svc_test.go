@@ -1,6 +1,7 @@
 package oauth2svc
 
 import (
+	"encoding/json"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1528,5 +1529,728 @@ func TestGenerateRandomString(t *testing.T) {
 	s3 := generateRandomString(32)
 	if len(s3) != 64 {
 		t.Errorf("expected length 64, got %d", len(s3))
+	}
+}
+
+func TestToken_AuthorizationCode_ScopeSubsetValidation(t *testing.T) {
+	srv := setupTestServer()
+
+	authReq := &AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read",
+		UserID:       "user123",
+	}
+	code, err := srv.Authorize(authReq)
+	if err != nil {
+		t.Fatalf("Authorize failed: %v", err)
+	}
+
+	tokenReq := &TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         code,
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read write",
+	}
+
+	_, err = srv.Token(tokenReq)
+	if err != ErrInvalidScope {
+		t.Errorf("expected ErrInvalidScope for requesting scope larger than authorized, got %v", err)
+	}
+}
+
+func TestToken_AuthorizationCode_ScopeSubset_Equal(t *testing.T) {
+	srv := setupTestServer()
+
+	authReq := &AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read write",
+		UserID:       "user123",
+	}
+	code, err := srv.Authorize(authReq)
+	if err != nil {
+		t.Fatalf("Authorize failed: %v", err)
+	}
+
+	tokenReq := &TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         code,
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read write",
+	}
+
+	resp, err := srv.Token(tokenReq)
+	if err != nil {
+		t.Fatalf("Token failed: %v", err)
+	}
+	if resp.Scope != "read write" {
+		t.Errorf("expected scope 'read write', got %q", resp.Scope)
+	}
+}
+
+func TestToken_AuthorizationCode_ScopeSubset_Narrow(t *testing.T) {
+	srv := setupTestServer()
+
+	authReq := &AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read write profile",
+		UserID:       "user123",
+	}
+	code, err := srv.Authorize(authReq)
+	if err != nil {
+		t.Fatalf("Authorize failed: %v", err)
+	}
+
+	tokenReq := &TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         code,
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read",
+	}
+
+	resp, err := srv.Token(tokenReq)
+	if err != nil {
+		t.Fatalf("Token failed: %v", err)
+	}
+	if resp.Scope != "read" {
+		t.Errorf("expected narrowed scope 'read', got %q", resp.Scope)
+	}
+}
+
+func TestToken_AuthorizationCode_ScopeSubset_NoScopeInTokenRequest(t *testing.T) {
+	srv := setupTestServer()
+
+	authReq := &AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read write",
+		UserID:       "user123",
+	}
+	code, err := srv.Authorize(authReq)
+	if err != nil {
+		t.Fatalf("Authorize failed: %v", err)
+	}
+
+	tokenReq := &TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         code,
+		RedirectURI:  "http://localhost/callback",
+	}
+
+	resp, err := srv.Token(tokenReq)
+	if err != nil {
+		t.Fatalf("Token failed: %v", err)
+	}
+	if resp.Scope != "read write" {
+		t.Errorf("expected original scope 'read write' when no scope in token request, got %q", resp.Scope)
+	}
+}
+
+func TestToken_AuthorizationCode_ScopeSubset_CompletelyUnauthorized(t *testing.T) {
+	srv := setupTestServer()
+
+	authReq := &AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read",
+		UserID:       "user123",
+	}
+	code, err := srv.Authorize(authReq)
+	if err != nil {
+		t.Fatalf("Authorize failed: %v", err)
+	}
+
+	tokenReq := &TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         code,
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "admin:read",
+	}
+
+	_, err = srv.Token(tokenReq)
+	if err != ErrInvalidScope {
+		t.Errorf("expected ErrInvalidScope for completely unauthorized scope, got %v", err)
+	}
+}
+
+func TestToken_RefreshToken_RotationEnabled(t *testing.T) {
+	config := DefaultConfig()
+	config.SigningKey = []byte("test-signing-key")
+	config.RefreshTokenRotation = true
+
+	clientStore := NewMemoryClientStore()
+	codeStore := NewMemoryAuthorizationCodeStore()
+	refreshTokenStore := NewMemoryRefreshTokenStore()
+
+	clientStore.SaveClient(&Client{
+		ID:           "test-client",
+		Secret:       "test-secret",
+		RedirectURIs: []string{"http://localhost/callback"},
+		Scopes:       []string{"read"},
+	})
+
+	srv := NewAuthorizationServer(config, clientStore, codeStore, refreshTokenStore)
+
+	authCode, _ := srv.Authorize(&AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read",
+		UserID:       "user123",
+	})
+
+	tokenResp, _ := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         authCode,
+		RedirectURI:  "http://localhost/callback",
+	})
+
+	oldRefreshToken := tokenResp.RefreshToken
+
+	refreshResp, err := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeRefreshToken,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		RefreshToken: oldRefreshToken,
+	})
+
+	if err != nil {
+		t.Fatalf("Refresh token failed: %v", err)
+	}
+
+	if refreshResp.RefreshToken == "" {
+		t.Error("expected new refresh token when rotation is enabled")
+	}
+	if refreshResp.RefreshToken == oldRefreshToken {
+		t.Error("expected new refresh token to be different from old one")
+	}
+
+	_, err = srv.refreshTokenStore.GetToken(oldRefreshToken)
+	if err == nil {
+		t.Error("old refresh token should be revoked when rotation is enabled")
+	}
+
+	_, err = srv.refreshTokenStore.GetToken(refreshResp.RefreshToken)
+	if err != nil {
+		t.Errorf("new refresh token should be valid: %v", err)
+	}
+}
+
+func TestToken_RefreshToken_RotationDisabled(t *testing.T) {
+	config := DefaultConfig()
+	config.SigningKey = []byte("test-signing-key")
+	config.RefreshTokenRotation = false
+
+	clientStore := NewMemoryClientStore()
+	codeStore := NewMemoryAuthorizationCodeStore()
+	refreshTokenStore := NewMemoryRefreshTokenStore()
+
+	clientStore.SaveClient(&Client{
+		ID:           "test-client",
+		Secret:       "test-secret",
+		RedirectURIs: []string{"http://localhost/callback"},
+		Scopes:       []string{"read"},
+	})
+
+	srv := NewAuthorizationServer(config, clientStore, codeStore, refreshTokenStore)
+
+	authCode, _ := srv.Authorize(&AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read",
+		UserID:       "user123",
+	})
+
+	tokenResp, _ := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         authCode,
+		RedirectURI:  "http://localhost/callback",
+	})
+
+	oldRefreshToken := tokenResp.RefreshToken
+
+	refreshResp, err := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeRefreshToken,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		RefreshToken: oldRefreshToken,
+	})
+
+	if err != nil {
+		t.Fatalf("Refresh token failed: %v", err)
+	}
+
+	if refreshResp.RefreshToken != "" {
+		t.Error("expected NO refresh token when rotation is disabled")
+	}
+
+	rt, err := srv.refreshTokenStore.GetToken(oldRefreshToken)
+	if err != nil {
+		t.Errorf("old refresh token should still be valid when rotation is disabled: %v", err)
+	}
+	if rt.Revoked {
+		t.Error("old refresh token should NOT be revoked when rotation is disabled")
+	}
+}
+
+func TestToken_RefreshToken_RotationDisabled_ReuseRefreshToken(t *testing.T) {
+	config := DefaultConfig()
+	config.SigningKey = []byte("test-signing-key")
+	config.RefreshTokenRotation = false
+
+	clientStore := NewMemoryClientStore()
+	codeStore := NewMemoryAuthorizationCodeStore()
+	refreshTokenStore := NewMemoryRefreshTokenStore()
+
+	clientStore.SaveClient(&Client{
+		ID:           "test-client",
+		Secret:       "test-secret",
+		RedirectURIs: []string{"http://localhost/callback"},
+		Scopes:       []string{"read"},
+	})
+
+	srv := NewAuthorizationServer(config, clientStore, codeStore, refreshTokenStore)
+
+	authCode, _ := srv.Authorize(&AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read",
+		UserID:       "user123",
+	})
+
+	tokenResp, _ := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         authCode,
+		RedirectURI:  "http://localhost/callback",
+	})
+
+	refreshToken := tokenResp.RefreshToken
+
+	resp1, err := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeRefreshToken,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		RefreshToken: refreshToken,
+	})
+	if err != nil {
+		t.Fatalf("First refresh failed: %v", err)
+	}
+
+	resp2, err := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeRefreshToken,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		RefreshToken: refreshToken,
+	})
+	if err != nil {
+		t.Fatalf("Second refresh failed: %v", err)
+	}
+
+	if resp1.AccessToken == resp2.AccessToken {
+		t.Error("expected different access tokens for each refresh")
+	}
+}
+
+func TestParseJWT_AlgorithmValidation(t *testing.T) {
+	key := []byte("test-key")
+
+	claims := &AccessTokenClaims{
+		Issuer:    "test",
+		Subject:   "user1",
+		Audience:  "client1",
+		ExpiresAt: time.Now().Add(time.Hour),
+		IssuedAt:  time.Now(),
+		ClientID:  "client1",
+		Scope:     "read",
+		TokenID:   "token123",
+	}
+
+	validToken, err := GenerateJWT(claims, key)
+	if err != nil {
+		t.Fatalf("GenerateJWT failed: %v", err)
+	}
+
+	_, err = ParseJWT(validToken, key)
+	if err != nil {
+		t.Errorf("valid HS256 token should be accepted, got error: %v", err)
+	}
+}
+
+func TestParseJWT_AlgorithmValidation_NoneAlgorithm(t *testing.T) {
+	key := []byte("test-key")
+
+	noneHeader := jwtHeader{
+		Alg: "none",
+		Typ: "JWT",
+	}
+
+	headerJSON, _ := json.Marshal(noneHeader)
+	encodedHeader := base64URLEncode(headerJSON)
+
+	claims := &AccessTokenClaims{
+		Issuer:    "test",
+		Subject:   "user1",
+		ExpiresAt: time.Now().Add(time.Hour),
+		IssuedAt:  time.Now(),
+	}
+	claimsJSON, _ := json.Marshal(claims)
+	encodedClaims := base64URLEncode(claimsJSON)
+
+	signingInput := encodedHeader + "." + encodedClaims
+	signature := base64URLEncode([]byte(""))
+
+	noneToken := signingInput + "." + signature
+
+	_, err := ParseJWT(noneToken, key)
+	if err != ErrInvalidToken {
+		t.Errorf("token with alg=none should be rejected, got error: %v", err)
+	}
+}
+
+func TestParseJWT_AlgorithmValidation_RS256Algorithm(t *testing.T) {
+	key := []byte("test-key")
+
+	rs256Header := jwtHeader{
+		Alg: "RS256",
+		Typ: "JWT",
+	}
+
+	headerJSON, _ := json.Marshal(rs256Header)
+	encodedHeader := base64URLEncode(headerJSON)
+
+	claims := &AccessTokenClaims{
+		Issuer:    "test",
+		Subject:   "user1",
+		ExpiresAt: time.Now().Add(time.Hour),
+		IssuedAt:  time.Now(),
+	}
+	claimsJSON, _ := json.Marshal(claims)
+	encodedClaims := base64URLEncode(claimsJSON)
+
+	signingInput := encodedHeader + "." + encodedClaims
+	signature := base64URLEncode(signHS256([]byte(signingInput), key))
+
+	rs256Token := signingInput + "." + signature
+
+	_, err := ParseJWT(rs256Token, key)
+	if err != ErrInvalidToken {
+		t.Errorf("token with alg=RS256 should be rejected, got error: %v", err)
+	}
+}
+
+func TestParseJWT_AlgorithmValidation_EmptyAlgorithm(t *testing.T) {
+	key := []byte("test-key")
+
+	emptyAlgHeader := jwtHeader{
+		Alg: "",
+		Typ: "JWT",
+	}
+
+	headerJSON, _ := json.Marshal(emptyAlgHeader)
+	encodedHeader := base64URLEncode(headerJSON)
+
+	claims := &AccessTokenClaims{
+		Issuer:    "test",
+		Subject:   "user1",
+		ExpiresAt: time.Now().Add(time.Hour),
+		IssuedAt:  time.Now(),
+	}
+	claimsJSON, _ := json.Marshal(claims)
+	encodedClaims := base64URLEncode(claimsJSON)
+
+	signingInput := encodedHeader + "." + encodedClaims
+	signature := base64URLEncode(signHS256([]byte(signingInput), key))
+
+	emptyAlgToken := signingInput + "." + signature
+
+	_, err := ParseJWT(emptyAlgToken, key)
+	if err != ErrInvalidToken {
+		t.Errorf("token with empty alg should be rejected, got error: %v", err)
+	}
+}
+
+func TestParseJWT_AlgorithmValidation_CaseSensitive(t *testing.T) {
+	key := []byte("test-key")
+
+	lowerCaseHeader := jwtHeader{
+		Alg: "hs256",
+		Typ: "JWT",
+	}
+
+	headerJSON, _ := json.Marshal(lowerCaseHeader)
+	encodedHeader := base64URLEncode(headerJSON)
+
+	claims := &AccessTokenClaims{
+		Issuer:    "test",
+		Subject:   "user1",
+		ExpiresAt: time.Now().Add(time.Hour),
+		IssuedAt:  time.Now(),
+	}
+	claimsJSON, _ := json.Marshal(claims)
+	encodedClaims := base64URLEncode(claimsJSON)
+
+	signingInput := encodedHeader + "." + encodedClaims
+	signature := base64URLEncode(signHS256([]byte(signingInput), key))
+
+	lowerCaseToken := signingInput + "." + signature
+
+	_, err := ParseJWT(lowerCaseToken, key)
+	if err != ErrInvalidToken {
+		t.Errorf("token with alg=hs256 (lowercase) should be rejected due to case sensitivity, got error: %v", err)
+	}
+}
+
+func TestParseJWT_InvalidHeaderBase64(t *testing.T) {
+	key := []byte("test-key")
+
+	invalidToken := "!!!invalid-base64!!!.eyJzdWIiOiJ1c2VyMSJ9.signature"
+
+	_, err := ParseJWT(invalidToken, key)
+	if err != ErrInvalidToken {
+		t.Errorf("token with invalid base64 header should be rejected, got error: %v", err)
+	}
+}
+
+func TestParseJWT_InvalidHeaderJSON(t *testing.T) {
+	key := []byte("test-key")
+
+	invalidJSON := base64URLEncode([]byte("not valid json"))
+	claims := base64URLEncode([]byte(`{"sub":"user1"}`))
+	signature := base64URLEncode([]byte("sig"))
+
+	invalidToken := invalidJSON + "." + claims + "." + signature
+
+	_, err := ParseJWT(invalidToken, key)
+	if err != ErrInvalidToken {
+		t.Errorf("token with invalid JSON header should be rejected, got error: %v", err)
+	}
+}
+
+func TestToken_AuthorizationCode_ScopeSubset_PartialOverlap(t *testing.T) {
+	srv := setupTestServer()
+
+	authReq := &AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read write",
+		UserID:       "user123",
+	}
+	code, err := srv.Authorize(authReq)
+	if err != nil {
+		t.Fatalf("Authorize failed: %v", err)
+	}
+
+	tokenReq := &TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         code,
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read profile",
+	}
+
+	_, err = srv.Token(tokenReq)
+	if err != ErrInvalidScope {
+		t.Errorf("expected ErrInvalidScope for partially overlapping scope with unauthorized 'profile', got %v", err)
+	}
+}
+
+func TestToken_AuthorizationCode_ScopeSubset_OrderIndependent(t *testing.T) {
+	srv := setupTestServer()
+
+	authReq := &AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read write profile",
+		UserID:       "user123",
+	}
+	code, err := srv.Authorize(authReq)
+	if err != nil {
+		t.Fatalf("Authorize failed: %v", err)
+	}
+
+	tokenReq := &TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         code,
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "profile read",
+	}
+
+	resp, err := srv.Token(tokenReq)
+	if err != nil {
+		t.Fatalf("Token failed: %v", err)
+	}
+	if resp.Scope != "profile read" {
+		t.Errorf("expected scope 'profile read' (order preserved), got %q", resp.Scope)
+	}
+}
+
+func TestToken_RefreshToken_RotationEnabled_ScopeNarrowed(t *testing.T) {
+	config := DefaultConfig()
+	config.SigningKey = []byte("test-signing-key")
+	config.RefreshTokenRotation = true
+
+	clientStore := NewMemoryClientStore()
+	codeStore := NewMemoryAuthorizationCodeStore()
+	refreshTokenStore := NewMemoryRefreshTokenStore()
+
+	clientStore.SaveClient(&Client{
+		ID:           "test-client",
+		Secret:       "test-secret",
+		RedirectURIs: []string{"http://localhost/callback"},
+		Scopes:       []string{"read", "write", "profile"},
+	})
+
+	srv := NewAuthorizationServer(config, clientStore, codeStore, refreshTokenStore)
+
+	authCode, _ := srv.Authorize(&AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read write profile",
+		UserID:       "user123",
+	})
+
+	tokenResp, _ := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         authCode,
+		RedirectURI:  "http://localhost/callback",
+	})
+
+	refreshResp, err := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeRefreshToken,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		RefreshToken: tokenResp.RefreshToken,
+		Scope:        "read",
+	})
+
+	if err != nil {
+		t.Fatalf("Refresh token failed: %v", err)
+	}
+
+	if refreshResp.Scope != "read" {
+		t.Errorf("expected narrowed scope 'read', got %q", refreshResp.Scope)
+	}
+	if refreshResp.RefreshToken == "" {
+		t.Error("expected new refresh token even when scope is narrowed")
+	}
+}
+
+func TestToken_RefreshToken_RotationDisabled_ScopeNarrowed(t *testing.T) {
+	config := DefaultConfig()
+	config.SigningKey = []byte("test-signing-key")
+	config.RefreshTokenRotation = false
+
+	clientStore := NewMemoryClientStore()
+	codeStore := NewMemoryAuthorizationCodeStore()
+	refreshTokenStore := NewMemoryRefreshTokenStore()
+
+	clientStore.SaveClient(&Client{
+		ID:           "test-client",
+		Secret:       "test-secret",
+		RedirectURIs: []string{"http://localhost/callback"},
+		Scopes:       []string{"read", "write"},
+	})
+
+	srv := NewAuthorizationServer(config, clientStore, codeStore, refreshTokenStore)
+
+	authCode, _ := srv.Authorize(&AuthorizeRequest{
+		ResponseType: ResponseTypeCode,
+		ClientID:     "test-client",
+		RedirectURI:  "http://localhost/callback",
+		Scope:        "read write",
+		UserID:       "user123",
+	})
+
+	tokenResp, _ := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeAuthorizationCode,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Code:         authCode,
+		RedirectURI:  "http://localhost/callback",
+	})
+
+	oldRefreshToken := tokenResp.RefreshToken
+
+	refreshResp, err := srv.Token(&TokenRequest{
+		GrantType:    GrantTypeRefreshToken,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		RefreshToken: oldRefreshToken,
+		Scope:        "read",
+	})
+
+	if err != nil {
+		t.Fatalf("Refresh token failed: %v", err)
+	}
+
+	if refreshResp.Scope != "read" {
+		t.Errorf("expected narrowed scope 'read', got %q", refreshResp.Scope)
+	}
+	if refreshResp.RefreshToken != "" {
+		t.Error("expected NO refresh token when rotation is disabled, even with scope narrowing")
+	}
+
+	rt, err := srv.refreshTokenStore.GetToken(oldRefreshToken)
+	if err != nil {
+		t.Fatalf("old refresh token should still be valid: %v", err)
+	}
+	if rt.Scope != "read write" {
+		t.Errorf("original refresh token should keep its original scope 'read write', got %q", rt.Scope)
+	}
+}
+
+func TestValidateToken_AlgorithmValidation_Integration(t *testing.T) {
+	srv := setupTestServer()
+
+	tokenReq := &TokenRequest{
+		GrantType:    GrantTypeClientCredentials,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		Scope:        "read",
+	}
+	resp, err := srv.Token(tokenReq)
+	if err != nil {
+		t.Fatalf("Token failed: %v", err)
+	}
+
+	claims, err := srv.ValidateToken(resp.AccessToken)
+	if err != nil {
+		t.Fatalf("ValidateToken failed for valid token: %v", err)
+	}
+	if claims.Scope != "read" {
+		t.Errorf("expected scope 'read', got %q", claims.Scope)
 	}
 }

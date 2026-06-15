@@ -78,15 +78,15 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 }
 
 type Stream struct {
-	ID        uint16
-	mux       *MuxConn
-	readCh    chan []byte
-	readBuf   []byte
-	closeOnce sync.Once
+	ID          uint16
+	mux         *MuxConn
+	readCh      chan []byte
+	readBuf     []byte
+	closeOnce   sync.Once
 	chCloseOnce sync.Once
-	closed    atomic.Bool
-	finSent   atomic.Bool
-	finRecv   atomic.Bool
+	closed      atomic.Bool
+	finSent     atomic.Bool
+	finRecv     atomic.Bool
 }
 
 func newStream(id uint16, mux *MuxConn) *Stream {
@@ -301,14 +301,22 @@ func (m *MuxConn) handleData(f *Frame) {
 }
 
 func (m *MuxConn) handleFin(f *Frame) {
-	m.streamMu.RLock()
+	m.streamMu.Lock()
 	s, ok := m.streams[f.StreamID]
-	m.streamMu.RUnlock()
-	if ok {
-		s.finRecv.Store(true)
-		if s.finSent.Load() {
-			m.removeStream(f.StreamID)
-		}
+	if !ok {
+		m.streamMu.Unlock()
+		return
+	}
+	s.finRecv.Store(true)
+	if s.finSent.Load() {
+		delete(m.streams, f.StreamID)
+	}
+	s.closed.Store(true)
+	s.chCloseOnce.Do(func() {
+		close(s.readCh)
+	})
+	m.streamMu.Unlock()
+	if !s.finSent.Load() {
 		s.Close()
 	}
 }
@@ -318,14 +326,12 @@ func (m *MuxConn) handleRst(f *Frame) {
 	s, ok := m.streams[f.StreamID]
 	if ok {
 		delete(m.streams, f.StreamID)
-	}
-	m.streamMu.Unlock()
-	if ok {
 		s.closed.Store(true)
 		s.chCloseOnce.Do(func() {
 			close(s.readCh)
 		})
 	}
+	m.streamMu.Unlock()
 }
 
 func (m *MuxConn) removeStream(id uint16) {
@@ -383,27 +389,27 @@ func (u *Upstream) Probe(timeout time.Duration) bool {
 }
 
 type HealthCheckerConfig struct {
-	CheckInterval  time.Duration
-	ProbeTimeout   time.Duration
-	FailThreshold  int
-	PassThreshold  int
+	CheckInterval time.Duration
+	ProbeTimeout  time.Duration
+	FailThreshold int
+	PassThreshold int
 }
 
 type HealthChecker struct {
-	cfg          HealthCheckerConfig
-	upstreams    map[string]*upstreamHealth
-	mu           sync.RWMutex
-	stopCh       chan struct{}
-	running      atomic.Bool
-	wg           sync.WaitGroup
-	onChange     func(addr string, healthy bool)
+	cfg       HealthCheckerConfig
+	upstreams map[string]*upstreamHealth
+	mu        sync.RWMutex
+	stopCh    chan struct{}
+	running   atomic.Bool
+	wg        sync.WaitGroup
+	onChange  func(addr string, healthy bool)
 }
 
 type upstreamHealth struct {
-	upstream   *Upstream
-	failCount  int
-	passCount  int
-	lastCheck  time.Time
+	upstream  *Upstream
+	failCount int
+	passCount int
+	lastCheck time.Time
 }
 
 func NewHealthChecker(cfg HealthCheckerConfig) *HealthChecker {
@@ -528,6 +534,9 @@ func (hc *HealthChecker) checkOne(addr string) {
 	if !ok {
 		return
 	}
+	if uh.upstream != upstream {
+		return
+	}
 	uh.lastCheck = now
 	oldHealthy := uh.upstream.Healthy()
 
@@ -563,10 +572,11 @@ type ConnPoolConfig struct {
 }
 
 type poolConn struct {
-	conn       net.Conn
-	upstream   *Upstream
-	lastUsed   time.Time
-	idle       atomic.Bool
+	conn     net.Conn
+	upstream *Upstream
+	lastUsed time.Time
+	idle     atomic.Bool
+	removed  atomic.Bool
 }
 
 type ConnPool struct {
@@ -612,21 +622,40 @@ func (p *ConnPool) Get() (net.Conn, error) {
 			p.mu.Unlock()
 			return nil, ErrPoolClosed
 		}
+
+		var expired []*poolConn
+		var selected *poolConn
+		validIdx := 0
 		for i := len(p.idleList) - 1; i >= 0; i-- {
 			pc := p.idleList[i]
 			if p.cfg.IdleTimeout > 0 && time.Since(pc.lastUsed) > p.cfg.IdleTimeout {
-				p.idleList = append(p.idleList[:i], p.idleList[i+1:]...)
-				p.mu.Unlock()
-				_ = pc.conn.Close()
-				p.mu.Lock()
+				expired = append(expired, pc)
 				continue
 			}
-			p.idleList = append(p.idleList[:i], p.idleList[i+1:]...)
-			pc.idle.Store(false)
+			p.idleList[validIdx] = pc
+			validIdx++
+			if selected == nil {
+				selected = pc
+			}
+		}
+		p.idleList = p.idleList[:validIdx]
+		for _, pc := range expired {
+			pc.conn.Close()
+		}
+
+		if selected != nil {
+			for i, pc := range p.idleList {
+				if pc == selected {
+					p.idleList = append(p.idleList[:i], p.idleList[i+1:]...)
+					break
+				}
+			}
+			selected.idle.Store(false)
 			p.activeCount++
 			p.mu.Unlock()
-			return &pooledConn{pc: pc, pool: p}, nil
+			return &pooledConn{pc: selected, pool: p}, nil
 		}
+
 		if p.activeCount < p.cfg.MaxConns {
 			p.activeCount++
 			p.mu.Unlock()
@@ -688,6 +717,9 @@ func (p *ConnPool) Put(pc *poolConn) error {
 		return ErrPoolClosed
 	}
 	p.activeCount--
+	if pc.removed.Load() {
+		return nil
+	}
 	if p.cfg.IdleTimeout > 0 && time.Since(pc.lastUsed) > p.cfg.IdleTimeout {
 		_ = pc.conn.Close()
 		p.cond.Signal()
@@ -703,6 +735,9 @@ func (p *ConnPool) Put(pc *poolConn) error {
 func (p *ConnPool) Remove(pc *poolConn) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if pc.removed.Swap(true) {
+		return nil
+	}
 	p.activeCount--
 	_ = pc.conn.Close()
 	p.cond.Signal()
@@ -813,7 +848,7 @@ func (c *pooledConn) Write(b []byte) (int, error) {
 }
 
 func (c *pooledConn) Close() error {
-	if c.pc.idle.Load() {
+	if c.pc.idle.Load() || c.pc.removed.Load() {
 		return nil
 	}
 	return c.pool.Put(c.pc)
@@ -867,23 +902,28 @@ func (b *IPHashBalancer) SetUpstreams(upstreams []*Upstream) {
 	copy(b.upstreams, upstreams)
 }
 
-func (b *IPHashBalancer) GetUpstream(clientIP string) (*Upstream, error) {
-	b.mu.RLock()
-	var healthy []*Upstream
+func (b *IPHashBalancer) getHealthyUpstreamsSnapshot() []*Upstream {
 	if b.hc != nil {
-		healthy = b.hc.GetHealthyUpstreams()
-	} else {
-		for _, u := range b.upstreams {
-			if u.Healthy() {
-				healthy = append(healthy, u)
-			}
+		return b.hc.GetHealthyUpstreams()
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	healthy := make([]*Upstream, 0, len(b.upstreams))
+	for _, u := range b.upstreams {
+		if u.Healthy() {
+			healthy = append(healthy, u)
 		}
 	}
+	return healthy
+}
+
+func (b *IPHashBalancer) GetUpstream(clientIP string) (*Upstream, error) {
+	healthy := b.getHealthyUpstreamsSnapshot()
 	if len(healthy) == 0 {
-		b.mu.RUnlock()
 		return nil, ErrNoHealthyUpstream
 	}
 
+	b.mu.RLock()
 	if mapped, ok := b.mapping[clientIP]; ok {
 		for _, u := range healthy {
 			if u.Address == mapped.Address {
@@ -892,11 +932,11 @@ func (b *IPHashBalancer) GetUpstream(clientIP string) (*Upstream, error) {
 			}
 		}
 	}
+	b.mu.RUnlock()
 
 	hash := b.hashIP(clientIP)
 	idx := int(hash % uint32(len(healthy)))
 	selected := healthy[idx]
-	b.mu.RUnlock()
 
 	b.mu.Lock()
 	b.mapping[clientIP] = selected
@@ -927,28 +967,28 @@ func (b *IPHashBalancer) MappingCount() int {
 }
 
 type ProxyConfig struct {
-	ListenAddress     string
-	Upstreams         []string
-	PoolMaxConns      int
-	PoolIdleTimeout   time.Duration
-	PoolWaitTimeout   time.Duration
-	HealthCheckConfig HealthCheckerConfig
+	ListenAddress       string
+	Upstreams           []string
+	PoolMaxConns        int
+	PoolIdleTimeout     time.Duration
+	PoolWaitTimeout     time.Duration
+	HealthCheckConfig   HealthCheckerConfig
 	EnableStickySession bool
 }
 
 type TCPProxy struct {
-	cfg         ProxyConfig
-	listener    net.Listener
-	hc          *HealthChecker
-	balancer    *IPHashBalancer
-	pools       map[string]*ConnPool
-	poolsMu     sync.RWMutex
-	muxes       map[string]*MuxConn
-	muxesMu     sync.RWMutex
-	closed      atomic.Bool
-	closeOnce   sync.Once
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
+	cfg       ProxyConfig
+	listener  net.Listener
+	hc        *HealthChecker
+	balancer  *IPHashBalancer
+	pools     map[string]*ConnPool
+	poolsMu   sync.RWMutex
+	muxes     map[string]*MuxConn
+	muxesMu   sync.RWMutex
+	closed    atomic.Bool
+	closeOnce sync.Once
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
 }
 
 func NewTCPProxy(cfg ProxyConfig) (*TCPProxy, error) {
@@ -1078,7 +1118,7 @@ func (p *TCPProxy) handleStream(s *Stream, clientIP string) {
 	if p.cfg.EnableStickySession {
 		upstream, err = p.balancer.GetUpstream(clientIP)
 	} else {
-		healthy := p.hc.GetHealthyUpstreams()
+		healthy := p.balancer.getHealthyUpstreamsSnapshot()
 		if len(healthy) == 0 {
 			err = ErrNoHealthyUpstream
 		} else {
@@ -1111,13 +1151,20 @@ func (p *TCPProxy) handleStream(s *Stream, clientIP string) {
 		_ = s.mux.writeFrame(rstFrame)
 		return
 	}
-	defer upstreamConn.Close()
+
+	var closeOnce sync.Once
+	closeUpstream := func() {
+		closeOnce.Do(func() {
+			upstreamConn.SetDeadline(time.Now())
+		})
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
+		defer closeUpstream()
 		buf := make([]byte, 32*1024)
 		for {
 			n, rerr := s.Read(buf)
@@ -1127,9 +1174,6 @@ func (p *TCPProxy) handleStream(s *Stream, clientIP string) {
 				}
 			}
 			if rerr != nil {
-				if tconn, ok := upstreamConn.(*pooledConn); ok {
-					_ = tconn.pool.Remove(tconn.pc)
-				}
 				return
 			}
 		}
@@ -1137,6 +1181,7 @@ func (p *TCPProxy) handleStream(s *Stream, clientIP string) {
 
 	go func() {
 		defer wg.Done()
+		defer closeUpstream()
 		buf := make([]byte, 32*1024)
 		for {
 			n, rerr := upstreamConn.Read(buf)
@@ -1152,6 +1197,7 @@ func (p *TCPProxy) handleStream(s *Stream, clientIP string) {
 	}()
 
 	wg.Wait()
+	upstreamConn.Close()
 }
 
 func (p *TCPProxy) Addr() string {

@@ -169,6 +169,20 @@ func (s *AuthorizationServer) handleAuthorizationCode(req *TokenRequest) (*Token
 		return nil, ErrInvalidScope
 	}
 
+	if req.Scope != "" {
+		requested := parseScope(req.Scope)
+		original := parseScope(authCode.Scope)
+		originalMap := make(map[string]bool)
+		for _, s := range original {
+			originalMap[s] = true
+		}
+		for _, r := range requested {
+			if !originalMap[r] {
+				return nil, ErrInvalidScope
+			}
+		}
+	}
+
 	scope := authCode.Scope
 	if req.Scope != "" {
 		scope = req.Scope
@@ -232,16 +246,19 @@ func (s *AuthorizationServer) handleRefreshToken(req *TokenRequest) (*TokenRespo
 		}
 	}
 
-	if err := s.refreshTokenStore.RevokeToken(req.RefreshToken); err != nil {
-		return nil, err
-	}
-
 	scope := rt.Scope
 	if req.Scope != "" {
 		scope = req.Scope
 	}
 
-	return s.createTokenResponse(rt.ClientID, rt.UserID, scope, true)
+	if s.config.RefreshTokenRotation {
+		if err := s.refreshTokenStore.RevokeToken(req.RefreshToken); err != nil {
+			return nil, err
+		}
+		return s.createTokenResponse(rt.ClientID, rt.UserID, scope, true)
+	}
+
+	return s.createTokenResponse(rt.ClientID, rt.UserID, scope, false)
 }
 
 func (s *AuthorizationServer) createTokenResponse(clientID, userID, scope string, includeRefresh bool) (*TokenResponse, error) {

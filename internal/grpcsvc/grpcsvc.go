@@ -5,19 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var (
-	ErrServiceNotFound    = errors.New("grpcsvc: service not found")
-	ErrServiceExists      = errors.New("grpcsvc: service already exists")
-	ErrMethodNotFound     = errors.New("grpcsvc: method not found")
-	ErrInvalidServiceDesc = errors.New("grpcsvc: invalid service descriptor")
-	ErrInvalidMethodDesc  = errors.New("grpcsvc: invalid method descriptor")
-	ErrServerStopped      = errors.New("grpcsvc: server is stopped")
-	ErrDeadlineExceeded   = errors.New("grpcsvc: deadline exceeded")
-	ErrStreamClosed       = errors.New("grpcsvc: stream is closed")
-	ErrNilHandler         = errors.New("grpcsvc: handler cannot be nil")
+	ErrServiceNotFound        = errors.New("grpcsvc: service not found")
+	ErrServiceExists          = errors.New("grpcsvc: service already exists")
+	ErrMethodNotFound         = errors.New("grpcsvc: method not found")
+	ErrInvalidServiceDesc     = errors.New("grpcsvc: invalid service descriptor")
+	ErrInvalidMethodDesc      = errors.New("grpcsvc: invalid method descriptor")
+	ErrServerStopped          = errors.New("grpcsvc: server is stopped")
+	ErrDeadlineExceeded       = errors.New("grpcsvc: deadline exceeded")
+	ErrStreamClosed           = errors.New("grpcsvc: stream is closed")
+	ErrNilHandler             = errors.New("grpcsvc: handler cannot be nil")
+	ErrTooManyStreams         = errors.New("grpcsvc: too many concurrent streams")
+	ErrConnectionTimeout      = errors.New("grpcsvc: connection timeout")
 )
 
 const (
@@ -119,22 +122,44 @@ func TrailerFromContext(ctx context.Context) (MD, bool) {
 	return (*md).Copy(), true
 }
 
+type headerKey struct{}
+
+func NewContextWithHeader(ctx context.Context) context.Context {
+	var header MD
+	return context.WithValue(ctx, headerKey{}, &header)
+}
+
+func SetHeader(ctx context.Context, md MD) {
+	if header, ok := ctx.Value(headerKey{}).(*MD); ok {
+		if *header == nil {
+			*header = NewMD()
+		}
+		for k, v := range md {
+			(*header)[k] = v
+		}
+	}
+}
+
+func HeaderFromContext(ctx context.Context) (MD, bool) {
+	md, ok := ctx.Value(headerKey{}).(*MD)
+	if !ok || md == nil || *md == nil {
+		return nil, false
+	}
+	return (*md).Copy(), true
+}
+
 type Stream interface {
 	Context() context.Context
 	SendMsg(msg interface{}) error
 	RecvMsg(msg interface{}) error
+	Recv() (interface{}, error)
+	Send() (interface{}, error)
+	PutRecv(msg interface{}) error
 	SetHeader(md MD)
 	SetTrailer(md MD)
+	Header() (MD, bool)
 	Close() error
 	Closed() bool
-}
-
-type ServerStream interface {
-	Stream
-}
-
-type ClientStream interface {
-	Stream
 }
 
 type UnaryHandler func(ctx context.Context, req interface{}) (interface{}, error)
@@ -143,7 +168,7 @@ type StreamHandler func(srv interface{}, stream Stream) error
 
 type UnaryInterceptor func(ctx context.Context, req interface{}, info *UnaryServerInfo, handler UnaryHandler) (interface{}, error)
 
-type StreamInterceptor func(srv interface{}, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error
+type StreamInterceptor func(srv interface{}, ss Stream, info *StreamServerInfo, handler StreamHandler) error
 
 type UnaryServerInfo struct {
 	Server      interface{}
@@ -153,32 +178,30 @@ type UnaryServerInfo struct {
 }
 
 type StreamServerInfo struct {
-	Server      interface{}
-	FullMethod  string
-	ServiceName string
-	MethodName  string
+	Server         interface{}
+	FullMethod     string
+	ServiceName    string
+	MethodName     string
 	IsClientStream bool
 	IsServerStream bool
 }
 
 type MethodDesc struct {
-	MethodName  string
-	Handler     UnaryHandler
+	MethodName string
+	Handler    UnaryHandler
 }
 
 type StreamDesc struct {
-	StreamName   string
-	Handler      StreamHandler
+	StreamName    string
+	Handler       StreamHandler
 	ServerStreams bool
 	ClientStreams bool
 }
 
 type ServiceDesc struct {
 	ServiceName string
-	HandlerType interface{}
 	Methods     []MethodDesc
 	Streams     []StreamDesc
-	Metadata    interface{}
 }
 
 type service struct {
@@ -189,12 +212,13 @@ type service struct {
 }
 
 type Server struct {
-	mu              sync.RWMutex
-	services        map[string]*service
+	mu                 sync.RWMutex
+	services           map[string]*service
 	unaryInterceptors  []UnaryInterceptor
 	streamInterceptors []StreamInterceptor
-	running         bool
-	options         ServerOptions
+	running            bool
+	options            ServerOptions
+	activeStreams      int32
 }
 
 type ServerOptions struct {
@@ -214,12 +238,19 @@ func NewServer() *Server {
 }
 
 func NewServerWithOptions(opts ServerOptions) *Server {
+	if opts.MaxConcurrentStreams == 0 {
+		opts.MaxConcurrentStreams = 100
+	}
+	if opts.ConnectionTimeout <= 0 {
+		opts.ConnectionTimeout = 30 * time.Second
+	}
+
 	return &Server{
-		services:        make(map[string]*service),
+		services:           make(map[string]*service),
 		unaryInterceptors:  make([]UnaryInterceptor, 0),
 		streamInterceptors: make([]StreamInterceptor, 0),
-		running:         true,
-		options:         opts,
+		running:            true,
+		options:            opts,
 	}
 }
 
@@ -337,18 +368,37 @@ func (s *Server) StreamInterceptorChain() StreamInterceptor {
 	interceptors := make([]StreamInterceptor, len(s.streamInterceptors))
 	copy(interceptors, s.streamInterceptors)
 
-	return func(srv interface{}, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error {
+	return func(srv interface{}, ss Stream, info *StreamServerInfo, handler StreamHandler) error {
 		chain := handler
 		for i := len(interceptors) - 1; i >= 0; i-- {
 			interceptor := interceptors[i]
 			next := chain
 			chain = func(currentSrv interface{}, currentStream Stream) error {
-				var cs ServerStream = currentStream.(ServerStream)
-				return interceptor(currentSrv, cs, info, next)
+				return interceptor(currentSrv, currentStream, info, next)
 			}
 		}
 		return chain(srv, ss)
 	}
+}
+
+func (s *Server) acquireStream() error {
+	for {
+		current := atomic.LoadInt32(&s.activeStreams)
+		if current >= int32(s.options.MaxConcurrentStreams) {
+			return ErrTooManyStreams
+		}
+		if atomic.CompareAndSwapInt32(&s.activeStreams, current, current+1) {
+			return nil
+		}
+	}
+}
+
+func (s *Server) releaseStream() {
+	atomic.AddInt32(&s.activeStreams, -1)
+}
+
+func (s *Server) ActiveStreams() int {
+	return int(atomic.LoadInt32(&s.activeStreams))
 }
 
 func (s *Server) Invoke(ctx context.Context, serviceName, methodName string, req interface{}) (interface{}, error) {
@@ -381,6 +431,15 @@ func (s *Server) Invoke(ctx context.Context, serviceName, methodName string, req
 	if _, ok := ctx.Value(trailerKey{}).(*MD); !ok {
 		ctx = NewContextWithTrailer(ctx)
 	}
+	if _, ok := ctx.Value(headerKey{}).(*MD); !ok {
+		ctx = NewContextWithHeader(ctx)
+	}
+
+	if s.options.ConnectionTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.options.ConnectionTimeout)
+		defer cancel()
+	}
 
 	info := &UnaryServerInfo{
 		Server:      impl,
@@ -393,7 +452,62 @@ func (s *Server) Invoke(ctx context.Context, serviceName, methodName string, req
 		if err := checkDeadline(ctx); err != nil {
 			return nil, err
 		}
-		return md.Handler(ctx, req)
+
+		type result struct {
+			resp interface{}
+			err  error
+		}
+		resultCh := make(chan result, 1)
+
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					resultCh <- result{nil, fmt.Errorf("handler panic: %v", r)}
+				}
+			}()
+
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+
+			done := make(chan struct{})
+			handlerDone := make(chan result, 1)
+
+			go func() {
+				resp, err := md.Handler(ctx, req)
+				handlerDone <- result{resp, err}
+				close(done)
+			}()
+
+			for {
+				select {
+				case <-ticker.C:
+					if err := checkDeadline(ctx); err != nil {
+						resultCh <- result{nil, err}
+						return
+					}
+				case r := <-handlerDone:
+					resultCh <- r
+					return
+				case <-ctx.Done():
+					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+						resultCh <- result{nil, ErrDeadlineExceeded}
+					} else {
+						resultCh <- result{nil, ctx.Err()}
+					}
+					return
+				}
+			}
+		}()
+
+		select {
+		case r := <-resultCh:
+			return r.resp, r.err
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, ErrDeadlineExceeded
+			}
+			return nil, ctx.Err()
+		}
 	})
 
 	return resp, err
@@ -423,17 +537,31 @@ func (s *Server) NewStream(ctx context.Context, serviceName, streamName string) 
 		return nil, err
 	}
 
+	if err := s.acquireStream(); err != nil {
+		return nil, err
+	}
+
 	if _, ok := ctx.Value(trailerKey{}).(*MD); !ok {
 		ctx = NewContextWithTrailer(ctx)
 	}
+	if _, ok := ctx.Value(headerKey{}).(*MD); !ok {
+		ctx = NewContextWithHeader(ctx)
+	}
+
+	if s.options.ConnectionTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.options.ConnectionTimeout)
+		_ = cancel
+	}
 
 	stream := &serverStream{
-		ctx:       ctx,
-		sendCh:    make(chan interface{}, 64),
-		recvCh:    make(chan interface{}, 64),
-		header:    NewMD(),
-		trailer:   NewMD(),
+		ctx:        ctx,
+		sendCh:     make(chan interface{}, 64),
+		recvCh:     make(chan interface{}, 64),
+		header:     NewMD(),
+		trailer:    NewMD(),
 		streamDesc: sd,
+		releaseFn:  s.releaseStream,
 	}
 
 	return stream, nil
@@ -466,6 +594,13 @@ func (s *Server) HandleStream(ctx context.Context, serviceName, streamName strin
 		return err
 	}
 
+	if _, ok := ctx.Value(trailerKey{}).(*MD); !ok {
+		ctx = NewContextWithTrailer(ctx)
+	}
+	if _, ok := ctx.Value(headerKey{}).(*MD); !ok {
+		ctx = NewContextWithHeader(ctx)
+	}
+
 	info := &StreamServerInfo{
 		Server:         impl,
 		FullMethod:     fmt.Sprintf("/%s/%s", serviceName, streamName),
@@ -475,14 +610,68 @@ func (s *Server) HandleStream(ctx context.Context, serviceName, streamName strin
 		IsServerStream: sd.ServerStreams,
 	}
 
-	var ss ServerStream = stream
 	handler := func(srv interface{}, st Stream) error {
 		if err := checkDeadline(st.Context()); err != nil {
 			return err
 		}
-		return sd.Handler(srv, st)
+
+		type result struct {
+			err error
+		}
+		resultCh := make(chan result, 1)
+
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					resultCh <- result{fmt.Errorf("handler panic: %v", r)}
+				}
+			}()
+
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+
+			done := make(chan struct{})
+			handlerDone := make(chan result, 1)
+
+			go func() {
+				err := sd.Handler(srv, st)
+				handlerDone <- result{err}
+				close(done)
+			}()
+
+			for {
+				select {
+				case <-ticker.C:
+					if err := checkDeadline(st.Context()); err != nil {
+						resultCh <- result{err}
+						return
+					}
+				case r := <-handlerDone:
+					resultCh <- r
+					return
+				case <-st.Context().Done():
+					if errors.Is(st.Context().Err(), context.DeadlineExceeded) {
+						resultCh <- result{ErrDeadlineExceeded}
+					} else {
+						resultCh <- result{st.Context().Err()}
+					}
+					return
+				}
+			}
+		}()
+
+		select {
+		case r := <-resultCh:
+			return r.err
+		case <-st.Context().Done():
+			if errors.Is(st.Context().Err(), context.DeadlineExceeded) {
+				return ErrDeadlineExceeded
+			}
+			return st.Context().Err()
+		}
 	}
-	err := chain(impl, ss, info, handler)
+
+	err := chain(impl, stream, info, handler)
 
 	return err
 }
@@ -544,6 +733,12 @@ func (s *Server) IsRunning() bool {
 	return s.running
 }
 
+func (s *Server) Options() ServerOptions {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.options
+}
+
 type serverStream struct {
 	ctx        context.Context
 	sendCh     chan interface{}
@@ -554,6 +749,7 @@ type serverStream struct {
 	mu         sync.RWMutex
 	closed     bool
 	closeOnce  sync.Once
+	releaseFn  func()
 }
 
 func (ss *serverStream) Context() context.Context {
@@ -609,50 +805,6 @@ func (ss *serverStream) RecvMsg(msg interface{}) error {
 	}
 }
 
-func (ss *serverStream) SetHeader(md MD) {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	if ss.header == nil {
-		ss.header = NewMD()
-	}
-	for k, v := range md {
-		ss.header[k] = v
-	}
-}
-
-func (ss *serverStream) SetTrailer(md MD) {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	if ss.trailer == nil {
-		ss.trailer = NewMD()
-	}
-	for k, v := range md {
-		ss.trailer[k] = v
-	}
-	SetTrailer(ss.ctx, ss.trailer.Copy())
-}
-
-func (ss *serverStream) Close() error {
-	ss.closeOnce.Do(func() {
-		ss.mu.Lock()
-		ss.closed = true
-		close(ss.sendCh)
-		close(ss.recvCh)
-		ss.mu.Unlock()
-	})
-	return nil
-}
-
-func (ss *serverStream) Closed() bool {
-	ss.mu.RLock()
-	defer ss.mu.RUnlock()
-	return ss.closed
-}
-
-func (ss *serverStream) Send(msg interface{}) error {
-	return ss.SendMsg(msg)
-}
-
 func (ss *serverStream) Recv() (interface{}, error) {
 	ss.mu.RLock()
 	if ss.closed {
@@ -667,6 +819,32 @@ func (ss *serverStream) Recv() (interface{}, error) {
 
 	select {
 	case msg, ok := <-ss.recvCh:
+		if !ok {
+			return nil, ErrStreamClosed
+		}
+		return msg, nil
+	case <-ss.ctx.Done():
+		if errors.Is(ss.ctx.Err(), context.DeadlineExceeded) {
+			return nil, ErrDeadlineExceeded
+		}
+		return nil, ss.ctx.Err()
+	}
+}
+
+func (ss *serverStream) Send() (interface{}, error) {
+	ss.mu.RLock()
+	if ss.closed {
+		ss.mu.RUnlock()
+		return nil, ErrStreamClosed
+	}
+	ss.mu.RUnlock()
+
+	if err := checkDeadline(ss.ctx); err != nil {
+		return nil, err
+	}
+
+	select {
+	case msg, ok := <-ss.sendCh:
 		if !ok {
 			return nil, ErrStreamClosed
 		}
@@ -696,6 +874,59 @@ func (ss *serverStream) PutRecv(msg interface{}) error {
 		}
 		return ss.ctx.Err()
 	}
+}
+
+func (ss *serverStream) SetHeader(md MD) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.header == nil {
+		ss.header = NewMD()
+	}
+	for k, v := range md {
+		ss.header[k] = v
+	}
+	SetHeader(ss.ctx, ss.header.Copy())
+}
+
+func (ss *serverStream) SetTrailer(md MD) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.trailer == nil {
+		ss.trailer = NewMD()
+	}
+	for k, v := range md {
+		ss.trailer[k] = v
+	}
+	SetTrailer(ss.ctx, ss.trailer.Copy())
+}
+
+func (ss *serverStream) Header() (MD, bool) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	if ss.header == nil {
+		return nil, false
+	}
+	return ss.header.Copy(), true
+}
+
+func (ss *serverStream) Close() error {
+	ss.closeOnce.Do(func() {
+		ss.mu.Lock()
+		ss.closed = true
+		close(ss.sendCh)
+		close(ss.recvCh)
+		ss.mu.Unlock()
+		if ss.releaseFn != nil {
+			ss.releaseFn()
+		}
+	})
+	return nil
+}
+
+func (ss *serverStream) Closed() bool {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	return ss.closed
 }
 
 func checkDeadline(ctx context.Context) error {
@@ -730,14 +961,13 @@ func ChainStreamInterceptors(interceptors ...StreamInterceptor) StreamIntercepto
 		return nil
 	}
 
-	return func(srv interface{}, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error {
+	return func(srv interface{}, ss Stream, info *StreamServerInfo, handler StreamHandler) error {
 		chain := handler
 		for i := len(interceptors) - 1; i >= 0; i-- {
 			interceptor := interceptors[i]
 			next := chain
 			chain = func(currentSrv interface{}, currentStream Stream) error {
-				var cs ServerStream = currentStream.(ServerStream)
-				return interceptor(currentSrv, cs, info, next)
+				return interceptor(currentSrv, currentStream, info, next)
 			}
 		}
 		return chain(srv, ss)
@@ -750,16 +980,4 @@ func WithIncomingMetadata(ctx context.Context, md MD) context.Context {
 
 func GetIncomingMetadata(ctx context.Context) (MD, bool) {
 	return FromContext(ctx)
-}
-
-func SetHeader(ctx context.Context, md MD) {
-	if stream, ok := ctx.Value(streamKey{}).(Stream); ok {
-		stream.SetHeader(md)
-	}
-}
-
-type streamKey struct{}
-
-func newContextWithStream(ctx context.Context, stream Stream) context.Context {
-	return context.WithValue(ctx, streamKey{}, stream)
 }

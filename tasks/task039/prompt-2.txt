@@ -1,0 +1,6 @@
+你实现的 RBAC 访问控制模块存在一些代码质量问题，需要修复：
+1. rbac.go 中定义了 ErrUserNotFound 错误变量但在整个模块中从未被任何方法返回，是明确的死代码。CheckPermission 方法在处理从未被分配角色的用户时返回的是普通字符串错误而非该错误变量，GetUserRoles 对不存在的用户直接返回空列表而非错误，文档中列出的该错误场景在代码中无对应逻辑。需要在相关方法中实际使用该错误来区分"用户不存在"与"用户无角色"。
+2. CheckPermission 方法在用户没有所需权限时生成的拒绝原因包含冗余信息。requested.String() 输出的权限字符串（如 article:delete）与末尾 required resource:action 信息重复，实际输出形如 "user xxx does not have permission article:delete (required article:delete)"，应精简重复信息。
+3. 修复以上问题后，需要为该模块补充用户不存在的错误码验证、拒绝原因格式正确性的单元测试。
+4. 运行 go test ./internal/rbac/ -v，需要让所有测试通过。
+5. 在 docs/rbac.md 中更新模块需求文档。

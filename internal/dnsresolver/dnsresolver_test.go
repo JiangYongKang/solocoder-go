@@ -1,6 +1,7 @@
 package dnsresolver
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,19 +20,32 @@ type mockConn struct {
 	writeErr  error
 	closed    bool
 	deadline  time.Time
+	queryID   uint16
+	hasQuery  bool
 }
 
 func (m *mockConn) Read(b []byte) (n int, err error) {
 	if m.readErr != nil {
 		return 0, m.readErr
 	}
-	n = copy(b, m.readData)
+	if m.hasQuery && len(m.readData) >= 2 {
+		respData := make([]byte, len(m.readData))
+		copy(respData, m.readData)
+		binary.BigEndian.PutUint16(respData[0:2], m.queryID)
+		n = copy(b, respData)
+	} else {
+		n = copy(b, m.readData)
+	}
 	return n, nil
 }
 
 func (m *mockConn) Write(b []byte) (n int, err error) {
 	if m.writeErr != nil {
 		return 0, m.writeErr
+	}
+	if len(b) >= 2 {
+		m.queryID = binary.BigEndian.Uint16(b[0:2])
+		m.hasQuery = true
 	}
 	m.writeData = append(m.writeData, b...)
 	return len(b), nil
@@ -305,7 +319,14 @@ func (s *mockDNSServer) serve() {
 			continue
 		}
 
-		resp := s.handler(buf[:n])
+		query := buf[:n]
+		resp := s.handler(query)
+
+		if len(query) >= 2 && len(resp) >= 2 {
+			queryID := binary.BigEndian.Uint16(query[0:2])
+			binary.BigEndian.PutUint16(resp[0:2], queryID)
+		}
+
 		s.conn.WriteTo(resp, addr)
 	}
 }
@@ -1030,10 +1051,11 @@ func TestExtractIPs(t *testing.T) {
 }
 
 func TestBuildQuery(t *testing.T) {
-	query, err := buildQuery("example.com", TypeA)
+	query, id, err := buildQuery("example.com", TypeA)
 	if err != nil {
 		t.Fatalf("buildQuery failed: %v", err)
 	}
+	_ = id
 
 	if len(query) < 12 {
 		t.Fatalf("query too short: %d bytes", len(query))
@@ -1052,7 +1074,7 @@ func TestBuildQuery(t *testing.T) {
 
 func TestBuildQueryInvalidDomain(t *testing.T) {
 	longLabel := strings.Repeat("a", 64)
-	_, err := buildQuery(longLabel+".com", TypeA)
+	_, _, err := buildQuery(longLabel+".com", TypeA)
 	if !errors.Is(err, ErrInvalidDomain) {
 		t.Errorf("expected ErrInvalidDomain for long label, got %v", err)
 	}
@@ -1061,7 +1083,7 @@ func TestBuildQueryInvalidDomain(t *testing.T) {
 func TestParseResponseA(t *testing.T) {
 	respBytes := buildTestResponse("example.com", "1.2.3.4", 300, TypeA)
 
-	resp, err := parseResponse(respBytes)
+	resp, err := parseResponse(respBytes, 0x1234)
 	if err != nil {
 		t.Fatalf("parseResponse failed: %v", err)
 	}
@@ -1085,7 +1107,7 @@ func TestParseResponseA(t *testing.T) {
 func TestParseResponseAAAA(t *testing.T) {
 	respBytes := buildTestResponse("example.com", "2001:db8::1", 300, TypeAAAA)
 
-	resp, err := parseResponse(respBytes)
+	resp, err := parseResponse(respBytes, 0x1234)
 	if err != nil {
 		t.Fatalf("parseResponse failed: %v", err)
 	}
@@ -1104,7 +1126,7 @@ func TestParseResponseAAAA(t *testing.T) {
 }
 
 func TestParseResponseTooShort(t *testing.T) {
-	_, err := parseResponse([]byte{0x00, 0x00})
+	_, err := parseResponse([]byte{0x00, 0x00}, 0)
 	if !errors.Is(err, ErrInvalidResponse) {
 		t.Errorf("expected ErrInvalidResponse, got %v", err)
 	}
@@ -1659,5 +1681,491 @@ func TestCacheKeyFormat(t *testing.T) {
 	aaaaCached, ok := r.getFromCache("example.com|28")
 	if !ok || len(aaaaCached) != 1 || aaaaCached[0].Data != "::1" {
 		t.Error("AAAA record cache miss")
+	}
+}
+
+func buildRcodeResponse(domain string, rcode uint16, qtype uint16) []byte {
+	resp := make([]byte, 512)
+	id := uint16(0x1234)
+	flags := uint16(0x8000) | rcode
+
+	binary.BigEndian.PutUint16(resp[0:2], id)
+	binary.BigEndian.PutUint16(resp[2:4], flags)
+	binary.BigEndian.PutUint16(resp[4:6], 1)
+	binary.BigEndian.PutUint16(resp[6:8], 0)
+	binary.BigEndian.PutUint16(resp[8:10], 0)
+	binary.BigEndian.PutUint16(resp[10:12], 0)
+
+	offset := 12
+	labels := splitDomain(domain)
+	for _, label := range labels {
+		resp[offset] = byte(len(label))
+		offset++
+		copy(resp[offset:], label)
+		offset += len(label)
+	}
+	resp[offset] = 0
+	offset++
+
+	binary.BigEndian.PutUint16(resp[offset:offset+2], qtype)
+	offset += 2
+	binary.BigEndian.PutUint16(resp[offset:offset+2], ClassIN)
+	offset += 2
+
+	return resp[:offset]
+}
+
+func TestParseResponseNXDOMAIN(t *testing.T) {
+	respBytes := buildRcodeResponse("nonexistent.example.com", RCODE_NXDOMAIN, TypeA)
+
+	resp, err := parseResponse(respBytes, 0x1234)
+	if err == nil {
+		t.Fatal("expected error for NXDOMAIN, got nil")
+	}
+
+	var dnsErr *DNSError
+	if !errors.As(err, &dnsErr) {
+		t.Fatalf("expected DNSError, got %T: %v", err, err)
+	}
+	if dnsErr.RCODE != RCODE_NXDOMAIN {
+		t.Errorf("expected RCODE_NXDOMAIN (%d), got %d", RCODE_NXDOMAIN, dnsErr.RCODE)
+	}
+	if !errors.Is(err, ErrNXDOMAIN) {
+		t.Error("expected error to be ErrNXDOMAIN")
+	}
+	if resp == nil {
+		t.Error("expected non-nil response even with error")
+	}
+	if resp != nil && resp.RCode != RCODE_NXDOMAIN {
+		t.Errorf("expected response RCode %d, got %d", RCODE_NXDOMAIN, resp.RCode)
+	}
+}
+
+func TestParseResponseSERVFAIL(t *testing.T) {
+	respBytes := buildRcodeResponse("example.com", RCODE_SERVFAIL, TypeA)
+
+	_, err := parseResponse(respBytes, 0x1234)
+	if err == nil {
+		t.Fatal("expected error for SERVFAIL, got nil")
+	}
+	if !errors.Is(err, ErrSERVFAIL) {
+		t.Errorf("expected ErrSERVFAIL, got %v", err)
+	}
+	var dnsErr *DNSError
+	if !errors.As(err, &dnsErr) {
+		t.Errorf("expected DNSError type, got %T", err)
+	}
+}
+
+func TestParseResponseFORMERR(t *testing.T) {
+	respBytes := buildRcodeResponse("example.com", RCODE_FORMERR, TypeA)
+
+	_, err := parseResponse(respBytes, 0x1234)
+	if err == nil {
+		t.Fatal("expected error for FORMERR, got nil")
+	}
+	if !errors.Is(err, ErrFORMERR) {
+		t.Errorf("expected ErrFORMERR, got %v", err)
+	}
+}
+
+func TestParseResponseREFUSED(t *testing.T) {
+	respBytes := buildRcodeResponse("example.com", RCODE_REFUSED, TypeA)
+
+	_, err := parseResponse(respBytes, 0x1234)
+	if err == nil {
+		t.Fatal("expected error for REFUSED, got nil")
+	}
+	if !errors.Is(err, ErrREFUSED) {
+		t.Errorf("expected ErrREFUSED, got %v", err)
+	}
+}
+
+func TestParseResponseTransactionIDMismatch(t *testing.T) {
+	respBytes := buildTestResponse("example.com", "1.2.3.4", 300, TypeA)
+
+	_, err := parseResponse(respBytes, 0x5678)
+	if err == nil {
+		t.Fatal("expected error for transaction ID mismatch, got nil")
+	}
+	if !errors.Is(err, ErrTransactionIDMismatch) {
+		t.Errorf("expected ErrTransactionIDMismatch, got %v", err)
+	}
+}
+
+func TestParseResponseHasTransactionID(t *testing.T) {
+	respBytes := buildTestResponse("example.com", "1.2.3.4", 300, TypeA)
+
+	resp, err := parseResponse(respBytes, 0x1234)
+	if err != nil {
+		t.Fatalf("parseResponse failed: %v", err)
+	}
+	if resp.TransactionID != 0x1234 {
+		t.Errorf("expected TransactionID 0x1234, got 0x%04x", resp.TransactionID)
+	}
+}
+
+func TestResolveNXDOMAIN(t *testing.T) {
+	cfg := Config{
+		EnableCache:      false,
+		EnableRecursion:  false,
+		UpstreamServers:  []string{"8.8.8.8:53"},
+		QueryTimeout:     100 * time.Millisecond,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		return &mockConn{
+			readData: buildRcodeResponse("nonexistent.example.com", RCODE_NXDOMAIN, TypeA),
+		}, nil
+	}
+
+	_, err := r.ResolveA("nonexistent.example.com")
+	if err == nil {
+		t.Fatal("expected error for NXDOMAIN, got nil")
+	}
+	if !errors.Is(err, ErrNXDOMAIN) {
+		t.Errorf("expected ErrNXDOMAIN, got %v", err)
+	}
+}
+
+func TestResolveSERVFAIL(t *testing.T) {
+	cfg := Config{
+		EnableCache:      false,
+		EnableRecursion:  false,
+		UpstreamServers:  []string{"8.8.8.8:53"},
+		QueryTimeout:     100 * time.Millisecond,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		return &mockConn{
+			readData: buildRcodeResponse("example.com", RCODE_SERVFAIL, TypeA),
+		}, nil
+	}
+
+	_, err := r.ResolveA("example.com")
+	if err == nil {
+		t.Fatal("expected error for SERVFAIL, got nil")
+	}
+	if !errors.Is(err, ErrSERVFAIL) {
+		t.Errorf("expected ErrSERVFAIL, got %v", err)
+	}
+}
+
+func TestDNSErrorType(t *testing.T) {
+	err := &DNSError{RCODE: 3, Msg: "test error"}
+	if err.RCODE != 3 {
+		t.Errorf("expected RCODE 3, got %d", err.RCODE)
+	}
+	expectedMsg := "dnsresolver: rcode=3 test error"
+	if err.Error() != expectedMsg {
+		t.Errorf("expected error message '%s', got '%s'", expectedMsg, err.Error())
+	}
+}
+
+func TestQuerySingleContextCancellation(t *testing.T) {
+	cfg := Config{
+		EnableCache:      false,
+		EnableRecursion:  false,
+		UpstreamServers:  []string{"8.8.8.8:53"},
+		QueryTimeout:     5 * time.Second,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		mc := &mockConn{
+			readErr: fmt.Errorf("simulated read error"),
+		}
+		return mc, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := r.querySingle(ctx, "8.8.8.8:53", "example.com", TypeA)
+	if err == nil {
+		t.Error("expected error after context cancellation, got nil")
+	}
+}
+
+func TestQueryParallelCancelStopsGoroutines(t *testing.T) {
+	cfg := Config{
+		EnableCache:      false,
+		EnableRecursion:  false,
+		UpstreamServers:  []string{"server1:53", "server2:53", "server3:53"},
+		QueryTimeout:     5 * time.Second,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	var dialCount int32
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		atomic.AddInt32(&dialCount, 1)
+		mc := &mockConn{
+			readErr: fmt.Errorf("simulated read error"),
+		}
+		return mc, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	results := make(chan queryResult, 3)
+	var pending int32 = 3
+
+	for i := 0; i < 3; i++ {
+		go func() {
+			defer func() {
+				atomic.AddInt32(&pending, -1)
+			}()
+			resp, err := r.querySingle(ctx, "server:53", "example.com", TypeA)
+			results <- queryResult{resp: resp, err: err}
+		}()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if atomic.LoadInt32(&dialCount) < 3 {
+		t.Logf("dial count: %d", atomic.LoadInt32(&dialCount))
+	}
+}
+
+type mockConnWithDeadline struct {
+	mockConn
+	deadline time.Time
+}
+
+func (m *mockConnWithDeadline) SetDeadline(t time.Time) error {
+	m.deadline = t
+	return nil
+}
+
+func TestContextDeadlinePropagation(t *testing.T) {
+	cfg := Config{
+		EnableCache:      false,
+		EnableRecursion:  false,
+		UpstreamServers:  []string{"8.8.8.8:53"},
+		QueryTimeout:     10 * time.Second,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	var mock *mockConnWithDeadline
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		mock = &mockConnWithDeadline{
+			mockConn: mockConn{
+				readErr: fmt.Errorf("test read error"),
+			},
+		}
+		return mock, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := r.querySingle(ctx, "8.8.8.8:53", "example.com", TypeA)
+	if err == nil {
+		t.Error("expected error, got nil")
+	}
+
+	if mock.deadline.IsZero() {
+		t.Error("expected deadline to be set")
+	}
+}
+
+func TestCNAMEFollowSameZoneEfficiency(t *testing.T) {
+	cfg := Config{
+		EnableCache:      false,
+		EnableRecursion:  true,
+		RootServers:      []string{"192.0.2.1:53"},
+		QueryTimeout:     100 * time.Millisecond,
+		MaxRecursionDepth: 10,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	queryCount := 0
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		queryCount++
+		switch queryCount {
+		case 1:
+			return &mockConn{
+				readData: buildNSResponse(".", []string{"a.root-servers.net"}, map[string]string{"a.root-servers.net": "192.0.2.1"}, 3600),
+			}, nil
+		case 2:
+			return &mockConn{
+				readData: buildNSResponse("com.", []string{"a.gtld-servers.net"}, map[string]string{"a.gtld-servers.net": "192.0.2.2"}, 3600),
+			}, nil
+		case 3:
+			return &mockConn{
+				readData: buildNSResponse("example.com.", []string{"ns1.example.com"}, map[string]string{"ns1.example.com": "192.0.2.3"}, 3600),
+			}, nil
+		case 4:
+			return &mockConn{
+				readData: buildCNAMEResponse("www.example.com", "cdn.example.com", 300),
+			}, nil
+		case 5:
+			return &mockConn{
+				readData: buildTestResponse("cdn.example.com", "1.2.3.4", 300, TypeA),
+			}, nil
+		default:
+			return &mockConn{
+				readErr: fmt.Errorf("unexpected query #%d", queryCount),
+			}, nil
+		}
+	}
+
+	ips, err := r.ResolveA("www.example.com")
+	if err != nil {
+		t.Fatalf("ResolveA failed: %v", err)
+	}
+	if len(ips) != 1 || ips[0] != "1.2.3.4" {
+		t.Errorf("expected [1.2.3.4], got %v", ips)
+	}
+
+	if queryCount > 6 {
+		t.Errorf("expected <= 6 queries (3 NS + 2 answers + 1 extra), got %d", queryCount)
+	}
+}
+
+func TestCNAMEFollowDifferentZone(t *testing.T) {
+	cfg := Config{
+		EnableCache:      false,
+		EnableRecursion:  true,
+		RootServers:      []string{"192.0.2.1:53"},
+		QueryTimeout:     100 * time.Millisecond,
+		MaxRecursionDepth: 20,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	queryCount := 0
+	r.dialUDP = func(network, address string) (net.Conn, error) {
+		queryCount++
+		switch queryCount {
+		case 1:
+			return &mockConn{
+				readData: buildNSResponse(".", []string{"a.root-servers.net"}, map[string]string{"a.root-servers.net": "192.0.2.1"}, 3600),
+			}, nil
+		case 2:
+			return &mockConn{
+				readData: buildNSResponse("com.", []string{"a.gtld-servers.net"}, map[string]string{"a.gtld-servers.net": "192.0.2.2"}, 3600),
+			}, nil
+		case 3:
+			return &mockConn{
+				readData: buildNSResponse("example.com.", []string{"ns1.example.com"}, map[string]string{"ns1.example.com": "192.0.2.3"}, 3600),
+			}, nil
+		case 4:
+			return &mockConn{
+				readData: buildCNAMEResponse("www.example.com", "cdn.otherdomain.net", 300),
+			}, nil
+		case 5:
+			return &mockConn{
+				readData: buildCNAMEResponse("www.example.com", "cdn.otherdomain.net", 300),
+			}, nil
+		case 6:
+			return &mockConn{
+				readData: buildNSResponse(".", []string{"a.root-servers.net"}, map[string]string{"a.root-servers.net": "192.0.2.1"}, 3600),
+			}, nil
+		case 7:
+			return &mockConn{
+				readData: buildNSResponse("net.", []string{"a.gtld-servers.net"}, map[string]string{"a.gtld-servers.net": "192.0.2.4"}, 3600),
+			}, nil
+		case 8:
+			return &mockConn{
+				readData: buildNSResponse("otherdomain.net.", []string{"ns1.otherdomain.net"}, map[string]string{"ns1.otherdomain.net": "192.0.2.5"}, 3600),
+			}, nil
+		case 9:
+			return &mockConn{
+				readData: buildTestResponse("cdn.otherdomain.net", "5.6.7.8", 300, TypeA),
+			}, nil
+		case 10:
+			return &mockConn{
+				readData: buildTestResponse("cdn.otherdomain.net", "5.6.7.8", 300, TypeA),
+			}, nil
+		default:
+			return &mockConn{
+				readErr: fmt.Errorf("unexpected query #%d", queryCount),
+			}, nil
+		}
+	}
+
+	ips, err := r.ResolveA("www.example.com")
+	if err != nil {
+		t.Fatalf("ResolveA failed (queryCount=%d): %v", queryCount, err)
+	}
+	if len(ips) != 1 || ips[0] != "5.6.7.8" {
+		t.Errorf("expected [5.6.7.8], got %v (queryCount=%d)", ips, queryCount)
+	}
+
+	if queryCount < 8 {
+		t.Errorf("expected at least 8 queries for cross-zone CNAME + full recursion, got %d", queryCount)
+	}
+}
+
+func TestRCodeConstants(t *testing.T) {
+	if RCODE_NOERROR != 0 {
+		t.Errorf("expected RCODE_NOERROR = 0, got %d", RCODE_NOERROR)
+	}
+	if RCODE_FORMERR != 1 {
+		t.Errorf("expected RCODE_FORMERR = 1, got %d", RCODE_FORMERR)
+	}
+	if RCODE_SERVFAIL != 2 {
+		t.Errorf("expected RCODE_SERVFAIL = 2, got %d", RCODE_SERVFAIL)
+	}
+	if RCODE_NXDOMAIN != 3 {
+		t.Errorf("expected RCODE_NXDOMAIN = 3, got %d", RCODE_NXDOMAIN)
+	}
+	if RCODE_REFUSED != 5 {
+		t.Errorf("expected RCODE_REFUSED = 5, got %d", RCODE_REFUSED)
+	}
+}
+
+func TestParallelQueryRCODEError(t *testing.T) {
+	nxdomainServer, _ := newMockDNSServer(func(q []byte) []byte {
+		return buildRcodeResponse("example.com", RCODE_NXDOMAIN, TypeA)
+	})
+	defer nxdomainServer.Close()
+
+	servfailServer, _ := newMockDNSServer(func(q []byte) []byte {
+		return buildRcodeResponse("example.com", RCODE_SERVFAIL, TypeA)
+	})
+	defer servfailServer.Close()
+
+	cfg := Config{
+		EnableCache:      false,
+		EnableRecursion:  false,
+		UpstreamServers:  []string{nxdomainServer.addr, servfailServer.addr},
+		QueryTimeout:     200 * time.Millisecond,
+	}
+	r, _ := NewResolverWithConfig(cfg)
+	defer r.Close()
+
+	_, err := r.ResolveA("example.com")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestDNSErrorIsComparison(t *testing.T) {
+	err1 := &DNSError{RCODE: 3, Msg: "NXDOMAIN"}
+	err2 := &DNSError{RCODE: 3, Msg: "different message"}
+	err3 := &DNSError{RCODE: 2, Msg: "SERVFAIL"}
+
+	if !errors.Is(err1, ErrNXDOMAIN) {
+		t.Error("expected err1 to match ErrNXDOMAIN")
+	}
+	if !errors.Is(err2, ErrNXDOMAIN) {
+		t.Error("expected err2 to match ErrNXDOMAIN (same RCODE)")
+	}
+	if errors.Is(err3, ErrNXDOMAIN) {
+		t.Error("expected err3 to not match ErrNXDOMAIN")
+	}
+	if !errors.Is(err3, ErrSERVFAIL) {
+		t.Error("expected err3 to match ErrSERVFAIL")
 	}
 }

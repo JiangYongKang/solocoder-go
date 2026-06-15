@@ -68,6 +68,20 @@ func ParseJWT(token string, signingKey []byte) (*AccessTokenClaims, error) {
 
 	encodedHeader, encodedClaims, encodedSignature := parts[0], parts[1], parts[2]
 
+	headerJSON, err := base64URLDecode(encodedHeader)
+	if err != nil {
+		return nil, ErrInvalidToken
+	}
+
+	var header jwtHeader
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		return nil, ErrInvalidToken
+	}
+
+	if header.Alg != "HS256" {
+		return nil, ErrInvalidToken
+	}
+
 	signingInput := encodedHeader + "." + encodedClaims
 
 	signature, err := base64URLDecode(encodedSignature)

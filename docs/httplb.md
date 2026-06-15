@@ -13,9 +13,9 @@ HTTP 负载均衡器是一个通用的请求分发组件，用于将 HTTP 请求
 | F1 | 轮询调度 (Round Robin) | 按后端服务器列表顺序依次分发请求，到达末尾后回到开头循环 |
 | F2 | 最少连接调度 (Least Connections) | 选择当前活跃连接数最少的服务器处理请求，连接数相同时按列表顺序选择 |
 | F3 | 加权轮询调度 (Weighted Round Robin) | 根据服务器权重比例分发请求，权重越高被选中频率越高，使用平滑加权轮询算法 |
-| F4 | 一致性哈希调度 (Consistent Hash) | 基于请求键（URL 路径或客户端 IP）计算哈希值，通过一致性哈希环映射到后端服务器 |
+| F4 | 一致性哈希调度 (Consistent Hash) | 基于请求键（URL 路径或客户端 IP）计算哈希值，通过一致性哈希环映射到后端服务器，目标节点不健康时沿环顺时针故障转移到下一个健康节点 |
 | F5 | 动态添加服务器 | 运行期间动态添加新的后端服务器，添加后立即参与调度 |
-| F6 | 动态移除服务器 | 运行期间将已有服务器从调度列表中完全移除 |
+| F6 | 动态移除服务器 | 运行期间将已有服务器从调度列表中安全移除（需先 Drain 且活跃连接为 0） |
 | F7 | 服务器优雅下线 (Drain) | 将服务器标记为 draining 状态，完成当前请求后停止接收新请求 |
 | F8 | 服务器恢复上线 (Restore) | 将下线中的服务器重新恢复为可用状态 |
 | F9 | 连接计数 | 记录每个后端服务器的当前活跃请求数 |
@@ -45,6 +45,15 @@ type BackendServer struct {
 - `StatusUp`：正常运行，可接收新请求
 - `StatusDraining`：优雅下线中，已接收的请求继续处理，但不接收新请求
 - `StatusDown`：已完全下线
+
+**关键方法：**
+- `IsHealthy()`：检查服务器是否处于 StatusUp 状态
+- `IsDraining()`：检查服务器是否处于 StatusDraining 状态
+- `ActiveConn()`：获取当前活跃连接数（原子操作）
+- `IncConn()` / `DecConn()`：增减活跃连接计数（原子操作）
+- `MarkDraining()`：将 StatusUp 转为 StatusDraining
+- `MarkDown()`：将服务器标记为 StatusDown
+- `MarkUp()`：将服务器恢复为 StatusUp
 
 ### 3.2 ServerPool - 服务器池
 
@@ -88,13 +97,12 @@ type Balancer interface {
 type RoundRobin struct {
     counter uint64        // 轮询计数器（原子操作，需64位对齐）
     pool    *ServerPool   // 服务器池
-    mu      sync.Mutex    // 互斥锁
 }
 ```
 
 **主要职责：**
 - 实现轮询调度算法
-- 维护轮询计数器
+- 维护轮询计数器（使用 `sync/atomic` 原子操作，无需额外互斥锁）
 - 每次请求按顺序选择下一个健康服务器
 
 ### 3.5 LeastConnections - 最少连接调度器
@@ -158,6 +166,7 @@ type hashNode struct {
 - 实现一致性哈希调度算法
 - 维护哈希环和虚拟节点
 - 基于请求键计算哈希并映射到对应服务器
+- 目标节点不健康时沿哈希环顺时针故障转移到下一个健康节点
 - 服务器增减时尽量减少受影响的请求范围
 
 **虚拟节点机制：**
@@ -165,6 +174,9 @@ type hashNode struct {
 - 虚拟节点通过 `地址#vn编号` 的格式生成哈希值
 - 虚拟节点越多，哈希分布越均匀
 - 默认虚拟节点数：100
+
+**故障转移机制：**
+当通过哈希计算找到目标服务器节点后，若该节点处于 Draining/Down 状态，`Next` 方法不会直接返回错误，而是沿哈希环顺时针方向继续查找下一个健康节点，直到遍历所有物理服务器。使用 `visited` 集合去重，确保每个物理服务器只检查一次。只有当所有物理服务器都不健康时才返回 `ErrNoHealthyServer`。
 
 ### 3.8 HTTPLoadBalancer - HTTP 负载均衡器
 
@@ -248,6 +260,7 @@ type HTTPLoadBalancer struct {
 - 支持会话保持，无需集中式 Session 存储
 - 适合缓存场景，提高缓存命中率
 - 虚拟节点机制保证分布均匀性
+- 目标节点不健康时自动故障转移到环上最近的健康节点
 
 **缺点：**
 - 实现复杂度较高
@@ -274,12 +287,22 @@ AddServer(address, weight)
 RemoveServer(address)
    │
    ├─ 检查地址是否存在 → 不存在返回 ErrServerNotFound
+   ├─ 检查服务器是否处于 Draining 状态 → 未 Draining 则返回 ErrServerNotDraining
+   ├─ 检查活跃连接数 → 仍有活跃连接则返回 ErrServerHasConns
    ├─ 从 servers map 中删除
    ├─ 从 order 列表中删除
    └─ 返回 nil
 ```
 
-**注意：** 直接移除会导致正在处理的请求无法追踪连接数，建议先调用 DrainServer 等待请求处理完毕后再移除。
+**安全移除约束：**
+`RemoveServer` 强制要求满足两个前置条件才能执行：
+1. 服务器必须已通过 `DrainServer` 标记为 Draining 状态，防止正在接收请求的服务器被意外移除
+2. 服务器的活跃连接数必须为 0，确保正在处理的请求不会因服务器被移除而丢失连接计数
+
+**推荐的完整下线流程：**
+1. 调用 `DrainServer(address)` 停止接收新请求
+2. 等待该服务器的活跃连接数降为 0（通过 `server.ActiveConn()` 轮询或事件通知）
+3. 调用 `RemoveServer(address)` 安全移除
 
 ### 5.3 优雅下线 (DrainServer)
 
@@ -294,7 +317,7 @@ DrainServer(address)
 **优雅下线特点：**
 - 下线中的服务器不再接收新请求
 - 已接收的请求继续处理，连接计数正常维护
-- 所有请求处理完成后，可安全调用 RemoveServer 完全移除
+- 所有请求处理完成后（ActiveConn() == 0），可安全调用 RemoveServer 完全移除
 - 可通过 RestoreServer 恢复上线
 
 ### 5.4 恢复上线 (RestoreServer)
@@ -307,13 +330,39 @@ RestoreServer(address)
    └─ 返回 nil
 ```
 
-## 6. 线程安全设计
+## 6. 一致性哈希故障转移机制
+
+### 6.1 故障转移流程
+
+```
+Next(key)
+   │
+   ├─ 计算请求键的哈希值
+   ├─ 在哈希环上二分查找，定位到起始节点
+   ├─ [遍历哈希环]
+   │     ├─ 取当前位置的虚拟节点对应的服务器地址
+   │     ├─ 已检查过的服务器 → 跳过（visited 去重）
+   │     ├─ 检查服务器是否存在且健康（IsHealthy）
+   │     │     ├─ 健康 → IncConn()，返回该服务器
+   │     │     └─ 不健康 → 继续顺时针查找
+   │     └─ 回到环起点后继续，直到遍历完所有物理服务器
+   ├─ 所有服务器都不健康 → 返回 ErrNoHealthyServer
+   └─ 返回 (*BackendServer, error)
+```
+
+### 6.2 故障转移保证
+
+- **最小影响原则**：当一台服务器被 Drain 后，原本哈希到该服务器的请求会被故障转移到环上顺时针方向最近的健康服务器，而非全部失败
+- **确定性路由**：同一个键在健康服务器集合不变的情况下始终路由到同一个服务器
+- **去重保证**：通过 `visited` 集合确保每个物理服务器只被检查一次，避免同一台不健康服务器上的多个虚拟节点导致重复检查
+
+## 7. 线程安全设计
 
 本模块所有对外接口均为并发安全：
 
 - **BackendServer**：状态变更使用 `sync.RWMutex` 保护，连接计数使用 `sync/atomic` 原子操作
 - **ServerPool**：使用 `sync.RWMutex` 保护服务器列表和映射
-- **RoundRobin**：计数器使用 `sync/atomic` 原子操作
+- **RoundRobin**：计数器使用 `sync/atomic` 原子操作，无额外互斥锁
 - **WeightedRoundRobin**：权重状态使用 `sync.Mutex` 保护
 - **ConsistentHash**：哈希环使用 `sync.RWMutex` 保护
 
@@ -322,7 +371,7 @@ RestoreServer(address)
 - 所有包含 `int64`/`uint64` 字段的结构体，将 64 位字段放在结构体最前面
 - 受影响结构体：`BackendServer`（activeConn）、`RoundRobin`（counter）
 
-## 7. 预定义错误
+## 8. 预定义错误
 
 | 错误变量 | 含义 | 触发场景 |
 |----------|------|----------|
@@ -330,10 +379,12 @@ RestoreServer(address)
 | `ErrServerNotFound` | 服务器不存在 | 移除/下线不存在的服务器 |
 | `ErrNoHealthyServer` | 无健康服务器 | 所有服务器均不可用时调用 Next |
 | `ErrInvalidWeight` | 无效权重 | 权重 <= 0 |
+| `ErrServerHasConns` | 服务器仍有活跃连接 | 移除服务器时检测到活跃连接数 > 0 |
+| `ErrServerNotDraining` | 服务器未处于 Draining 状态 | 移除服务器时服务器状态不是 StatusDraining |
 
-## 8. 使用示例
+## 9. 使用示例
 
-### 8.1 基础使用：轮询负载均衡
+### 9.1 基础使用：轮询负载均衡
 
 ```go
 package main
@@ -360,7 +411,7 @@ func main() {
 }
 ```
 
-### 8.2 加权轮询：性能异构集群
+### 9.2 加权轮询：性能异构集群
 
 ```go
 cfg := httplb.Config{
@@ -372,7 +423,7 @@ cfg := httplb.Config{
 lb, _ := httplb.NewHTTPLoadBalancer(cfg)
 ```
 
-### 8.3 一致性哈希：缓存服务
+### 9.3 一致性哈希：缓存服务
 
 ```go
 cfg := httplb.Config{
@@ -387,7 +438,7 @@ cfg := httplb.Config{
 lb, _ := httplb.NewHTTPLoadBalancer(cfg)
 ```
 
-### 8.4 基于客户端 IP 的会话保持
+### 9.4 基于客户端 IP 的会话保持
 
 ```go
 cfg := httplb.Config{
@@ -399,7 +450,7 @@ cfg := httplb.Config{
 }
 ```
 
-### 8.5 动态管理服务器
+### 9.5 动态管理服务器（完整的优雅下线流程）
 
 ```go
 lb, _ := httplb.NewHTTPLoadBalancer(cfg)
@@ -407,18 +458,28 @@ lb, _ := httplb.NewHTTPLoadBalancer(cfg)
 // 添加新服务器
 lb.AddServer("new-backend:8080", 2)
 
-// 优雅下线服务器（先停止接收新请求）
+// 步骤 1：优雅下线服务器（停止接收新请求）
 lb.DrainServer("old-backend:8080")
 
-// 等待现有请求处理完毕后...
-// 完全移除服务器
-lb.RemoveServer("old-backend:8080")
+// 步骤 2：等待现有请求处理完毕
+// 可通过查询活跃连接数判断：
+//   server, _ := lb.Balancer().(*ConsistentHash).pool.GetServer("old-backend:8080")
+//   server.ActiveConn() == 0 时表示所有请求已处理完毕
 
-// 恢复上线
-lb.RestoreServer("maintenance-backend:8080")
+// 步骤 3：安全移除服务器（仅当 Draining 且 ActiveConn==0 时允许）
+err := lb.RemoveServer("old-backend:8080")
+if err == httplb.ErrServerHasConns {
+    // 仍有活跃请求，稍后重试
+}
+if err == httplb.ErrServerNotDraining {
+    // 忘记调用 DrainServer
+}
+
+// 如果需要取消下线（在 RemoveServer 之前）
+lb.RestoreServer("old-backend:8080")
 ```
 
-### 8.6 直接使用调度器（非 HTTP 场景）
+### 9.6 直接使用调度器（非 HTTP 场景）
 
 ```go
 // 直接创建轮询调度器
@@ -433,23 +494,28 @@ defer server.DecConn() // 请求处理完成后减少连接计数
 fmt.Printf("Routing to: %s\n", server.Address)
 ```
 
-### 8.7 灰度发布（逐步调整权重）
+### 9.7 一致性哈希的故障转移
 
 ```go
-// 初始：所有流量到 v1
-wrr, _ := httplb.NewWeightedRoundRobin(
-    []string{"v1:8080", "v2:8080"},
-    []int{100, 0},
-)
+ch, _ := httplb.NewConsistentHash([]string{"s1:8080", "s2:8080", "s3:8080"}, 100)
 
-// 灰度 10% 流量到 v2
-wrr.AddServer("v2:8080", 10) // 假设已存在则需先移除再添加
-// 或使用动态调整权重的方式（需要额外实现权重更新接口）
+// 正常情况：同一 key 始终路由到同一服务器
+s, _ := ch.Next("/api/users/123")
+fmt.Printf("Routed to: %s\n", s.Address)
+s.DecConn()
 
-// 逐步增加 v2 的权重...
+// 当 s1 下线后，原来哈希到 s1 的请求自动故障转移到环上最近的健康节点
+ch.DrainServer("s1:8080")
+s, err := ch.Next("/api/users/123") // 不会返回错误（只要还有健康节点）
+if err == httplb.ErrNoHealthyServer {
+    // 所有节点都不健康
+} else {
+    fmt.Printf("Failover to: %s\n", s.Address) // 路由到 s2 或 s3
+    s.DecConn()
+}
 ```
 
-## 9. 文件结构
+## 10. 文件结构
 
 ```
 internal/httplb/
@@ -460,7 +526,7 @@ internal/httplb/
 ├── weighted_rr.go     # 加权轮询调度算法
 ├── consistent_hash.go # 一致性哈希调度算法
 ├── httplb.go          # HTTP 负载均衡器主入口
-└── httplb_test.go     # 单元测试（覆盖正常流程、边界条件、异常分支）
+└── httplb_test.go     # 单元测试（覆盖正常流程、边界条件、异常分支、故障转移）
 
 docs/
 └── httplb.md          # 本文档

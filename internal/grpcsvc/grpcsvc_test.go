@@ -30,11 +30,11 @@ func newEchoServiceDesc() *ServiceDesc {
 	svc := &echoService{}
 	return &ServiceDesc{
 		ServiceName: "EchoService",
-		HandlerType: svc,
 		Methods: []MethodDesc{
 			{
 				MethodName: "Echo",
 				Handler: func(ctx context.Context, req interface{}) (interface{}, error) {
+					svc.incr()
 					return req, nil
 				},
 			},
@@ -68,7 +68,7 @@ func newEchoServiceDesc() *ServiceDesc {
 				Handler: func(srv interface{}, stream Stream) error {
 					count := 0
 					for {
-						err := stream.RecvMsg(nil)
+						_, err := stream.Recv()
 						if err != nil {
 							if errors.Is(err, ErrStreamClosed) {
 								break
@@ -76,6 +76,9 @@ func newEchoServiceDesc() *ServiceDesc {
 							return err
 						}
 						count++
+						if count == 5 {
+							break
+						}
 					}
 					return stream.SendMsg(fmt.Sprintf("received %d messages", count))
 				},
@@ -86,7 +89,7 @@ func newEchoServiceDesc() *ServiceDesc {
 				ClientStreams: true,
 				Handler: func(srv interface{}, stream Stream) error {
 					for {
-						err := stream.RecvMsg(nil)
+						_, err := stream.Recv()
 						if err != nil {
 							if errors.Is(err, ErrStreamClosed) {
 								return nil
@@ -127,6 +130,27 @@ func TestNewServerWithOptions(t *testing.T) {
 	}
 	if !s.IsRunning() {
 		t.Error("expected server to be running")
+	}
+
+	gotOpts := s.Options()
+	if gotOpts.MaxConcurrentStreams != 200 {
+		t.Errorf("expected MaxConcurrentStreams 200, got %d", gotOpts.MaxConcurrentStreams)
+	}
+	if gotOpts.ConnectionTimeout != 60*time.Second {
+		t.Errorf("expected ConnectionTimeout 60s, got %v", gotOpts.ConnectionTimeout)
+	}
+}
+
+func TestNewServerWithOptions_Defaults(t *testing.T) {
+	opts := ServerOptions{}
+	s := NewServerWithOptions(opts)
+	gotOpts := s.Options()
+
+	if gotOpts.MaxConcurrentStreams != 100 {
+		t.Errorf("expected default MaxConcurrentStreams 100, got %d", gotOpts.MaxConcurrentStreams)
+	}
+	if gotOpts.ConnectionTimeout != 30*time.Second {
+		t.Errorf("expected default ConnectionTimeout 30s, got %v", gotOpts.ConnectionTimeout)
 	}
 }
 
@@ -426,14 +450,14 @@ func TestStreamInterceptor(t *testing.T) {
 
 	var order []string
 
-	interceptor1 := func(srv interface{}, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error {
+	interceptor1 := func(srv interface{}, ss Stream, info *StreamServerInfo, handler StreamHandler) error {
 		order = append(order, "before1")
 		err := handler(srv, ss)
 		order = append(order, "after1")
 		return err
 	}
 
-	interceptor2 := func(srv interface{}, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error {
+	interceptor2 := func(srv interface{}, ss Stream, info *StreamServerInfo, handler StreamHandler) error {
 		order = append(order, "before2")
 		err := handler(srv, ss)
 		order = append(order, "after2")
@@ -471,7 +495,7 @@ func TestStreamInterceptor_Info(t *testing.T) {
 
 	var capturedInfo *StreamServerInfo
 
-	interceptor := func(srv interface{}, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error {
+	interceptor := func(srv interface{}, ss Stream, info *StreamServerInfo, handler StreamHandler) error {
 		capturedInfo = info
 		return handler(srv, ss)
 	}
@@ -507,7 +531,7 @@ func TestAddStreamInterceptor_ServerStopped(t *testing.T) {
 	s := NewServer()
 	s.Stop()
 
-	interceptor := func(srv interface{}, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error {
+	interceptor := func(srv interface{}, ss Stream, info *StreamServerInfo, handler StreamHandler) error {
 		return handler(srv, ss)
 	}
 
@@ -544,6 +568,104 @@ func TestDeadlineExceeded(t *testing.T) {
 	}
 }
 
+func TestDeadline_ContinuousCheck(t *testing.T) {
+	s := NewServer()
+
+	handlerStarted := make(chan struct{})
+	handlerDone := make(chan struct{})
+	defer close(handlerDone)
+
+	sd := &ServiceDesc{
+		ServiceName: "LongBlockingService",
+		Methods: []MethodDesc{
+			{
+				MethodName: "LongBlockingMethod",
+				Handler: func(ctx context.Context, req interface{}) (interface{}, error) {
+					close(handlerStarted)
+					time.Sleep(500 * time.Millisecond)
+					return "done", nil
+				},
+			},
+		},
+	}
+	s.RegisterService(sd, &echoService{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := s.Invoke(ctx, "LongBlockingService", "LongBlockingMethod", nil)
+		resultCh <- err
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatal("handler did not start")
+	}
+
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, ErrDeadlineExceeded) {
+			t.Errorf("expected ErrDeadlineExceeded for long blocking handler, got %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Error("expected deadline check to interrupt handler within ticker interval")
+	}
+}
+
+func TestDeadline_StreamContinuousCheck(t *testing.T) {
+	s := NewServer()
+
+	handlerStarted := make(chan struct{})
+
+	sd := &ServiceDesc{
+		ServiceName: "LongStreamService",
+		Streams: []StreamDesc{
+			{
+				StreamName:    "LongStream",
+				ServerStreams: true,
+				Handler: func(srv interface{}, stream Stream) error {
+					close(handlerStarted)
+					time.Sleep(500 * time.Millisecond)
+					return stream.SendMsg("done")
+				},
+			},
+		},
+	}
+	s.RegisterService(sd, &echoService{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	stream, err := s.NewStream(ctx, "LongStreamService", "LongStream")
+	if err != nil {
+		t.Fatalf("unexpected error creating stream: %v", err)
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		err := s.HandleStream(ctx, "LongStreamService", "LongStream", stream)
+		resultCh <- err
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatal("handler did not start")
+	}
+
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, ErrDeadlineExceeded) {
+			t.Errorf("expected ErrDeadlineExceeded for long stream handler, got %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Error("expected deadline check to interrupt stream handler within ticker interval")
+	}
+}
+
 func TestDeadline_ImmediateExceeded(t *testing.T) {
 	s := NewServer()
 	sd := newEchoServiceDesc()
@@ -560,7 +682,7 @@ func TestDeadline_ImmediateExceeded(t *testing.T) {
 
 func TestDeadline_NoDeadline(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	ctx := context.Background()
@@ -707,9 +829,91 @@ func TestTrailer(t *testing.T) {
 	}
 }
 
+func TestHeader(t *testing.T) {
+	s := NewServer()
+	sd := &ServiceDesc{
+		ServiceName: "HeaderService",
+		Methods: []MethodDesc{
+			{
+				MethodName: "Method",
+				Handler: func(ctx context.Context, req interface{}) (interface{}, error) {
+					header := NewMD()
+					header.Set("x-custom", "custom-value")
+					SetHeader(ctx, header)
+					return "ok", nil
+				},
+			},
+		},
+	}
+	s.RegisterService(sd, &echoService{})
+
+	ctx := NewContextWithHeader(context.Background())
+	resp, err := s.Invoke(ctx, "HeaderService", "Method", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp != "ok" {
+		t.Errorf("expected ok, got %v", resp)
+	}
+
+	header, ok := HeaderFromContext(ctx)
+	if !ok {
+		t.Fatal("expected header in context")
+	}
+	if header.Get("x-custom")[0] != "custom-value" {
+		t.Errorf("expected custom-value, got %s", header.Get("x-custom")[0])
+	}
+}
+
+func TestStreamHeader(t *testing.T) {
+	s := NewServer()
+	sd := &ServiceDesc{
+		ServiceName: "StreamHeaderService",
+		Streams: []StreamDesc{
+			{
+				StreamName:    "Stream",
+				ServerStreams: true,
+				Handler: func(srv interface{}, stream Stream) error {
+					header := NewMD()
+					header.Set("x-stream-header", "stream-value")
+					stream.SetHeader(header)
+					return stream.SendMsg("hello")
+				},
+			},
+		},
+	}
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "StreamHeaderService", "Stream")
+	if err != nil {
+		t.Fatalf("unexpected error creating stream: %v", err)
+	}
+
+	err = s.HandleStream(context.Background(), "StreamHeaderService", "Stream", stream)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	header, ok := stream.Header()
+	if !ok {
+		t.Fatal("expected header in stream")
+	}
+	if header.Get("x-stream-header")[0] != "stream-value" {
+		t.Errorf("expected stream-value, got %s", header.Get("x-stream-header")[0])
+	}
+
+	ctxHeader, ok := HeaderFromContext(stream.Context())
+	if !ok {
+		t.Fatal("expected header in context")
+	}
+	if ctxHeader.Get("x-stream-header")[0] != "stream-value" {
+		t.Errorf("expected stream-value in context, got %s", ctxHeader.Get("x-stream-header")[0])
+	}
+}
+
 func TestServerStream(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	ctx := context.Background()
@@ -727,6 +931,96 @@ func TestServerStream(t *testing.T) {
 	}
 }
 
+func TestClientStream_InterfaceIntegrity(t *testing.T) {
+	s := NewServer()
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	ctx := context.Background()
+	stream, err := s.NewStream(ctx, "EchoService", "ClientStream")
+	if err != nil {
+		t.Fatalf("unexpected error creating stream: %v", err)
+	}
+
+	var streamInterface Stream = stream
+
+	handlerDone := make(chan error, 1)
+	go func() {
+		handlerDone <- s.HandleStream(ctx, "EchoService", "ClientStream", stream)
+	}()
+
+	for i := 0; i < 5; i++ {
+		err := streamInterface.PutRecv(fmt.Sprintf("msg-%d", i))
+		if err != nil {
+			t.Fatalf("PutRecv through Stream interface failed: %v", err)
+		}
+	}
+
+	resp, err := streamInterface.Send()
+	if err != nil {
+		t.Fatalf("Send through Stream interface failed: %v", err)
+	}
+	if resp != "received 5 messages" {
+		t.Errorf("expected 'received 5 messages', got %v", resp)
+	}
+
+	stream.Close()
+
+	select {
+	case err := <-handlerDone:
+		if err != nil && !errors.Is(err, ErrStreamClosed) {
+			t.Fatalf("unexpected handler error: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("handler did not complete")
+	}
+}
+
+func TestBidiStream_InterfaceIntegrity(t *testing.T) {
+	s := NewServer()
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	ctx := context.Background()
+	stream, err := s.NewStream(ctx, "EchoService", "BidiStream")
+	if err != nil {
+		t.Fatalf("unexpected error creating stream: %v", err)
+	}
+
+	var streamInterface Stream = stream
+
+	handlerDone := make(chan error, 1)
+	go func() {
+		handlerDone <- s.HandleStream(ctx, "EchoService", "BidiStream", stream)
+	}()
+
+	for i := 0; i < 3; i++ {
+		err := streamInterface.PutRecv(fmt.Sprintf("ping-%d", i))
+		if err != nil {
+			t.Fatalf("PutRecv through Stream interface failed: %v", err)
+		}
+
+		msg, err := streamInterface.Send()
+		if err != nil {
+			t.Fatalf("Send through Stream interface failed: %v", err)
+		}
+		if msg != "echo" {
+			t.Errorf("expected echo, got %v", msg)
+		}
+	}
+
+	stream.Close()
+
+	select {
+	case err := <-handlerDone:
+		if err != nil {
+			t.Fatalf("unexpected handler error: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("handler did not complete")
+	}
+}
+
 func TestNewStream_ServiceNotFound(t *testing.T) {
 	s := NewServer()
 	_, err := s.NewStream(context.Background(), "NonExistent", "Stream")
@@ -737,7 +1031,7 @@ func TestNewStream_ServiceNotFound(t *testing.T) {
 
 func TestNewStream_StreamNotFound(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	_, err := s.NewStream(context.Background(), "EchoService", "NonExistent")
@@ -748,7 +1042,7 @@ func TestNewStream_StreamNotFound(t *testing.T) {
 
 func TestNewStream_ServerStopped(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 	s.Stop()
 
@@ -756,6 +1050,50 @@ func TestNewStream_ServerStopped(t *testing.T) {
 	if !errors.Is(err, ErrServerStopped) {
 		t.Errorf("expected ErrServerStopped, got %v", err)
 	}
+}
+
+func TestNewStream_TooManyConcurrent(t *testing.T) {
+	opts := ServerOptions{
+		MaxConcurrentStreams: 2,
+		ConnectionTimeout:    10 * time.Second,
+	}
+	s := NewServerWithOptions(opts)
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream1, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
+	if err != nil {
+		t.Fatalf("failed to create stream 1: %v", err)
+	}
+	defer stream1.Close()
+
+	stream2, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
+	if err != nil {
+		t.Fatalf("failed to create stream 2: %v", err)
+	}
+	defer stream2.Close()
+
+	if s.ActiveStreams() != 2 {
+		t.Errorf("expected 2 active streams, got %d", s.ActiveStreams())
+	}
+
+	_, err = s.NewStream(context.Background(), "EchoService", "ServerStream")
+	if !errors.Is(err, ErrTooManyStreams) {
+		t.Errorf("expected ErrTooManyStreams, got %v", err)
+	}
+
+	stream2.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	if s.ActiveStreams() != 1 {
+		t.Errorf("expected 1 active stream after closing, got %d", s.ActiveStreams())
+	}
+
+	stream3, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
+	if err != nil {
+		t.Fatalf("failed to create stream 3 after closing: %v", err)
+	}
+	defer stream3.Close()
 }
 
 func TestHandleStream_ServiceNotFound(t *testing.T) {
@@ -769,7 +1107,7 @@ func TestHandleStream_ServiceNotFound(t *testing.T) {
 
 func TestHandleStream_StreamNotFound(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	stream, _ := s.NewStream(context.Background(), "EchoService", "ServerStream")
@@ -781,7 +1119,7 @@ func TestHandleStream_StreamNotFound(t *testing.T) {
 
 func TestHandleStream_ServerStopped(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 	s.Stop()
 
@@ -794,7 +1132,7 @@ func TestHandleStream_ServerStopped(t *testing.T) {
 
 func TestStream_Close(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	stream, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
@@ -823,7 +1161,7 @@ func TestStream_Close(t *testing.T) {
 
 func TestStream_SendOnClosed(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	stream, _ := s.NewStream(context.Background(), "EchoService", "ServerStream")
@@ -837,7 +1175,7 @@ func TestStream_SendOnClosed(t *testing.T) {
 
 func TestStream_RecvOnClosed(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	stream, _ := s.NewStream(context.Background(), "EchoService", "ServerStream")
@@ -849,9 +1187,23 @@ func TestStream_RecvOnClosed(t *testing.T) {
 	}
 }
 
+func TestStream_PutRecvOnClosed(t *testing.T) {
+	s := NewServer()
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	stream, _ := s.NewStream(context.Background(), "EchoService", "ServerStream")
+	stream.Close()
+
+	err := stream.PutRecv("test")
+	if !errors.Is(err, ErrStreamClosed) {
+		t.Errorf("expected ErrStreamClosed, got %v", err)
+	}
+}
+
 func TestStream_SetHeader(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	stream, _ := s.NewStream(context.Background(), "EchoService", "ServerStream")
@@ -859,11 +1211,19 @@ func TestStream_SetHeader(t *testing.T) {
 	md := NewMD()
 	md.Set("x-custom", "value")
 	stream.SetHeader(md)
+
+	header, ok := stream.Header()
+	if !ok {
+		t.Fatal("expected header to be set")
+	}
+	if header.Get("x-custom")[0] != "value" {
+		t.Errorf("expected value, got %s", header.Get("x-custom")[0])
+	}
 }
 
 func TestStream_SetTrailer(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	stream, _ := s.NewStream(context.Background(), "EchoService", "ServerStream")
@@ -875,7 +1235,7 @@ func TestStream_SetTrailer(t *testing.T) {
 
 func TestStream_Context(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	ctx := context.Background()
@@ -938,7 +1298,7 @@ func TestMethodCount(t *testing.T) {
 		t.Errorf("expected 0 methods for non-existent service, got %d", s.MethodCount("NonExistent"))
 	}
 
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	if count := s.MethodCount("EchoService"); count != 5 {
@@ -1015,27 +1375,31 @@ func TestChainUnaryInterceptors_Empty(t *testing.T) {
 	}
 }
 
-type mockServerStream struct{}
+type mockStream struct{}
 
-func (m *mockServerStream) Context() context.Context    { return context.Background() }
-func (m *mockServerStream) SendMsg(msg interface{}) error { return nil }
-func (m *mockServerStream) RecvMsg(msg interface{}) error { return nil }
-func (m *mockServerStream) SetHeader(md MD)              {}
-func (m *mockServerStream) SetTrailer(md MD)             {}
-func (m *mockServerStream) Close() error                 { return nil }
-func (m *mockServerStream) Closed() bool                 { return false }
+func (m *mockStream) Context() context.Context    { return context.Background() }
+func (m *mockStream) SendMsg(msg interface{}) error { return nil }
+func (m *mockStream) RecvMsg(msg interface{}) error { return nil }
+func (m *mockStream) Recv() (interface{}, error)   { return nil, nil }
+func (m *mockStream) Send() (interface{}, error)   { return nil, nil }
+func (m *mockStream) PutRecv(msg interface{}) error { return nil }
+func (m *mockStream) SetHeader(md MD)              {}
+func (m *mockStream) SetTrailer(md MD)             {}
+func (m *mockStream) Header() (MD, bool)            { return nil, false }
+func (m *mockStream) Close() error                 { return nil }
+func (m *mockStream) Closed() bool                 { return false }
 
 func TestChainStreamInterceptors(t *testing.T) {
 	var order []string
 
-	i1 := func(srv interface{}, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error {
+	i1 := func(srv interface{}, ss Stream, info *StreamServerInfo, handler StreamHandler) error {
 		order = append(order, "before1")
 		err := handler(srv, ss)
 		order = append(order, "after1")
 		return err
 	}
 
-	i2 := func(srv interface{}, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error {
+	i2 := func(srv interface{}, ss Stream, info *StreamServerInfo, handler StreamHandler) error {
 		order = append(order, "before2")
 		err := handler(srv, ss)
 		order = append(order, "after2")
@@ -1049,7 +1413,7 @@ func TestChainStreamInterceptors(t *testing.T) {
 		return nil
 	}
 
-	var ss ServerStream = &mockServerStream{}
+	var ss Stream = &mockStream{}
 	err := chain(nil, ss, info, handler)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1075,7 +1439,7 @@ func TestChainStreamInterceptors_Empty(t *testing.T) {
 
 func TestConcurrentInvoke(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	var wg sync.WaitGroup
@@ -1169,7 +1533,7 @@ func TestDeadlineInStream(t *testing.T) {
 
 func TestInterceptorWithMetadata(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	authInterceptor := func(ctx context.Context, req interface{}, info *UnaryServerInfo, handler UnaryHandler) (interface{}, error) {
@@ -1201,7 +1565,7 @@ func TestInterceptorWithMetadata(t *testing.T) {
 
 func TestInterceptorWithMetadata_Unauthorized(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	authInterceptor := func(ctx context.Context, req interface{}, info *UnaryServerInfo, handler UnaryHandler) (interface{}, error) {
@@ -1237,7 +1601,7 @@ func TestDefaultServerOptions(t *testing.T) {
 
 func TestServerStream_RecvAndSend(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	stream, err := s.NewStream(context.Background(), "EchoService", "BidiStream")
@@ -1245,14 +1609,12 @@ func TestServerStream_RecvAndSend(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	ss := stream.(*serverStream)
-
-	err = ss.PutRecv("hello")
+	err = stream.PutRecv("hello")
 	if err != nil {
 		t.Fatalf("unexpected error putting recv: %v", err)
 	}
 
-	msg, err := ss.Recv()
+	msg, err := stream.Recv()
 	if err != nil {
 		t.Fatalf("unexpected error receiving: %v", err)
 	}
@@ -1263,34 +1625,158 @@ func TestServerStream_RecvAndSend(t *testing.T) {
 
 func TestServerStream_RecvOnClosedChannel(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
 	stream, _ := s.NewStream(context.Background(), "EchoService", "BidiStream")
-	ss := stream.(*serverStream)
 	stream.Close()
 
-	_, err := ss.Recv()
+	_, err := stream.Recv()
 	if !errors.Is(err, ErrStreamClosed) {
 		t.Errorf("expected ErrStreamClosed, got %v", err)
 	}
 }
 
-func TestServerStream_PutRecvOnClosed(t *testing.T) {
+func TestConnectionTimeout(t *testing.T) {
+	opts := ServerOptions{
+		MaxConcurrentStreams: 100,
+		ConnectionTimeout:    10 * time.Millisecond,
+	}
+	s := NewServerWithOptions(opts)
+
+	sd := &ServiceDesc{
+		ServiceName: "TimeoutService",
+		Methods: []MethodDesc{
+			{
+				MethodName: "Method",
+				Handler: func(ctx context.Context, req interface{}) (interface{}, error) {
+					time.Sleep(50 * time.Millisecond)
+					return "done", nil
+				},
+			},
+		},
+	}
+	s.RegisterService(sd, &echoService{})
+
+	_, err := s.Invoke(context.Background(), "TimeoutService", "Method", nil)
+	if !errors.Is(err, ErrDeadlineExceeded) {
+		t.Errorf("expected ErrDeadlineExceeded from connection timeout, got %v", err)
+	}
+}
+
+func TestConnectionTimeout_Stream(t *testing.T) {
+	opts := ServerOptions{
+		MaxConcurrentStreams: 100,
+		ConnectionTimeout:    10 * time.Millisecond,
+	}
+	s := NewServerWithOptions(opts)
+
+	sd := &ServiceDesc{
+		ServiceName: "TimeoutStreamService",
+		Streams: []StreamDesc{
+			{
+				StreamName:    "Stream",
+				ServerStreams: true,
+				Handler: func(srv interface{}, stream Stream) error {
+					time.Sleep(50 * time.Millisecond)
+					return stream.SendMsg("done")
+				},
+			},
+		},
+	}
+	s.RegisterService(sd, &echoService{})
+
+	stream, err := s.NewStream(context.Background(), "TimeoutStreamService", "Stream")
+	if err != nil {
+		t.Fatalf("unexpected error creating stream: %v", err)
+	}
+
+	err = s.HandleStream(context.Background(), "TimeoutStreamService", "Stream", stream)
+	if !errors.Is(err, ErrDeadlineExceeded) {
+		t.Errorf("expected ErrDeadlineExceeded from connection timeout, got %v", err)
+	}
+}
+
+func TestMaxConcurrentStreams(t *testing.T) {
+	opts := ServerOptions{
+		MaxConcurrentStreams: 3,
+		ConnectionTimeout:    30 * time.Second,
+	}
+	s := NewServerWithOptions(opts)
+	sd := newEchoServiceDesc()
+	s.RegisterService(sd, &echoService{})
+
+	streams := make([]Stream, 0, 3)
+	for i := 0; i < 3; i++ {
+		stream, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
+		if err != nil {
+			t.Fatalf("failed to create stream %d: %v", i, err)
+		}
+		streams = append(streams, stream)
+		defer stream.Close()
+	}
+
+	if s.ActiveStreams() != 3 {
+		t.Errorf("expected 3 active streams, got %d", s.ActiveStreams())
+	}
+
+	_, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
+	if !errors.Is(err, ErrTooManyStreams) {
+		t.Errorf("expected ErrTooManyStreams, got %v", err)
+	}
+
+	streams[0].Close()
+	time.Sleep(10 * time.Millisecond)
+
+	if s.ActiveStreams() != 2 {
+		t.Errorf("expected 2 active streams after closing, got %d", s.ActiveStreams())
+	}
+
+	stream4, err := s.NewStream(context.Background(), "EchoService", "ServerStream")
+	if err != nil {
+		t.Fatalf("failed to create stream after releasing slot: %v", err)
+	}
+	stream4.Close()
+}
+
+func TestStream_RecvInterface(t *testing.T) {
 	s := NewServer()
-	sd := newEchoService_desc()
+	sd := newEchoServiceDesc()
 	s.RegisterService(sd, &echoService{})
 
-	stream, _ := s.NewStream(context.Background(), "EchoService", "BidiStream")
-	ss := stream.(*serverStream)
-	stream.Close()
+	stream, err := s.NewStream(context.Background(), "EchoService", "BidiStream")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-	err := ss.PutRecv("test")
-	if !errors.Is(err, ErrStreamClosed) {
-		t.Errorf("expected ErrStreamClosed, got %v", err)
+	var streamInterface Stream = stream
+
+	err = streamInterface.PutRecv("test")
+	if err != nil {
+		t.Fatalf("PutRecv through Stream interface failed: %v", err)
+	}
+
+	msg, err := streamInterface.Recv()
+	if err != nil {
+		t.Fatalf("Recv through Stream interface failed: %v", err)
+	}
+	if msg != "test" {
+		t.Errorf("expected test, got %v", msg)
 	}
 }
 
-func newEchoService_desc() *ServiceDesc {
-	return newEchoServiceDesc()
+func TestServerOptions_Options(t *testing.T) {
+	opts := ServerOptions{
+		MaxConcurrentStreams: 50,
+		ConnectionTimeout:    15 * time.Second,
+	}
+	s := NewServerWithOptions(opts)
+
+	got := s.Options()
+	if got.MaxConcurrentStreams != 50 {
+		t.Errorf("expected MaxConcurrentStreams 50, got %d", got.MaxConcurrentStreams)
+	}
+	if got.ConnectionTimeout != 15*time.Second {
+		t.Errorf("expected ConnectionTimeout 15s, got %v", got.ConnectionTimeout)
+	}
 }

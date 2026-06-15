@@ -125,9 +125,10 @@ CheckPermission(userID, resource, action)
         └─► 未注册 → 拒绝："permission xxx is not registered"
         │
         ▼
-  查询用户角色
+  查询用户是否存在
         │
-        └─► 用户无角色 → 拒绝："user xxx has no roles assigned"
+        ├─► 用户不存在（从未分配过角色） → 拒绝：ErrUserNotFound
+        └─► 用户存在且无角色 → 拒绝："user xxx has no roles assigned"
         │
         ▼
   遍历用户所有角色

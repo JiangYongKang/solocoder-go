@@ -23,9 +23,40 @@ var (
 	ErrNoRecordsFound      = errors.New("dnsresolver: no DNS records found")
 	ErrInvalidConfig       = errors.New("dnsresolver: invalid configuration")
 	ErrResolverClosed      = errors.New("dnsresolver: resolver is closed")
+	ErrTransactionIDMismatch = errors.New("dnsresolver: transaction ID mismatch")
+)
+
+type DNSError struct {
+	RCODE uint16
+	Msg   string
+}
+
+func (e *DNSError) Error() string {
+	return fmt.Sprintf("dnsresolver: rcode=%d %s", e.RCODE, e.Msg)
+}
+
+func (e *DNSError) Is(target error) bool {
+	t, ok := target.(*DNSError)
+	if !ok {
+		return false
+	}
+	return e.RCODE == t.RCODE
+}
+
+var (
+	ErrNXDOMAIN  = &DNSError{RCODE: 3, Msg: "NXDOMAIN - non-existent domain"}
+	ErrSERVFAIL  = &DNSError{RCODE: 2, Msg: "SERVFAIL - server failure"}
+	ErrFORMERR   = &DNSError{RCODE: 1, Msg: "FORMERR - format error"}
+	ErrREFUSED   = &DNSError{RCODE: 5, Msg: "REFUSED - query refused"}
 )
 
 const (
+	RCODE_NOERROR  uint16 = 0
+	RCODE_FORMERR  uint16 = 1
+	RCODE_SERVFAIL uint16 = 2
+	RCODE_NXDOMAIN uint16 = 3
+	RCODE_REFUSED  uint16 = 5
+
 	TypeA     uint16 = 1
 	TypeNS    uint16 = 2
 	TypeCNAME uint16 = 5
@@ -101,10 +132,12 @@ type DNSQuestion struct {
 }
 
 type DNSResponse struct {
-	Answers     []DNSRecord
-	Authorities []DNSRecord
-	Additionals []DNSRecord
-	Flags       uint16
+	TransactionID uint16
+	RCode         uint16
+	Answers       []DNSRecord
+	Authorities   []DNSRecord
+	Additionals   []DNSRecord
+	Flags         uint16
 }
 
 type cacheMap map[string]*CacheEntry
@@ -221,11 +254,19 @@ func (r *Resolver) Resolve(domain string, qtype uint16) ([]string, error) {
 }
 
 func (r *Resolver) resolveRecursive(domain string, qtype uint16, depth int) ([]DNSRecord, error) {
+	return r.resolveRecursiveWithServers(domain, qtype, depth, nil)
+}
+
+func (r *Resolver) resolveRecursiveWithServers(domain string, qtype uint16, depth int, knownServers []string) ([]DNSRecord, error) {
 	if depth >= r.cfg.MaxRecursionDepth {
 		return nil, ErrMaxDepthExceeded
 	}
 
-	servers := r.cfg.RootServers
+	servers := knownServers
+	if len(servers) == 0 {
+		servers = r.cfg.RootServers
+	}
+
 	labels := splitDomain(domain)
 
 	for i := 0; i <= len(labels); i++ {
@@ -284,7 +325,11 @@ func (r *Resolver) resolveRecursive(domain string, qtype uint16, depth int) ([]D
 		if depth+1 >= r.cfg.MaxRecursionDepth {
 			return nil, ErrMaxDepthExceeded
 		}
-		return r.resolveRecursive(cname, qtype, depth+1)
+		cnameRecords, cnameErr := r.followCNAME(domain, cname, qtype, depth, servers, resp)
+		if cnameErr == nil {
+			return cnameRecords, nil
+		}
+		return nil, cnameErr
 	}
 
 	targetRecords := filterRecords(answers, qtype)
@@ -293,6 +338,50 @@ func (r *Resolver) resolveRecursive(domain string, qtype uint16, depth int) ([]D
 	}
 
 	return answers, nil
+}
+
+func (r *Resolver) followCNAME(originalDomain, cname string, qtype uint16, depth int, currentServers []string, currentResp *DNSResponse) ([]DNSRecord, error) {
+	if depth+1 >= r.cfg.MaxRecursionDepth {
+		return nil, ErrMaxDepthExceeded
+	}
+
+	if currentResp != nil && len(currentResp.Answers) > 0 {
+		targetRecords := filterRecords(currentResp.Answers, qtype)
+		if len(targetRecords) > 0 {
+			return currentResp.Answers, nil
+		}
+	}
+
+	cnameDomain := cname
+	originalLabels := splitDomain(originalDomain)
+	cnameLabels := splitDomain(cnameDomain)
+
+	if len(cnameLabels) >= len(originalLabels) {
+		sameSuffix := true
+		for i := 0; i < len(originalLabels); i++ {
+			if cnameLabels[len(cnameLabels)-1-i] != originalLabels[len(originalLabels)-1-i] {
+				sameSuffix = false
+				break
+			}
+		}
+		if sameSuffix {
+			resp, err := r.queryParallel(currentServers, cnameDomain, qtype)
+			if err == nil {
+				answers := resp.Answers
+				cnames := filterRecords(answers, TypeCNAME)
+				if len(cnames) > 0 {
+					nextCname := strings.TrimSuffix(cnames[0].Data, ".")
+					return r.followCNAME(cnameDomain, nextCname, qtype, depth+1, currentServers, resp)
+				}
+				targetRecords := filterRecords(answers, qtype)
+				if len(targetRecords) > 0 {
+					return answers, nil
+				}
+			}
+		}
+	}
+
+	return r.resolveRecursive(cnameDomain, qtype, depth+1)
 }
 
 func (r *Resolver) resolveIterative(domain string, qtype uint16) ([]DNSRecord, error) {
@@ -401,7 +490,7 @@ func (r *Resolver) queryParallel(servers []string, domain string, qtype uint16) 
 }
 
 func (r *Resolver) querySingle(ctx context.Context, server, domain string, qtype uint16) (*DNSResponse, error) {
-	query, err := buildQuery(domain, qtype)
+	query, id, err := buildQuery(domain, qtype)
 	if err != nil {
 		return nil, err
 	}
@@ -412,20 +501,51 @@ func (r *Resolver) querySingle(ctx context.Context, server, domain string, qtype
 	}
 	defer conn.Close()
 
-	conn.SetDeadline(r.nowFunc().Add(r.cfg.QueryTimeout))
-
-	_, err = conn.Write(query)
-	if err != nil {
-		return nil, err
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = r.nowFunc().Add(r.cfg.QueryTimeout)
 	}
+	conn.SetDeadline(deadline)
 
-	buf := make([]byte, 512)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
+	readDone := make(chan struct{})
+	var resp *DNSResponse
+	var readErr error
+
+	go func() {
+		defer close(readDone)
+		_, writeErr := conn.Write(query)
+		if writeErr != nil {
+			readErr = writeErr
+			return
+		}
+
+		buf := make([]byte, 512)
+		var n int
+		n, readErr = conn.Read(buf)
+		if readErr != nil {
+			return
+		}
+
+		resp, readErr = parseResponse(buf[:n], id)
+	}()
+
+	select {
+	case <-ctx.Done():
+		conn.Close()
+		<-readDone
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, ErrQueryTimeout
+		}
+		return nil, ctx.Err()
+	case <-readDone:
+		if readErr != nil {
+			if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+				return nil, ErrQueryTimeout
+			}
+			return nil, readErr
+		}
+		return resp, nil
 	}
-
-	return parseResponse(buf[:n])
 }
 
 func (r *Resolver) getFromCache(key string) ([]DNSRecord, bool) {
@@ -548,13 +668,13 @@ func extractIPs(records []DNSRecord, qtype uint16) []string {
 	return ips
 }
 
-func buildQuery(domain string, qtype uint16) ([]byte, error) {
+func buildQuery(domain string, qtype uint16) ([]byte, uint16, error) {
 	id := uint16(rand.Intn(65535))
 	flags := uint16(0x0100)
 
 	question, err := encodeQuestion(domain, qtype, ClassIN)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	msg := make([]byte, 12+len(question))
@@ -566,7 +686,7 @@ func buildQuery(domain string, qtype uint16) ([]byte, error) {
 	binary.BigEndian.PutUint16(msg[10:12], 0)
 	copy(msg[12:], question)
 
-	return msg, nil
+	return msg, id, nil
 }
 
 func encodeQuestion(domain string, qtype, qclass uint16) ([]byte, error) {
@@ -593,7 +713,7 @@ func encodeQuestion(domain string, qtype, qclass uint16) ([]byte, error) {
 	return buf, nil
 }
 
-func parseResponse(msg []byte) (*DNSResponse, error) {
+func parseResponse(msg []byte, expectedID uint16) (*DNSResponse, error) {
 	if len(msg) < 12 {
 		return nil, ErrInvalidResponse
 	}
@@ -605,8 +725,11 @@ func parseResponse(msg []byte) (*DNSResponse, error) {
 	nsCount := binary.BigEndian.Uint16(msg[8:10])
 	arCount := binary.BigEndian.Uint16(msg[10:12])
 
-	_ = id
-	_ = flags
+	rcode := flags & 0x000F
+
+	if id != expectedID {
+		return nil, ErrTransactionIDMismatch
+	}
 
 	offset := 12
 
@@ -619,7 +742,9 @@ func parseResponse(msg []byte) (*DNSResponse, error) {
 	}
 
 	resp := &DNSResponse{
-		Flags: flags,
+		TransactionID: id,
+		RCode:         rcode,
+		Flags:         flags,
 	}
 
 	var err error
@@ -636,6 +761,21 @@ func parseResponse(msg []byte) (*DNSResponse, error) {
 	resp.Additionals, offset, err = parseRRs(msg, offset, int(arCount))
 	if err != nil {
 		return nil, err
+	}
+
+	if rcode != RCODE_NOERROR {
+		switch rcode {
+		case RCODE_FORMERR:
+			return resp, ErrFORMERR
+		case RCODE_SERVFAIL:
+			return resp, ErrSERVFAIL
+		case RCODE_NXDOMAIN:
+			return resp, ErrNXDOMAIN
+		case RCODE_REFUSED:
+			return resp, ErrREFUSED
+		default:
+			return resp, &DNSError{RCODE: rcode, Msg: "unknown error"}
+		}
 	}
 
 	return resp, nil
@@ -699,7 +839,6 @@ func parseRR(msg []byte, offset int) (DNSRecord, int, error) {
 		rr.Data = fmt.Sprintf("%x", rdata)
 	}
 
-	_ = name
 	return rr, offset, nil
 }
 

@@ -46,6 +46,12 @@
 
 注册中心，管理所有服务实例的注册、心跳、过期和推送。
 
+`Registry` 使用两个独立的状态标志来实现安全的生命周期管理：
+- `running`：表示注册中心是否接受操作（Register、Deregister、Heartbeat 等）
+- `expiryRunning`：表示后台过期检查协程是否在运行
+
+这种分离设计确保了 `WaitGroup` 的安全使用，避免了并发 Start/Stop 场景下的竞态条件。
+
 主要方法：
 
 | 方法 | 说明 |
@@ -57,8 +63,9 @@
 | `GetHealth(serviceName, instanceID string) (*HealthStatus, error)` | 获取指定实例的健康状态 |
 | `Subscribe(serviceName string, handler SubscriberFunc) (string, error)` | 订阅服务实例列表变更通知 |
 | `Unsubscribe(serviceName, subscriberID string) error` | 取消订阅 |
-| `Start()` | 启动后台心跳过期检查协程 |
-| `Stop()` | 停止注册中心 |
+| `Start()` | 启动后台心跳过期检查协程（幂等） |
+| `Stop()` | 停止注册中心，拒绝后续操作，等待后台协程退出 |
+| `IsRunning() bool` | 检查注册中心是否在运行（接受操作） |
 | `InstanceCount(serviceName string) int` | 获取指定服务的实例数 |
 | `ServiceCount() int` | 获取已注册的服务数 |
 | `SubscriberCount(serviceName string) int` | 获取指定服务的订阅者数 |
@@ -113,6 +120,44 @@
 5. 重新注册
    实例可再次调用 Register() 重新加入注册列表（如重启后）
 ```
+
+## 并发安全设计
+
+### Start/Stop 生命周期管理
+
+`Registry` 采用双状态标志设计来确保并发安全：
+
+- **`running`**：控制是否接受操作（Register、Deregister、Heartbeat、Subscribe 等）
+- **`expiryRunning`**：控制后台过期检查协程的运行状态
+
+关键保证：
+1. `wg.Add(1)` 始终在持锁时调用，确保不会在 `wg.Wait()` 之后执行
+2. `Start()` 是幂等的，重复调用不会启动多个后台协程
+3. `Stop()` 会等待所有后台协程退出后才返回
+4. 支持 Stop 之后重新 Start（可重启设计）
+
+### 通知一致性保证
+
+多服务过期通知采用"先收集快照，后统一发送"的策略：
+
+1. **原子扫描**：在持有锁的情况下完成所有服务的过期扫描和实例删除
+2. **快照收集**：为每个发生变更的服务构建实例列表快照和订阅者回调列表
+3. **批量通知**：释放锁后，依次发送所有通知
+
+这种设计确保：
+- 同一轮过期检测产生的所有通知都基于扫描时刻的一致快照
+- 通知发送期间新注册的实例不会出现在前一轮的过期通知中
+- 避免了原设计中每发送一个通知就解锁-重新加锁导致的一致性问题
+
+### 通知架构
+
+通知系统采用三层架构：
+
+1. **`buildEventLocked(serviceName, action)`**：在持锁时构建事件快照
+2. **`collectHandlersLocked(serviceName)`**：在持锁时收集订阅者回调
+3. **`dispatchEvent(event, handlers)`**：在锁外发送通知
+
+这种分离确保了锁持有时间最短，同时保证了通知内容的一致性。
 
 ## 使用示例
 

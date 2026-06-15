@@ -1,0 +1,9 @@
+产物不满意：
+1. expiryLoop 的 defer 函数中先执行 wg.Done() 后设置 expiryRunning = false，Stop 的 wg.Wait() 在 Done 后立即返回，此时 expiryRunning 仍为 true。StartStopNoPanic 等测试中 Start 紧接着 Stop 调用时发现 expiryRunning 为 true 会认为过期协程正在运行而直接返回，不启动新的过期循环。应在 defer 中先设置 expiryRunning = false 再调用 wg.Done()。
+2. expireInstances 方法在删除过期实例后才调用 buildEventLocked 构建 expire 事件通知，传入订阅者的是过期后的存活实例列表。当某服务全部实例过期时 expire 事件中 Instances 为空列表，订阅者无法获知哪些实例被逐出。正确做法是在删除实例前先通过 buildEventLocked 构建过期前快照，再将事件发送出去。
+3. TestMultiServiceExpireNotificationAtomic 中定义了 atomicViolation 变量但从未被任何代码递增为非零值，assert 语句 atomic.LoadInt32(&atomicViolation) != 0 恒为 false，测试始终通过。它不验证任何原子性或通知一致性，仅运行了一个并发心跳场景后退出，属于不提供有效测试覆盖的虚假测试用例。
+4. TestConcurrentStartStop 启动了 10 个 goroutine 并发调用 Start 后直接等待 wg 结束，没有验证 expireLoop 是否被正确启动了恰好一次，也没有检查 expiryRunning 的状态是否一致。该测试仅验证了没有 panic，无法覆盖提示词第 4 条要求验证的并发 Start/Stop 交叉语义。
+过程不满意：
+1. 思考轨迹文件 session-cot-2.md 的全部内容描述的是 idempotent 包的修改而非 servicereg 包的修复。第一个工具调用就打开 idempotent.go 并讨论缓存命中响应头丢失问题，后续每一步操作都在 idempotent 包上。模型完全没有读到 servicereg.go 的代码，属于严重的目标理解偏差和路径混淆。
+2. 模型在刚收到任务后未做任何分析就创建了 8 项 TodoList，内容包括"缓存命中时响应头丢失"和"Stop 后等待请求返回错误值"等 idempotent 特有的修复条目。计划与任务目标完全不符说明模型没有先阅读提示词和代码文件就直接套用了其他会话的规划模板。
+3. 模型在 idempotent.go 上经历了三轮试错式修改：先重写全文件遇编译错误，再读测试文件修改逻辑，再修 channel 重复关闭产生的 panic。同一段并发控制逻辑三易其稿。虽然最终产物通过测试，但模型始终未曾分析 servicereg 包的代码，导致了实际产物与提示词要求之间的脱节。

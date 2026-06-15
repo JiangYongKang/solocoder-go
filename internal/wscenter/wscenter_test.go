@@ -608,8 +608,8 @@ func TestSendToClient(t *testing.T) {
 	}
 
 	err = ws.SendToClient("client1", "nonexistent", payload)
-	if err != ErrClientOffline {
-		t.Errorf("expected ErrClientOffline, got %v", err)
+	if err != ErrClientNotFound {
+		t.Errorf("expected ErrClientNotFound for never-connected target, got %v", err)
 	}
 
 	err = ws.SendToClient("nonexistent", "client2", payload)
@@ -670,8 +670,8 @@ func TestHandlePong(t *testing.T) {
 
 func TestHeartbeatTimeout(t *testing.T) {
 	cfg := Config{
-		PingInterval: 50 * time.Millisecond,
-		PongTimeout:  80 * time.Millisecond,
+		PingInterval: 25 * time.Millisecond,
+		PongTimeout:  25 * time.Millisecond,
 		SendTimeout:  10 * time.Millisecond,
 	}
 	ws := NewWSCenter(cfg)
@@ -685,7 +685,7 @@ func TestHeartbeatTimeout(t *testing.T) {
 		t.Fatalf("expected 1 client, got %d", ws.ClientCount())
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
 	if ws.ClientCount() != 0 {
 		t.Errorf("expected client to be disconnected due to pong timeout, got %d clients", ws.ClientCount())
@@ -1305,8 +1305,8 @@ func TestSendToClientDisconnectedSender(t *testing.T) {
 	ws.Disconnect("client1")
 
 	err := ws.SendToClient("client1", "client2", []byte("test"))
-	if err != ErrClientNotFound {
-		t.Errorf("expected ErrClientNotFound for disconnected sender, got %v", err)
+	if err != ErrClientOffline {
+		t.Errorf("expected ErrClientOffline for disconnected sender (was connected before), got %v", err)
 	}
 }
 
@@ -1338,5 +1338,264 @@ func TestNewWSCenterCustomLogger(t *testing.T) {
 	defer ws.Stop()
 	if ws.cfg.Logger != logger {
 		t.Error("expected custom logger to be used")
+	}
+}
+
+func TestHeartbeatFirstTickNoTimeout(t *testing.T) {
+	cfg := Config{
+		PingInterval: 60 * time.Millisecond,
+		PongTimeout:  10 * time.Millisecond,
+		SendTimeout:  10 * time.Millisecond,
+	}
+	ws := NewWSCenter(cfg)
+	ws.Start()
+	defer ws.Stop()
+
+	conn := newMockConn("client1")
+	ws.Connect(conn)
+
+	time.Sleep(30 * time.Millisecond)
+
+	if ws.ClientCount() != 1 {
+		t.Errorf("expected client to still be connected before first ping, got %d clients", ws.ClientCount())
+	}
+	if conn.isClosed() {
+		t.Error("expected conn to NOT be closed before any ping is sent")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	if ws.ClientCount() != 1 {
+		t.Errorf("expected client to still be connected right after first ping (timeout not reached), got %d clients", ws.ClientCount())
+	}
+}
+
+func TestHeartbeatPingSentBeforeTimeoutCheck(t *testing.T) {
+	cfg := Config{
+		PingInterval: 30 * time.Millisecond,
+		PongTimeout:  200 * time.Millisecond,
+		SendTimeout:  10 * time.Millisecond,
+	}
+	ws := NewWSCenter(cfg)
+	ws.Start()
+	defer ws.Stop()
+
+	conn := newMockConn("client1")
+	ws.Connect(conn)
+
+	time.Sleep(100 * time.Millisecond)
+
+	msgs := conn.getReceivedMessages()
+	pingCount := 0
+	for _, msg := range msgs {
+		if msg.Type == MessageTypePing {
+			pingCount++
+		}
+	}
+	if pingCount < 2 {
+		t.Errorf("expected at least 2 pings to be sent, got %d", pingCount)
+	}
+
+	if ws.ClientCount() != 1 {
+		t.Errorf("expected client to still be connected with long PongTimeout, got %d clients", ws.ClientCount())
+	}
+}
+
+func TestSendToClientErrorCodeDistinction(t *testing.T) {
+	ws := NewWSCenter(DefaultConfig())
+	defer ws.Stop()
+
+	conn1 := newMockConn("client1")
+	conn2 := newMockConn("client2")
+	ws.Connect(conn1)
+	ws.Connect(conn2)
+
+	err := ws.SendToClient("client1", "never_existed", []byte("test"))
+	if err != ErrClientNotFound {
+		t.Errorf("expected ErrClientNotFound for never-connected target, got %v", err)
+	}
+
+	err = ws.SendToClient("never_existed", "client1", []byte("test"))
+	if err != ErrClientNotFound {
+		t.Errorf("expected ErrClientNotFound for never-connected sender, got %v", err)
+	}
+
+	ws.Disconnect("client2")
+
+	err = ws.SendToClient("client1", "client2", []byte("test"))
+	if err != ErrClientOffline {
+		t.Errorf("expected ErrClientOffline for disconnected target (was connected), got %v", err)
+	}
+
+	err = ws.SendToClient("client2", "client1", []byte("test"))
+	if err != ErrClientOffline {
+		t.Errorf("expected ErrClientOffline for disconnected sender (was connected), got %v", err)
+	}
+}
+
+func TestJoinRoomWithConcurrentRoomDestruction(t *testing.T) {
+	ws := NewWSCenter(DefaultConfig())
+	defer ws.Stop()
+
+	numClients := 20
+	conns := make([]*mockConn, numClients)
+	for i := 0; i < numClients; i++ {
+		conns[i] = newMockConn(fmt.Sprintf("client%d", i))
+		ws.Connect(conns[i])
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < numClients; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			roomID := fmt.Sprintf("room%d", idx%5)
+			ws.GetOrCreateRoom(roomID)
+			ws.JoinRoom(fmt.Sprintf("client%d", idx), roomID)
+		}(i)
+	}
+	wg.Wait()
+
+	for r := 0; r < 5; r++ {
+		roomID := fmt.Sprintf("room%d", r)
+		_, err := ws.GetRoomClients(roomID)
+		if err != nil && err != ErrRoomNotFound {
+			t.Errorf("unexpected error for room %s: %v", roomID, err)
+		}
+	}
+
+	var wg2 sync.WaitGroup
+	for i := 0; i < numClients; i++ {
+		wg2.Add(1)
+		go func(idx int) {
+			defer wg2.Done()
+			roomID := fmt.Sprintf("room%d", idx%5)
+			ws.LeaveRoom(fmt.Sprintf("client%d", idx), roomID)
+		}(i)
+	}
+	wg2.Wait()
+
+	for r := 0; r < 5; r++ {
+		roomID := fmt.Sprintf("room%d", r)
+		if ws.RoomExists(roomID) {
+			t.Errorf("expected room %s to be destroyed after all clients left", roomID)
+		}
+	}
+}
+
+func TestDisconnectReentrantCall(t *testing.T) {
+	ws := NewWSCenter(DefaultConfig())
+	defer ws.Stop()
+
+	conn := newMockConn("client1")
+	ws.Connect(conn)
+	ws.CreateRoom("room1")
+	ws.JoinRoom("client1", "room1")
+
+	err := ws.Disconnect("client1")
+	if err != nil {
+		t.Fatalf("first Disconnect failed: %v", err)
+	}
+
+	err = ws.Disconnect("client1")
+	if err != ErrClientNotFound {
+		t.Errorf("expected ErrClientNotFound for second Disconnect on removed client, got %v", err)
+	}
+}
+
+func TestJoinRoomDisconnectedClient(t *testing.T) {
+	ws := NewWSCenter(DefaultConfig())
+	defer ws.Stop()
+
+	conn := newMockConn("client1")
+	ws.Connect(conn)
+	ws.CreateRoom("room1")
+	ws.Disconnect("client1")
+
+	err := ws.JoinRoom("client1", "room1")
+	if err != ErrClientNotFound {
+		t.Errorf("expected ErrClientNotFound for joining room after full disconnect, got %v", err)
+	}
+}
+
+func TestKnownClientsPersistsAfterStop(t *testing.T) {
+	ws := NewWSCenter(DefaultConfig())
+
+	conn1 := newMockConn("client1")
+	ws.Connect(conn1)
+	ws.Disconnect("client1")
+
+	err := ws.SendToClient("client1", "client1", []byte("test"))
+	if err != ErrClientOffline {
+		t.Errorf("expected ErrClientOffline for known but disconnected client, got %v", err)
+	}
+
+	ws.Stop()
+
+	ws2 := NewWSCenter(DefaultConfig())
+	defer ws2.Stop()
+
+	err = ws2.SendToClient("client1", "client1", []byte("test"))
+	if err != ErrClientNotFound {
+		t.Errorf("expected ErrClientNotFound in new center (knownClients cleared), got %v", err)
+	}
+}
+
+func TestHeartbeatPongResetsPendingState(t *testing.T) {
+	cfg := Config{
+		PingInterval: 40 * time.Millisecond,
+		PongTimeout:  80 * time.Millisecond,
+		SendTimeout:  10 * time.Millisecond,
+	}
+	ws := NewWSCenter(cfg)
+	ws.Start()
+	defer ws.Stop()
+
+	conn := newMockConn("client1")
+	ws.Connect(conn)
+
+	time.Sleep(50 * time.Millisecond)
+	ws.HandlePong("client1")
+
+	time.Sleep(50 * time.Millisecond)
+	ws.HandlePong("client1")
+
+	time.Sleep(50 * time.Millisecond)
+	if ws.ClientCount() != 1 {
+		t.Errorf("expected client to stay connected with periodic pong responses, got %d clients", ws.ClientCount())
+	}
+}
+
+func TestConcurrentDisconnectAndSend(t *testing.T) {
+	ws := NewWSCenter(DefaultConfig())
+	defer ws.Stop()
+
+	numPairs := 10
+	for i := 0; i < numPairs; i++ {
+		c1 := newMockConn(fmt.Sprintf("pair-%d-a", i))
+		c2 := newMockConn(fmt.Sprintf("pair-%d-b", i))
+		ws.Connect(c1)
+		ws.Connect(c2)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < numPairs; i++ {
+		wg.Add(2)
+		aID := fmt.Sprintf("pair-%d-a", i)
+		bID := fmt.Sprintf("pair-%d-b", i)
+		go func() {
+			defer wg.Done()
+			ws.SendToClient(aID, bID, []byte("msg-a"))
+		}()
+		go func() {
+			defer wg.Done()
+			ws.Disconnect(aID)
+		}()
+	}
+	wg.Wait()
+
+	remainingClients := ws.ClientCount()
+	if remainingClients > numPairs {
+		t.Errorf("expected at most %d clients remaining, got %d", numPairs, remainingClients)
 	}
 }

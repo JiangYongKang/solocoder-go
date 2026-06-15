@@ -28,6 +28,12 @@ func DefaultConfig() Config {
 	}
 }
 
+type Response struct {
+	StatusCode int
+	Body       []byte
+	Header     http.Header
+}
+
 type Idempotent struct {
 	cfg       Config
 	mu        sync.Mutex
@@ -40,17 +46,20 @@ type Idempotent struct {
 }
 
 type cacheEntry struct {
-	key       string
+	key        string
 	statusCode int
 	body       []byte
-	expiresAt time.Time
+	header     http.Header
+	expiresAt  time.Time
 }
 
 type pendingEntry struct {
-	key     string
-	done    chan struct{}
+	key        string
+	done       chan struct{}
 	statusCode int
-	body    []byte
+	body       []byte
+	header     http.Header
+	err        error
 }
 
 func NewIdempotent() *Idempotent {
@@ -116,6 +125,13 @@ func (i *Idempotent) Stop() {
 		return
 	}
 	i.stopped = true
+
+	for _, pending := range i.pending {
+		pending.err = ErrIdempotentStopped
+		close(pending.done)
+	}
+	i.pending = make(map[string]*pendingEntry)
+
 	if i.running {
 		i.running = false
 		close(i.stopCh)
@@ -125,24 +141,29 @@ func (i *Idempotent) Stop() {
 	i.wg.Wait()
 }
 
-func (i *Idempotent) Execute(key string, handler func() (int, []byte)) (int, []byte, bool, error) {
+func (i *Idempotent) Execute(key string, handler func() Response) (Response, bool, error) {
 	if key == "" {
-		return 0, nil, false, ErrEmptyKey
+		return Response{}, false, ErrEmptyKey
 	}
 	if handler == nil {
-		return 0, nil, false, ErrHandlerNil
+		return Response{}, false, ErrHandlerNil
 	}
 
 	i.mu.Lock()
 	if i.stopped {
 		i.mu.Unlock()
-		return 0, nil, false, ErrIdempotentStopped
+		return Response{}, false, ErrIdempotentStopped
 	}
 
 	if entry, ok := i.cache[key]; ok {
 		if time.Now().Before(entry.expiresAt) {
+			resp := Response{
+				StatusCode: entry.statusCode,
+				Body:       entry.body,
+				Header:     cloneHeader(entry.header),
+			}
 			i.mu.Unlock()
-			return entry.statusCode, entry.body, true, nil
+			return resp, true, nil
 		}
 		delete(i.cache, key)
 	}
@@ -150,7 +171,15 @@ func (i *Idempotent) Execute(key string, handler func() (int, []byte)) (int, []b
 	if pending, ok := i.pending[key]; ok {
 		i.mu.Unlock()
 		<-pending.done
-		return pending.statusCode, pending.body, true, nil
+		if pending.err != nil {
+			return Response{}, false, pending.err
+		}
+		resp := Response{
+			StatusCode: pending.statusCode,
+			Body:       pending.body,
+			Header:     cloneHeader(pending.header),
+		}
+		return resp, true, nil
 	}
 
 	pending := &pendingEntry{
@@ -160,23 +189,30 @@ func (i *Idempotent) Execute(key string, handler func() (int, []byte)) (int, []b
 	i.pending[key] = pending
 	i.mu.Unlock()
 
-	statusCode, body := handler()
+	resp := handler()
 
 	i.mu.Lock()
+	if _, stillPending := i.pending[key]; !stillPending {
+		i.mu.Unlock()
+		return Response{}, false, ErrIdempotentStopped
+	}
 	if i.stopped {
 		delete(i.pending, key)
+		pending.err = ErrIdempotentStopped
 		close(pending.done)
 		i.mu.Unlock()
-		return 0, nil, false, ErrIdempotentStopped
+		return Response{}, false, ErrIdempotentStopped
 	}
 
-	pending.statusCode = statusCode
-	pending.body = body
+	pending.statusCode = resp.StatusCode
+	pending.body = resp.Body
+	pending.header = cloneHeader(resp.Header)
 
 	entry := &cacheEntry{
 		key:        key,
-		statusCode: statusCode,
-		body:       body,
+		statusCode: resp.StatusCode,
+		body:       resp.Body,
+		header:     cloneHeader(resp.Header),
 		expiresAt:  time.Now().Add(i.cfg.TTL),
 	}
 	i.cache[key] = entry
@@ -185,7 +221,20 @@ func (i *Idempotent) Execute(key string, handler func() (int, []byte)) (int, []b
 	close(pending.done)
 	i.mu.Unlock()
 
-	return statusCode, body, false, nil
+	return resp, false, nil
+}
+
+func cloneHeader(h http.Header) http.Header {
+	if h == nil {
+		return nil
+	}
+	cloned := make(http.Header, len(h))
+	for k, vv := range h {
+		vv2 := make([]string, len(vv))
+		copy(vv2, vv)
+		cloned[k] = vv2
+	}
+	return cloned
 }
 
 func (i *Idempotent) Middleware(next http.Handler) http.Handler {
@@ -200,12 +249,16 @@ func (i *Idempotent) Middleware(next http.Handler) http.Handler {
 			header: make(http.Header),
 		}
 
-		handler := func() (int, []byte) {
+		handler := func() Response {
 			next.ServeHTTP(rr, r)
-			return rr.statusCode, rr.body
+			return Response{
+				StatusCode: rr.statusCode,
+				Body:       rr.body,
+				Header:     rr.header,
+			}
 		}
 
-		statusCode, body, fromCache, err := i.Execute(key, handler)
+		resp, fromCache, err := i.Execute(key, handler)
 		if err != nil {
 			if errors.Is(err, ErrIdempotentStopped) {
 				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
@@ -215,9 +268,11 @@ func (i *Idempotent) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		for k, vv := range rr.header {
-			for _, v := range vv {
-				w.Header().Add(k, v)
+		if resp.Header != nil {
+			for k, vv := range resp.Header {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
 			}
 		}
 
@@ -227,8 +282,8 @@ func (i *Idempotent) Middleware(next http.Handler) http.Handler {
 			w.Header().Set("X-Idempotent-Cache", "MISS")
 		}
 
-		w.WriteHeader(statusCode)
-		w.Write(body)
+		w.WriteHeader(resp.StatusCode)
+		w.Write(resp.Body)
 	})
 }
 
@@ -254,32 +309,37 @@ func (rr *responseRecorder) WriteHeader(statusCode int) {
 	rr.statusCode = statusCode
 }
 
-func (i *Idempotent) Get(key string) (int, []byte, bool, error) {
+func (i *Idempotent) Get(key string) (Response, bool, error) {
 	if key == "" {
-		return 0, nil, false, ErrEmptyKey
+		return Response{}, false, ErrEmptyKey
 	}
 
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
 	if i.stopped {
-		return 0, nil, false, ErrIdempotentStopped
+		return Response{}, false, ErrIdempotentStopped
 	}
 
 	entry, ok := i.cache[key]
 	if !ok {
-		return 0, nil, false, nil
+		return Response{}, false, nil
 	}
 
 	if time.Now().After(entry.expiresAt) {
 		delete(i.cache, key)
-		return 0, nil, false, nil
+		return Response{}, false, nil
 	}
 
-	return entry.statusCode, entry.body, true, nil
+	resp := Response{
+		StatusCode: entry.statusCode,
+		Body:       entry.body,
+		Header:     cloneHeader(entry.header),
+	}
+	return resp, true, nil
 }
 
-func (i *Idempotent) Set(key string, statusCode int, body []byte) error {
+func (i *Idempotent) Set(key string, statusCode int, body []byte, header http.Header) error {
 	if key == "" {
 		return ErrEmptyKey
 	}
@@ -295,6 +355,7 @@ func (i *Idempotent) Set(key string, statusCode int, body []byte) error {
 		key:        key,
 		statusCode: statusCode,
 		body:       body,
+		header:     cloneHeader(header),
 		expiresAt:  time.Now().Add(i.cfg.TTL),
 	}
 	i.cache[key] = entry

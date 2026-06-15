@@ -1,0 +1,8 @@
+你实现的 WebSocket 连接中心模块存在一些功能缺陷，需要修复：
+1. 心跳超时检测逻辑在首次 tick 时同时执行发送 Ping 和检查超时，由于 lastPong 初始值为连接时间，在默认 PingInterval=30s、PongTimeout=10s 配置下，客户端在从未收到任何 Ping 消息的情况下就被判定为超时断连。需要区分"尚未发送过 Ping"和"已发 Ping 未收到 Pong"两种状态。
+2. SendToClient 方法对目标客户端从未连接过的情况和已连接后断开的情况统一返回了 ErrClientOffline，调用方无法区分两种不同场景，错误信息失去诊断价值。需要为不同情况返回恰当的错误码。
+3. Disconnect 方法在持有 ws.mu 锁时立即将客户端从全局 clients map 中删除，导致后续在断连通知流程中 SendToClient 等查找发送方的逻辑无法区分"发送方从未连接"和"发送方已断连"。
+4. JoinRoom 方法在 ws.mu 读锁内获取房间引用后释放锁，在两次加锁间隙另一个协程可能通过 LeaveRoom 或 Disconnect 使房间变空并触发自动销毁，导致客户端被添加到已从全局 rooms map 中删除的僵尸房间对象。
+5. 修复以上问题后，需要为该模块补充相关边界场景的单元测试，特别是心跳首次触发、断连后的错误码区分、JoinRoom 的竞态条件等用例。
+6. 运行 go test ./internal/wscenter/ -v，需要让所有测试通过。
+7. 在 docs/wscenter.md 中更新模块需求文档，说明修复后的心跳机制和错误码语义。

@@ -1,0 +1,8 @@
+你实现的 DNS 解析器模块存在一些功能缺失和资源管理问题，需要修复：
+1. parseResponse 函数解析 DNS 响应头部后丢弃了 flags 和 id 字段，没有校验 RCODE 响应码（如 NXDOMAIN、SERVFAIL）和事务 ID 是否匹配。当上游返回 NXDOMAIN 时解析器将其当作正常响应处理，最终返回通用的 ErrNoRecordsFound，丢失了真实的 DNS 级错误语义。同时 UDP 环境下可能错误接受不属于本次查询的响应包。
+2. querySingle 函数签名声明了 ctx context.Context 参数但函数体内完全不使用，queryParallel 中创建的超时 context 形同虚设。当第一个有效响应返回后 queryParallel 调用 cancel，但各 goroutine 内的 querySingle 并不感知 context 取消，继续执行 UDP 读写直到各自超时到期，在高延迟网络下会导致 goroutine 堆积和资源浪费。
+3. resolveRecursive 中 CNAME 追踪部分在处理 CNAME 时触发完整的递归链重建——从根服务器开始逐级重新解析 NS 委派。当前权威服务器已确认了 CNAME 指向，重复构建整条 NS 链是冗余的，且一旦某级委派因网络问题不可达会导致 CNAME 追踪失败，而实际上当前服务器可能同时知道目标域名的 A 记录。
+4. 代码中存在多处无意义的空白标识符赋值（_ = id, _ = flags, _ = name）是迭代修改后留下的残留代码，影响代码整洁度。
+5. 修复以上问题后，需要为该模块补充 RCODE 错误处理、context 超时传播验证、CNAME 追踪效率等场景的单元测试。
+6. 运行 go test ./internal/dnsresolver/ -v，需要让所有测试通过。
+7. 在 docs/dnsresolver.md 中更新模块需求文档。

@@ -87,21 +87,23 @@ type Conn interface {
 
 ```go
 type Client struct {
-    id         string           // 客户端 ID
-    conn       Conn             // 底层连接
-    rooms      map[string]*Room // 加入的房间集合
-    sendCh     chan *Message    // 发送消息通道
-    lastPong   time.Time        // 最后一次收到 Pong 的时间
-    mu         sync.RWMutex     // 保护内部状态
-    closeOnce  sync.Once        // 保证 Close 只执行一次
-    disconnect bool             // 是否已断开连接
+    id           string           // 客户端 ID
+    conn         Conn             // 底层连接
+    rooms        map[string]*Room // 加入的房间集合
+    sendCh       chan *Message    // 发送消息通道
+    lastPong     time.Time        // 最后一次收到 Pong 的时间
+    lastPingSent time.Time        // 最后一次发送 Ping 的时间
+    mu           sync.RWMutex     // 保护内部状态
+    closeOnce    sync.Once        // 保证 Close 只执行一次
+    disconnect   bool             // 是否已断开连接
 }
 ```
 
 **主要职责：**
 - 包装底层 `Conn` 连接，附加房间信息和心跳状态
 - 管理发送通道，实现异步消息发送
-- 维护心跳状态，记录最后 Pong 时间
+- 维护心跳状态，记录最后 Pong 时间和最后 Ping 发送时间
+- 通过 `hasPendingPing()` 区分"尚未发送Ping"和"已发Ping未收Pong"两种状态
 
 ### 3.5 Room - 房间管理
 
@@ -123,20 +125,22 @@ type Room struct {
 
 ```go
 type WSCenter struct {
-    cfg       Config             // 配置快照
-    mu        sync.RWMutex       // 保护内部状态
-    clients   map[string]*Client // 所有连接的客户端
-    rooms     map[string]*Room   // 所有存在的房间
-    running   bool               // 是否运行中
-    stopCh    chan struct{}      // 后台协程停止信号
-    wg        sync.WaitGroup     // 后台协程同步等待组
-    logger    *log.Logger        // 日志记录器
-    nextMsgID uint64             // 消息 ID 生成器
+    cfg          Config             // 配置快照
+    mu           sync.RWMutex       // 保护内部状态
+    clients      map[string]*Client // 所有连接的客户端
+    knownClients map[string]bool    // 曾经连接过的客户端 ID 集合
+    rooms        map[string]*Room   // 所有存在的房间
+    running      bool               // 是否运行中
+    stopCh       chan struct{}      // 后台协程停止信号
+    wg           sync.WaitGroup     // 后台协程同步等待组
+    logger       *log.Logger        // 日志记录器
+    nextMsgID    uint64             // 消息 ID 生成器
 }
 ```
 
 **主要职责：**
 - 维护全局客户端和房间映射
+- 通过 `knownClients` 记录所有曾经连接过的客户端 ID，用于区分"从未连接"和"已断连"
 - 协调并发的客户端连接、房间操作
 - 驱动心跳检测、超时检查等后台协程
 - 提供对外 API 接口，保证线程安全
@@ -146,7 +150,7 @@ type WSCenter struct {
 | 错误变量 | 含义 | 触发场景 |
 |----------|------|----------|
 | `ErrCenterStopped` | 连接中心已停止 | 已停止的中心上调用 Connect/CreateRoom 等 |
-| `ErrClientNotFound` | 客户端不存在 | 操作不存在的客户端 ID |
+| `ErrClientNotFound` | 客户端不存在（从未连接过） | 操作 ID 从未被 Connect 过的客户端 |
 | `ErrClientExists` | 客户端已存在 | 重复连接相同 ID 的客户端 |
 | `ErrRoomNotFound` | 房间不存在 | 操作不存在的房间 ID |
 | `ErrRoomExists` | 房间已存在 | 重复创建相同 ID 的房间 |
@@ -154,7 +158,16 @@ type WSCenter struct {
 | `ErrClientAlreadyInRoom` | 客户端已在房间内 | 重复加入同一个房间 |
 | `ErrInvalidID` | ID 无效 | 传入空字符串的 ID |
 | `ErrSendTimeout` | 发送超时 | 消息发送缓冲区满且超时 |
-| `ErrClientOffline` | 客户端已离线 | 向已断开的客户端发送消息 |
+| `ErrClientOffline` | 客户端已离线（曾连接但已断开） | 向曾经连接过但已 Disconnect 的客户端发送消息 |
+
+**错误码语义说明（关键区别）：**
+
+| 场景 | 错误码 | 诊断含义 |
+|------|--------|----------|
+| 目标客户端 ID 从未调用过 `Connect` | `ErrClientNotFound` | ID 拼写错误 / 客户端从未接入过系统 |
+| 目标客户端 ID 曾 `Connect` 过但已 `Disconnect` | `ErrClientOffline` | 客户端已下线，可能需要重连 |
+| 发送方 ID 从未调用过 `Connect` | `ErrClientNotFound` | 发送方身份无效 |
+| 发送方 ID 曾 `Connect` 过但已 `Disconnect` | `ErrClientOffline` | 发送方连接已断开，需要重新认证 |
 
 ## 4. 消息流转路径
 
@@ -189,25 +202,26 @@ JoinRoom(clientID, roomID)
    │
    ├─ 参数校验 → ID 为空 → 返回 ErrInvalidID
    │
-   ├─ mu.RLock() → 查找客户端和房间
+   ├─ mu.Lock() → 查找客户端和房间（使用写锁，防止竞态）
    │     ├─ 客户端不存在 → 返回 ErrClientNotFound
-   │     └─ 房间不存在 → 返回 ErrRoomNotFound
+   │     ├─ 房间不存在 → 返回 ErrRoomNotFound
+   │     └─ 客户端已断开 → 返回 ErrClientOffline
    │
-   ├─ 检查客户端是否已断开 → 已断开 → 返回 ErrClientOffline
-   │
-   ├─ 房间添加客户端
-   │     └─ room.mu.Lock() → 检查是否已在房间内
-   │     └─ 已在房间内 → 返回 ErrClientAlreadyInRoom
+   ├─ 房间添加客户端（持有 ws.mu 期间）
+   │     └─ 检查是否已在房间内 → 已在 → 返回 ErrClientAlreadyInRoom
    │     └─ 加入 clients 映射
-   │     └─ room.mu.Unlock()
    │
-   ├─ 客户端记录房间
-   │     └─ client.mu.Lock()
+   ├─ 客户端记录房间（持有 ws.mu 期间）
    │     └─ 加入 rooms 映射
-   │     └─ client.mu.Unlock()
+   │
+   ├─ mu.Unlock() → 完成状态修改后释放锁
    │
    └─ 广播加入通知 → 向房间内其他成员发送 MessageTypeJoin 消息
 ```
+
+**竞态防护说明：**
+- 使用 `mu.Lock()` 写锁而非读锁，避免在"获取房间引用"和"添加客户端"间隙，房间因其他协程的 LeaveRoom/Disconnect 变空并被自动销毁
+- 保证房间引用和 rooms map 中对象的一致性，防止客户端被添加到"僵尸房间"（已从全局 rooms map 删除但仍有引用的房间对象）
 
 ### 4.3 离开房间流程
 
@@ -273,9 +287,13 @@ SendToClient(fromClientID, toClientID, payload)
    │
    ├─ 参数校验 → ID 为空 → 返回 ErrInvalidID
    │
-   ├─ mu.RLock() → 查找发送方和接收方
-   │     ├─ 发送方不存在 → 返回 ErrClientNotFound
-   │     └─ 接收方不存在 → 返回 ErrClientOffline
+   ├─ mu.RLock() → 查找发送方和接收方，并检查 knownClients
+   │     ├─ 发送方不存在
+   │     │   ├─ 发送方曾连接过（knownClients=true）→ 返回 ErrClientOffline
+   │     │   └─ 发送方从未连接 → 返回 ErrClientNotFound
+   │     └─ 接收方不存在
+   │         ├─ 接收方曾连接过（knownClients=true）→ 返回 ErrClientOffline
+   │         └─ 接收方从未连接 → 返回 ErrClientNotFound
    │
    ├─ 检查发送方是否已断开 → 已断开 → 返回 ErrClientOffline
    │
@@ -292,7 +310,8 @@ SendToClient(fromClientID, toClientID, payload)
 
 **关键特性：**
 - 不缓存离线消息，接收方不在线立即返回失败
-- 发送方和接收方都需要在线
+- 发送方和接收方均使用错误码区分"从未连接"与"已断连"
+- 调用方可根据不同错误码采取不同处理策略（如提示重连 vs 提示 ID 无效）
 
 ### 4.6 心跳检测流程
 
@@ -301,24 +320,34 @@ pingLoop（后台协程，PingInterval 驱动）
    │
    └─ [ticker.C]
       │
-      ├─ 发送 Ping 消息
+      ├─ 先执行超时检查（checkTimeouts）
       │     └─ 遍历所有客户端
       │           ├─ 已断开 → 跳过
-      │           └─ 发送 MessageTypePing 消息
+      │           ├─ hasPendingPing() == false → 跳过（尚未发送过 Ping）
+      │           │     条件：lastPingSent 是零值，或 lastPingSent <= lastPong
+      │           └─ 有未回复的 Ping：
+      │                 ├─ 计算时间差：now - lastPingSent
+      │                 └─ 时间差 >= PongTimeout → 调用 Disconnect()
       │
-      └─ 超时检查
+      └─ 再发送 Ping 消息（sendPings）
             └─ 遍历所有客户端
                   ├─ 已断开 → 跳过
-                  ├─ 计算超时阈值：now - PongTimeout
-                  ├─ lastPong < 超时阈值 → 调用 Disconnect()
-                  └─ 记录超时断开日志
+                  ├─ 发送 MessageTypePing 消息
+                  └─ 发送成功 → 更新 lastPingSent = now
 ```
 
-**心跳机制说明：**
-- `PingInterval` 控制心跳发送频率
-- `PongTimeout` 控制超时判定阈值
-- 客户端需要在 `PongTimeout` 内回复 Pong 消息
-- 超时未回复的客户端被视为断线，主动断开连接
+**心跳机制说明（修复后）：**
+- 执行顺序：先 `checkTimeouts` 再 `sendPings`，避免同一 tick 内发送的 Ping 立即被判定为超时
+- 状态区分：通过 `hasPendingPing()` 判断是否有"已发未回"的 Ping
+  - `lastPingSent` 为零值 → 从未发送过 Ping，不进行超时判定
+  - `lastPingSent > lastPong` → 有 Ping 待回复，进行超时判定
+  - `lastPingSent <= lastPong` → 所有 Ping 都已回复，不判定超时
+- 超时判定条件：`now - lastPingSent >= PongTimeout`（基于发送时间而非 Pong 时间）
+- 客户端需在 `PongTimeout` 内回复 Pong 消息，更新 `lastPong` 以清除待回复状态
+
+**避免的问题：**
+- 修复前：`lastPong` 初始值为连接时间，首次 tick 时同时发送 Ping 和检查超时，由于 `PongTimeout < PingInterval`，在客户端从未收到 Ping 的情况下就被判定超时
+- 修复后：首次 tick 先检查超时（无待回复 Ping，跳过），再发送 Ping；第二次 tick 才检查第一次发送的 Ping 是否超时，符合预期
 
 ### 4.7 客户端断开流程
 
@@ -330,29 +359,38 @@ Disconnect(clientID)
    ├─ mu.Lock() → 查找客户端
    │     └─ 不存在 → 返回 ErrClientNotFound
    │
-   ├─ 获取客户端加入的所有房间
+   ├─ client.mu.Lock() → 标记断开状态
+   │     ├─ 已标记 disconnect → 幂等返回 nil
+   │     └─ 设置 disconnect = true
    │
-   ├─ 从 clients 映射删除客户端
+   ├─ 获取客户端加入的所有房间快照
    │
-   ├─ mu.Unlock()
+   ├─ mu.Unlock() → 释放全局锁（避免通知期间阻塞其他操作）
    │
-   ├─ 遍历所有房间
+   ├─ 遍历所有房间（不持有 ws.mu 锁）
    │     ├─ 从房间移除客户端
    │     ├─ 客户端移除房间记录
    │     ├─ 广播离开通知（MessageTypeLeave）
+   │     │     └─ 通知期间可正常通过 knownClients 区分断连状态
    │     └─ 房间为空 → 自动销毁
    │
-   └─ 关闭客户端连接
-         └─ client.close()
-               ├─ 设置 disconnect = true
-               ├─ 关闭 sendCh
-               └─ 调用 conn.Close()
+   ├─ 关闭客户端连接（client.close()）
+   │     ├─ 保证只执行一次（closeOnce）
+   │     ├─ 关闭 sendCh
+   │     └─ 调用 conn.Close()
+   │
+   ├─ mu.Lock() → 重新获取锁
+   │     └─ 从 clients 映射删除客户端（保留 knownClients 记录）
+   │
+   └─ mu.Unlock()
 ```
 
 **关键特性：**
-- 客户端断开后，自动从所有房间移除
-- 每个房间广播离开通知，告知其他成员
-- 房间为空时自动销毁，释放资源
+- **延迟删除策略**：先标记断开状态，完成通知和房间清理后，最后才从 clients map 删除客户端
+- **断连期间状态可区分**：通知流程中，若有 `SendToClient` 等调用，通过 `knownClients` 能区分"从未连接"与"已断连"
+- **幂等性保证**：重复调用 `Disconnect` 不会重复执行清理逻辑（已标记 disconnect 直接返回）
+- **房间空时自动销毁**：每个房间处理完后检查是否为空，释放资源
+- **knownClients 保留**：即使从 clients map 删除，knownClients 中仍保留 ID 记录，用于后续错误码区分
 
 ## 5. 核心机制说明
 
@@ -603,7 +641,7 @@ docs/
 
 ## 8. 测试覆盖范围
 
-单元测试覆盖以下场景：
+单元测试覆盖以下场景（共 47 个测试用例）：
 
 ### 正常流程
 - ✅ 客户端连接与断开
@@ -615,6 +653,7 @@ docs/
 - ✅ 加入/离开通知
 - ✅ 断线通知
 - ✅ 并发操作
+- ✅ 定期 Pong 回复保持连接
 
 ### 边界条件
 - ✅ 空 ID 参数处理
@@ -623,12 +662,24 @@ docs/
 - ✅ 查询不存在的房间/客户端
 - ✅ 房间为空时自动销毁
 - ✅ 发送缓冲区满时的超时
+- ✅ 心跳首次触发不误判超时（从未发送 Ping 的场景）
+- ✅ 心跳发送顺序：先检查超时再发送 Ping
+- ✅ JoinRoom 与房间销毁的并发竞态
+- ✅ 并发 Disconnect 与 SendToClient
+- ✅ 多房间断线通知完整性
+- ✅ Disconnect 幂等性（重复调用）
 
 ### 异常分支
-- ✅ 目标客户端不在线时发送消息
-- ✅ 发送方客户端已断开
+- ✅ 目标客户端不在线时发送消息（分两种场景）
+  - 从未连接过 → ErrClientNotFound
+  - 曾连接但已断开 → ErrClientOffline
+- ✅ 发送方客户端已断开（分两种场景）
+  - 从未连接过 → ErrClientNotFound
+  - 曾连接但已断开 → ErrClientOffline
 - ✅ 中心已停止后的操作
 - ✅ 消息发送超时
 - ✅ 单个客户端发送失败不影响其他
 - ✅ Pong 超时自动断开
 - ✅ 多房间断线通知
+- ✅ 断连后加入房间失败
+- ✅ Stop 后 knownClients 被清理，新中心正确区分状态

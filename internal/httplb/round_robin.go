@@ -1,14 +1,12 @@
 package httplb
 
 import (
-	"sync"
 	"sync/atomic"
 )
 
 type RoundRobin struct {
 	counter uint64
 	pool    *ServerPool
-	mu      sync.Mutex
 }
 
 func NewRoundRobin(servers []string) (*RoundRobin, error) {

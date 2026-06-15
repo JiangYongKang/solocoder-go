@@ -1,0 +1,9 @@
+你实现的 TCP 反向代理模块存在一些并发安全和资源管理问题，需要修复：
+1. handleStream 方法中，客户端到上游的转发协程在 s.Read 返回错误时调用了 pool.Remove 移除上游连接，但 defer upstreamConn.Close 随后又会将同一连接归还到空闲列表，导致连接计数出现负数，已关闭的连接被放回池中后续取出后读写立即失败。需要区分流层面错误和上游连接错误。
+2. ConnPool 的 Get 方法在处理空闲连接过期时，在 for 循环中检测到超时后先解锁关闭连接再重新加锁，锁释放期间并发的 reclaimIdle 或 Put 可能修改了 idleList 长度，导致循环索引越界。
+3. IPHashBalancer 的 GetUpstream 方法在持有自身读锁的情况下调用了 HealthChecker 的 GetHealthyUpstreams 方法获取健康列表，两者之间的锁顺序与 onChange 回调路径中 HealthChecker 写锁到 IPHashBalancer 写锁的锁顺序不一致，存在潜在死锁风险。
+4. handleFin 和 handleRst 方法在 check-then-act 模式中存在竞态窗口，并发场景下可能重复操作已被另一个方法处理过的 stream。
+5. HealthChecker 的 checkOne 方法在读写锁之间的 check-then-act 窗口中，如果上游被删除后又以相同地址重新添加，failCount 和 passCount 计数器会错误继承旧实例的状态。
+6. 修复以上问题后，需要为该模块补充相关并发场景的单元测试，特别是涉及连接计数正确性、锁竞争和竞态窗口的用例。
+7. 运行 go test ./internal/tcpproxy/ -v，需要让所有测试通过。
+8. 在 docs/tcpproxy.md 中更新模块需求文档，说明修复后的并发保证策略。

@@ -1316,3 +1316,335 @@ func TestIPHashBalancer_DifferentIPs(t *testing.T) {
 		t.Error("hash should distribute across at least 2 upstreams")
 	}
 }
+
+func TestConnPool_RemoveThenCloseNoNegativeCount(t *testing.T) {
+	addr, cleanup := startTCPServer(t, echoHandler)
+	defer cleanup()
+
+	u := NewUpstream(addr)
+	pool := NewConnPool(u, ConnPoolConfig{
+		MaxConns:    5,
+		IdleTimeout: 1 * time.Hour,
+	})
+	defer pool.Close()
+
+	conn, err := pool.Get()
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	pc := conn.(*pooledConn)
+	_ = pool.Remove(pc.pc)
+
+	if pool.ActiveCount() != 0 {
+		t.Errorf("active count after Remove: got %d want 0", pool.ActiveCount())
+	}
+
+	err = conn.Close()
+	if err != nil {
+		t.Logf("Close after Remove: %v", err)
+	}
+
+	if pool.ActiveCount() < 0 {
+		t.Errorf("active count should not be negative, got %d", pool.ActiveCount())
+	}
+	if pool.TotalCount() < 0 {
+		t.Errorf("total count should not be negative, got %d", pool.TotalCount())
+	}
+}
+
+func TestConnPool_RemoveIdempotent(t *testing.T) {
+	addr, cleanup := startTCPServer(t, echoHandler)
+	defer cleanup()
+
+	u := NewUpstream(addr)
+	pool := NewConnPool(u, ConnPoolConfig{
+		MaxConns:    5,
+		IdleTimeout: 1 * time.Hour,
+	})
+	defer pool.Close()
+
+	conn, err := pool.Get()
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	pc := conn.(*pooledConn)
+	_ = pool.Remove(pc.pc)
+	_ = pool.Remove(pc.pc)
+	_ = pool.Remove(pc.pc)
+
+	if pool.ActiveCount() != 0 {
+		t.Errorf("active count after multiple Remove: got %d want 0", pool.ActiveCount())
+	}
+}
+
+func TestConnPool_PutAfterRemovedNoReturnToIdle(t *testing.T) {
+	addr, cleanup := startTCPServer(t, echoHandler)
+	defer cleanup()
+
+	u := NewUpstream(addr)
+	pool := NewConnPool(u, ConnPoolConfig{
+		MaxConns:    5,
+		IdleTimeout: 1 * time.Hour,
+	})
+	defer pool.Close()
+
+	conn, err := pool.Get()
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	pc := conn.(*pooledConn)
+	_ = pool.Remove(pc.pc)
+
+	err = conn.Close()
+	if err != nil {
+		t.Logf("Close returned: %v", err)
+	}
+
+	if pool.IdleCount() != 0 {
+		t.Errorf("idle count should be 0 after Remove+Close, got %d", pool.IdleCount())
+	}
+	if pool.TotalCount() != 0 {
+		t.Errorf("total count should be 0 after Remove+Close, got %d", pool.TotalCount())
+	}
+}
+
+func TestConnPool_ConcurrentRemoveAndPut(t *testing.T) {
+	addr, cleanup := startTCPServer(t, echoHandler)
+	defer cleanup()
+
+	u := NewUpstream(addr)
+	pool := NewConnPool(u, ConnPoolConfig{
+		MaxConns:    20,
+		IdleTimeout: 1 * time.Hour,
+	})
+	defer pool.Close()
+
+	var wg sync.WaitGroup
+	numOps := 100
+	var countErrors atomic.Int32
+
+	for i := 0; i < numOps; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := pool.Get()
+			if err != nil {
+				return
+			}
+			pc := conn.(*pooledConn)
+			if i%3 == 0 {
+				_ = pool.Remove(pc.pc)
+			}
+			_ = conn.Close()
+			if pool.ActiveCount() < 0 || pool.TotalCount() < 0 {
+				countErrors.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if countErrors.Load() > 0 {
+		t.Errorf("detected negative counts %d times", countErrors.Load())
+	}
+	if pool.ActiveCount() < 0 {
+		t.Errorf("final active count is negative: %d", pool.ActiveCount())
+	}
+}
+
+func TestConnPool_GetIdleExpiryNoIndexPanic(t *testing.T) {
+	addr, cleanup := startTCPServer(t, echoHandler)
+	defer cleanup()
+
+	u := NewUpstream(addr)
+	pool := NewConnPool(u, ConnPoolConfig{
+		MaxConns:    10,
+		IdleTimeout: 1 * time.Millisecond,
+	})
+	defer pool.Close()
+
+	conns := make([]net.Conn, 5)
+	for i := 0; i < 5; i++ {
+		c, err := pool.Get()
+		if err != nil {
+			t.Fatalf("Get %d failed: %v", i, err)
+		}
+		conns[i] = c
+	}
+	for _, c := range conns {
+		c.Close()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := pool.Get()
+			if err != nil && err != ErrPoolExhausted && err != ErrPoolClosed {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestIPHashBalancer_NoDeadlockWithHealthChecker(t *testing.T) {
+	hc := NewHealthChecker(HealthCheckerConfig{
+		CheckInterval: 10 * time.Millisecond,
+		ProbeTimeout:  5 * time.Millisecond,
+		FailThreshold: 1,
+		PassThreshold: 1,
+	})
+
+	b := NewIPHashBalancer(hc)
+	u1 := NewUpstream("127.0.0.1:1")
+	u2 := NewUpstream("127.0.0.1:2")
+	b.SetUpstreams([]*Upstream{u1, u2})
+	hc.AddUpstream(u1)
+	hc.AddUpstream(u2)
+
+	var mu sync.Mutex
+	onChangeCalled := false
+	hc.SetOnChange(func(addr string, healthy bool) {
+		mu.Lock()
+		onChangeCalled = true
+		mu.Unlock()
+		b.RemoveFromMapping(addr)
+	})
+
+	hc.Start()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			_, _ = b.GetUpstream(fmt.Sprintf("10.0.0.%d", i%256))
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock detected in GetUpstream with HealthChecker running")
+	}
+
+	hc.Stop()
+
+	mu.Lock()
+	_ = onChangeCalled
+	mu.Unlock()
+}
+
+func TestMuxConcurrentFinAndRst(t *testing.T) {
+	for trial := 0; trial < 10; trial++ {
+		c1, c2 := net.Pipe()
+		var wg sync.WaitGroup
+		wg.Add(1)
+		muxServer := NewMuxConn(c2, func(s *Stream) {
+			wg.Done()
+		})
+		muxClient := NewMuxConn(c1, nil)
+
+		s, err := muxClient.NewStream()
+		if err != nil {
+			t.Fatalf("NewStream failed: %v", err)
+		}
+
+		wg.Wait()
+
+		go func() {
+			finFrame := &Frame{
+				Type:     FrameTypeFIN,
+				StreamID: s.ID,
+			}
+			data, _ := EncodeFrame(finFrame)
+			c1.Write(data)
+		}()
+
+		go func() {
+			rstFrame := &Frame{
+				Type:     FrameTypeRST,
+				StreamID: s.ID,
+			}
+			data, _ := EncodeFrame(rstFrame)
+			c1.Write(data)
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+		muxClient.Close()
+		muxServer.Close()
+	}
+}
+
+func TestHealthChecker_RemoveAndReaddResetsCounters(t *testing.T) {
+	addr, cleanup := startTCPServer(t, echoHandler)
+	defer cleanup()
+
+	hc := NewHealthChecker(HealthCheckerConfig{
+		CheckInterval: 1 * time.Hour,
+		FailThreshold: 3,
+		PassThreshold: 2,
+	})
+	defer hc.Stop()
+
+	u1 := NewUpstream(addr)
+	hc.AddUpstream(u1)
+
+	hc.checkOne(addr)
+	hc.checkOne(addr)
+
+	hc.RemoveUpstream(addr)
+
+	u2 := NewUpstream(addr)
+	u2.SetHealthy(false)
+	hc.AddUpstream(u2)
+
+	hc.checkOne(addr)
+
+	if u2.Healthy() {
+		t.Error("re-added upstream should not inherit old passCount; one pass should not make it healthy with PassThreshold=2")
+	}
+}
+
+func TestConnPool_ConcurrentGetWithIdleExpiry(t *testing.T) {
+	addr, cleanup := startTCPServer(t, echoHandler)
+	defer cleanup()
+
+	u := NewUpstream(addr)
+	pool := NewConnPool(u, ConnPoolConfig{
+		MaxConns:    10,
+		IdleTimeout: 5 * time.Millisecond,
+	})
+	defer pool.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				conn, err := pool.Get()
+				if err != nil {
+					if err == ErrPoolExhausted || err == ErrPoolClosed {
+						continue
+					}
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+				time.Sleep(time.Millisecond)
+				conn.Close()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if pool.ActiveCount() < 0 {
+		t.Errorf("active count should not be negative: %d", pool.ActiveCount())
+	}
+}

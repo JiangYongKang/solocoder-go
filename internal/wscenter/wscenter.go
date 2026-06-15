@@ -76,14 +76,15 @@ func DefaultConfig() Config {
 }
 
 type Client struct {
-	id         string
-	conn       Conn
-	rooms      map[string]*Room
-	sendCh     chan *Message
-	lastPong   time.Time
-	mu         sync.RWMutex
-	closeOnce  sync.Once
-	disconnect bool
+	id           string
+	conn         Conn
+	rooms        map[string]*Room
+	sendCh       chan *Message
+	lastPong     time.Time
+	lastPingSent time.Time
+	mu           sync.RWMutex
+	closeOnce    sync.Once
+	disconnect   bool
 }
 
 func newClient(id string, conn Conn, bufferSize int) *Client {
@@ -128,6 +129,24 @@ func (c *Client) getLastPong() time.Time {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.lastPong
+}
+
+func (c *Client) updatePingSent() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastPingSent = time.Now()
+}
+
+func (c *Client) getLastPingSent() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastPingSent
+}
+
+func (c *Client) hasPendingPing() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return !c.lastPingSent.IsZero() && c.lastPingSent.After(c.lastPong)
 }
 
 func (c *Client) addRoom(room *Room) {
@@ -240,15 +259,16 @@ func (r *Room) isEmpty() bool {
 }
 
 type WSCenter struct {
-	cfg       Config
-	mu        sync.RWMutex
-	clients   map[string]*Client
-	rooms     map[string]*Room
-	running   bool
-	stopCh    chan struct{}
-	wg        sync.WaitGroup
-	logger    *log.Logger
-	nextMsgID uint64
+	cfg          Config
+	mu           sync.RWMutex
+	clients      map[string]*Client
+	knownClients map[string]bool
+	rooms        map[string]*Room
+	running      bool
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+	logger       *log.Logger
+	nextMsgID    uint64
 }
 
 func NewWSCenter(cfg Config) *WSCenter {
@@ -269,12 +289,13 @@ func NewWSCenter(cfg Config) *WSCenter {
 	}
 
 	return &WSCenter{
-		cfg:     cfg,
-		clients: make(map[string]*Client),
-		rooms:   make(map[string]*Room),
-		stopCh:  make(chan struct{}),
-		running: true,
-		logger:  cfg.Logger,
+		cfg:          cfg,
+		clients:      make(map[string]*Client),
+		knownClients: make(map[string]bool),
+		rooms:        make(map[string]*Room),
+		stopCh:       make(chan struct{}),
+		running:      true,
+		logger:       cfg.Logger,
 	}
 }
 
@@ -308,6 +329,7 @@ func (ws *WSCenter) Stop() {
 		client.close()
 	}
 	ws.clients = make(map[string]*Client)
+	ws.knownClients = make(map[string]bool)
 	ws.rooms = make(map[string]*Room)
 	ws.mu.Unlock()
 
@@ -336,6 +358,7 @@ func (ws *WSCenter) Connect(conn Conn) (*Client, error) {
 
 	client := newClient(id, conn, ws.cfg.ClientBufferSize)
 	ws.clients[id] = client
+	ws.knownClients[id] = true
 
 	ws.wg.Add(1)
 	go ws.clientWriteLoop(client)
@@ -355,14 +378,21 @@ func (ws *WSCenter) Disconnect(clientID string) error {
 		return ErrClientNotFound
 	}
 
+	client.mu.Lock()
+	if client.disconnect {
+		client.mu.Unlock()
+		ws.mu.Unlock()
+		return nil
+	}
+	client.disconnect = true
+	client.mu.Unlock()
+
 	client.mu.RLock()
 	roomObjs := make([]*Room, 0, len(client.rooms))
 	for _, room := range client.rooms {
 		roomObjs = append(roomObjs, room)
 	}
 	client.mu.RUnlock()
-
-	delete(ws.clients, clientID)
 	ws.mu.Unlock()
 
 	for _, room := range roomObjs {
@@ -381,6 +411,11 @@ func (ws *WSCenter) Disconnect(clientID string) error {
 	}
 
 	client.close()
+
+	ws.mu.Lock()
+	delete(ws.clients, clientID)
+	ws.mu.Unlock()
+
 	return nil
 }
 
@@ -431,25 +466,28 @@ func (ws *WSCenter) JoinRoom(clientID, roomID string) error {
 		return ErrInvalidID
 	}
 
-	ws.mu.RLock()
+	ws.mu.Lock()
 	client, clientExists := ws.clients[clientID]
 	room, roomExists := ws.rooms[roomID]
-	ws.mu.RUnlock()
-
 	if !clientExists {
+		ws.mu.Unlock()
 		return ErrClientNotFound
 	}
 	if !roomExists {
+		ws.mu.Unlock()
 		return ErrRoomNotFound
 	}
 	if client.isDisconnected() {
+		ws.mu.Unlock()
 		return ErrClientOffline
 	}
 
 	if err := room.addClient(client); err != nil {
+		ws.mu.Unlock()
 		return err
 	}
 	client.addRoom(room)
+	ws.mu.Unlock()
 
 	ws.broadcastJoin(room, client)
 	return nil
@@ -569,13 +607,21 @@ func (ws *WSCenter) SendToClient(fromClientID, toClientID string, payload []byte
 	ws.mu.RLock()
 	fromClient, fromExists := ws.clients[fromClientID]
 	toClient, toExists := ws.clients[toClientID]
+	fromKnown := ws.knownClients[fromClientID]
+	toKnown := ws.knownClients[toClientID]
 	ws.mu.RUnlock()
 
 	if !fromExists {
+		if fromKnown {
+			return ErrClientOffline
+		}
 		return ErrClientNotFound
 	}
 	if !toExists {
-		return ErrClientOffline
+		if toKnown {
+			return ErrClientOffline
+		}
+		return ErrClientNotFound
 	}
 	if fromClient.isDisconnected() {
 		return ErrClientOffline
@@ -651,8 +697,8 @@ func (ws *WSCenter) pingLoop() {
 		case <-ws.stopCh:
 			return
 		case <-ticker.C:
-			ws.sendPings()
 			ws.checkTimeouts()
+			ws.sendPings()
 		}
 	}
 }
@@ -676,6 +722,8 @@ func (ws *WSCenter) sendPings() {
 		}
 		if err := client.send(msg, ws.cfg.SendTimeout); err != nil {
 			ws.logger.Printf("wscenter: send ping to client %s failed: %v", client.id, err)
+		} else {
+			client.updatePingSent()
 		}
 	}
 }
@@ -688,14 +736,20 @@ func (ws *WSCenter) checkTimeouts() {
 	}
 	ws.mu.RUnlock()
 
-	timeoutThreshold := time.Now().Add(-ws.cfg.PongTimeout)
+	now := time.Now()
 
 	for _, client := range clients {
 		if client.isDisconnected() {
 			continue
 		}
-		lastPong := client.getLastPong()
-		if lastPong.Before(timeoutThreshold) {
+
+		if !client.hasPendingPing() {
+			continue
+		}
+
+		lastPingSent := client.getLastPingSent()
+		timeSincePing := now.Sub(lastPingSent)
+		if timeSincePing >= ws.cfg.PongTimeout {
 			ws.logger.Printf("wscenter: client %s pong timeout, disconnecting", client.id)
 			ws.Disconnect(client.id)
 		}

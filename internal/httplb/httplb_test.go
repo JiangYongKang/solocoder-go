@@ -40,6 +40,9 @@ func TestBackendServer_StatusTransitions(t *testing.T) {
 	if s.Status() != StatusDraining {
 		t.Errorf("expected StatusDraining, got %v", s.Status())
 	}
+	if !s.IsDraining() {
+		t.Error("expected IsDraining to return true")
+	}
 
 	s.MarkDown()
 	if s.Status() != StatusDown {
@@ -131,8 +134,15 @@ func TestServerPool_RemoveServer(t *testing.T) {
 	sp.AddServer("server3:8080", 1)
 
 	err := sp.RemoveServer("server2:8080")
+	if err != ErrServerNotDraining {
+		t.Errorf("expected ErrServerNotDraining when removing without draining, got %v", err)
+	}
+
+	sp.DrainServer("server2:8080")
+
+	err = sp.RemoveServer("server2:8080")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("unexpected error after draining: %v", err)
 	}
 	if sp.ServerCount() != 2 {
 		t.Errorf("expected 2 servers, got %d", sp.ServerCount())
@@ -149,6 +159,42 @@ func TestServerPool_RemoveServer(t *testing.T) {
 	err = sp.RemoveServer("nonexistent:8080")
 	if err != ErrServerNotFound {
 		t.Errorf("expected ErrServerNotFound, got %v", err)
+	}
+}
+
+func TestServerPool_RemoveServerWithActiveConns(t *testing.T) {
+	sp := NewServerPool()
+	sp.AddServer("server1:8080", 1)
+
+	sp.DrainServer("server1:8080")
+
+	s, _ := sp.GetServer("server1:8080")
+	s.IncConn()
+
+	err := sp.RemoveServer("server1:8080")
+	if err != ErrServerHasConns {
+		t.Errorf("expected ErrServerHasConns when server has active connections, got %v", err)
+	}
+
+	s.DecConn()
+
+	err = sp.RemoveServer("server1:8080")
+	if err != nil {
+		t.Fatalf("expected success after connections dropped, got %v", err)
+	}
+}
+
+func TestServerPool_RemoveServerNotDraining(t *testing.T) {
+	sp := NewServerPool()
+	sp.AddServer("server1:8080", 1)
+
+	err := sp.RemoveServer("server1:8080")
+	if err != ErrServerNotDraining {
+		t.Errorf("expected ErrServerNotDraining, got %v", err)
+	}
+
+	if sp.ServerCount() != 1 {
+		t.Errorf("server should not have been removed, expected 1, got %d", sp.ServerCount())
 	}
 }
 
@@ -275,6 +321,7 @@ func TestRoundRobin_AddRemoveServer(t *testing.T) {
 		t.Errorf("expected round-robin between s1 and s2, got %v", order)
 	}
 
+	rr.DrainServer("s1:8080")
 	err = rr.RemoveServer("s1:8080")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -511,6 +558,7 @@ func TestWeightedRoundRobin_AddRemoveServer(t *testing.T) {
 		t.Errorf("s2 ratio: expected ~%.2f, got %.2f", 2.0/3.0, ratioS2)
 	}
 
+	wrr.DrainServer("s1:8080")
 	err = wrr.RemoveServer("s1:8080")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -618,6 +666,7 @@ func TestConsistentHash_RemoveServerMinimalImpact(t *testing.T) {
 		s.DecConn()
 	}
 
+	ch.DrainServer("s3:8080")
 	ch.RemoveServer("s3:8080")
 
 	changed := 0
@@ -655,16 +704,15 @@ func TestConsistentHash_DrainedServer(t *testing.T) {
 	ch.DrainServer("s1:8080")
 
 	counts := make(map[string]int)
-	for i := 0; i < 100; i++ {
+	totalRequests := 100
+	for i := 0; i < totalRequests; i++ {
 		key := "key_" + string(rune('a'+i%26))
 		s, err := ch.Next(key)
-		if err != nil && err != ErrNoHealthyServer {
-			t.Fatalf("unexpected error: %v", err)
+		if err != nil {
+			t.Fatalf("Next should not fail when healthy servers exist, got: %v", err)
 		}
-		if s != nil {
-			counts[s.Address]++
-			s.DecConn()
-		}
+		counts[s.Address]++
+		s.DecConn()
 	}
 
 	_, hasS1 := counts["s1:8080"]
@@ -672,9 +720,9 @@ func TestConsistentHash_DrainedServer(t *testing.T) {
 		t.Error("drained server should not receive requests")
 	}
 
-	_, hasS2 := counts["s2:8080"]
-	if !hasS2 {
-		t.Error("s2 should receive all requests")
+	countS2 := counts["s2:8080"]
+	if countS2 != totalRequests {
+		t.Errorf("s2 should receive all %d requests, got %d", totalRequests, countS2)
 	}
 }
 
@@ -692,6 +740,154 @@ func TestConsistentHash_DefaultVirtualNodes(t *testing.T) {
 		t.Errorf("expected s1:8080, got %s", s.Address)
 	}
 	s.DecConn()
+}
+
+func TestConsistentHash_Failover_OnDrain(t *testing.T) {
+	servers := []string{"s1:8080", "s2:8080", "s3:8080"}
+	ch, _ := NewConsistentHash(servers, 100)
+
+	mapping := make(map[string]string)
+	numKeys := 500
+	for i := 0; i < numKeys; i++ {
+		key := "fo_key_" + string(rune('a'+i%26)) + "_" + string(rune('0'+i%10))
+		s, err := ch.Next(key)
+		if err != nil {
+			t.Fatalf("Next failed before drain: %v", err)
+		}
+		mapping[key] = s.Address
+		s.DecConn()
+	}
+
+	ch.DrainServer("s1:8080")
+
+	redirected := 0
+	remained := 0
+	for i := 0; i < numKeys; i++ {
+		key := "fo_key_" + string(rune('a'+i%26)) + "_" + string(rune('0'+i%10))
+		s, err := ch.Next(key)
+		if err != nil {
+			t.Fatalf("Next should not fail after draining one server, key=%s, err=%v", key, err)
+		}
+		if mapping[key] != s.Address {
+			if mapping[key] == "s1:8080" {
+				redirected++
+			}
+		} else {
+			remained++
+		}
+		s.DecConn()
+	}
+
+	if redirected == 0 {
+		t.Error("expected some keys originally mapped to s1 to be redirected after drain")
+	}
+
+	if remained == 0 {
+		t.Error("expected keys mapped to s2/s3 to remain unchanged")
+	}
+
+	for i := 0; i < numKeys; i++ {
+		key := "fo_key_" + string(rune('a'+i%26)) + "_" + string(rune('0'+i%10))
+		s, err := ch.Next(key)
+		if err != nil {
+			t.Fatalf("Next failed: %v", err)
+		}
+		if s.Address == "s1:8080" {
+			t.Errorf("drained server s1 should never be selected, got s1 for key %s", key)
+		}
+		s.DecConn()
+	}
+}
+
+func TestConsistentHash_Failover_MultipleDrain(t *testing.T) {
+	servers := []string{"s1:8080", "s2:8080", "s3:8080"}
+	ch, _ := NewConsistentHash(servers, 100)
+
+	ch.DrainServer("s1:8080")
+	ch.DrainServer("s2:8080")
+
+	for i := 0; i < 100; i++ {
+		key := "md_key_" + string(rune('a'+i%26))
+		s, err := ch.Next(key)
+		if err != nil {
+			t.Fatalf("Next should not fail when s3 is healthy, got: %v", err)
+		}
+		if s.Address != "s3:8080" {
+			t.Errorf("expected all requests to go to s3, got %s", s.Address)
+		}
+		s.DecConn()
+	}
+}
+
+func TestConsistentHash_Failover_AllDown(t *testing.T) {
+	servers := []string{"s1:8080", "s2:8080"}
+	ch, _ := NewConsistentHash(servers, 50)
+
+	ch.DrainServer("s1:8080")
+	ch.DrainServer("s2:8080")
+
+	_, err := ch.Next("any_key")
+	if err != ErrNoHealthyServer {
+		t.Errorf("expected ErrNoHealthyServer when all servers are drained, got %v", err)
+	}
+}
+
+func TestConsistentHash_Failover_RestoreAfterDrain(t *testing.T) {
+	servers := []string{"s1:8080", "s2:8080"}
+	ch, _ := NewConsistentHash(servers, 50)
+
+	ch.DrainServer("s1:8080")
+
+	for i := 0; i < 10; i++ {
+		key := "restore_key_" + string(rune('a'+i%26))
+		s, err := ch.Next(key)
+		if err != nil {
+			t.Fatalf("Next failed with s1 drained: %v", err)
+		}
+		if s.Address == "s1:8080" {
+			t.Error("drained server should not be selected")
+		}
+		s.DecConn()
+	}
+
+	ch.RestoreServer("s1:8080")
+
+	s1Count := 0
+	for i := 0; i < 100; i++ {
+		key := "restore_key_" + string(rune('a'+i%26))
+		s, err := ch.Next(key)
+		if err != nil {
+			t.Fatalf("Next failed after restore: %v", err)
+		}
+		if s.Address == "s1:8080" {
+			s1Count++
+		}
+		s.DecConn()
+	}
+
+	if s1Count == 0 {
+		t.Error("restored server s1 should receive requests again")
+	}
+}
+
+func TestConsistentHash_RemoveServerRequiresDrain(t *testing.T) {
+	servers := []string{"s1:8080", "s2:8080", "s3:8080"}
+	ch, _ := NewConsistentHash(servers, 50)
+
+	err := ch.RemoveServer("s1:8080")
+	if err != ErrServerNotDraining {
+		t.Errorf("expected ErrServerNotDraining, got %v", err)
+	}
+
+	ch.DrainServer("s1:8080")
+	err = ch.RemoveServer("s1:8080")
+	if err != nil {
+		t.Fatalf("expected success after draining, got %v", err)
+	}
+
+	if ch.ServerCount() != 2 {
+		t.Errorf("expected 2 servers after removal, got %d", ch.ServerCount())
+	}
 }
 
 func TestHTTPLoadBalancer_New(t *testing.T) {
@@ -831,6 +1027,7 @@ func TestHTTPLoadBalancer_DynamicManagement(t *testing.T) {
 		t.Errorf("expected 2 healthy servers, got %d", lb.HealthyCount())
 	}
 
+	lb.DrainServer("s2:8080")
 	err = lb.RemoveServer("s2:8080")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -966,7 +1163,6 @@ func TestConcurrent_AddRemoveServers(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		counter := 0
 		for {
 			select {
 			case <-stop:
@@ -976,7 +1172,6 @@ func TestConcurrent_AddRemoveServers(t *testing.T) {
 				if err == nil {
 					s.DecConn()
 				}
-				counter++
 			}
 		}
 	}()
@@ -985,8 +1180,10 @@ func TestConcurrent_AddRemoveServers(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
-			rr.AddServer("dynamic_"+string(rune('a'+i%26))+":8080", 1)
-			rr.RemoveServer("dynamic_"+string(rune('a'+i%26))+":8080")
+			addr := "dynamic_" + string(rune('a'+i%26)) + ":8080"
+			rr.AddServer(addr, 1)
+			rr.DrainServer(addr)
+			rr.RemoveServer(addr)
 		}
 	}()
 
@@ -1000,8 +1197,10 @@ func TestConcurrent_AddRemoveServers(t *testing.T) {
 	}()
 
 	for i := 0; i < 50; i++ {
-		rr.AddServer("dyn_"+string(rune('A'+i%26))+":8080", 1)
-		rr.RemoveServer("dyn_"+string(rune('A'+i%26))+":8080")
+		addr := "dyn_" + string(rune('A'+i%26)) + ":8080"
+		rr.AddServer(addr, 1)
+		rr.DrainServer(addr)
+		rr.RemoveServer(addr)
 	}
 
 	close(stop)

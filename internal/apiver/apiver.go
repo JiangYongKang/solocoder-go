@@ -45,6 +45,12 @@ func parseVersionNumber(v Version) int {
 	return n
 }
 
+var validVersionPattern = regexp.MustCompile(`^v\d+$`)
+
+func IsValidVersion(v Version) bool {
+	return validVersionPattern.MatchString(string(v))
+}
+
 type VersionStrategy int
 
 const (
@@ -277,6 +283,9 @@ func (vr *VersionRouter) ExtractVersion(r *http.Request) (Version, *http.Request
 
 	for _, extractor := range extractors {
 		if v, ok := extractor.ExtractVersion(r); ok {
+			if !IsValidVersion(v) {
+				return "", r, ErrInvalidVersionFormat
+			}
 			if extractor.Strategy() == PathStrategy {
 				stripped := stripVersionPrefix(r.URL.Path, v)
 				newReq := r.Clone(r.Context())
@@ -290,6 +299,9 @@ func (vr *VersionRouter) ExtractVersion(r *http.Request) (Version, *http.Request
 	}
 
 	if defaultVersion != "" {
+		if !IsValidVersion(defaultVersion) {
+			return "", r, ErrInvalidVersionFormat
+		}
 		return defaultVersion, r, nil
 	}
 
@@ -363,6 +375,15 @@ func (vr *VersionRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, hasReqConv := vr.GetRequestConverter(requestedVersion, latestVersion)
+	if !hasReqConv {
+		vr.mu.RLock()
+		handler := vr.handlers[requestedVersion]
+		vr.mu.RUnlock()
+		handler(w, req)
+		return
+	}
+
 	convertedReq, err := vr.convertRequest(req, requestedVersion, latestVersion)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -416,7 +437,7 @@ func (vr *VersionRouter) convertResponse(statusCode int, header http.Header, bod
 
 	conv, ok := vr.GetResponseConverter(from, to)
 	if !ok {
-		return statusCode, header, body, nil
+		return 0, nil, nil, ErrConverterNotFound
 	}
 
 	return conv(statusCode, header, body)

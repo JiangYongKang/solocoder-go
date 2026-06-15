@@ -68,14 +68,23 @@ func (ch *ConsistentHash) Next(key string) (*BackendServer, error) {
 		idx = 0
 	}
 
-	address := ch.ring[idx].server
-	server, ok := ch.pool.GetServer(address)
-	if !ok || !server.IsHealthy() {
-		return nil, ErrNoHealthyServer
+	visited := make(map[string]struct{})
+	for i := 0; i < len(ch.ring); i++ {
+		ringIdx := (idx + i) % len(ch.ring)
+		address := ch.ring[ringIdx].server
+		if _, seen := visited[address]; seen {
+			continue
+		}
+		visited[address] = struct{}{}
+
+		server, ok := ch.pool.GetServer(address)
+		if ok && server.IsHealthy() {
+			server.IncConn()
+			return server, nil
+		}
 	}
 
-	server.IncConn()
-	return server, nil
+	return nil, ErrNoHealthyServer
 }
 
 func (ch *ConsistentHash) AddServer(address string, weight int) error {
