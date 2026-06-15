@@ -1,10 +1,10 @@
 产物不满意：
-1. tieredcache.go 的 lruCache.get 方法获取读锁 RLock 后调用 MoveToFront 修改链表指针，而 container/list 非并发安全。多个 goroutine 并发 Get 时因 TieredCache 层 tc.mu.RLock 可并行，导致多个 MoveToFront 同时修改链表形成数据竞争。后果是链表指针损坏，后续可能 panic 或数据错乱。根因是 MoveToFront 是写操作却用了读锁。正确做法是将 RLock 改为 Lock。
-2. tieredcache.go 的 loadL2FromDisk 方法在 L2 容量不足时会导致持久化数据被不可逆删除。当磁盘文件数超过 L2 容量上限时，逐条 put 加载触发淘汰，淘汰回调 handleL2Eviction 调用 os.Remove 将磁盘文件永久删除。后果是重启恢复过程反而丢失了比重启前更多的持久化数据。根因是加载阶段使用了绑定磁盘删除逻辑的淘汰回调。正确做法是在恢复加载期间禁用淘汰回调，或使用不触发回调的内部方法，保护已有持久化数据。
-3. tieredcache.go 的 lruCache.delete 和 evictOneLocked 在持有互斥锁时同步调用 onEvict 回调，其中 handleL2Eviction 执行 os.Remove 磁盘删除。磁盘 I/O 在持锁状态下阻塞全部缓存读写，低速磁盘下所有并发的 Get 和 Put 都被迫排队等待。根因是回调设计与业务锁强耦合。正确做法是将待清理的键收集后释放锁，再异步执行 os.Remove，将磁盘 I/O 与缓存核心路径解耦。
-4. tieredcache.go 的 flushWriteBack 对 writeToL2 错误用 `continue` 静默跳过，失败条目的 Dirty 标记未被清除。后果是每次刷盘都重试注定失败的条目，浪费 I/O。更严重的是该条目被 L1 淘汰时 handleL1Eviction 同样因 Dirty 标记再次失败，形成多路径重复无效 I/O。根因是错误处理未区分可重试与不可恢复错误。正确做法是收集失败条目或至少清除不可恢复条目的 Dirty 标记防止死循环。
+1. tieredcache.go 的 lruCache.get 方法获取 RLock 后调用 MoveToFront 修改链表指针，而 container/list 非并发安全。多个 goroutine 并发 Get 时因 TieredCache 层 tc.mu.RLock 可并行，导致多 MoveToFront 同时修改链表形成数据竞争，可能导致 panic 或数据错乱。根因是 MoveToFront 是写操作却用了读锁，应将 RLock 改为 Lock。
+2. loadL2FromDisk 方法在 L2 容量不足时，逐条 put 加载触发淘汰回调 handleL2Eviction 调用 os.Remove 将磁盘文件永久删除。后果是重启恢复过程反而丢失了比重启前更多的持久化数据。根因是加载阶段使用了绑定磁盘删除的淘汰回调。应在恢复加载期间禁用淘汰回调，保护已有持久化数据。
+3. lruCache.delete 和 evictOneLocked 在持有互斥锁时同步调用 onEvict 回调执行 os.Remove 磁盘删除。磁盘 I/O 在持锁状态下阻塞全部缓存读写。根因是回调设计与业务锁强耦合。应将待清理的键收集后释放锁再异步执行 os.Remove。
+4. flushWriteBack 对 writeToL2 错误用 continue 静默跳过，失败条目的 Dirty 标记未清除。每次刷盘重试注定失败的条目浪费 I/O，且该条目被 L1 淘汰时 handleL1Eviction 同样失败，形成多路径重复无效 I/O。根因是错误处理未区分可重试与不可恢复错误。应收集失败条目或清除其 Dirty 标记。
 
 过程不满意：
-1. 模型仅阅读 kvstore 包代码风格后直接创建粗粒度 todo 并编码，完全跳过了多级缓存架构设计。L1/L2 锁层级关系、淘汰回调与磁盘 I/O 的交互、回写模式异步刷盘时机等均未提前推演。后果是后续在 evictAll 并发问题、handleL1Eviction 是否写 L2、Clear 触发回调 panic 等架构问题上反复横跳修改。正确做法是先梳理锁策略和回调调用链，明确磁盘 I/O 的执行层级和时机，再动手编码。
-2. 模型经历了 5 到 6 轮编译报错到测试失败的试错循环。首次运行就出现 delete 参数缺少类型的基础语法错误，第二次运行后同时出现 sanitizeKey、LRU 逻辑、evictAll 并发、测试 bug 四类问题，模型未逐一分析根因就批量修改多文件。其中 sanitizeKey 转义机制从 `_c` 格式到 `__` 前缀再到字符字面量经历三轮反复，evictAll 并发问题选择新增 clear 方法绕过而非从根本上解决。正确做法是先逐个分析失败用例，定位根因后做最小修正。
-3. 模型编写并发测试并通过后全程未使用 `go test -race` 验证并发安全，导致 lruCache.get 在 RLock 下调用 MoveToFront 的数据竞争从未被发现。普通 go test 不检测 race condition。模型却在思考总结中声称"并发安全：所有操作通过 sync.RWMutex 保证线程安全"，属于对自身设计的盲目自信。正确做法是对于并发模块在开发中必须使用 `go test -race -v` 验证无数据竞争。
+1. 模型仅阅读 kvstore 包代码风格后直接创建粗粒度 todo 并编码，跳过了多级缓存架构设计。L1/L2 锁层级关系、淘汰回调与磁盘 I/O 交互、回写时机等均未提前推演，导致后续在并发问题、回调语义等架构问题上反复横跳修改。应先梳理锁策略和回调调用链再动手编码。
+2. 模型经历 5 到 6 轮编译报错到测试失败的试错循环。首次就出现基础语法错误，第二次同时出现四类问题，模型未逐一分析根因就批量修改。其中 sanitizeKey 转义机制经历三轮反复，evictAll 并发问题选择绕过而非从根本上解决。应先逐个分析失败用例再做最小修正。
+3. 模型编写并发测试并通过后全程未使用 go test -race 验证并发安全，导致 lruCache.get 在 RLock 下调用 MoveToFront 的数据竞争从未被发现。普通 go test 不检测 race condition。模型却在总结中声称"所有操作通过 sync.RWMutex 保证线程安全"，属于盲目自信。并发模块开发中必须使用 go test -race 验证。

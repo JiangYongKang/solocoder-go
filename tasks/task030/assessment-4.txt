@@ -1,8 +1,8 @@
 产物不满意：
-1. reliableBroadcast 从并发改为串行发送时，模型只是机械地删除了 go 关键字和 sync.WaitGroup，但将原有 goroutine 内的匿名函数体原样保留为一个立即调用的 func(n *Node, m Message) { ... }(node, msgCopy) 闭包。在串行场景下这层匿名函数包装已经没有语义价值，参数拷贝 msgCopy 在 for 循环体内已经完成，额外嵌套一层函数调用徒增缩进和阅读负担。正确的做法是将匿名函数体内代码直接内联在 for 循环中，仅保留 defer recover() 防 panic 逻辑即可。
-2. 其余四项修复均正确实现。handleLockAcquire 中 Grant 和 Deny 回复从 unicast 改为 reliableUnicast，Lock 方法移除了 tryLock 包装和 sleep 50ms 的重试逻辑，将可靠性统一到协议层解决。releaseMark 的 expiresAt 从 time.Now().Add(5s) 改为 msg.Timestamp.Add(releaseMarkTTL)，统一使用发送端消息时间戳，新增 releaseMarkTTL 常量。handleLockGranted 函数开头增加了详细的状态机不变式注释，新增 assertStatusTransitionValid 断言函数并在两处状态转换点强制执行 Pending 到 Succeeded/Failed 的单向转换约束。go test ./internal/cachesync/ -count=5 -v 全部 38 个测试用例连续 5 次稳定通过。docs/cachesync.md 按提示词要求更新了消息传递可靠性分级策略表格，明确区分了 8 种消息类型的可靠性级别及其原因。
+1. reliableBroadcast 从并发改为串行发送时，模型只删掉了 go 关键字和 WaitGroup，但将原有 goroutine 内的匿名函数体原样保留为立即调用的闭包。在串行场景下这层匿名函数包装已无语义价值，msgCopy 在 for 循环内已完成拷贝，额外嵌套徒增阅读负担。正确做法是将匿名函数体内代码直接内联在 for 循环中，仅保留 defer recover 防 panic 逻辑。
+2. 其余四项修复均正确。Grant 和 Deny 回复改为 reliableUnicast，Lock 移除了 tryLock 包装和重试逻辑。releaseMark 的 expiresAt 改为 msg.Timestamp.Add(releaseMarkTTL) 统一时间戳。handleLockGranted 增加了状态机不变式注释和断言函数。go test -count=5 -v 全部 38 个测试连续 5 次通过。
 
 过程不满意：
-1. 模型在步骤 1 收到提示词后未经分析就直接用 todo_write 创建了 6 项子任务计划，之后才在步骤 2-3 两次读取 cachesync.go 源码。这违反了"先分析需求文档和代码骨架，理清修改范围后再制定执行计划"的标注原则。正确做法是先阅读提示词要求和源码理解当前代码状态，梳理四个修复点的相关代码位置和关联影响，再制定有逻辑顺序的执行计划。
-2. 步骤 2 和步骤 3 对 cachesync.go 进行了两次完全相同的全文读取，中间没有任何代码修改操作，属于无意义的重复读取。此后模型又通过 search_by_regex 和多次分段 view_files 累计 9 次读取同一个文件。虽然大文件分段读取可以理解，但首次全文读取后未做有效的代码位置梳理记录，导致后续仍需反复搜索定位。正确做法是首次阅读时记录各修复点对应的函数名和大致行范围，后续直接定位编辑。
-3. 步骤 14 修复 reliableBroadcast 时模型只关注了"删除并发"这一功能目标，删掉 go 关键字和 WaitGroup 后就认为任务完成，没有审视串行化后匿名函数包装是否还有存在必要。这种只追求功能等价而忽视代码质量的修改方式，反映模型缺乏结构性重构的二次审视习惯。正确做法是在完成功能修改后通读修改后代码块，检查是否有因上下文变化而变得冗余或不合时宜的结构。
+1. 模型收到提示词后未经分析就创建 6 项子任务，之后才两次读取源码。违反"先分析再规划"原则。应先理解当前代码状态和四个修复点的关联影响再制定有逻辑顺序的执行计划。
+2. 模型对 cachesync.go 进行了两次完全相同的全文读取中间无修改，此后又累计 9 次读取同一文件。虽大文件分段读取可理解，但首次全文读取后未记录关键信息导致后续仍需反复搜索。应首次阅读时记录各修复点对应函数和行范围。
+3. 修复 reliableBroadcast 时模型只关注"删除并发"功能目标，删掉 go 和 WaitGroup 就认为完成，未审视串行化后匿名函数包装是否还有存在必要。这种只追求功能等价忽视代码质量的修改方式，反映缺乏结构性重构的二次审视习惯。

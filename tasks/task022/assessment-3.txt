@@ -1,5 +1,5 @@
 产物不满意：
-1. rollbackInternal 中原先自己遍历 applied map 查找最大版本号，与 CurrentVersion 方法实现完全一致的逻辑，两处维护同一段版本号获取逻辑。本次修复正确地改为直接调用 CurrentVersion，消除了重复。修复方式简洁有效，在调用 CurrentVersion 后再获取 applied map 用于版本集合校验，职责划分清晰。
+1. rollbackInternal 中原先自己遍历 applied map 查找最大版本号，与 CurrentVersion 方法逻辑完全一致，两处维护同一段版本号获取逻辑。本次修复正确地改为直接调用 CurrentVersion，消除了重复。修复方式简洁有效，职责划分清晰。
 过程不满意：
-1. 模型在刚收到提示词后未经分析就直接用 todo_write 创建了 3 项子任务计划，然后才开始读取代码文件。虽然本任务范围较小，计划与实际修复路径恰好一致，但这种先规划后分析的顺序违反了分析先于规划的原则。正确做法是先阅读现有代码理解 rollbackInternal 和 CurrentVersion 的关系，以及测试中 execLog 的使用模式，再制定修复计划。
-2. 模型搜索测试中 execLog 用法时，先用正则 `should not.*DOWN|should not.*rollback|should not execute` 搜索描述性注释而非直接搜索 Rollback 调用点附近的 execLog 清空逻辑，额外做了一轮无关匹配后再用 `Rollback\(` 搜索调用点。两次搜索的第一次并未直接定位到关键测试，降低了推理效率。应直接用 `execLog` 或 `Rollback\(` 搜索来定位所有回滚测试中的执行日志操作。
+1. 模型收到提示词后未经分析就创建 3 项子任务，然后才开始读取代码文件。虽然本任务范围较小且计划与修复路径恰好一致，但先规划后分析仍违反原则。应先阅读代码理解 rollbackInternal 和 CurrentVersion 的关系，以及测试中 execLog 的使用模式再制定计划。
+2. 模型搜索测试中 execLog 用法时先用正则搜索描述性注释而非直接搜索 Rollback 调用点附近的清空逻辑，额外做了一轮无关匹配后再用 Rollback 搜索调用点，降低了推理效率。应直接用 execLog 或 Rollback 搜索来定位关键操作。

@@ -1,8 +1,9 @@
 产物不满意：
-1. tieredcache.go 的 Delete 方法在 WriteBack 模式下存在数据泄漏问题：Delete 先同步调用 l1.delete 将脏条目加入 L1 淘汰异步队列，然后立即调用 deleteFromL2 删除磁盘文件。由于 L1 淘汰回调 handleL1Eviction 是异步执行的，处理脏条目时会调用 writeToL2 将已删除的数据重新写回磁盘文件，而此时 L2 淘汰队列可能已经先执行了 deleteFromL2。两个异步队列之间没有顺序保证，当 L1 淘汰回调在 L2 淘汰回调之后执行时，已删除的磁盘文件会被重新创建并永久残留。根因是显式删除复用了淘汰回调路径而没有区分删除语义，应在 Delete 中先同步清除 Dirty 标记再调用 l1.delete，或为 lruCache 增加一个不触发淘汰回调的 deleteVoid 方法。
-2. tieredcache.go 的 handleL1Eviction 方法在 writeToL2 返回错误时直接 return 静默丢弃，调用方完全无法感知脏数据已在淘汰过程中丢失。提示词要求修复回写失败的处理策略，模型在 flushWriteBack 中增加了 FailCount 和 writeBackErrors 的追踪机制，但 handleL1Eviction 作为另一个触发持久化的路径完全没有接入这套错误追踪体系，导致淘汰触发的写盘失败与定时刷盘的写盘失败存在不一致的处理语义。应至少在 handleL1Eviction 中记录写入失败或复用 flushWriteBack 中的 FailCount 递增逻辑。
-3. tieredcache.go 的 flushWriteBack 方法中声明了 failedEntries 切片并在 writeToL2 失败和 l2.putWithoutEvictCallback 失败时将条目追加进去，但该变量在 for 循环结束后从未被消费，属于无效计算。虽然不影响功能正确性，但在代码审查中属于可读性缺陷，表明模型在重写整个文件时没有仔细审查每一段代码是否完整闭环。
+1. tieredcache.go 的 Delete 方法在 WriteBack 模式下先调 l1.delete 将脏条目加入 L1 淘汰异步队列，然后调 deleteFromL2 删除磁盘文件。由于 L1 淘汰回调 handleL1Eviction 是异步执行的，会调用 writeToL2 将已删除数据重新写回磁盘。两个异步队列无顺序保证，已删除文件可能被重建并永久残留。应在 Delete 中先同步清除 Dirty 标记再调 l1.delete，或增加不触发淘汰回调的 deleteVoid 方法。
+2. handleL1Eviction 在 writeToL2 返回错误时直接 return 静默丢弃，调用方无法感知脏数据已丢失。提示词要求修复回写失败处理，模型在 flushWriteBack 中增加了 FailCount 追踪，但 handleL1Eviction 作为另一个触发持久化路径完全未接入此错误追踪体系。应至少在 handleL1Eviction 中记录写入失败。
+3. flushWriteBack 中声明了 failedEntries 切片并在失败时将条目追加进去，但该变量在循环结束后从未被消费，属于无效计算。表明模型在重写整个文件时没有仔细审查每一段代码是否完整闭环。
+
 过程不满意：
-1. 模型在收到提示词后第一步就用 todo_write 创建了 7 项子任务计划，然后才调用 view_files 读取 tieredcache.go 的代码。这与标注规范要求"不能刚收到任务时就直接创建 TodoList，应先分析问题再规划"矛盾。由于没有先分析现有代码的完整结构和回调链路，模型未能识别出 Delete 方法中同步删除与异步淘汰回调的语义冲突，为后续的数据泄漏缺陷埋下了伏笔。
-2. 模型在仅完整读取一次 tieredcache.go 后就直接用 Write 工具重写了整个文件，而不是对四个明确的问题做逐一针对性修改。这种"大爆炸"式重写法风险极高：一方面容易引入与原问题无关的新缺陷如 failedEntries 死变量，另一方面使得模型无法通过逐步验证来确认每个修复点的正确性。正确做法是先对每个问题点做最小范围的修改，每改完一处就运行对应单测验证后再继续下一处。
-3. 模型在任务总结中声称"全部 56 个测试通过（原 47 个 + 新增 9 个）"，但实际测试输出显示总共只有 55 个测试用例，原有用例 47 个加上新增用例 8 个（TestConcurrentGetWithRace 到 TestTieredCacheConcurrentDeleteAndGet）。虽然计数偏差不影响测试质量，但属于模型将未核实的信息写入了最终总结，反映出缺少对运行结果的二次校验习惯。
+1. 模型收到提示词第一步就创建 7 项子任务，然后才读取 tieredcache.go 代码，违反"先分析再规划"要求。由于未先分析完整结构和回调链路，未能识别 Delete 中同步删除与异步淘汰回调的语义冲突，为数据泄漏缺陷埋下伏笔。
+2. 模型仅完整读取一次 tieredcache.go 后就直接重写整个文件，而非对四个明确问题做逐一针对性修改。重写法容易引入与原问题无关的新缺陷如 failedEntries 死变量，也使模型无法逐步验证每个修复点的正确性。应先对每个问题做最小修改，每改一处验证后再继续。
+3. 模型声称"全部 56 个测试通过（原 47 个 + 新增 9 个）"，但实际测试输出显示总共 55 个测试用例，新增用例 8 个。计数偏差不影响测试质量，但属于将未核实信息写入总结，缺少对运行结果的二次校验习惯。

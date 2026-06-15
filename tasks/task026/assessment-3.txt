@@ -1,5 +1,5 @@
 产物不满意：
-1. Delete 方法修复后正确地在 l1.delete(key) 之前调用了 l1.clearDirty(key)，防止异步淘汰回调将已删除数据重新写回磁盘。新增的 4 个数据泄漏测试用例覆盖了基本 Delete、Flush 后 Delete、L1 淘汰后 Delete、批量 Delete 四种场景，验证了磁盘文件确实被删除且 Get 返回 ErrKeyNotFound。handleL1Eviction 也增加了 writeBackErrors 计数，与 flushWriteBack 统一了错误追踪，flushWriteBack 中无效的 failedEntries 切片已删除。修复范围精确，代码改动最小化。
+1. Delete 方法修复后正确地在 l1.delete 之前调用了 l1.clearDirty，防止异步淘汰回调将已删除数据重新写回磁盘。新增 4 个数据泄漏测试覆盖四种场景，验证了磁盘文件确实被删除。handleL1Eviction 增加 writeBackErrors 计数与 flushWriteBack 统一了错误追踪，flushWriteBack 中无效的 failedEntries 切片已删除。修复范围精确，代码改动最小化。
 过程不满意：
-1. 模型在编写 Windows 平台测试时，TestHandleL1Eviction_TracksWriteFailure 和 TestWriteBackFailureHandling 等测试最初使用 os.Chmod 将目录设为只读来模拟磁盘写入失败，但 Windows 上 os.Chmod 不能真正阻止文件创建导致测试不稳定。模型经历了多轮试错：先逐个修改测试用例的磁盘失败模拟方式，又遇到进程异常退出需要单独运行子集测试，再调整 Flush 调用次数和断言。三个测试用例的 os.Chmod 问题分三批修复而非一次性扫描全部测试文件统一替换，同类问题反复出现。正确做法是先扫描全部测试中使用了 os.Chmod 模拟写盘失败的地方，一次性统一替换为 os.RemoveAll 方案。
-2. 模型在多次测试失败后将 WriteBackInterval 从短间隔改为 time.Hour 来禁用自动回写定时器，这个改动虽然让测试更可控，但同时也改变了测试的语义——原测试依赖自动回写触发来验证失败处理，修改后变为纯手动 Flush 驱动。这种改动应明确在思考过程中说明原因，而非悄无声息地改变测试策略。
+1. 模型编写 Windows 测试时，TestHandleL1Eviction_TracksWriteFailure 等测试使用 os.Chmod 将目录设为只读模拟磁盘写入失败，但 Windows 上 os.Chmod 不能真正阻止文件创建导致测试不稳定。三个测试用例的 os.Chmod 问题分三批修复而非一次性扫描全部文件统一替换。应先扫描全部使用 os.Chmod 模拟写盘失败的测试，统一替换为 os.RemoveAll 方案。
+2. 模型在多次测试失败后将 WriteBackInterval 从短间隔改为 time.Hour 来禁用自动回写定时器，虽让测试更可控但也改变了测试语义——原测试依赖自动回写触发验证失败处理，修改后变为纯手动 Flush 驱动。这种改动应在思考过程中说明原因。

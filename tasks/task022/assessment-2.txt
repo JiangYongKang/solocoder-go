@@ -1,9 +1,9 @@
 产物不满意：
-1. schemamig.go 的 rollbackInternal 方法修复后在计算当前版本时自己遍历 applied map 找最大值，而 Migrator 中已有 CurrentVersion 方法实现了完全相同的逻辑。这种重复实现导致两处代码对已应用版本最大值的计算方式分裂，如果未来 CurrentVersion 的查找逻辑发生变更（例如改为从数据库直接取 MAX），rollbackInternal 中的内联实现就会遗漏同步更新。正确做法是直接调用 CurrentVersion 获取当前版本，或至少将求最大值的逻辑抽成一个内部方法供两处复用。
-2. schemamig_test.go 中测试用例 TestMigrator_Rollback_UnappliedVersionsIgnored 和 TestMigrator_Rollback_NoDownSQLOnlyForApplied 在调用 Rollback 之前没有清空 mockExecutor 的 execLog，导致这两个测试对 DOWN SQL 语句的校验是在包含 UpTo 和建表操作的全部历史日志上进行的。虽然当前测试数据不会产生误报，但一旦后续有人修改 Up SQL 内容使之包含类似 `DOWN2` 的子串，这两个测试就会在非回滚阶段误触发失败，根源是测试对日志的校验范围不够精确，应先清空 execLog 或只在 Rollback 调用后的新增日志中校验。
+1. rollbackInternal 修复后自己遍历 applied map 找最大值，而 Migrator 中已有 CurrentVersion 实现了相同逻辑。这种重复实现导致两处代码对已应用版本最大值的计算分裂，如果 CurrentVersion 未来发生变更，rollbackInternal 的内联实现就会遗漏同步更新。应直接调用 CurrentVersion 获取当前版本，或将求最大值逻辑抽成内部方法供两处复用。
+2. 测试用例 TestMigrator_Rollback_UnappliedVersionsIgnored 和 TestMigrator_Rollback_NoDownSQLOnlyForApplied 在调用 Rollback 前未清空 mockExecutor 的 execLog，导致对 DOWN SQL 的校验在 UpTo 和建表操作的全部历史日志上进行。虽然当前不会误报，但后续修改 Up SQL 内容可能触发误判。应先清空 execLog 或只在 Rollback 调用后的新增日志中校验。
 
 过程不满意：
-1. 模型在刚收到提示词后未经分析就直接创建了 TodoList（session-cot-2 第 3-9 步），然后在第 11-51 步才反复读取 schemamig.go。TodoList 的创建发生在阅读理解代码之前，导致计划的粒度划分缺少对代码结构的实际认知。正确做法是先阅读提示词指出的两个问题对应的代码区域，理解现有实现的缺陷所在，再制定包含修复步骤、测试补充、文档更新的执行计划。
-2. 模型在第 11-51 步连续四次读取了同一个文件 schemamig.go，四次调用之间没有任何代码变更发生。这说明模型在同一文件上做了无意义的重复读取，推理效率低。合理做法是一次性完整阅读目标代码文件，记录关键信息后再进入修改阶段，而非反复读取相同区域。
-3. 模型在编写测试用例 TestMigrator_Rollback_PartiallyAppliedMigrations 时，直接在持有 mockExecutor 的 mu 互斥锁的情况下调用了 m.Rollback 方法。Rollback 内部链路会通过 getAppliedVersions 调用 executor.Query，而 mockExecutor 的 Query 方法内部也需要获取同一把 mu 锁，导致同一 goroutine 重入加锁触发死锁。这反映出模型在写测试代码前没有分析 mockExecutor 内部 Exec 和 Query 方法的锁语义与上层调用链的交互关系，属于边写边试、运行出错后再修的方式。正确做法是先理清 mock 对象的内部并发控制机制，再编写测试流程避免锁冲突。
-4. 模型在编写作测试代码时把 `Migration` 误写为 `Mutation`（session-cot-2 第 133-150 步），这种拼写错误反映出编码时不够细心。虽然后续自行发现并修正，但在真实开发中这类错误可能未被注意到就通过编译，埋下隐患。
+1. 模型收到提示词后未经分析就创建 TodoList，然后才反复读取 schemamig.go。TodoList 的创建发生在理解代码之前，计划粒度缺少对代码结构的认知。应先阅读提示词指出的两个问题对应的代码区域，理解缺陷所在再制定计划。
+2. 模型连续四次读取同一个 schemamig.go 文件，中间无任何代码变更，是无意义的重复读取。应一次性完整阅读目标代码，记录关键信息后再修改，而非反复读取相同区域。
+3. 编写 TestMigrator_Rollback_PartiallyAppliedMigrations 时在持有 mockExecutor 的 mutex 情况下调用了 m.Rollback，而 Rollback 内部又需获取同一把锁，导致同一 goroutine 重入死锁。模型没先分析 mockExecutor 锁语义与上层调用链的交互关系，属于边写边试的方式。应先理清 mock 对象的并发控制机制再编写测试。
+4. 编写测试代码时把 Migration 误写为 Mutation，是拼写错误，反映出编码不够细心。虽然后续自行修正，但真实开发中可能未被注意就通过编译。

@@ -1,5 +1,5 @@
 产物不满意：
-1. compareValues 函数修改后，对 int 和 float64 的跨类型比较从之前的 Kind 检查改为精确类型比对（reflect.TypeOf(int(0)) 和 reflect.TypeOf(float64(0))），正确处理了自定义命名类型（如 type CustomA int）不应被放行到数值比较分支的问题。default 分支使用 reflect.DeepEqual 做相等判断、按 reflect.Value 数值方法做排序比较，覆盖了 int64、float32、uint 等先前不支持的同类型值比较，逻辑完整。
-2. 新增的 16 个测试用例覆盖了同类型非四种基本类型的相等比较、排序比较、谓词过滤以及类型不兼容的 Kind 排序语义验证。但 TestCompareValues_TypeMismatch_SameKindDifferentType 中新建了 CustomA 和 CustomB 两个命名类型来验证"同 Kind 不同命名类型"的场景，而这段逻辑是在 default 分支的深层 swtich 之前由精确类型比对拦截的，测试虽通过但对的是"类型不兼容"分支而非"同类型 default"分支，测试命名与实际覆盖路径不完全对应。根因是模型写测试时对 compareValues 的三层分支结构（类型不等→同类型已支持四种→同类型 default）的分发路径理解不完全，应确认每个测试的实际代码路径后调整测试命名。
+1. compareValues 修改后对 int 和 float64 的跨类型比较从 Kind 检查改为精确类型比对，正确处理了自定义命名类型不应放行到数值比较分支的问题。default 分支使用 reflect.DeepEqual 做相等判断、按数值方法做排序比较，覆盖了 int64、float32 等先前不支持的同类型值比较，逻辑完整。
+2. 新增 16 个测试用例覆盖了同类型比较、排序比较、谓词过滤等场景。但 TestCompareValues_TypeMismatch_SameKindDifferentType 中新建自定义类型验证"同 Kind 不同命名类型"，而这段逻辑由精确类型比对拦截走的是"类型不兼容"分支而非"同类型 default"分支，测试命名与实际覆盖路径不对应。根因是模型对 compareValues 三层分支结构理解不完全，应确认实际路径后调整命名。
 过程不满意：
-1. 模型第一次修改 compareValues 后在运行测试时发现 TestCompareValues_TypeMismatch_SameKindDifferentType 失败，原因是 Kind 检查把自定义类型 CustomA 和 CustomB 误放行到 default 分支按数值比较判为相等。模型没有先写一个调试输出验证实际执行路径，而是直接根据失败信息分析出根因并修改为精确类型比对，这一次修正正确且高效。但模型在总结中将这个"发现并修复的问题"归为"额外修复"，实际上它是第一次修复引入的新 bug，属于质量问题而非额外发现。
+1. 模型修改 compareValues 后运行测试发现 TestCompareValues_TypeMismatch_SameKindDifferentType 失败，原因是 Kind 检查把自定义类型误放行。模型未先写调试输出验证路径，而是直接根据失败信息分析出根因并修改为精确类型比对，这次修正正确高效。但模型在总结中将此归为"额外修复"，而实际上它是修改引入的新 bug 属于质量问题而非额外发现。

@@ -1,5 +1,5 @@
 产物不满意：
-无发现产品问题。hotcold.go 中正确恢复了 HotThreshold <= ColdThreshold 的自动修正逻辑，当用户传入 HotThreshold=1 ColdThreshold=5 时自动将 HotThreshold 设为 ColdThreshold 的 5 倍即 25.0 后再通过校验。hotcold_test.go 中 TestAutoAdjustThresholds_LoadFactorHigh 删除了未使用的 initialHot 变量，并在 t.Logf 中改为内联调用 m.HotCount()。模型还主动识别到恢复自动修正后原有 TestNewHotColdManagerWithConfig_InvalidThresholds 测试会失败，将该测试重命名为 TestNewHotColdManagerWithConfig_AutoFixThresholdOrder 并改为验证自动修正行为。docs/hotcold.md 同步更新了处理流程描述。go test ./internal/hotcold/ -v 全部 66 个测试用例通过。
+无发现产品问题。hotcold.go 中正确恢复了 HotThreshold <= ColdThreshold 的自动修正逻辑，hotcold_test.go 中删除了未使用的 initialHot 变量，模型还主动识别到恢复自动修正后原有 InvalidThresholds 测试会失败并将其重命名为验证自动修正行为。docs/hotcold.md 同步更新，go test 全部 66 个测试用例通过。
 
 过程不满意：
-模型在步骤 1 收到提示词后未经分析就直接用 todo_write 创建了 3 项子任务计划，之后才在步骤 2-3 阅读 hotcold.go 和 hotcold_test.go 源码。这违反了"先分析需求文档和代码骨架，理清修改范围后再制定执行计划"的标注原则。直接后果是步骤 4 修复问题 1 恢复自动修正逻辑后，直到步骤 7 才意识到这会连带破坏原有阈值校验测试 TestNewHotColdManagerWithConfig_InvalidThresholds，说明初始计划缺乏对修复影响的预判。正确做法是先阅读源码理解当前代码状态，梳理两个修复点各自关联的测试用例和文档，再制定完整的修改计划。
+模型收到提示词后未经分析就直接用 todo_write 创建了 3 项子任务，之后才阅读 hotcold.go 和 hotcold_test.go 源码。这违反"先分析需求文档和代码骨架再制定计划"的标注原则。直接后果是修复问题 1 后直到步骤 7 才意识到会连带破坏原有阈值校验测试，说明初始计划缺乏对修复影响的预判。正确做法是先理解代码状态，梳理修复点关联的测试和文档再制定完整计划。
