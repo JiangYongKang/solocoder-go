@@ -20,8 +20,8 @@
 - 支持使用刷新令牌换取新的访问令牌
 - 刷新令牌可配置过期时间
 - **刷新令牌滚动刷新（可配置）**：
-  - 当 `Config.RefreshTokenRotation = true`（默认）时：刷新令牌使用后旧令牌立即失效，同时签发新的刷新令牌
-  - 当 `Config.RefreshTokenRotation = false` 时：刷新令牌使用后旧令牌仍然有效，不会签发新的刷新令牌（非滚动模式）
+  - 当 `Config.RefreshTokenRotation = true`（默认）时：刷新令牌使用后旧令牌立即失效，同时签发新的刷新令牌并在响应中返回
+  - 当 `Config.RefreshTokenRotation = false` 时：刷新令牌使用后旧令牌仍然有效，不会签发新的刷新令牌，响应中不包含 `refresh_token` 字段
 
 ### 1.4 Scope 校验
 - 客户端请求时声明所需的权限范围
@@ -219,14 +219,14 @@ JWT 访问令牌声明：
   |                                 |    - 校验 refresh_token 有效  |
   |                                 |    - **不吊销旧 refresh_token**|
   |                                 |    - 生成新 access_token      |
-  |                                 |    - **不生成新 refresh_token**|
+  |                                 |    - **不返回 refresh_token**  |
   |<--------------------------------|
   | 3. 返回新访问令牌               |
   | {                               |
   |   "access_token": "NEW_JWT",    |
   |   "token_type": "Bearer",       |
   |   "expires_in": 3600,            |
-  |   "refresh_token": "OLD_REFRESH"|
+  |   "scope": "read write"         |
   | }                               |
 ```
 
@@ -345,9 +345,11 @@ if err != nil {
 }
 
 // 滚动刷新模式（RefreshTokenRotation = true）时，旧的刷新令牌已被吊销，必须使用新的
-// 非滚动模式（RefreshTokenRotation = false）时，旧的刷新令牌仍然有效
+// 非滚动模式（RefreshTokenRotation = false）时，旧的刷新令牌仍然有效，但响应中不包含 refresh_token 字段
 fmt.Printf("New Access Token: %s\n", newTokenResp.AccessToken)
-fmt.Printf("New Refresh Token: %s\n", newTokenResp.RefreshToken)
+if newTokenResp.RefreshToken != "" {
+    fmt.Printf("New Refresh Token: %s\n", newTokenResp.RefreshToken)
+}
 ```
 
 ### 4.5 令牌验证示例

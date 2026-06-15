@@ -1560,6 +1560,11 @@ func TestConcurrentSubscribeUnsubscribe(t *testing.T) {
 func TestConcurrentStartStop(t *testing.T) {
 	r := NewRegistry(DefaultRegistryConfig())
 
+	initialStarts := atomic.LoadInt32(&r.expiryLoopStarts)
+	if initialStarts != 0 {
+		t.Fatalf("expected initial expiryLoopStarts=0, got %d", initialStarts)
+	}
+
 	const n = 10
 	var wg sync.WaitGroup
 	wg.Add(n)
@@ -1580,6 +1585,11 @@ func TestConcurrentStartStop(t *testing.T) {
 		t.Error("expected expiryRunning to be true after concurrent Start calls")
 	}
 
+	startsAfterConcurrent := atomic.LoadInt32(&r.expiryLoopStarts)
+	if startsAfterConcurrent != 1 {
+		t.Errorf("expected expiryLoopStarts=1 after %d concurrent Start calls, got %d", n, startsAfterConcurrent)
+	}
+
 	r.Stop()
 
 	r.mu.RLock()
@@ -1587,6 +1597,32 @@ func TestConcurrentStartStop(t *testing.T) {
 	r.mu.RUnlock()
 	if running {
 		t.Error("expected expiryRunning to be false after Stop")
+	}
+
+	startsAfterStop := atomic.LoadInt32(&r.expiryLoopStarts)
+	if startsAfterStop != startsAfterConcurrent {
+		t.Errorf("expiryLoopStarts should not change after Stop, expected %d, got %d", startsAfterConcurrent, startsAfterStop)
+	}
+
+	r.Start()
+
+	startsAfterRestart := atomic.LoadInt32(&r.expiryLoopStarts)
+	if startsAfterRestart != 2 {
+		t.Errorf("expected expiryLoopStarts=2 after restart, got %d", startsAfterRestart)
+	}
+
+	r.Stop()
+
+	startsAfterSecondStop := atomic.LoadInt32(&r.expiryLoopStarts)
+	if startsAfterSecondStop != 2 {
+		t.Errorf("expiryLoopStarts should remain 2 after second Stop, got %d", startsAfterSecondStop)
+	}
+
+	r.mu.RLock()
+	running = r.expiryRunning
+	r.mu.RUnlock()
+	if running {
+		t.Error("expected expiryRunning to be false after second Stop")
 	}
 }
 

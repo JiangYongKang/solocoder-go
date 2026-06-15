@@ -1,0 +1,4 @@
+你实现的服务注册与发现模块的 TestConcurrentStartStop 测试用例覆盖不充分：
+1. 该测试在修复后验证了并发的 Start 后 expiryRunning 为 true、Stop 后为 false，但仍未直接验证后台过期协程 expireLoop 的启动次数。提示词要求"补充对后台协程启动次数和状态标志一致性的验证"，当前测试仅覆盖了状态标志位一致性，缺失对协程启动次数的独立验证。若未来 Start 方法的幂等逻辑被错误修改导致多次启动协程，当前测试无法捕获这一回归。
+2. 增强 TestConcurrentStartStop 测试，补充对 expireLoop 协程启动次数的验证，确保多次并发的 Start 调用只启动了恰好一个后台过期协程。
+3. 运行 go test ./internal/servicereg/ -v，需要让所有测试通过。
