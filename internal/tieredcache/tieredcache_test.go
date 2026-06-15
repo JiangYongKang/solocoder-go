@@ -1746,7 +1746,7 @@ func TestWriteBackFailureHandling(t *testing.T) {
 		},
 		WritePolicy:       WritePolicyWriteBack,
 		L2Dir:             tmpDir,
-		WriteBackInterval: 10 * time.Millisecond,
+		WriteBackInterval: time.Hour,
 	}
 
 	tc, err := NewTieredCacheWithConfig(cfg)
@@ -1762,18 +1762,17 @@ func TestWriteBackFailureHandling(t *testing.T) {
 		t.Fatalf("Put failed: %v", err)
 	}
 
-	if err := os.Chmod(tmpDir, 0444); err != nil {
-		t.Skipf("cannot chmod directory to read-only, skipping test: %v", err)
+	os.RemoveAll(tmpDir)
+
+	for i := 0; i < maxWriteBackRetries+2; i++ {
+		tc.Flush()
 	}
-	defer os.Chmod(tmpDir, 0755)
 
-	time.Sleep(200 * time.Millisecond)
-
-	os.Chmod(tmpDir, 0755)
+	os.MkdirAll(tmpDir, 0755)
 
 	errCount := tc.WriteBackErrorCount()
-	if errCount > 1 {
-		t.Errorf("unexpected write-back error count: %d (should be 0 or 1, depending on timing)", errCount)
+	if errCount < 1 {
+		t.Errorf("expected at least 1 write-back error after directory removal, got %d", errCount)
 	}
 }
 
@@ -1792,7 +1791,7 @@ func TestWriteBackMaxRetriesExceeded(t *testing.T) {
 		},
 		WritePolicy:       WritePolicyWriteBack,
 		L2Dir:             tmpDir,
-		WriteBackInterval: 5 * time.Millisecond,
+		WriteBackInterval: time.Hour,
 	}
 
 	lc, err := NewTieredCacheWithConfig(cfg)
@@ -1808,21 +1807,20 @@ func TestWriteBackMaxRetriesExceeded(t *testing.T) {
 		}
 	}
 
-	if err := os.Chmod(tmpDir, 0444); err != nil {
-		lc.Close()
-		lc.Clear()
-		t.Skipf("cannot chmod directory, skipping: %v", err)
-	}
-	defer os.Chmod(tmpDir, 0755)
+	os.RemoveAll(tmpDir)
 
-	time.Sleep(200 * time.Millisecond)
-	os.Chmod(tmpDir, 0755)
-
-	if err := lc.Close(); err != nil {
-		if err != ErrWriteBackFailed {
-			t.Logf("Close returned error (expected if failures occurred): %v", err)
-		}
+	for i := 0; i < maxWriteBackRetries+2; i++ {
+		lc.Flush()
 	}
+
+	os.MkdirAll(tmpDir, 0755)
+
+	errCount := lc.WriteBackErrorCount()
+	if errCount < 1 {
+		t.Errorf("expected at least 1 permanent write-back error, got %d", errCount)
+	}
+
+	lc.Close()
 	lc.Clear()
 }
 
@@ -1930,5 +1928,301 @@ func TestTieredCacheConcurrentDeleteAndGet(t *testing.T) {
 
 	if deleteErrors > 0 {
 		t.Errorf("found %d Delete errors during concurrent operations", deleteErrors)
+	}
+}
+
+func TestDelete_WriteBackNoDataLeak(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       10,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       100,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy:       WritePolicyWriteBack,
+		L2Dir:             tmpDir,
+		WriteBackInterval: time.Hour,
+	}
+
+	tc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc.Close()
+	defer tc.Clear()
+
+	tc.Put("leak-key", []byte("leak-value"))
+
+	filename := filepath.Join(tmpDir, sanitizeKey("leak-key"))
+	if _, err := os.Stat(filename); !os.IsNotExist(err) {
+		t.Fatalf("dirty entry should not yet be on disk in write-back mode")
+	}
+
+	tc.l1.waitEvictions()
+
+	err = tc.Delete("leak-key")
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	tc.l1.waitEvictions()
+	tc.l2.waitEvictions()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if _, err := os.Stat(filename); !os.IsNotExist(err) {
+		data, readErr := os.ReadFile(filename)
+		if readErr != nil {
+			t.Errorf("disk file for deleted key still exists but cannot be read: %v", readErr)
+		} else {
+			t.Errorf("data leak: disk file for 'leak-key' still exists after Delete with content %q", string(data))
+		}
+	}
+
+	_, err = tc.Get("leak-key")
+	if err != ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound after Delete, got err=%v", err)
+	}
+}
+
+func TestDelete_WriteBackNoDataLeakAfterFlush(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       10,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       100,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy:       WritePolicyWriteBack,
+		L2Dir:             tmpDir,
+		WriteBackInterval: time.Hour,
+	}
+
+	tc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc.Close()
+	defer tc.Clear()
+
+	tc.Put("flush-leak", []byte("flush-value"))
+
+	tc.Flush()
+
+	filename := filepath.Join(tmpDir, sanitizeKey("flush-leak"))
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		t.Fatalf("file should exist after Flush")
+	}
+
+	tc.l1.waitEvictions()
+	tc.l2.waitEvictions()
+
+	err = tc.Delete("flush-leak")
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	tc.l1.waitEvictions()
+	tc.l2.waitEvictions()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if _, err := os.Stat(filename); !os.IsNotExist(err) {
+		data, readErr := os.ReadFile(filename)
+		if readErr != nil {
+			t.Errorf("disk file for deleted key still exists but cannot be read: %v", readErr)
+		} else {
+			t.Errorf("data leak: disk file for 'flush-leak' still exists after Delete with content %q", string(data))
+		}
+	}
+
+	_, err = tc.Get("flush-leak")
+	if err != ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound after Delete, got err=%v", err)
+	}
+}
+
+func TestDelete_WriteBackEvictionNoDataLeak(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       2,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       100,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy:       WritePolicyWriteBack,
+		L2Dir:             tmpDir,
+		WriteBackInterval: time.Hour,
+	}
+
+	tc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc.Close()
+	defer tc.Clear()
+
+	tc.Put("evict-a", []byte("value-a"))
+	tc.Put("evict-b", []byte("value-b"))
+	tc.Put("evict-c", []byte("value-c"))
+
+	tc.l1.waitEvictions()
+
+	err = tc.Delete("evict-a")
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	tc.l1.waitEvictions()
+	tc.l2.waitEvictions()
+
+	time.Sleep(50 * time.Millisecond)
+
+	filename := filepath.Join(tmpDir, sanitizeKey("evict-a"))
+	if _, err := os.Stat(filename); !os.IsNotExist(err) {
+		data, readErr := os.ReadFile(filename)
+		if readErr != nil {
+			t.Errorf("disk file for evicted+deleted key still exists but cannot be read: %v", readErr)
+		} else {
+			t.Errorf("data leak: disk file for 'evict-a' still exists after Delete with content %q", string(data))
+		}
+	}
+
+	_, err = tc.Get("evict-a")
+	if err != ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound after Delete, got err=%v", err)
+	}
+}
+
+func TestDelete_MultipleKeysWriteBackNoResidue(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       100,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       1000,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy:       WritePolicyWriteBack,
+		L2Dir:             tmpDir,
+		WriteBackInterval: time.Hour,
+	}
+
+	tc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc.Close()
+	defer tc.Clear()
+
+	numKeys := 20
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("multi:%d", i)
+		val := []byte(fmt.Sprintf("val:%d", i))
+		if err := tc.Put(key, val); err != nil {
+			t.Fatalf("Put %s failed: %v", key, err)
+		}
+	}
+
+	deleteKeys := []int{0, 5, 10, 15, 19}
+	for _, idx := range deleteKeys {
+		key := fmt.Sprintf("multi:%d", idx)
+		if err := tc.Delete(key); err != nil {
+			t.Fatalf("Delete %s failed: %v", key, err)
+		}
+	}
+
+	tc.l1.waitEvictions()
+	tc.l2.waitEvictions()
+
+	time.Sleep(50 * time.Millisecond)
+
+	for _, idx := range deleteKeys {
+		key := fmt.Sprintf("multi:%d", idx)
+		filename := filepath.Join(tmpDir, sanitizeKey(key))
+		if _, err := os.Stat(filename); !os.IsNotExist(err) {
+			t.Errorf("data leak: disk file for deleted key %q still exists", key)
+		}
+	}
+
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("multi:%d", i)
+		isDeleted := false
+		for _, idx := range deleteKeys {
+			if idx == i {
+				isDeleted = true
+				break
+			}
+		}
+		if isDeleted {
+			_, err := tc.Get(key)
+			if err != ErrKeyNotFound {
+				t.Errorf("deleted key %q should return ErrKeyNotFound, got err=%v", key, err)
+			}
+		}
+	}
+}
+
+func TestHandleL1Eviction_TracksWriteFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := Config{
+		L1Config: CacheLevelConfig{
+			Capacity:       2,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		L2Config: CacheLevelConfig{
+			Capacity:       100,
+			CapacityMode:   CapacityModeCount,
+			EvictionPolicy: EvictionPolicyLRU,
+		},
+		WritePolicy:       WritePolicyWriteBack,
+		L2Dir:             tmpDir,
+		WriteBackInterval: time.Hour,
+	}
+
+	tc, err := NewTieredCacheWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewTieredCacheWithConfig failed: %v", err)
+	}
+	defer tc.Close()
+	defer tc.Clear()
+
+	tc.Put("track-a", []byte("val-a"))
+	tc.Put("track-b", []byte("val-b"))
+
+	beforeErrors := tc.WriteBackErrorCount()
+
+	os.RemoveAll(tmpDir)
+
+	tc.Put("track-c", []byte("val-c"))
+
+	tc.l1.waitEvictions()
+	time.Sleep(50 * time.Millisecond)
+
+	os.MkdirAll(tmpDir, 0755)
+
+	afterErrors := tc.WriteBackErrorCount()
+	if afterErrors <= beforeErrors {
+		t.Errorf("expected writeBackErrors to increase after eviction write failure, before=%d after=%d", beforeErrors, afterErrors)
 	}
 }

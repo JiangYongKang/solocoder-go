@@ -106,39 +106,11 @@ func NewHotColdManager() *HotColdManager {
 }
 
 func NewHotColdManagerWithConfig(cfg Config) (*HotColdManager, error) {
-	if cfg.HotCapacityRatio < 0 || cfg.HotCapacityRatio >= 1 {
-		return nil, ErrInvalidConfig
-	}
-	if cfg.MinHotThreshold < 0 || (cfg.MinHotThreshold > 0 && cfg.MaxHotThreshold > 0 && cfg.MaxHotThreshold <= cfg.MinHotThreshold) {
-		return nil, ErrInvalidConfig
-	}
-	if cfg.MinColdThreshold < 0 || (cfg.MinColdThreshold > 0 && cfg.MaxColdThreshold > 0 && cfg.MaxColdThreshold <= cfg.MinColdThreshold) {
-		return nil, ErrInvalidConfig
-	}
-	if cfg.HotThreshold < 0 || cfg.ColdThreshold < 0 {
-		return nil, ErrInvalidConfig
-	}
-	if cfg.HotThreshold > 0 && cfg.ColdThreshold > 0 && cfg.HotThreshold <= cfg.ColdThreshold {
-		return nil, ErrInvalidConfig
-	}
-	if cfg.DecayHalfLife < 0 {
-		return nil, ErrInvalidConfig
-	}
-	if cfg.ColdCheckCycles < 0 {
-		return nil, ErrInvalidConfig
-	}
-	if cfg.AdjustInterval < 0 {
-		return nil, ErrInvalidConfig
-	}
-
 	if cfg.HotThreshold == 0 {
 		cfg.HotThreshold = 10.0
 	}
 	if cfg.ColdThreshold == 0 {
 		cfg.ColdThreshold = 2.0
-	}
-	if cfg.HotThreshold <= cfg.ColdThreshold {
-		cfg.HotThreshold = cfg.ColdThreshold * 5
 	}
 	if cfg.DecayHalfLife == 0 {
 		cfg.DecayHalfLife = time.Hour

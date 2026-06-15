@@ -1,0 +1,4 @@
+你实现的缓存失效管理器模块在上一轮修复后仍存在一些问题，需要继续修复：
+1. docs/cacheinvalid.md 第 9.2 节淘汰算法流程图描述与代码实际行为矛盾。代码中 evictOne 在全部条目受保护时已正确返回 false 并通过 PutWithTTL 返回 ErrCapacityExhausted，但流程图仍描述为"未找到（全是热点/预加载）→ 删除任意一条（极端情况）"。
+2. docs/cacheinvalid.md 第 11 节错误定义表中遗漏了新增的 ErrCapacityExhausted 公开错误类型，开发者仅通过文档无法了解此错误的存在及触发条件。
+3. 修复文档后运行 go test ./internal/cacheinvalid/ -v，需要让所有测试通过。

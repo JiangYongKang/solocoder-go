@@ -363,9 +363,17 @@ func compareValues(a, b Value) int {
 	ta := reflect.TypeOf(a)
 	tb := reflect.TypeOf(b)
 	if ta != tb {
-		if (ta.Kind() == reflect.Int || ta.Kind() == reflect.Float64) &&
-			(tb.Kind() == reflect.Int || tb.Kind() == reflect.Float64) {
+		typeInt := reflect.TypeOf(int(0))
+		typeFloat64 := reflect.TypeOf(float64(0))
+		if (ta == typeInt && tb == typeFloat64) || (ta == typeFloat64 && tb == typeInt) {
 		} else {
+			ka, kb := ta.Kind(), tb.Kind()
+			if ka != kb {
+				if ka < kb {
+					return -1
+				}
+				return 1
+			}
 			if ta.String() < tb.String() {
 				return -1
 			}
@@ -427,6 +435,42 @@ func compareValues(a, b Value) int {
 				return 1
 			}
 			return 0
+		}
+	default:
+		if reflect.DeepEqual(a, b) {
+			return 0
+		}
+		va := reflect.ValueOf(a)
+		vb := reflect.ValueOf(b)
+		switch va.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			ai, bi := va.Int(), vb.Int()
+			if ai < bi {
+				return -1
+			}
+			return 1
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			au, bu := va.Uint(), vb.Uint()
+			if au < bu {
+				return -1
+			}
+			return 1
+		case reflect.Float32, reflect.Float64:
+			af, bf := va.Float(), vb.Float()
+			if af < bf {
+				return -1
+			}
+			return 1
+		default:
+			sa := fmt.Sprintf("%#v", a)
+			sb := fmt.Sprintf("%#v", b)
+			if sa < sb {
+				return -1
+			}
+			if sa > sb {
+				return 1
+			}
+			return 1
 		}
 	}
 	return 1

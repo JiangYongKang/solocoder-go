@@ -1343,76 +1343,87 @@ func TestGetEntry_LiveScore(t *testing.T) {
 
 func TestAutoAdjustThresholds_LoadFactorHigh(t *testing.T) {
 	cfg := Config{
-		HotThreshold:         10.0,
-		ColdThreshold:        2.0,
+		HotThreshold:         50.0,
+		ColdThreshold:        20.0,
 		DecayHalfLife:        time.Hour,
 		ColdCheckCycles:      3,
 		HotCapacityRatio:     0.3,
 		AutoAdjustThresholds: true,
-		AdjustInterval:       time.Millisecond,
+		AdjustInterval:       100 * time.Millisecond,
 		MinHotThreshold:      1.0,
-		MaxHotThreshold:      100.0,
+		MaxHotThreshold:      200.0,
 		MinColdThreshold:     0.1,
-		MaxColdThreshold:     20.0,
+		MaxColdThreshold:     100.0,
 	}
 	m := newTestManager(t, cfg)
 
-	for i := 0; i < 10; i++ {
-		key := fmt.Sprintf("k%d", i)
-		m.Put(key, "v")
+	for i := 0; i < 100; i++ {
+		m.Put(fmt.Sprintf("k%d", i), "v")
 	}
 
-	initialCfg := m.GetConfig()
-
-	for i := 0; i < 500; i++ {
-		for j := 0; j < 10; j++ {
+	for i := 0; i < 2000; i++ {
+		for j := 0; j < 100; j++ {
 			m.Get(fmt.Sprintf("k%d", j))
 		}
 	}
 
-	time.Sleep(time.Millisecond * 2)
+	initialCfg := m.GetConfig()
+	initialHot := m.HotCount()
+	t.Logf("Before adjust: hotCount=%d, coldCount=%d, hotRatio=%.2f", initialHot, m.ColdCount(), float64(initialHot)/float64(m.TotalCount()))
+
+	time.Sleep(150 * time.Millisecond)
 	m.CheckAndMigrate()
 
 	afterCfg := m.GetConfig()
-	t.Logf("Before: hot=%.2f cold=%.2f", initialCfg.HotThreshold, initialCfg.ColdThreshold)
-	t.Logf("After (high load): hot=%.2f cold=%.2f", afterCfg.HotThreshold, afterCfg.ColdThreshold)
+	t.Logf("High load - Before: hot=%.2f cold=%.2f", initialCfg.HotThreshold, initialCfg.ColdThreshold)
+	t.Logf("High load - After:  hot=%.2f cold=%.2f", afterCfg.HotThreshold, afterCfg.ColdThreshold)
 
 	if afterCfg.HotThreshold >= initialCfg.HotThreshold {
-		t.Log("Note: high load did not decrease threshold (combined with capacity ratio)")
+		t.Errorf("expected hot threshold to decrease under high load (capacity+load both push down), before=%.2f, after=%.2f", initialCfg.HotThreshold, afterCfg.HotThreshold)
+	}
+	if afterCfg.ColdThreshold >= initialCfg.ColdThreshold {
+		t.Errorf("expected cold threshold to decrease under high load (capacity+load both push down), before=%.2f, after=%.2f", initialCfg.ColdThreshold, afterCfg.ColdThreshold)
 	}
 }
 
 func TestAutoAdjustThresholds_LoadFactorLow(t *testing.T) {
 	cfg := Config{
-		HotThreshold:         10.0,
-		ColdThreshold:        5.0,
+		HotThreshold:         1.0,
+		ColdThreshold:        0.1,
 		DecayHalfLife:        time.Hour,
 		ColdCheckCycles:      3,
 		HotCapacityRatio:     0.3,
 		AutoAdjustThresholds: true,
-		AdjustInterval:       time.Millisecond,
-		MinHotThreshold:      1.0,
-		MaxHotThreshold:      100.0,
-		MinColdThreshold:     0.1,
-		MaxColdThreshold:     20.0,
+		AdjustInterval:       100 * time.Millisecond,
+		MinHotThreshold:      0.1,
+		MaxHotThreshold:      200.0,
+		MinColdThreshold:     0.01,
+		MaxColdThreshold:     100.0,
 	}
 	m := newTestManager(t, cfg)
 
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 100; i++ {
 		m.Put(fmt.Sprintf("k%d", i), "v")
+		m.Get(fmt.Sprintf("k%d", i))
 	}
 
-	initialCfg := m.GetConfig()
-
-	time.Sleep(time.Millisecond * 2)
+	time.Sleep(150 * time.Millisecond)
 	m.CheckAndMigrate()
 
-	afterCfg := m.GetConfig()
-	t.Logf("Before: hot=%.2f cold=%.2f", initialCfg.HotThreshold, initialCfg.ColdThreshold)
-	t.Logf("After (low load): hot=%.2f cold=%.2f", afterCfg.HotThreshold, afterCfg.ColdThreshold)
+	afterFirstCfg := m.GetConfig()
 
-	if afterCfg.HotThreshold >= initialCfg.HotThreshold {
-		t.Log("Note: low load did not increase threshold (combined with capacity ratio)")
+	time.Sleep(150 * time.Millisecond)
+	m.CheckAndMigrate()
+
+	afterSecondCfg := m.GetConfig()
+	t.Logf("Low load - After 1st adjust: hot=%.2f cold=%.2f", afterFirstCfg.HotThreshold, afterFirstCfg.ColdThreshold)
+	t.Logf("Low load - After 2nd adjust: hot=%.2f cold=%.2f", afterSecondCfg.HotThreshold, afterSecondCfg.ColdThreshold)
+
+	if afterSecondCfg.HotThreshold <= afterFirstCfg.HotThreshold {
+		t.Errorf("expected hot threshold to increase under low load (capacity+load both push up), 1st=%.2f, 2nd=%.2f", afterFirstCfg.HotThreshold, afterSecondCfg.HotThreshold)
+	}
+	if afterSecondCfg.ColdThreshold <= afterFirstCfg.ColdThreshold {
+		t.Errorf("expected cold threshold to increase under low load (capacity+load both push up), 1st=%.2f, 2nd=%.2f", afterFirstCfg.ColdThreshold, afterSecondCfg.ColdThreshold)
 	}
 }
 

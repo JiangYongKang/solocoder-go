@@ -1571,6 +1571,10 @@ func TestMigrator_Rollback_UnappliedVersionsIgnored(t *testing.T) {
 		t.Errorf("Rollback(1) when current=1 should roll back 0, got %d", len(rolledBack))
 	}
 
+	exec.mu.Lock()
+	exec.execLog = nil
+	exec.mu.Unlock()
+
 	_, err = m.Rollback(0)
 	if err != nil {
 		t.Fatalf("Rollback(0) error = %v", err)

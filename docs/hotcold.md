@@ -147,19 +147,16 @@ func NewHotColdManager() *HotColdManager
 func NewHotColdManagerWithConfig(cfg Config) (*HotColdManager, error)
 ```
 
-**错误返回规则**:
-- **返回 `ErrInvalidConfig`**（配置明显错误，无法自动修复）:
-  - `HotCapacityRatio < 0` 或 `HotCapacityRatio >= 1`（超出合理范围）
-  - `MinHotThreshold < 0`，或同时设置了 `MinHotThreshold > 0` 且 `MaxHotThreshold > 0` 但 `MaxHotThreshold <= MinHotThreshold`
-  - `MinColdThreshold < 0`，或同时设置了 `MinColdThreshold > 0` 且 `MaxColdThreshold > 0` 但 `MaxColdThreshold <= MinColdThreshold`
-  - `HotThreshold < 0` 或 `ColdThreshold < 0`
-  - 同时设置了 `HotThreshold > 0` 且 `ColdThreshold > 0` 但 `HotThreshold <= ColdThreshold`
-  - `DecayHalfLife < 0`、`ColdCheckCycles < 0`、`AdjustInterval < 0`（负数无意义）
-- **自动填充默认值**（零值或未设置）:
-  - `HotThreshold == 0` → 默认 10.0
-  - `ColdThreshold == 0` → 默认 2.0
-  - `DecayHalfLife == 0` → 默认 1 小时
-  - 其他零值配置项也会自动填充合理默认
+**处理流程**（先填充默认值，再统一校验）:
+
+```
+1. 对零值字段自动填充默认值（如 HotThreshold==0 → 10.0）
+2. 调用 ValidateConfig(cfg) 统一校验所有字段
+3. 校验失败 → 返回 (nil, ErrInvalidConfig)
+4. 校验成功 → 创建并返回管理器实例
+```
+
+> **设计原则**: 构造函数内部**不包含**独立的内联校验逻辑，所有校验规则统一在 `ValidateConfig` 中维护。修改校验规则只需改 `ValidateConfig` 一处，不会出现两套规则不一致的漏洞。
 
 ### 4.3 ValidateConfig
 
@@ -170,6 +167,21 @@ func ValidateConfig(cfg Config) error
 ```
 
 该函数不执行任何默认值填充，要求传入的 cfg 所有字段都已设置为合法值。任何字段不合法都会返回 `ErrInvalidConfig`。
+
+**校验规则**（唯一的校验规则来源）:
+
+| 字段 | 校验条件 |
+|------|---------|
+| `HotCapacityRatio` | 必须 > 0 且 < 1 |
+| `MinHotThreshold` | 必须 > 0 |
+| `MaxHotThreshold` | 必须 > MinHotThreshold |
+| `MinColdThreshold` | 必须 > 0 |
+| `MaxColdThreshold` | 必须 > MinColdThreshold |
+| `HotThreshold` | 必须 > 0 且 > ColdThreshold |
+| `ColdThreshold` | 必须 > 0 |
+| `DecayHalfLife` | 必须 > 0 |
+| `ColdCheckCycles` | 必须 > 0 |
+| `AdjustInterval` | 必须 > 0 |
 
 典型使用场景：在持久化配置前进行预校验。
 
@@ -632,4 +644,6 @@ manager, _ := hotcold.NewHotColdManagerWithConfig(cfg)
 6. **自适应阈值调整间隔**: 调整不会立即生效，需等待 AdjustInterval 间隔
 7. **冷降级延迟**: 数据变冷后需要经过 ColdCheckCycles 个检查周期才会真正降级，避免抖动
 8. **阈值缓冲区间**: 热阈值始终大于冷阈值，两者之间的缓冲区可减少频繁迁移
-9. **构造函数错误处理**: `NewHotColdManagerWithConfig` 现在返回 `(*HotColdManager, error)`，调用者必须检查错误；零值配置会自动填充默认值，但明显错误的配置会返回 `ErrInvalidConfig`
+9. **构造函数错误处理**: `NewHotColdManagerWithConfig` 现在返回 `(*HotColdManager, error)`，调用者必须检查错误；零值配置会自动填充默认值，但填充后仍不合法的配置会返回 `ErrInvalidConfig`
+10. **校验逻辑单一来源**: 所有配置校验规则统一在 `ValidateConfig` 中维护，构造函数先填充默认值再调用 `ValidateConfig`，不存在独立于 `ValidateConfig` 的内联校验逻辑，避免两套规则不一致
+11. **负载因子测试设计**: 高/低负载测试通过控制数据量和访问模式确保容量维度和负载维度同向作用（高负载 + 热数据不足 → 两维度均降低阈值；低负载 + 热数据过多 → 两维度均提高阈值），使用强制断言确保测试有效性

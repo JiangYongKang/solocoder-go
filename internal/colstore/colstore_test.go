@@ -1402,3 +1402,199 @@ func TestCompareValues_IntFloatMixed(t *testing.T) {
 		t.Error("float64(1.5) should be less than int(2)")
 	}
 }
+
+func TestCompareValues_SameTypeUnsupported_Int64Equal(t *testing.T) {
+	if compareValues(int64(42), int64(42)) != 0 {
+		t.Error("int64(42) and int64(42) should be equal")
+	}
+	if compareValues(int64(0), int64(0)) != 0 {
+		t.Error("int64(0) and int64(0) should be equal")
+	}
+}
+
+func TestCompareValues_SameTypeUnsupported_Int64Ordering(t *testing.T) {
+	if compareValues(int64(10), int64(20)) >= 0 {
+		t.Error("int64(10) should be less than int64(20)")
+	}
+	if compareValues(int64(30), int64(20)) <= 0 {
+		t.Error("int64(30) should be greater than int64(20)")
+	}
+	if compareValues(int64(5), int64(100)) >= 0 {
+		t.Error("int64(5) should be less than int64(100)")
+	}
+}
+
+func TestCompareValues_SameTypeUnsupported_Int64NotEqual(t *testing.T) {
+	if compareValues(int64(1), int64(2)) == 0 {
+		t.Error("int64(1) and int64(2) should not be equal")
+	}
+}
+
+func TestCompareValues_SameTypeUnsupported_Float32Equal(t *testing.T) {
+	if compareValues(float32(3.14), float32(3.14)) != 0 {
+		t.Error("float32(3.14) and float32(3.14) should be equal")
+	}
+}
+
+func TestCompareValues_SameTypeUnsupported_Float32Ordering(t *testing.T) {
+	if compareValues(float32(1.0), float32(2.0)) >= 0 {
+		t.Error("float32(1.0) should be less than float32(2.0)")
+	}
+	if compareValues(float32(5.5), float32(3.3)) <= 0 {
+		t.Error("float32(5.5) should be greater than float32(3.3)")
+	}
+}
+
+func TestCompareValues_SameTypeUnsupported_UintEqual(t *testing.T) {
+	if compareValues(uint(100), uint(100)) != 0 {
+		t.Error("uint(100) and uint(100) should be equal")
+	}
+}
+
+func TestCompareValues_SameTypeUnsupported_UintOrdering(t *testing.T) {
+	if compareValues(uint(5), uint(10)) >= 0 {
+		t.Error("uint(5) should be less than uint(10)")
+	}
+	if compareValues(uint(20), uint(15)) <= 0 {
+		t.Error("uint(20) should be greater than uint(15)")
+	}
+}
+
+func TestCompareValues_SameTypeUnsupported_SliceEqual(t *testing.T) {
+	if compareValues([]int{1, 2, 3}, []int{1, 2, 3}) != 0 {
+		t.Error("[]int{1,2,3} and []int{1,2,3} should be equal via DeepEqual")
+	}
+}
+
+func TestCompareValues_SameTypeUnsupported_SliceOrdering(t *testing.T) {
+	if compareValues([]int{1}, []int{2}) == 0 {
+		t.Error("[]int{1} and []int{2} should not be equal")
+	}
+	r1 := compareValues([]int{1}, []int{2})
+	r2 := compareValues([]int{2}, []int{1})
+	if r1 == r2 {
+		t.Error("slice ordering should be antisymmetric")
+	}
+}
+
+func TestCompareValues_SameTypeUnsupported_Int32Ordering(t *testing.T) {
+	if compareValues(int32(1), int32(2)) >= 0 {
+		t.Error("int32(1) should be less than int32(2)")
+	}
+	if compareValues(int32(100), int32(50)) <= 0 {
+		t.Error("int32(100) should be greater than int32(50)")
+	}
+	if compareValues(int32(7), int32(7)) != 0 {
+		t.Error("int32(7) and int32(7) should be equal")
+	}
+}
+
+func TestPredicate_SameTypeUnsupported_Int64(t *testing.T) {
+	cs := NewColumnStore()
+	batch := []ColumnBatch{
+		{Name: "id", Values: []Value{int64(1), int64(2), int64(3), int64(4), int64(5)}},
+		{Name: "name", Values: []Value{"a", "b", "c", "d", "e"}},
+	}
+	cs.Write(batch)
+
+	predicates := []*Predicate{
+		{Column: "id", Op: OpEq, Value: int64(3)},
+	}
+
+	result, err := cs.ReadWithFilter([]string{"name"}, predicates)
+	if err != nil {
+		t.Fatalf("ReadWithFilter failed: %v", err)
+	}
+
+	if result.TotalMatched != 1 {
+		t.Errorf("expected 1 match, got %d", result.TotalMatched)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if result.Rows[0].Values["name"] != "c" {
+		t.Errorf("expected name=c, got %v", result.Rows[0].Values["name"])
+	}
+}
+
+func TestPredicate_SameTypeUnsupported_Int64Gt(t *testing.T) {
+	cs := NewColumnStore()
+	batch := []ColumnBatch{
+		{Name: "id", Values: []Value{int64(10), int64(20), int64(30), int64(40)}},
+	}
+	cs.Write(batch)
+
+	predicates := []*Predicate{
+		{Column: "id", Op: OpGt, Value: int64(20)},
+	}
+
+	result, err := cs.ReadWithFilter([]string{"id"}, predicates)
+	if err != nil {
+		t.Fatalf("ReadWithFilter failed: %v", err)
+	}
+
+	if result.TotalMatched != 2 {
+		t.Errorf("expected 2 matches (30, 40), got %d", result.TotalMatched)
+	}
+}
+
+func TestPredicate_SameTypeUnsupported_Int64TypeMismatch(t *testing.T) {
+	cs := NewColumnStore()
+	batch := []ColumnBatch{
+		{Name: "id", Values: []Value{int64(1), int64(2), int64(3)}},
+	}
+	cs.Write(batch)
+
+	predicates := []*Predicate{
+		{Column: "id", Op: OpEq, Value: int(1)},
+	}
+
+	result, err := cs.ReadWithFilter([]string{"id"}, predicates)
+	if err != nil {
+		t.Fatalf("ReadWithFilter failed: %v", err)
+	}
+
+	if result.TotalMatched != 0 {
+		t.Errorf("expected 0 matches (int64 vs int type mismatch), got %d", result.TotalMatched)
+	}
+}
+
+func TestCompareValues_TypeMismatch_KindBasedOrdering(t *testing.T) {
+	r1 := compareValues(true, "hello")
+	r2 := compareValues("hello", true)
+	if r1 == 0 || r2 == 0 {
+		t.Error("bool and string should never be equal")
+	}
+	if r1+r2 != 0 {
+		t.Error("type-incompatible comparison should be antisymmetric")
+	}
+	if r1 >= 0 {
+		t.Error("bool should compare less than string by Kind ordering (Bool=1 < String=24)")
+	}
+}
+
+func TestCompareValues_TypeMismatch_KindDifferentTypes(t *testing.T) {
+	r1 := compareValues(1.5, "x")
+	r2 := compareValues("x", 1.5)
+	if r1 == 0 {
+		t.Error("float64 and string should never be equal")
+	}
+	if r1+r2 != 0 {
+		t.Error("should be antisymmetric")
+	}
+}
+
+func TestCompareValues_TypeMismatch_SameKindDifferentType(t *testing.T) {
+	type CustomA int
+	type CustomB int
+	a := CustomA(1)
+	b := CustomB(1)
+	r := compareValues(a, b)
+	if r == 0 {
+		t.Error("different named types with same underlying kind should not be equal")
+	}
+	rRev := compareValues(b, a)
+	if r+rRev != 0 {
+		t.Error("should be antisymmetric for same-kind different-named-type")
+	}
+}

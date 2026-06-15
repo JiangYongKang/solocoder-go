@@ -17,6 +17,7 @@ var (
 	ErrClusterStopped     = errors.New("cachesync: cluster is stopped")
 	ErrInvalidMessageType = errors.New("cachesync: invalid message type")
 	ErrVersionTooOld      = errors.New("cachesync: update rejected due to older version")
+	ErrMessageDropped     = errors.New("cachesync: message dropped due to full channel")
 )
 
 const (
@@ -79,11 +80,21 @@ func DefaultConfig() Config {
 	}
 }
 
+type pendingLockStatus int
+
+const (
+	pendingLockStatusPending   pendingLockStatus = iota
+	pendingLockStatusSucceeded
+	pendingLockStatusFailed
+)
+
 type pendingLock struct {
 	grantCh    chan bool
 	denyCh     chan string
 	grantedBy  map[string]struct{}
 	grantedMu  sync.Mutex
+	status     pendingLockStatus
+	statusMu   sync.RWMutex
 }
 
 type VersionRejectEvent struct {
@@ -96,13 +107,21 @@ type VersionRejectEvent struct {
 
 type VersionRejectHandler func(event VersionRejectEvent)
 
+type releaseMark struct {
+	timestamp time.Time
+	expiresAt time.Time
+}
+
 type Node struct {
+	msgSent             uint64
+	msgRecv             uint64
+	rejectCount         uint64
 	ID                  string
 	cache               map[string]*CacheEntry
 	locks               map[string]*lockInfo
 	pendingLocks        map[string]*pendingLock
+	releaseMarks        map[string]map[string]*releaseMark
 	rejectHandlers      []VersionRejectHandler
-	rejectCount         uint64
 	cacheMu             sync.RWMutex
 	lockMu              sync.Mutex
 	pendingLockMu       sync.Mutex
@@ -112,8 +131,6 @@ type Node struct {
 	running             bool
 	stopCh              chan struct{}
 	wg                  sync.WaitGroup
-	msgSent             uint64
-	msgRecv             uint64
 }
 
 type Cluster struct {
@@ -182,6 +199,7 @@ func (c *Cluster) AddNode(nodeID string) (*Node, error) {
 		cache:           make(map[string]*CacheEntry),
 		locks:           make(map[string]*lockInfo),
 		pendingLocks:    make(map[string]*pendingLock),
+		releaseMarks:    make(map[string]map[string]*releaseMark),
 		rejectHandlers:  make([]VersionRejectHandler, 0),
 		inbox:           make(chan *Message, c.cfg.MessageBuffer),
 		cluster:         c,
@@ -289,8 +307,45 @@ func (c *Cluster) unicast(fromNodeID, toNodeID string, msg *Message) (err error)
 		atomic.AddUint64(&node.msgRecv, 1)
 		return nil
 	default:
+		return ErrMessageDropped
+	}
+}
+
+func (c *Cluster) reliableUnicast(fromNodeID, toNodeID string, msg *Message) error {
+	c.nodesMu.RLock()
+	node, exists := c.nodes[toNodeID]
+	running := c.running
+	c.nodesMu.RUnlock()
+
+	if !exists || !running {
+		return ErrNodeNotFound
+	}
+
+	if c.shouldDropMessage() {
 		return nil
 	}
+
+	msgCopy := *msg
+	msgCopy.FromNodeID = fromNodeID
+	msgCopy.ToNodeID = toNodeID
+
+	defer func() { recover() }()
+
+	retries := 5
+	retryDelay := 20 * time.Millisecond
+	for i := 0; i < retries; i++ {
+		select {
+		case node.inbox <- &msgCopy:
+			atomic.AddUint64(&node.msgRecv, 1)
+			return nil
+		case <-time.After(50 * time.Millisecond):
+			if i < retries-1 {
+				time.Sleep(retryDelay)
+				continue
+			}
+		}
+	}
+	return ErrMessageDropped
 }
 
 func (c *Cluster) Stop() {
@@ -452,14 +507,67 @@ func (n *Node) handleLockGranted(msg *Message) {
 	n.pendingLockMu.Lock()
 	pl, ok := n.pendingLocks[msg.Key]
 	n.pendingLockMu.Unlock()
-	if ok {
-		pl.grantedMu.Lock()
-		pl.grantedBy[msg.FromNodeID] = struct{}{}
-		pl.grantedMu.Unlock()
-		select {
-		case pl.grantCh <- true:
-		default:
+	if !ok {
+		n.lockMu.Lock()
+		li, hasLock := n.locks[msg.Key]
+		isHolder := hasLock && li.holder == n.ID && time.Now().Before(li.expiresAt)
+		n.lockMu.Unlock()
+		if !isHolder {
+			releaseMsg := &Message{
+				Type:      MsgLockRelease,
+				FromNodeID: n.ID,
+				Key:       msg.Key,
+				Timestamp: time.Now(),
+			}
+			_ = n.cluster.reliableUnicast(n.ID, msg.FromNodeID, releaseMsg)
+			atomic.AddUint64(&n.msgSent, 1)
 		}
+		return
+	}
+
+	pl.statusMu.RLock()
+	status := pl.status
+	pl.statusMu.RUnlock()
+
+	if status == pendingLockStatusSucceeded {
+		return
+	}
+
+	if status == pendingLockStatusFailed {
+		releaseMsg := &Message{
+			Type:      MsgLockRelease,
+			FromNodeID: n.ID,
+			Key:       msg.Key,
+			Timestamp: time.Now(),
+		}
+		_ = n.cluster.reliableUnicast(n.ID, msg.FromNodeID, releaseMsg)
+		atomic.AddUint64(&n.msgSent, 1)
+		return
+	}
+
+	pl.grantedMu.Lock()
+	pl.grantedBy[msg.FromNodeID] = struct{}{}
+	pl.grantedMu.Unlock()
+
+	pl.statusMu.RLock()
+	status = pl.status
+	pl.statusMu.RUnlock()
+
+	if status == pendingLockStatusFailed {
+		releaseMsg := &Message{
+			Type:      MsgLockRelease,
+			FromNodeID: n.ID,
+			Key:       msg.Key,
+			Timestamp: time.Now(),
+		}
+		_ = n.cluster.reliableUnicast(n.ID, msg.FromNodeID, releaseMsg)
+		atomic.AddUint64(&n.msgSent, 1)
+		return
+	}
+
+	select {
+	case pl.grantCh <- true:
+	default:
 	}
 }
 
@@ -531,6 +639,20 @@ func (n *Node) handleLockAcquire(msg *Message) {
 	n.lockMu.Lock()
 	defer n.lockMu.Unlock()
 
+	n.cleanupExpiredReleaseMarks()
+
+	if marks, ok := n.releaseMarks[msg.Key]; ok {
+		if mark, ok := marks[msg.FromNodeID]; ok {
+			if !msg.Timestamp.After(mark.timestamp) {
+				return
+			}
+			delete(marks, msg.FromNodeID)
+			if len(marks) == 0 {
+				delete(n.releaseMarks, msg.Key)
+			}
+		}
+	}
+
 	li, ok := n.locks[msg.Key]
 	if ok && time.Now().Before(li.expiresAt) {
 		denyMsg := &Message{
@@ -559,16 +681,38 @@ func (n *Node) handleLockAcquire(msg *Message) {
 	_ = n.cluster.unicast(n.ID, msg.FromNodeID, grantMsg)
 }
 
+func (n *Node) cleanupExpiredReleaseMarks() {
+	now := time.Now()
+	for key, marks := range n.releaseMarks {
+		for holder, mark := range marks {
+			if !now.Before(mark.expiresAt) {
+				delete(marks, holder)
+			}
+		}
+		if len(marks) == 0 {
+			delete(n.releaseMarks, key)
+		}
+	}
+}
+
 func (n *Node) handleLockRelease(msg *Message) {
 	n.lockMu.Lock()
 	defer n.lockMu.Unlock()
 
 	li, ok := n.locks[msg.Key]
-	if !ok {
-		return
-	}
-	if li.holder == msg.FromNodeID {
+	if ok && li.holder == msg.FromNodeID {
 		delete(n.locks, msg.Key)
+	}
+
+	if _, ok := n.releaseMarks[msg.Key]; !ok {
+		n.releaseMarks[msg.Key] = make(map[string]*releaseMark)
+	}
+	existing, ok := n.releaseMarks[msg.Key][msg.FromNodeID]
+	if !ok || !msg.Timestamp.Before(existing.timestamp) {
+		n.releaseMarks[msg.Key][msg.FromNodeID] = &releaseMark{
+			timestamp: msg.Timestamp,
+			expiresAt: time.Now().Add(5 * time.Second),
+		}
 	}
 }
 
@@ -708,7 +852,55 @@ func (n *Node) Delete(key string) bool {
 	return existed
 }
 
+func (c *Cluster) reliableBroadcast(fromNodeID string, msg *Message) {
+	c.nodesMu.RLock()
+	nodes := make([]*Node, 0, len(c.nodes))
+	for id, node := range c.nodes {
+		if id == fromNodeID {
+			continue
+		}
+		if c.shouldDropMessage() {
+			continue
+		}
+		nodes = append(nodes, node)
+	}
+	c.nodesMu.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, node := range nodes {
+		msgCopy := *msg
+		msgCopy.ToNodeID = node.ID
+		wg.Add(1)
+		go func(n *Node, m Message) {
+			defer wg.Done()
+			defer func() { recover() }()
+			retries := 5
+			retryDelay := 20 * time.Millisecond
+			for i := 0; i < retries; i++ {
+				select {
+				case n.inbox <- &m:
+					atomic.AddUint64(&n.msgRecv, 1)
+					return
+				case <-time.After(100 * time.Millisecond):
+					if i < retries-1 {
+						time.Sleep(retryDelay)
+						continue
+					}
+				}
+			}
+		}(node, msgCopy)
+	}
+	wg.Wait()
+}
+
 func (n *Node) rollbackLock(key string, pl *pendingLock) {
+	releaseMsg := &Message{
+		Type:      MsgLockRelease,
+		FromNodeID: n.ID,
+		Key:       key,
+		Timestamp: time.Now(),
+	}
+
 	pl.grantedMu.Lock()
 	grantedNodes := make([]string, 0, len(pl.grantedBy))
 	for id := range pl.grantedBy {
@@ -716,63 +908,23 @@ func (n *Node) rollbackLock(key string, pl *pendingLock) {
 	}
 	pl.grantedMu.Unlock()
 
-	if len(grantedNodes) == 0 {
-		return
-	}
-
-	releaseMsg := &Message{
-		Type:      MsgLockRelease,
-		FromNodeID: n.ID,
-		Key:       key,
-		Timestamp: time.Now(),
-	}
-
 	for _, nodeID := range grantedNodes {
-		_ = n.cluster.unicast(n.ID, nodeID, releaseMsg)
+		_ = n.cluster.reliableUnicast(n.ID, nodeID, releaseMsg)
 		atomic.AddUint64(&n.msgSent, 1)
 	}
+
+	n.cluster.reliableBroadcast(n.ID, releaseMsg)
+	atomic.AddUint64(&n.msgSent, 1)
 }
 
 func (n *Node) startRollbackWatcher(key string, pl *pendingLock, watchWindow time.Duration) {
-	releaseMsg := &Message{
-		Type:      MsgLockRelease,
-		FromNodeID: n.ID,
-		Key:       key,
-		Timestamp: time.Now(),
-	}
+	pl.statusMu.Lock()
+	pl.status = pendingLockStatusFailed
+	pl.statusMu.Unlock()
 
-	deadline := time.Now().Add(watchWindow)
-	for time.Now().Before(deadline) {
-		pl.grantedMu.Lock()
-		if len(pl.grantedBy) == 0 {
-			pl.grantedMu.Unlock()
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		nodes := make([]string, 0, len(pl.grantedBy))
-		for id := range pl.grantedBy {
-			nodes = append(nodes, id)
-		}
-		pl.grantedBy = make(map[string]struct{})
-		pl.grantedMu.Unlock()
+	n.rollbackLock(key, pl)
 
-		for _, nodeID := range nodes {
-			_ = n.cluster.unicast(n.ID, nodeID, releaseMsg)
-			atomic.AddUint64(&n.msgSent, 1)
-		}
-	}
-
-	pl.grantedMu.Lock()
-	remaining := make([]string, 0, len(pl.grantedBy))
-	for id := range pl.grantedBy {
-		remaining = append(remaining, id)
-	}
-	pl.grantedMu.Unlock()
-
-	for _, nodeID := range remaining {
-		_ = n.cluster.unicast(n.ID, nodeID, releaseMsg)
-		atomic.AddUint64(&n.msgSent, 1)
-	}
+	time.Sleep(watchWindow)
 
 	n.pendingLockMu.Lock()
 	cur, ok := n.pendingLocks[key]
@@ -787,6 +939,20 @@ func (n *Node) Lock(key string, timeout time.Duration) (string, error) {
 		timeout = n.cluster.cfg.LockTimeout
 	}
 
+	result, err := n.tryLock(key, timeout)
+	if err == nil {
+		return result, nil
+	}
+
+	if errors.Is(err, ErrLockTimeout) {
+		time.Sleep(50 * time.Millisecond)
+		return n.tryLock(key, timeout)
+	}
+
+	return "", err
+}
+
+func (n *Node) tryLock(key string, timeout time.Duration) (string, error) {
 	n.cluster.nodesMu.RLock()
 	peerCount := len(n.cluster.nodes) - 1
 	n.cluster.nodesMu.RUnlock()
@@ -859,6 +1025,10 @@ func (n *Node) Lock(key string, timeout time.Duration) (string, error) {
 		case <-pl.grantCh:
 			grantCount++
 			if grantCount >= requiredGrants {
+				pl.statusMu.Lock()
+				pl.status = pendingLockStatusSucceeded
+				pl.statusMu.Unlock()
+
 				n.pendingLockMu.Lock()
 				cur, ok := n.pendingLocks[key]
 				if ok && cur == pl {
@@ -877,11 +1047,9 @@ func (n *Node) Lock(key string, timeout time.Duration) (string, error) {
 			}
 		case holder := <-pl.denyCh:
 			deniedHolder = holder
-			n.rollbackLock(key, pl)
 			go n.startRollbackWatcher(key, pl, rollbackWindow)
 			return "", fmt.Errorf("%w: held by %s", ErrLockTimeout, holder)
 		case <-timer.C:
-			n.rollbackLock(key, pl)
 			go n.startRollbackWatcher(key, pl, rollbackWindow)
 			if deniedHolder != "" {
 				return "", fmt.Errorf("%w: timed out waiting for lock held by %s", ErrLockTimeout, deniedHolder)

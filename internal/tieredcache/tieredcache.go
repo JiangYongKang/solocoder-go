@@ -536,6 +536,7 @@ func (tc *TieredCache) Delete(key string) error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
+	tc.l1.clearDirty(key)
 	tc.l1.delete(key)
 	tc.l2.delete(key)
 	tc.deleteFromL2(key)
@@ -546,6 +547,7 @@ func (tc *TieredCache) Delete(key string) error {
 func (tc *TieredCache) handleL1Eviction(entry *CacheEntry) {
 	if entry.Dirty {
 		if err := tc.writeToL2(entry.Key, entry.Value); err != nil {
+			tc.writeBackErrors.Add(1)
 			return
 		}
 		l2Entry, ok := tc.l2.putWithoutEvictCallback(entry.Key, entry.Value)
@@ -584,7 +586,6 @@ func (tc *TieredCache) flushWriteBack() {
 	tc.mu.Lock()
 
 	dirtyEntries := tc.l1.getDirtyEntries()
-	failedEntries := make([]*CacheEntry, 0)
 
 	for _, entry := range dirtyEntries {
 		failCount := tc.l1.incrementFailCount(entry.Key)
@@ -595,13 +596,11 @@ func (tc *TieredCache) flushWriteBack() {
 		}
 
 		if err := tc.writeToL2(entry.Key, entry.Value); err != nil {
-			failedEntries = append(failedEntries, entry)
 			continue
 		}
 
 		l2Entry, ok := tc.l2.putWithoutEvictCallback(entry.Key, entry.Value)
 		if !ok {
-			failedEntries = append(failedEntries, entry)
 			continue
 		}
 		l2Entry.Dirty = false

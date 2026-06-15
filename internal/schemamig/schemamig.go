@@ -411,23 +411,20 @@ func (m *Migrator) Rollback(targetVersion int) ([]int, error) {
 }
 
 func (m *Migrator) rollbackInternal(targetVersion int) ([]int, error) {
-	applied, err := m.getAppliedVersions()
+	current, err := m.CurrentVersion()
 	if err != nil {
 		return nil, err
 	}
-
-	var current int
-	for v := range applied {
-		if v > current {
-			current = v
-		}
-	}
-
 	if targetVersion > current {
 		return nil, fmt.Errorf("%w: target %d > current %d", ErrRollbackTarget, targetVersion, current)
 	}
 	if targetVersion == current {
 		return nil, nil
+	}
+
+	applied, err := m.getAppliedVersions()
+	if err != nil {
+		return nil, err
 	}
 
 	allMigrations := m.registry.All()

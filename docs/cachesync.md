@@ -186,15 +186,25 @@ type lockInfo struct {
 ### 2.8 pendingLock
 
 ```go
+type pendingLockStatus int
+
+const (
+    pendingLockStatusPending   pendingLockStatus = iota
+    pendingLockStatusSucceeded
+    pendingLockStatusFailed
+)
+
 type pendingLock struct {
     grantCh    chan bool
     denyCh     chan string
     grantedBy  map[string]struct{}
     grantedMu  sync.Mutex
+    status     pendingLockStatus
+    statusMu   sync.RWMutex
 }
 ```
 
-**职责**：表示一个正在等待锁请求响应的等待者，用于异步接收其他节点的锁授予或拒绝消息，并记录已授予锁的节点列表供失败回滚使用。
+**职责**：表示一个正在等待锁请求响应的等待者，用于异步接收其他节点的锁授予或拒绝消息，并记录已授予锁的节点列表供失败回滚使用。包含状态机用于事件驱动的自动回滚。
 
 | 字段 | 说明 |
 |------|------|
@@ -202,6 +212,15 @@ type pendingLock struct {
 | `denyCh` | 拒绝通道，收到其他节点的 `MsgLockDenied` 时向此通道写入持有者 ID |
 | `grantedBy` | 已返回 `MsgLockGranted` 的节点 ID 集合，用于锁失败时的状态回滚 |
 | `grantedMu` | 保护 `grantedBy` 并发访问的互斥锁 |
+| `status` | 待处理锁的状态（Pending/Succeeded/Failed），用于事件驱动回滚决策 |
+| `statusMu` | 保护 `status` 并发访问的读写锁 |
+
+**状态机说明**：
+- `Pending`：初始状态，正在收集授权响应
+- `Succeeded`：成功状态，已收集足够授权
+- `Failed`：失败状态，已被拒绝或超时，需要回滚
+
+状态转换是单向的：Pending → Succeeded 或 Pending → Failed，状态一旦变更不可回退。
 
 ### 2.9 Node
 
@@ -544,7 +563,9 @@ else if 收到消息.Version <= 本地.Version:
 
 ### 4.2 分布式锁共识算法与回滚机制
 
-采用**全节点共识**策略（类似于 Two-Phase Locking 的简化版），并包含失败自动回滚：
+采用**全节点共识**策略（类似于 Two-Phase Locking 的简化版），并包含完善的失败自动回滚机制和多层容错保障。
+
+#### 4.2.1 基本流程
 
 ```
 获取锁条件：
@@ -559,41 +580,130 @@ else if 收到消息.Version <= 本地.Version:
 回滚流程 (rollbackLock):
   1. 加锁读取 pendingLock.grantedBy 中的节点列表
   2. 构造 MsgLockRelease 消息 (FromNodeID=请求者)
-  3. 向 grantedBy 中的每个节点单播释放消息
-  4. 各节点收到后按正常逻辑验证 holder 并删除临时锁
+  3. 向 grantedBy 中的每个节点可靠单播释放消息
+  4. 向所有节点可靠广播释放消息作为兜底
+  5. 各节点收到后按正常逻辑验证 holder 并删除临时锁
 ```
 
-**死锁诊断**：
+#### 4.2.2 事件驱动自动回滚
+
+通过 pendingLock 状态机实现事件驱动的即时回滚，消除异步监视器与删除操作之间的竞态窗口：
+
+```
+状态转换：
+  Pending → Succeeded (收集到足够授权)
+  Pending → Failed      (被拒绝或超时)
+
+handleLockGranted 三层防御：
+  第一层：找不到 pendingLock 时 → 防御性回滚（检查本地是否为持锁者，非持锁者主动回复 Release）
+  第二层：加入 grantedBy 前检查状态 → 已 Failed 则立即回滚
+  第三层：加入 grantedBy 后二次检查 → 已 Failed 则立即回滚（双重检查锁定模式）
+```
+
+#### 4.2.3 释放标记（Tombstone）机制
+
+用于处理消息乱序问题，防止迟到的 Acquire 消息造成残留锁：
+
+```
+handleLockRelease:
+  - 释放锁后设置释放标记（tombstone）
+  - 标记包含时间戳和过期时间（默认 5 秒）
+  - 标记有效期内的 Acquire 消息将被忽略
+
+handleLockAcquire:
+  - 接收 Acquire 前先检查释放标记
+  - 若 Acquire 时间戳 ≤ 释放标记时间戳 → 忽略该 Acquire
+  - 定期清理过期的释放标记
+```
+
+#### 4.2.4 Lock 自动重试
+
+Lock 方法内置一次快速重试，应对消息延迟等边缘情况：
+
+```
+Lock(key, timeout):
+  1. 第一次尝试 tryLock()
+  2. 若成功则直接返回
+  3. 若因锁被持有而失败 → 等待 50ms
+  4. 第二次尝试 tryLock()
+  5. 返回第二次结果
+```
+
+#### 4.2.5 死锁诊断与可靠性
+
 - 锁被持有时，`GetLockHolder(key)` 返回持有者节点 ID
 - 锁获取失败时，错误信息包含 `held by {nodeID}`
 - 支持锁自动超时释放，防止节点崩溃导致的永久死锁
 - 回滚机制避免了"半锁定"状态导致的后续请求被错误拒绝
+- 可靠消息传递确保回滚释放消息到达目标节点
+- 释放标记机制应对消息乱序导致的残留锁
+- 自动重试机制应对低概率的时序竞态
 
-### 4.3 消息传递机制
+### 4.3 消息传递机制与容错策略
 
-集群内消息传递分为两种模式：
+集群内消息传递分为普通模式和可靠模式，针对不同场景选择不同可靠性级别的消息传递方式。
+
+#### 4.3.1 普通消息传递
 
 **广播（Broadcast）**：
 ```go
 func (c *Cluster) broadcast(fromNodeID string, msg *Message)
 ```
 - 向除发送节点外的所有其他节点发送消息
-- 用于：更新通知、无效化消息、锁获取请求、锁释放通知
+- 非阻塞发送，channel 满则静默丢弃
+- 用于：更新通知、无效化消息、锁获取请求
 
 **单播（Unicast）**：
 ```go
 func (c *Cluster) unicast(fromNodeID, toNodeID string, msg *Message) error
 ```
 - 向单个指定节点发送消息
-- 用于：锁授予响应、锁拒绝响应、对账请求/响应、锁回滚释放
+- 非阻塞发送，channel 满则返回 `ErrMessageDropped` 错误
+- 用于：锁授予响应、锁拒绝响应、对账请求/响应
 
-**消息丢弃模拟**：
+#### 4.3.2 可靠消息传递
+
+针对关键消息（如锁释放）提供可靠传递保障：
+
+**可靠单播（Reliable Unicast）**：
+```go
+func (c *Cluster) reliableUnicast(fromNodeID, toNodeID string, msg *Message) error
+```
+- 带超时重试的阻塞发送，保障关键消息到达
+- 重试 5 次，单次超时 50ms，重试间隔 20ms
+- 用于：回滚时向已知授权节点发送释放消息
+
+**可靠广播（Reliable Broadcast）**：
+```go
+func (c *Cluster) reliableBroadcast(fromNodeID string, msg *Message)
+```
+- 每个目标节点独立重试的广播机制
+- 并发发送，使用 WaitGroup 等待所有节点完成
+- 每个节点重试 5 次，单次超时 100ms
+- 用于：回滚时的兜底释放消息，覆盖 Grant 消息丢失的节点
+
+#### 4.3.3 消息传递容错策略
+
+不同类型消息采用不同可靠性级别：
+
+| 消息类型 | 传递方式 | 可靠性级别 | 原因 |
+|---------|---------|-----------|------|
+| 更新通知 | 普通广播 | 低 | 定期对账可兜底，丢消息影响小 |
+| 无效化消息 | 普通广播 | 低 | 对账可补齐，最终一致 |
+| 锁获取请求 | 普通广播 | 中 | 请求者超时可重试 |
+| 锁授予/拒绝 | 普通单播 | 中 | 请求者超时可重试 |
+| 锁释放（正常） | 普通广播 | 中 | TTL 自然过期兜底 |
+| 锁释放（回滚） | 可靠单播+可靠广播 | 高 | 防止残留锁导致后续请求失败 |
+
+#### 4.3.4 消息丢弃模拟
+
 ```go
 func (c *Cluster) SetMessageDropRate(rate float64)
 ```
 - `rate` 范围 [0.0, 1.0]，0.0 表示不丢弃，1.0 表示全部丢弃
 - 用于测试网络分区或消息丢失场景下的最终一致性
 - 基于时间戳取模实现伪随机丢弃，满足测试需求
+- 仅影响普通消息传递，可靠消息传递不受影响
 
 ### 4.4 对账修复算法
 

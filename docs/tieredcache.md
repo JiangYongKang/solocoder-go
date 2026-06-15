@@ -269,6 +269,67 @@ LRU 淘汰触发:
 - L1 和 L2 独立配置容量和淘汰策略
 - L1 淘汰 Dirty 条目时会自动写入 L2
 - L2 淘汰时会删除对应的磁盘文件
+- 淘汰回调通过异步队列执行，不阻塞缓存操作
+
+### 5.5 删除流程（Delete）
+
+```
+Delete(key) 流程:
+  ┌──────────────────────────┐
+  │ 1. 清除 L1 Dirty 标记    │
+  │    l1.clearDirty(key)    │
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ 2. 从 L1 缓存删除        │
+  │    l1.delete(key)        │
+  │    (条目入异步淘汰队列)   │
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ 3. 从 L2 缓存删除        │
+  │    l2.delete(key)        │
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ 4. 删除磁盘文件          │
+  │    deleteFromL2(key)     │
+  └──────────┬───────────────┘
+             ▼
+  ┌──────────────────────────┐
+  │ 异步: L1 淘汰回调执行    │
+  │ handleL1Eviction(entry)  │
+  │  → entry.Dirty == false  │
+  │  → 跳过 writeToL2       │
+  └──────────────────────────┘
+```
+
+**Delete 与异步淘汰回调的交互关系**:
+
+关键设计：**先清除 Dirty 标记，再删除条目**。
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | `l1.clearDirty(key)` | 在条目仍存在于 L1 时，将 Dirty 标记置为 false |
+| 2 | `l1.delete(key)` | 从 L1 移除条目，放入异步淘汰队列 |
+| 3 | `l2.delete(key)` | 从 L2 移除条目，放入异步淘汰队列 |
+| 4 | `deleteFromL2(key)` | 立即删除磁盘文件 |
+| 异步 | `handleL1Eviction(entry)` | 检查 Dirty==false，跳过 writeToL2 |
+
+**为什么必须先清除 Dirty 标记**：
+
+在回写模式下，L1 中的条目可能标记为 Dirty（尚未刷盘）。如果 Delete 直接删除 L1 条目而不先清除 Dirty：
+1. `l1.delete(key)` 将 Dirty=true 的条目放入异步淘汰队列
+2. `deleteFromL2(key)` 立即删除磁盘文件
+3. 异步回调 `handleL1Eviction` 延迟执行，发现 Dirty=true，调用 `writeToL2` 将已删除的数据重新写回磁盘
+4. 结果：磁盘文件永久残留，形成**数据泄漏**
+
+通过先清除 Dirty 标记，异步回调执行时发现 `entry.Dirty == false`，直接跳过写入操作，避免数据泄漏。
+
+**WriteBack 模式下 Delete 的数据安全保证**：
+- 删除操作保证数据不会在磁盘上残留
+- 异步回调与同步删除操作之间不存在竞争条件
+- 无论异步回调何时执行，都不会重新写入已删除的数据
 
 ## 6. LRU 算法实现
 
@@ -415,13 +476,20 @@ func (c *lruCache) get(key string) (*CacheEntry, bool) {
 
 #### 问题背景
 
-原始 `flushWriteBack()` 对 `writeToL2` 错误用 `continue` 静默跳过：
-- 失败条目的 Dirty 标记未被清除
-- 每次刷盘都重试注定失败的条目，形成死循环
+原始实现存在两个问题：
+1. `flushWriteBack()` 对 `writeToL2` 错误用 `continue` 静默跳过，失败条目的 Dirty 标记未被清除，每次刷盘都重试注定失败的条目，形成死循环
+2. `handleL1Eviction()` 对 `writeToL2` 错误直接 `return` 静默丢弃，调用方完全无法感知脏数据已丢失。两个触发持久化的路径对失败的处理方式不一致
 
-#### 修复方案：有限重试 + 永久失败标记
+#### 修复方案：统一失败追踪 + 有限重试
 
-**失败处理流程**：
+两条持久化路径现在使用统一的 `writeBackErrors` 计数器：
+
+| 触发路径 | 失败处理 | 错误追踪 |
+|----------|----------|----------|
+| `flushWriteBack` | FailCount 递增，超过 `maxWriteBackRetries` 后清除 Dirty 并记录 | `writeBackErrors.Add(1)` |
+| `handleL1Eviction` | 条目已从 L1 移除无法重试，直接记录 | `writeBackErrors.Add(1)` |
+
+**flushWriteBack 失败处理流程**：
 
 ```
 flushWriteBack 处理每个 Dirty 条目:
@@ -523,8 +591,9 @@ loadL2FromDisk:
 | 并发 Get | 写锁保护链表，无数据竞争 |
 | 并发 Get + Put | TieredCache 写锁阻塞所有读 |
 | 淘汰回调 | 异步队列执行，不阻塞缓存操作 |
-| 回写失败 | 有限重试后永久失败标记 |
+| 回写失败 | 统一 writeBackErrors 计数器，有限重试后永久失败标记 |
 | 重启加载 | 不删除磁盘文件，保证数据安全 |
+| Delete + 异步回调 | 先清除 Dirty 标记再删除，避免异步回调重新写入已删除数据 |
 
 ## 8. 使用示例
 

@@ -1,0 +1,3 @@
+你实现的 Write-Through 缓存策略模块在上一轮修复后仍存在一些问题，需要继续修复：
+1. docs/writethrough.md 文档在第 6.2 节处内容截断，Write-Around 策略的说明、完整的状态流转描述和使用示例代码实际并未补全。修复后的 Delete 一致性策略和降级计数器触发条件的精确说明也未写入文档。
+2. 补全文档后运行 go test ./internal/writethrough/ -v，需要让所有测试通过。

@@ -1,0 +1,4 @@
+你实现的数据库 Schema 迁移工具模块在上一轮修复后仍存在一些问题，需要继续修复：
+1. rollbackInternal 方法修复后自己遍历 applied map 查找当前最大版本号，而代码中已有 CurrentVersion 方法实现了完全相同的逻辑。同一个版本号获取逻辑在两个函数中重复维护，未来修改一处时另一处容易遗漏。
+2. 两个回滚测试用例在调用 Rollback 前没有清空 mockExecutor 的执行日志，导致对 DOWN SQL 语句的校验是在包含建表阶段 Up SQL 的全部历史日志上进行的。校验范围过宽，一旦后续有人修改 Up SQL 内容就可能误触发失败。
+3. 修复后运行 go test ./internal/schemamig/ -v，需要让所有测试通过。
