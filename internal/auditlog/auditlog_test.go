@@ -1711,8 +1711,8 @@ func TestFix_Issue4_VerifyIntegrity_DetectsWriterDataLoss_AfterStop(t *testing.T
 	if result2.Valid {
 		t.Fatal("integrity check should fail after writer data loss")
 	}
-	if result2.TamperedIndex != total-2 {
-		t.Errorf("expected TamperedIndex %d (after 4 remaining), got %d", total-2, result2.TamperedIndex)
+	if result2.TamperedIndex != -1 {
+		t.Errorf("expected TamperedIndex -1 (sentinel for data loss without single blame index), got %d", result2.TamperedIndex)
 	}
 	if !containsSubstring(result2.Message, "data loss") {
 		t.Errorf("expected Message to contain 'data loss', got: %s", result2.Message)
@@ -1800,6 +1800,9 @@ func TestFix_Issue4_VerifyIntegrity_WriterDeleteSpecificLog(t *testing.T) {
 	result2 := logger.VerifyIntegrityStrict()
 	if result2.Valid {
 		t.Fatal("integrity check should fail after deleting a log from writer")
+	}
+	if result2.TamperedIndex != -1 {
+		t.Errorf("expected TamperedIndex -1 (sentinel for data loss without single blame index), got %d", result2.TamperedIndex)
 	}
 	if !containsSubstring(result2.Message, "data loss") {
 		t.Errorf("expected 'data loss' in message, got: %s", result2.Message)
@@ -1922,6 +1925,44 @@ func TestFix_Issue4_NonReadableWriter_OnlyMemoryCheck(t *testing.T) {
 	result := logger.VerifyIntegrity()
 	if !result.Valid {
 		t.Errorf("integrity check should pass with non-ReadableWriter: %s", result.Message)
+	}
+}
+
+func TestFix_Issue4_VerifyIntegrity_DetectsWriterSelfConsistencyHashFailure(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger := startLogger(t, writer)
+	defer logger.Stop()
+
+	total := 4
+	for i := 0; i < total; i++ {
+		logger.LogSync(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	waitForCondition(t, func() bool { return writer.Count() == total }, 2*time.Second, "all logs written")
+
+	targetIdx := total - 1
+
+	writer.mu.Lock()
+	wlCopy := *writer.logs[targetIdx]
+	wlCopy.Detail = "tampered content to break self-consistency hash without changing CurrentHash"
+	writer.logs[targetIdx] = &wlCopy
+	writer.mu.Unlock()
+
+	result := logger.VerifyIntegrity()
+	if result.Valid {
+		t.Fatal("integrity check should fail for self-consistency hash mismatch")
+	}
+	if result.TamperedIndex != targetIdx {
+		t.Errorf("expected TamperedIndex %d (last log), got %d (msg: %s)", targetIdx, result.TamperedIndex, result.Message)
+	}
+	if !containsSubstring(result.Message, "self-consistency") {
+		t.Errorf("expected Message to contain 'self-consistency' to indicate self-consistency check path, got: %s", result.Message)
+	}
+	if !containsSubstring(result.Message, "hash mismatch") {
+		t.Errorf("expected Message to contain 'hash mismatch', got: %s", result.Message)
+	}
+	if result.FullySynchronized {
+		t.Error("expected FullySynchronized to be false when self-consistency failure detected")
 	}
 }
 

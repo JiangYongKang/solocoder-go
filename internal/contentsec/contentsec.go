@@ -601,17 +601,18 @@ func (s *HTMLSanitizer) processAttributes(attrStr string, cfg *SanitizerConfig) 
 					mimeEnd = len(dataRest)
 				}
 				mimeType := dataRest[:mimeEnd]
-				if strings.HasPrefix(mimeType, "image/") ||
-					strings.HasPrefix(mimeType, "audio/") ||
-					strings.HasPrefix(mimeType, "video/") ||
-					strings.HasPrefix(mimeType, "font/") ||
-					mimeType == "application/pdf" ||
-					mimeType == "application/json" ||
-					mimeType == "text/plain" ||
-					mimeType == "text/css" ||
-					mimeType == "application/octet-stream" ||
-					strings.HasPrefix(mimeType, "image/") ||
-					strings.HasPrefix(mimeType, "application/vnd.") {
+				safeImageTypes := map[string]bool{
+					"image/png":  true,
+					"image/jpeg": true,
+					"image/jpg":  true,
+					"image/gif":  true,
+					"image/webp": true,
+					"image/bmp":  true,
+					"image/ico":  true,
+					"image/x-icon": true,
+					"image/tiff": true,
+				}
+				if safeImageTypes[mimeType] {
 					isSafe = true
 				}
 			} else {

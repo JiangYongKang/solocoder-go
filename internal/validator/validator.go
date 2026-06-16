@@ -313,15 +313,43 @@ func (v *Validator) isRegisteredCondition(name string) bool {
 	return ok
 }
 
-func extractFieldNameFromCondition(expr string) string {
+type conditionMode int
+
+const (
+	conditionSimple conditionMode = iota
+	conditionNegate
+	conditionEquals
+)
+
+type parsedCondition struct {
+	mode      conditionMode
+	fieldName string
+	expected  string
+}
+
+func parseCondition(expr string) parsedCondition {
 	if strings.HasPrefix(expr, "!") {
-		return strings.TrimSpace(strings.TrimPrefix(expr, "!"))
+		return parsedCondition{
+			mode:      conditionNegate,
+			fieldName: strings.TrimSpace(strings.TrimPrefix(expr, "!")),
+		}
 	}
 	eqIdx := strings.Index(expr, "=")
 	if eqIdx != -1 {
-		return strings.TrimSpace(expr[:eqIdx])
+		return parsedCondition{
+			mode:      conditionEquals,
+			fieldName: strings.TrimSpace(expr[:eqIdx]),
+			expected:  strings.TrimSpace(expr[eqIdx+1:]),
+		}
 	}
-	return strings.TrimSpace(expr)
+	return parsedCondition{
+		mode:      conditionSimple,
+		fieldName: strings.TrimSpace(expr),
+	}
+}
+
+func extractFieldNameFromCondition(expr string) string {
+	return parseCondition(expr).fieldName
 }
 
 func (v *Validator) structHasField(s interface{}, fieldName string) bool {
@@ -460,6 +488,7 @@ func splitTag(tag string) []string {
 }
 
 func buildCondition(expr string) ConditionFunc {
+	parsed := parseCondition(expr)
 	return func(s interface{}) bool {
 		if s == nil {
 			return false
@@ -475,31 +504,26 @@ func buildCondition(expr string) ConditionFunc {
 			return false
 		}
 
-		if strings.HasPrefix(expr, "!") {
-			fieldName := strings.TrimSpace(strings.TrimPrefix(expr, "!"))
-			fv, ok := findFieldByName(val, fieldName)
+		switch parsed.mode {
+		case conditionNegate:
+			fv, ok := findFieldByName(val, parsed.fieldName)
 			if !ok {
 				return false
 			}
 			return isEmptyValue(fv)
-		}
-
-		eqIdx := strings.Index(expr, "=")
-		if eqIdx != -1 {
-			fieldName := strings.TrimSpace(expr[:eqIdx])
-			expected := strings.TrimSpace(expr[eqIdx+1:])
-			fv, ok := findFieldByName(val, fieldName)
+		case conditionEquals:
+			fv, ok := findFieldByName(val, parsed.fieldName)
 			if !ok {
 				return false
 			}
-			return fmt.Sprintf("%v", fv.Interface()) == expected
+			return fmt.Sprintf("%v", fv.Interface()) == parsed.expected
+		default:
+			fv, ok := findFieldByName(val, parsed.fieldName)
+			if !ok {
+				return false
+			}
+			return !isEmptyValue(fv)
 		}
-
-		fv, ok := findFieldByName(val, strings.TrimSpace(expr))
-		if !ok {
-			return false
-		}
-		return !isEmptyValue(fv)
 	}
 }
 

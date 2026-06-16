@@ -1,0 +1,7 @@
+产物不满意：
+1. 本轮将严格模式数据丢失场景的 TamperedIndex 从 `len(writerLogs)` 改为 `-1` 哨兵值，修复了调用方用该越界索引访问剩余日志数组导致 panic 的问题。两个相关测试的断言同步更新为检查 TamperedIndex 等于 -1，语义明确。所有 63 个测试用例通过，修复质量合格。
+2. 新增的自洽性校验测试通过仅修改 Writer 末端日志 Detail 而不改 CurrentHash，使内存自洽性、链式校验和跨层哈希对比依次通过后精确触发 Writer 自洽性校验路径。断言验证 TamperedIndex 指向正确索引、Message 含 `self-consistency` 和 `hash mismatch`、FullySynchronized 为 false，覆盖准确。
+
+过程不满意：
+1. 模型在刚收到提示词后未经任何分析就直接用 todo_write 创建了三项子任务计划，然后才开始用 search_by_regex 定位 verifyLogSetConsistency 函数并读取代码。这种先规划再分析的顺序与标注规范要求的先分析需求文档和代码结构再制定执行计划相悖。本轮修改范围小未导致返工，但面对更复杂任务时此习惯会带来计划与实际模块边界不匹配的风险。
+2. 编写自洽性校验测试时模型经历三轮推理迭代才锁定正确策略：先试图同时篡改内存和 Writer 的 CurrentHash，发现内存自洽性会先触发；又尝试两侧同时改内容保留旧 CurrentHash，仍无法绕过内存自洽性检查；第三次才确定只改 Writer 末端 Detail 的策略。模型没有先系统性追踪 verifyLogSetConsistency 的检查项执行顺序一次性推导正确篡改方式，而是采用逐个方案验证的试错式推理，效率偏低。

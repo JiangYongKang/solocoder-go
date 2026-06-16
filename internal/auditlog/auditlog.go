@@ -670,7 +670,7 @@ func verifyLogSetConsistency(writerLogs []*AuditLog, memLogs []*AuditLog, strict
 	if strictCount && !fullySynced {
 		return VerificationResult{
 			Valid:         false,
-			TamperedIndex: len(writerLogs),
+			TamperedIndex: -1,
 			Message:       fmt.Sprintf("%v: strict mode: writer has %d logs but memory has %d (data loss detected, expected fully synchronized)", ErrWriterIntegrityFailed, len(writerLogs), len(memLogs)),
 		}
 	}

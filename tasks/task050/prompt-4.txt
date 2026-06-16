@@ -1,0 +1,4 @@
+你实现的数据校验引擎模块修复后，条件表达式解析逻辑引入了新的代码重复问题，需要修复：
+1. extractFieldNameFromCondition 和 buildCondition 两个函数现在各自独立实现了取反表达式、等值表达式、简单表达式三种模式的字段名解析逻辑，两处代码对条件表达式的解析规则完全一致。这与上一轮提示词指出的 dereferenceValue 和 isEmptyValue 重复解引用问题属于同一模式：同一个模块内两处独立维护的相同解析规则，将来修改条件语法时必须同步改动两处。应将字段名提取逻辑抽取为一个共用的辅助函数，extractFieldNameFromCondition 和 buildCondition 都通过该函数获取字段名，消除重复。
+2. 抽取共用函数后需要验证原有的空值校验、required 校验、条件表达式校验及新增的空格处理回归测试全部保持通过。
+3. 运行 go test ./internal/validator/ -v，需要让所有测试通过。

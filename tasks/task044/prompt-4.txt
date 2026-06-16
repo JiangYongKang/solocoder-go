@@ -1,0 +1,4 @@
+你实现的审计日志系统模块修复后仍存在两个残留问题，需要修复：
+1. VerifyIntegrityStrict 方法在严格模式数量检查检测到 Writer 数据丢失场景时，将 TamperedIndex 设置为 `len(writerLogs)`，这个值等于剩余日志数组的长度而非有效索引。例如 6 条日志被截断仅剩 4 条，TamperedIndex 被设为 4，但剩余数组的合法索引范围是 0 到 3，调用方若直接使用该索引访问 writerLogs 会造成数组越界 panic。数据丢失场景不存在单一可指责的被篡改日志，TamperedIndex 应使用 -1 等明确语义的哨兵值表示该场景。
+2. TestFix_Issue4_VerifyIntegrity_DetectsWriterHashMismatch 测试通过修改篡改目标为末尾日志来适配新的校验顺序，该测试目前走的是跨层哈希对比路径（与内存哈希比对）而非自洽性校验路径（日志内容与 CurrentHash 比对），导致 Writer 层日志内容与自身 CurrentHash 不一致的自洽性校验场景失去测试覆盖。需要补充独立的测试用例专门验证自洽性校验在 Writer CurrentHash 被篡改时能正确检测。
+3. 运行 go test ./internal/auditlog/ -v，需要让所有测试通过。
