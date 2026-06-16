@@ -1,6 +1,7 @@
 package contentsec
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"html"
@@ -589,6 +590,8 @@ func (s *HTMLSanitizer) processAttributes(attrStr string, cfg *SanitizerConfig) 
 			if colonIdx == -1 {
 				isSafe = true
 			} else if strings.HasPrefix(trimmed, "data:") {
+				originalTrimmed := strings.TrimSpace(attrValue)
+				originalDataRest := originalTrimmed[5:]
 				dataRest := trimmed[5:]
 				semicolonIdx := strings.Index(dataRest, ";")
 				commaIdx := strings.Index(dataRest, ",")
@@ -602,18 +605,20 @@ func (s *HTMLSanitizer) processAttributes(attrStr string, cfg *SanitizerConfig) 
 				}
 				mimeType := dataRest[:mimeEnd]
 				safeImageTypes := map[string]bool{
-					"image/png":  true,
-					"image/jpeg": true,
-					"image/jpg":  true,
-					"image/gif":  true,
-					"image/webp": true,
-					"image/bmp":  true,
-					"image/ico":  true,
+					"image/png":    true,
+					"image/jpeg":   true,
+					"image/jpg":    true,
+					"image/gif":    true,
+					"image/webp":   true,
+					"image/bmp":    true,
+					"image/ico":    true,
 					"image/x-icon": true,
-					"image/tiff": true,
+					"image/tiff":   true,
 				}
 				if safeImageTypes[mimeType] {
 					isSafe = true
+				} else if mimeType == "image/svg+xml" {
+					isSafe = isSafeSVGDataURI(originalDataRest, commaIdx)
 				}
 			} else {
 				for prefix := range safeProtocols {
@@ -633,6 +638,76 @@ func (s *HTMLSanitizer) processAttributes(attrStr string, cfg *SanitizerConfig) 
 	}
 
 	return strings.Join(attrs, " ")
+}
+
+var svgDangerousPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)<script[\s>]`),
+	regexp.MustCompile(`(?i)\bon\w+\s*=`),
+}
+
+func isSafeSVGDataURI(originalDataRest string, commaIdx int) bool {
+	if commaIdx == -1 {
+		return false
+	}
+	svgContent := originalDataRest[commaIdx+1:]
+	if svgContent == "" {
+		return true
+	}
+
+	if strings.Contains(strings.ToLower(originalDataRest[:commaIdx]), ";base64") {
+		decoded, err := base64.StdEncoding.DecodeString(svgContent)
+		if err != nil {
+			decoded, err = base64.RawStdEncoding.DecodeString(svgContent)
+			if err != nil {
+				return false
+			}
+		}
+		svgContent = string(decoded)
+	} else {
+		svgContent = unescapeURIComponent(svgContent)
+	}
+
+	svgLower := strings.ToLower(svgContent)
+	for _, pattern := range svgDangerousPatterns {
+		if pattern.MatchString(svgLower) {
+			return false
+		}
+	}
+	return true
+}
+
+func unescapeURIComponent(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] == '%' && i+2 < len(s) {
+			hex := s[i+1 : i+3]
+			var val byte
+			for _, c := range hex {
+				val <<= 4
+				switch {
+				case c >= '0' && c <= '9':
+					val |= byte(c - '0')
+				case c >= 'a' && c <= 'f':
+					val |= byte(c - 'a' + 10)
+				case c >= 'A' && c <= 'F':
+					val |= byte(c - 'A' + 10)
+				default:
+					b.WriteString(s[i : i+3])
+					i += 3
+					goto next
+				}
+			}
+			b.WriteByte(val)
+			i += 3
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	next:
+	}
+	return b.String()
 }
 
 func isSelfClosingTag(tag string) bool {

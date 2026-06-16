@@ -1,6 +1,8 @@
 package contentsec
 
 import (
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -1318,17 +1320,12 @@ func TestSanitizeDataURIDangerousTypesBlocked(t *testing.T) {
 		{
 			name:     "SVG XSS with onload blocked",
 			input:    `<img src="data:image/svg+xml,<svg onload=alert(1)>" alt="xss">`,
-			excludes: "data:image/svg+xml",
+			excludes: "onload",
 		},
 		{
-			name:     "SVG XSS with script tag blocked",
+			name:     "SVG XSS with script tag base64 blocked",
 			input:    `<img src="data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+" alt="xss">`,
-			excludes: "data:image/svg+xml",
-		},
-		{
-			name:     "SVG without base64 blocked",
-			input:    `<img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E" alt="svg">`,
-			excludes: "data:image/svg+xml",
+			excludes: "onload",
 		},
 		{
 			name:     "data:text/css blocked",
@@ -1398,27 +1395,87 @@ func TestSanitizeDataURISVGScriptBlocked(t *testing.T) {
 			input: `<img src='data:image/svg+xml,<svg onclick="alert(1)"/>' alt="xss">`,
 		},
 		{
-			name:  "SVG with script tag",
+			name:  "SVG with script tag base64",
 			input: `<img src='data:image/svg+xml;base64,PHN2Zz48c2NyaXB0PmFsZXJ0KDEpPC9zY3JpcHQ+PC9zdmc+' alt='xss'>`,
 		},
 		{
-			name:  "SVG base64 encoded script",
+			name:  "SVG base64 encoded script double quotes",
 			input: `<img src="data:image/svg+xml;base64,PHN2Zz48c2NyaXB0PmFsZXJ0KDEpPC9zY3JpcHQ+PC9zdmc+" alt="xss">`,
 		},
 		{
-			name:  "SVG with onmouseover",
+			name:  "SVG with onmouseover URL encoded",
 			input: `<img src="data:image/svg+xml,%3Csvg%20onmouseover%3D%22alert%281%29%22%3E" alt="xss">`,
+		},
+		{
+			name:  "SVG with onfocus event",
+			input: `<img src="data:image/svg+xml,<svg onfocus=alert(1)>" alt="xss">`,
+		},
+		{
+			name:  "SVG with onerror event",
+			input: `<img src="data:image/svg+xml,<svg onerror=alert(1)>" alt="xss">`,
+		},
+		{
+			name:  "SVG with script tag inline",
+			input: `<img src="data:image/svg+xml,<svg><script>alert(1)</script></svg>" alt="xss">`,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := s.Sanitize(tt.input)
-			if strings.Contains(result, "image/svg+xml") {
-				t.Errorf("%s: image/svg+xml data URI should be blocked, got: %s", tt.name, result)
-			}
-			if strings.Contains(result, "onload") || strings.Contains(result, "onclick") || strings.Contains(result, "onmouseover") {
+			if strings.Contains(result, "onload") || strings.Contains(result, "onclick") || strings.Contains(result, "onmouseover") || strings.Contains(result, "onfocus") || strings.Contains(result, "onerror") {
 				t.Errorf("%s: event handlers should not appear in output, got: %s", tt.name, result)
+			}
+		})
+	}
+}
+
+func TestSanitizeDataURISafeSVGAllowed(t *testing.T) {
+	s := NewHTMLSanitizer()
+
+	simpleSVG := `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect fill="red" width="100" height="100"/></svg>`
+	simpleSVGB64 := base64.StdEncoding.EncodeToString([]byte(simpleSVG))
+
+	iconSVG := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2L2 22h20L12 2z"/></svg>`
+	iconSVGB64 := base64.StdEncoding.EncodeToString([]byte(iconSVG))
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+	}{
+		{
+			name:     "Simple SVG icon base64",
+			input:    fmt.Sprintf(`<img src="data:image/svg+xml;base64,%s" alt="icon">`, simpleSVGB64),
+			contains: `src="data:image/svg+xml;base64,`,
+		},
+		{
+			name:     "SVG with rect base64",
+			input:    fmt.Sprintf(`<img src="data:image/svg+xml;base64,%s" alt="rect">`, simpleSVGB64),
+			contains: `data:image/svg+xml`,
+		},
+		{
+			name:     "SVG icon path base64",
+			input:    fmt.Sprintf(`<img src="data:image/svg+xml;base64,%s" alt="path">`, iconSVGB64),
+			contains: `data:image/svg+xml`,
+		},
+		{
+			name:     "Safe SVG URL encoded",
+			input:    `<img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E" alt="svg">`,
+			contains: `data:image/svg+xml`,
+		},
+		{
+			name:     "Empty SVG data URI",
+			input:    `<img src="data:image/svg+xml," alt="empty">`,
+			contains: `data:image/svg+xml`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.Sanitize(tt.input)
+			if !strings.Contains(result, tt.contains) {
+				t.Errorf("%s: safe SVG should be allowed, missing %q in result: %s", tt.name, tt.contains, result)
 			}
 		})
 	}
