@@ -1,9 +1,9 @@
 产物不满意：
-1. extractFieldNameFromCondition 函数在处理取反表达式分支时只调用了 strings.TrimPrefix 去掉感叹号前缀，但没有对去掉前缀后的字段名做 TrimSpace 处理。当用户写 `when=! FieldName`（感叹号与字段名之间有空格）时，函数返回的是带前导空格的 ` FieldName`，导致 structHasField 中的 findFieldByName 找不到该字段，进而 applyRules 误报 "condition references unknown field" 错误，而实际上字段是存在的。根因是取反分支缺少与等号分支一致的 TrimSpace 调用，应在 strings.TrimPrefix 后对结果再做 strings.TrimSpace。
-2. applyRules 方法中通过 dereferenceValue 在传入校验器之前对字段值做了指针解引用，同时在 isEmptyValue 中也新增了 Ptr 和 Interface 分支的递归解引用。这两个解引用步骤分别在 applyRules 和 validateRequired 中执行了相似操作——dereferenceValue 将 `*int` 指向 10 解包为 int 类型的 10 传给校验器，isEmptyValue 又用 reflect 对传入值再次递归解引用。两处代码对指针解引用的权责划分不清晰，如果将来有人修改 isEmptyValue 的解引用逻辑而忘记同步调整 dereferenceValue，两个路径行为会产生不一致。应将解引用统一到一处（要么全部在 applyRules 传入前完成，要么全部由各校验器内部通过 reflect 自处理），而非在两个层次各自执行一遍。
+1. extractFieldNameFromCondition 在处理取反表达式时只调用了 strings.TrimPrefix 去掉感叹号但没有对结果做 TrimSpace。当用户写 `when=! FieldName` 时返回带前导空格的字段名导致 findFieldByName 找不到该字段误报 unknown field 但字段实际存在。取反分支缺少与等号分支一致的 TrimSpace 调用。
+2. applyRules 中 dereferenceValue 在传入校验器前对字段值做指针解引用，同时 isEmptyValue 中也新增了递归解引用。两个解引用分别在 applyRules 和 validateRequired 中执行相似操作，两处权责划分不清晰。应将解引用统一到一处而非在两个层次各自执行。
 过程不满意：
 1. 模型在刚收到提示词后未经任何需求分析和代码阅读就直接用 todo_write 创建了 6 项子任务计划，此后在整个修复过程中又先后执行了 7 次 todo_write 不断修改 TodoList。这违反了"先分析问题再规划"的原则，导致计划粒度与实际问题不匹配，后续修复顺序从问题 4 跳到问题 1 再跳到问题 2 再到问题 3，完全没有系统性。正确做法是先完整阅读 validator.go 中与四个问题相关的所有函数，理清依赖关系后再制定执行计划。
 2. 模型在整个修复过程中对 validator.go 的查看操作达到了至少 15 次以上，而且每次都是从文件开头读取，大量内容重复出现。例如在确认 ValidateWithRules 方法、buildCondition 函数、validatePositive 函数的实现时，都分别从文件首行起读了一遍完整文件，没有使用按行号偏移或按函数名定位的方式高效查找。这种低效的重复读取严重浪费了推理窗口，属于典型的推理效率问题。
 3. 模型在还没搞清楚代码库状态时就运行了 `go test -run "TestConditionMissingField|TestRequiredPointer|TestPositiveUint"`，试图执行三个当时根本不存在的测试用例。这是试错式调试的典型表现——模型假设这些测试已存在但实际并未来得及编写，说明它对自己当前所处的修复阶段没有清晰认知。正确做法是先编写针对四个问题的测试用例来锁定缺陷，然后再运行测试确认当前行为，最后再修改生产代码。
 4. 在处理问题 3 指针类型必填校验时，模型在第 668 步声称"虽然测试显示当前代码对指针类型的处理是正确的"，对提示词明确指出的 validateRequired 中 `*string` 判空只检查 nil 不检查指向值的缺陷持怀疑态度。这表明模型没有充分理解提示词中"JSON 反序列化产生 `name: ""` 时非 nil 指针指向空字符串仍会通过必填校验"这一定性问题描述，而是依赖自己编写的测试用例来反向推断 BUG 是否存在，属于目标理解偏差。
-5. 模型在第 1644 步的总结中声称"所有问题已修复并通过测试"，并给出了 110+ 个测试全部通过的结论。但此时它尚未添加提示词第 5 条要求的针对性单元测试（条件校验字段缺失、指针类型值透传、ValidateWithRules 与标签交互）。后续第 1318 步才开始补充测试，补充后又遇到 TestDereferencePointerNilSkipsNonRequiredValidators 失败需要在第 1454 步做额外修复。这属于典型的幻觉与虚假完成——模型在测试还未完备的情况下就宣布任务完成，跳过了关键验证环节。
+5. 模型在第 1644 步的总结中声称"所有问题已修复并通过测试"并给出 110+ 个测试全部通过的结论。但此时尚未添加提示词第 5 条要求的针对性单元测试（条件校验字段缺失、指针类型值透传、ValidateWithRules 与标签交互）。后续才开始补充测试，补充后又遇到 TestDereferencePointerNilSkipsNonRequiredValidators 失败需要额外修复。这属于典型幻觉与虚假完成——测试未完备就宣布任务完成，跳过了关键验证环节。

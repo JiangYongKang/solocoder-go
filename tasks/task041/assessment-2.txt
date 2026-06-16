@@ -1,5 +1,5 @@
 产物不满意：
-1. jwtmgr_test.go 的 TestBlacklist 函数中 "Close then Add does not store data" 子测试在 setup 阶段调用 `bl.Add("before-close", time.Hour)` 时未校验返回值。当初始 Add 操作因某种原因失败时，"before-close" 数据根本没有被存入黑名单，但后续断言 `if !exists { t.Error("token added before Close should still exist") }` 仍会触发失败并将根因错误地归为"Close 后数据丢失"，实际上问题出在前序 Add 执行失败而非 Close 的行为。该 setup 步骤应改为 `if err := bl.Add("before-close", time.Hour); err != nil { t.Fatalf("setup Add failed: %v", err) }`，确保前置条件成立后再进行 Close 相关验证，避免将初始化失败与测试目标行为的失败混淆。
+1. TestBlacklist 的 "Close then Add does not store data" 子测试 setup 阶段调用 `bl.Add("before-close", time.Hour)` 未校验返回值。若该 Add 失败数据根本没存入，但后续断言仍会触发把根因错误归为"Close 后数据丢失"，实际是前序 Add 失败。setup 应改为 `if err := bl.Add(...); err != nil { t.Fatalf(...) }`。
 
 过程不满意：
-1. 模型在收到提示词后的第一个动作是调用 todo_write 创建 6 项子任务计划（session-cot-2.md 第 1-6 行），然后才开始依次读取 internal/jwtmgr/ 包下的 8 个源代码文件和文档文件（第 10-86 行）。标注规范明确要求"不能在刚收到任务时就直接创建 TodoList，应先分析问题再规划"，原因是在未阅读代码确认问题实际代码位置和影响范围的前提下制定的计划可能粒度不匹配或遗漏关联改动。虽然本轮提示词已明确描述了三个缺陷的位置和修复方向，但模型仍应先阅读 blacklist.go 和 errors.go 确认 Contains 的空 tokenID 处理逻辑和 Add 的 closed 判断逻辑后，再根据代码实际状态制定修改计划。这样做能避免计划与实际代码结构脱节，也能在代码审查中发现提示词未提及但实际存在的关联问题。
+1. 模型收到提示词后第一个动作是 todo_write 创建 6 项子任务，然后才依次读取 8 个源代码文件。虽本轮提示词已明确描述三个缺陷位置，但仍应先阅读 blacklist.go 和 errors.go 确认 Contains 的空 tokenID 处理和 Add 的 closed 判断，再据代码实际状态制定修改计划，避免计划与代码结构脱节。

@@ -1,7 +1,7 @@
 产物不满意：
-1. 模型只为自定义 ID 字段编写了管道级端到端测试 TestPipeline_CustomIncrementalIDField，验证了自定义 ID 字段在完整管道中的增量提取和二次运行去重，但没有为自定义时间戳字段编写对应的管道级测试。TestMemorySource_CustomTimestampField_Incremental 仅覆盖了 MemorySource 层面的 fetch 过滤逻辑，缺少 Pipeline.updateCursor 写入游标后新建管道实例二次消费的验证，无法证明自定义时间戳字段在整个管道链路中能正确实现增量去重。
-2. 在清理 slowMemoryTarget 死字段的同时，模型将 TestPipelineWriteTimeout 中断言从 `WriteErrorCount < 0` 改为 `WriteErrorCount == 10` 并与具体数值做严格等值比较，同时新增了 WrittenCount、TransformedCount 和错误队列中 ErrWriteTimeout 包装的逐条校验。这些扩展断言超出了提示词"移除 onceDelay 死字段"的修复范围，属于夹带无关修改。如果 writeBatch 错误处理逻辑发生变化导致 WriteErrorCount 不再是 10，硬编码断言会误报失败。
+1. 模型只为自定义 ID 字段编写了管道级端到端测试 TestPipeline_CustomIncrementalIDField，但没有为自定义时间戳字段编写对应的管道级测试。TestMemorySource_CustomTimestampField_Incremental 仅覆盖了 MemorySource 层面的 fetch 过滤，缺少 Pipeline.updateCursor 写入游标后新建管道二次消费的验证，无法证明自定义时间戳字段在整个管道链路中能正确实现增量去重。
+2. 在清理 slowMemoryTarget 死字段的同时，模型将 TestPipelineWriteTimeout 断言从 `WriteErrorCount < 0` 改为 `WriteErrorCount == 10` 做严格等值比较，并新增了 WrittenCount、TransformedCount 和逐条校验。这些扩展断言超出"移除 onceDelay 死字段"的修复范围属于夹带无关修改。如果 writeBatch 逻辑变化导致值不再为 10，硬编码断言会误报失败。
 
 过程不满意：
 1. 模型在收到提示词后第一步就创建了 4 项 TodoList，然后才开始读取 findStartIndex 区域的代码，没有先分析两个问题的完整上下文再制定修改计划。这种先规划后分析的做法导致实际新增了约 22 个测试函数但回复摘要中声称"新增的 10 个单元测试"并仅列出 9 个，产出的数量汇总与实际情况严重不符。正确做法是先阅读所有受影响代码路径再制定精确计划并如实汇报产出。
-2. 模型修改了 findStartIndex 和 Batch 构造后运行 go test 看到全部通过就立即宣告完成，没有主动查看 Pipeline.updateCursor 方法确认游标更新逻辑与修复后的 Batch 字段是否一致。updateCursor 直接使用 batch.EndTs 和 batch.LastSeq 写入游标，虽然因 Batch 已修复而自动受益，但模型从未显式验证这个消费路径。如果修复方案只在 findStartIndex 使用了辅助方法而 Batch 仍用硬编码字段，游标值与下次比较值就会不一致导致增量重复。正确做法是追踪所有读写增量值的上下游方法确保端到端一致。
+2. 模型修改了 findStartIndex 和 Batch 构造后运行测试全部通过立即宣告完成，没有主动查看 updateCursor 确认游标更新与 Batch 字段是否一致。updateCursor 使用 batch.EndTs 写入游标虽因 Batch 已修复而受益但模型从未验证。如修复仅在 findStartIndex 使用辅助方法而 Batch 仍用硬编码字段游标值与下次比较就会不一致导致增量重复。应追踪所有上下游方法确保端到端一致。
