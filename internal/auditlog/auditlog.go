@@ -18,6 +18,7 @@ var (
 	ErrLogNotFound           = errors.New("audit log not found")
 	ErrHashChainBroken       = errors.New("audit log hash chain is broken")
 	ErrNilWriter             = errors.New("writer cannot be nil")
+	ErrWriterIntegrityFailed = errors.New("audit log writer integrity check failed")
 )
 
 type OperationType int
@@ -96,6 +97,11 @@ type Writer interface {
 	Write(log *AuditLog) error
 }
 
+type ReadableWriter interface {
+	ReadAll() []*AuditLog
+	Count() int
+}
+
 type MemoryWriter struct {
 	mu   sync.RWMutex
 	logs []*AuditLog
@@ -165,8 +171,9 @@ type Logger struct {
 	buffer      chan *AuditLog
 	started     bool
 	stopped     bool
-	stopCh      chan struct{}
 	wg          sync.WaitGroup
+	pendingWg   sync.WaitGroup
+	asyncWg     sync.WaitGroup
 
 	indexBySubject map[string][]*AuditLog
 	indexByResource map[string][]*AuditLog
@@ -200,7 +207,6 @@ func NewLoggerWithConfig(writer Writer, cfg Config) (*Logger, error) {
 		indexBySubject:  make(map[string][]*AuditLog),
 		indexByResource: make(map[string][]*AuditLog),
 		buffer:          make(chan *AuditLog, cfg.BufferSize),
-		stopCh:          make(chan struct{}),
 	}, nil
 }
 
@@ -218,7 +224,6 @@ func (l *Logger) Start() error {
 	}
 	l.started = true
 	l.stopped = false
-	l.stopCh = make(chan struct{})
 	l.mu.Unlock()
 
 	for i := 0; i < l.cfg.WorkerCount; i++ {
@@ -236,29 +241,21 @@ func (l *Logger) Stop() {
 		return
 	}
 	l.stopped = true
-	close(l.stopCh)
 	l.mu.Unlock()
+
+	l.pendingWg.Wait()
+
+	close(l.buffer)
 
 	l.wg.Wait()
 
-	close(l.buffer)
-	for log := range l.buffer {
-		l.persistWithRetry(log)
-	}
+	l.asyncWg.Wait()
 }
 
 func (l *Logger) workerLoop() {
 	defer l.wg.Done()
-	for {
-		select {
-		case <-l.stopCh:
-			return
-		case log, ok := <-l.buffer:
-			if !ok {
-				return
-			}
-			l.persistWithRetry(log)
-		}
+	for log := range l.buffer {
+		l.persistWithRetry(log)
 	}
 }
 
@@ -371,25 +368,27 @@ func (l *Logger) Log(entry *Entry) error {
 	}
 
 	l.mu.Lock()
-	if l.stopped {
+	if l.stopped || !l.started {
 		l.mu.Unlock()
 		return ErrLoggerStopped
 	}
-	if !l.started {
-		l.mu.Unlock()
-		return ErrLoggerStopped
-	}
+	l.pendingWg.Add(1)
 	l.mu.Unlock()
+
+	defer l.pendingWg.Done()
 
 	log := l.createLog(entry)
 
 	select {
 	case l.buffer <- log:
-		return nil
 	default:
-		go l.persistWithRetry(log)
-		return nil
+		l.asyncWg.Add(1)
+		go func() {
+			defer l.asyncWg.Done()
+			l.persistWithRetry(log)
+		}()
 	}
+	return nil
 }
 
 func (l *Logger) LogSync(entry *Entry) error {
@@ -398,11 +397,14 @@ func (l *Logger) LogSync(entry *Entry) error {
 	}
 
 	l.mu.Lock()
-	if l.stopped {
+	if l.stopped || !l.started {
 		l.mu.Unlock()
 		return ErrLoggerStopped
 	}
+	l.pendingWg.Add(1)
 	l.mu.Unlock()
+
+	defer l.pendingWg.Done()
 
 	log := l.createLog(entry)
 	var lastErr error
@@ -410,7 +412,14 @@ func (l *Logger) LogSync(entry *Entry) error {
 		if attempt > 0 {
 			time.Sleep(l.cfg.RetryInterval)
 		}
-		err := l.writer.Write(log)
+		err := func() (retErr error) {
+			defer func() {
+				if r := recover(); r != nil {
+					retErr = fmt.Errorf("writer panic: %v", r)
+				}
+			}()
+			return l.writer.Write(log)
+		}()
 		if err == nil {
 			return nil
 		}
@@ -498,40 +507,99 @@ type VerificationResult struct {
 	Message       string
 }
 
-func (l *Logger) VerifyIntegrity() VerificationResult {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if len(l.logs) == 0 {
-		return VerificationResult{Valid: true, TamperedIndex: -1, Message: "no logs"}
+func verifyLogChainStrict(logs []*AuditLog, label string) VerificationResult {
+	if len(logs) == 0 {
+		return VerificationResult{Valid: true, TamperedIndex: -1, Message: label + ": no logs"}
 	}
 
-	if l.logs[0].PreviousHash != "" {
+	if logs[0].PreviousHash != "" {
 		return VerificationResult{
 			Valid:         false,
 			TamperedIndex: 0,
-			Message:       "first log should have empty previous hash",
+			Message:       fmt.Sprintf("%s: first log should have empty previous hash", label),
 		}
 	}
 
-	for i, log := range l.logs {
+	for i, log := range logs {
 		expectedHash := computeHash(log)
 		if log.CurrentHash != expectedHash {
 			return VerificationResult{
 				Valid:         false,
 				TamperedIndex: i,
-				Message:       fmt.Sprintf("log at index %d (EventID=%s) has been tampered: hash mismatch", i, log.EventID),
+				Message:       fmt.Sprintf("%s: log at index %d (EventID=%s) has been tampered: hash mismatch", label, i, log.EventID),
 			}
 		}
 
 		if i > 0 {
-			prevHash := l.logs[i-1].CurrentHash
+			prevHash := logs[i-1].CurrentHash
 			if log.PreviousHash != prevHash {
 				return VerificationResult{
 					Valid:         false,
 					TamperedIndex: i,
-					Message:       fmt.Sprintf("hash chain broken at index %d (EventID=%s): previous hash does not match preceding log's hash", i, log.EventID),
+					Message:       fmt.Sprintf("%s: hash chain broken at index %d (EventID=%s): previous hash does not match preceding log's hash", label, i, log.EventID),
 				}
+			}
+		}
+	}
+	return VerificationResult{
+		Valid:         true,
+		TamperedIndex: -1,
+		Message:       fmt.Sprintf("%s: all %d logs are intact", label, len(logs)),
+	}
+}
+
+func verifyLogSetConsistency(writerLogs []*AuditLog, memLogs []*AuditLog) VerificationResult {
+	if len(writerLogs) == 0 && len(memLogs) == 0 {
+		return VerificationResult{Valid: true, TamperedIndex: -1, Message: "no logs"}
+	}
+
+	if len(writerLogs) > len(memLogs) {
+		return VerificationResult{
+			Valid:         false,
+			TamperedIndex: len(memLogs),
+			Message:       fmt.Sprintf("%v: writer has %d logs but memory only has %d (extra logs in writer)", ErrWriterIntegrityFailed, len(writerLogs), len(memLogs)),
+		}
+	}
+
+	memByEvent := make(map[string]*AuditLog, len(memLogs))
+	for _, m := range memLogs {
+		memByEvent[m.EventID] = m
+	}
+
+	seenEvents := make(map[string]bool, len(writerLogs))
+	for wi, wl := range writerLogs {
+		if seenEvents[wl.EventID] {
+			return VerificationResult{
+				Valid:         false,
+				TamperedIndex: wi,
+				Message:       fmt.Sprintf("%v: writer has duplicate log at index %d (EventID=%s)", ErrWriterIntegrityFailed, wi, wl.EventID),
+			}
+		}
+		seenEvents[wl.EventID] = true
+
+		ml, exists := memByEvent[wl.EventID]
+		if !exists {
+			return VerificationResult{
+				Valid:         false,
+				TamperedIndex: wi,
+				Message:       fmt.Sprintf("%v: writer log at index %d (EventID=%s) does not exist in memory", ErrWriterIntegrityFailed, wi, wl.EventID),
+			}
+		}
+
+		expectedHash := computeHash(wl)
+		if wl.CurrentHash != expectedHash {
+			return VerificationResult{
+				Valid:         false,
+				TamperedIndex: wi,
+				Message:       fmt.Sprintf("%v: writer log at index %d (EventID=%s) has been tampered: hash mismatch", ErrWriterIntegrityFailed, wi, wl.EventID),
+			}
+		}
+
+		if ml.CurrentHash != wl.CurrentHash {
+			return VerificationResult{
+				Valid:         false,
+				TamperedIndex: wi,
+				Message:       fmt.Sprintf("%v: writer log at index %d (EventID=%s) hash differs from memory version", ErrWriterIntegrityFailed, wi, wl.EventID),
 			}
 		}
 	}
@@ -539,8 +607,44 @@ func (l *Logger) VerifyIntegrity() VerificationResult {
 	return VerificationResult{
 		Valid:         true,
 		TamperedIndex: -1,
-		Message:       fmt.Sprintf("all %d logs are intact", len(l.logs)),
+		Message:       fmt.Sprintf("writer has %d logs, memory has %d logs (all consistent; %d pending flush)", len(writerLogs), len(memLogs), len(memLogs)-len(writerLogs)),
 	}
+}
+
+func (l *Logger) VerifyIntegrity() VerificationResult {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	memLogs := make([]*AuditLog, len(l.logs))
+	for i, log := range l.logs {
+		cp := *log
+		memLogs[i] = &cp
+	}
+
+	memResult := verifyLogChainStrict(memLogs, "memory")
+	if !memResult.Valid {
+		return memResult
+	}
+
+	if rw, ok := l.writer.(ReadableWriter); ok {
+		writerLogs := rw.ReadAll()
+
+		writerResult := verifyLogSetConsistency(writerLogs, memLogs)
+		if !writerResult.Valid {
+			return writerResult
+		}
+
+		if len(writerLogs) == len(memLogs) {
+			return VerificationResult{
+				Valid:         true,
+				TamperedIndex: -1,
+				Message:       fmt.Sprintf("all %d logs intact in memory and writer (fully synchronized)", len(memLogs)),
+			}
+		}
+		return writerResult
+	}
+
+	return memResult
 }
 
 func (l *Logger) tamperLog(index int, newDetail string) {
@@ -553,4 +657,37 @@ func (l *Logger) breakChain(index int) {
 	if index >= 0 && index < len(l.logs) {
 		l.logs[index].PreviousHash = "broken-hash"
 	}
+}
+
+func (l *Logger) TamperMemoryLog(index int, newDetail string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.tamperLog(index, newDetail)
+}
+
+func (mw *MemoryWriter) TamperLog(index int, newDetail string) bool {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	if index < 0 || index >= len(mw.logs) {
+		return false
+	}
+	mw.logs[index].Detail = newDetail
+	return true
+}
+
+func (mw *MemoryWriter) BreakChain(index int) bool {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	if index < 0 || index >= len(mw.logs) {
+		return false
+	}
+	mw.logs[index].PreviousHash = "tampered-prev-hash"
+	return true
+}
+
+func (mw *MemoryWriter) AppendSpoofedLog(log *AuditLog) {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	cp := *log
+	mw.logs = append(mw.logs, &cp)
 }

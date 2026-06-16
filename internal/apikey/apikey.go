@@ -261,6 +261,8 @@ func hashSecret(secret string) string {
 }
 
 func (m *Manager) CreateKey(opts CreateKeyOptions) (*CreatedKey, error) {
+	now := time.Now()
+
 	id, err := m.generateKeyID()
 	if err != nil {
 		return nil, err
@@ -282,10 +284,10 @@ func (m *Manager) CreateKey(opts CreateKeyOptions) (*CreatedKey, error) {
 	hasExpiration := opts.HasExpiration
 
 	if opts.TTL > 0 {
-		expiresAt = time.Now().Add(opts.TTL)
+		expiresAt = now.Add(opts.TTL)
 		hasExpiration = true
 	} else if !opts.ExpiresAt.IsZero() {
-		if opts.ExpiresAt.Before(time.Now()) {
+		if opts.ExpiresAt.Before(now) {
 			return nil, ErrExpiresAtInThePast
 		}
 		expiresAt = opts.ExpiresAt
@@ -310,7 +312,7 @@ func (m *Manager) CreateKey(opts CreateKeyOptions) (*CreatedKey, error) {
 		Name:         opts.Name,
 		Description:  opts.Description,
 		MaxUses:      opts.MaxUses,
-		CreatedAt:    time.Now(),
+		CreatedAt:    now,
 	}
 	key.state.permissions = permMap
 	key.state.expiresAt = expiresAt
@@ -482,36 +484,24 @@ func (m *Manager) VerifyKey(secret string) *VerifyResult {
 		prefix = secret[:len(SecretPrefix)+PrefixLength]
 	}
 
-	var matchedKey *APIKey
-
-	if prefix != "" {
-		m.mu.RLock()
-		ids, exists := m.byPrefix[prefix]
-		m.mu.RUnlock()
-
-		if exists {
-			for _, id := range ids {
-				m.mu.RLock()
-				key, ok := m.keys[id]
-				m.mu.RUnlock()
-				if ok && key.SecretHash == secretHash {
-					matchedKey = key
-					break
-				}
-			}
-		}
+	if prefix == "" {
+		return &VerifyResult{Valid: false, Reason: ErrInvalidSecret}
 	}
 
-	if matchedKey == nil {
-		m.mu.RLock()
-		for _, key := range m.keys {
-			if key.SecretHash == secretHash {
+	var matchedKey *APIKey
+
+	m.mu.RLock()
+	ids, exists := m.byPrefix[prefix]
+	if exists {
+		for _, id := range ids {
+			key, ok := m.keys[id]
+			if ok && key.SecretHash == secretHash {
 				matchedKey = key
 				break
 			}
 		}
-		m.mu.RUnlock()
 	}
+	m.mu.RUnlock()
 
 	if matchedKey == nil {
 		return &VerifyResult{Valid: false, Reason: ErrInvalidSecret}

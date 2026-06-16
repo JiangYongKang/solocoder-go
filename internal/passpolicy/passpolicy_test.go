@@ -557,8 +557,11 @@ func TestVerifyPassword(t *testing.T) {
 		engine4.SetPassword("mustchange", validPassword)
 		engine4.ForcePasswordChange("mustchange")
 		_, err := engine4.VerifyPassword("mustchange", validPassword)
-		if !errors.Is(err, ErrPasswordExpired) {
-			t.Errorf("expected ErrPasswordExpired for must change, got %v", err)
+		if !errors.Is(err, ErrMustChangePassword) {
+			t.Errorf("expected ErrMustChangePassword for must change, got %v", err)
+		}
+		if errors.Is(err, ErrPasswordExpired) {
+			t.Error("should not return ErrPasswordExpired for must change")
 		}
 	})
 }
@@ -997,8 +1000,8 @@ func TestFullLifecycle(t *testing.T) {
 	}
 
 	_, err = engine.VerifyPassword("lifecycle_user", "NewPass789!")
-	if !errors.Is(err, ErrPasswordExpired) {
-		t.Errorf("expected ErrPasswordExpired after force change, got %v", err)
+	if !errors.Is(err, ErrMustChangePassword) {
+		t.Errorf("expected ErrMustChangePassword after force change, got %v", err)
 	}
 
 	err = engine.SetPassword("lifecycle_user", "FinalPass000!")
@@ -1030,6 +1033,7 @@ func TestErrorStrings(t *testing.T) {
 		ErrEmptyPassword:             "password cannot be empty",
 		ErrUserNotFound:              "user not found",
 		ErrPasswordExpired:           "password has expired",
+		ErrMustChangePassword:        "password must be changed",
 		ErrPasswordHistoryReused:     "cannot reuse recent passwords",
 		ErrPasswordMismatch:          "password mismatch",
 		ErrPasswordTooShort:          "password too short",
@@ -1067,5 +1071,347 @@ func TestHistoryDepthZero(t *testing.T) {
 	err = engine.ChangePassword("user", "Pass3!", "Pass1!")
 	if err != nil {
 		t.Errorf("expected no history check with depth 0, got: %v", err)
+	}
+}
+
+func TestSetPassword_HistoryCheck(t *testing.T) {
+	t.Run("admin reset reuses recent password", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MinLength = 8
+		cfg.HistoryDepth = 3
+		engine, err := NewEngineWithConfig(cfg)
+		if err != nil {
+			t.Fatalf("NewEngineWithConfig failed: %v", err)
+		}
+
+		pass1 := "Password1!"
+		pass2 := "Password2@"
+		pass3 := "Password3#"
+
+		err = engine.SetPassword("admin_user", pass1)
+		if err != nil {
+			t.Fatalf("SetPassword pass1 failed: %v", err)
+		}
+
+		err = engine.SetPassword("admin_user", pass2)
+		if err != nil {
+			t.Fatalf("SetPassword pass2 failed: %v", err)
+		}
+
+		err = engine.SetPassword("admin_user", pass3)
+		if err != nil {
+			t.Fatalf("SetPassword pass3 failed: %v", err)
+		}
+
+		err = engine.SetPassword("admin_user", pass1)
+		if !errors.Is(err, ErrPasswordHistoryReused) {
+			t.Errorf("expected ErrPasswordHistoryReused when reusing pass1, got %v", err)
+		}
+
+		err = engine.SetPassword("admin_user", pass2)
+		if !errors.Is(err, ErrPasswordHistoryReused) {
+			t.Errorf("expected ErrPasswordHistoryReused when reusing pass2, got %v", err)
+		}
+	})
+
+	t.Run("new user has no history check", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MinLength = 8
+		cfg.HistoryDepth = 3
+		engine, _ := NewEngineWithConfig(cfg)
+
+		err := engine.SetPassword("new_user", "FreshPass1!")
+		if err != nil {
+			t.Errorf("expected no error for new user, got %v", err)
+		}
+	})
+
+	t.Run("history depth zero skips check", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MinLength = 8
+		cfg.HistoryDepth = 0
+		engine, _ := NewEngineWithConfig(cfg)
+
+		err := engine.SetPassword("user_no_history", "SamePass1!")
+		if err != nil {
+			t.Fatalf("First SetPassword failed: %v", err)
+		}
+
+		err = engine.SetPassword("user_no_history", "SamePass1!")
+		if err != nil {
+			t.Errorf("expected no history check with depth 0, got %v", err)
+		}
+	})
+}
+
+func TestValidatePassword_ConcurrentConfigUpdate(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MinLength = 8
+	engine, _ := NewEngineWithConfig(cfg)
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			engine.ValidatePassword("TestPass1!")
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			newCost := MinBcryptCost + (i % (MaxBcryptCost - MinBcryptCost + 1))
+			_ = engine.UpdateBcryptCost(newCost)
+			time.Sleep(10 * time.Microsecond)
+		}
+		close(done)
+	}()
+
+	go func() {
+		<-done
+	}()
+
+	wg.Wait()
+}
+
+func TestVerifyPassword_MustChangeVsExpired(t *testing.T) {
+	t.Run("must change returns ErrMustChangePassword", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MinLength = 8
+		cfg.ExpiryDays = 90
+		engine, _ := NewEngineWithConfig(cfg)
+
+		err := engine.SetPassword("must_change_user", "TestPass1!")
+		if err != nil {
+			t.Fatalf("SetPassword failed: %v", err)
+		}
+
+		err = engine.ForcePasswordChange("must_change_user")
+		if err != nil {
+			t.Fatalf("ForcePasswordChange failed: %v", err)
+		}
+
+		_, err = engine.VerifyPassword("must_change_user", "TestPass1!")
+		if !errors.Is(err, ErrMustChangePassword) {
+			t.Errorf("expected ErrMustChangePassword, got %v", err)
+		}
+		if errors.Is(err, ErrPasswordExpired) {
+			t.Error("should not return ErrPasswordExpired for must change")
+		}
+	})
+
+	t.Run("naturally expired returns ErrPasswordExpired", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MinLength = 8
+		cfg.ExpiryDays = 1
+		engine, _ := NewEngineWithConfig(cfg)
+
+		err := engine.SetPassword("expired_user", "TestPass1!")
+		if err != nil {
+			t.Fatalf("SetPassword failed: %v", err)
+		}
+
+		engine.SetNowFunc(func() time.Time {
+			return time.Now().Add(48 * time.Hour)
+		})
+
+		_, err = engine.VerifyPassword("expired_user", "TestPass1!")
+		if !errors.Is(err, ErrPasswordExpired) {
+			t.Errorf("expected ErrPasswordExpired, got %v", err)
+		}
+		if errors.Is(err, ErrMustChangePassword) {
+			t.Error("should not return ErrMustChangePassword for natural expiry")
+		}
+	})
+}
+
+func TestVerifyPassword_ConcurrentCostUpdate(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MinLength = 8
+	cfg.BcryptCost = MinBcryptCost
+	engine, _ := NewEngineWithConfig(cfg)
+
+	err := engine.SetPassword("rehash_user", "TestPass1!")
+	if err != nil {
+		t.Fatalf("SetPassword failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	verifyCount := 500
+	updateCount := 50
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < verifyCount; i++ {
+			result, err := engine.VerifyPassword("rehash_user", "TestPass1!")
+			if err != nil && !errors.Is(err, ErrPasswordExpired) && !errors.Is(err, ErrMustChangePassword) {
+				t.Errorf("VerifyPassword error: %v", err)
+			}
+			_ = result
+			time.Sleep(1 * time.Microsecond)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < updateCount; i++ {
+			newCost := MinBcryptCost + (i % 3)
+			if newCost > MaxBcryptCost {
+				newCost = MaxBcryptCost
+			}
+			_ = engine.UpdateBcryptCost(newCost)
+			time.Sleep(10 * time.Microsecond)
+		}
+	}()
+
+	wg.Wait()
+
+	_, currentCost, err := engine.GetPasswordHash("rehash_user")
+	if err != nil {
+		t.Fatalf("GetPasswordHash failed: %v", err)
+	}
+	if currentCost < MinBcryptCost || currentCost > MaxBcryptCost {
+		t.Errorf("cost out of range after concurrent updates: %d", currentCost)
+	}
+}
+
+func TestChangePassword_TimeOfCheckToTimeOfUse(t *testing.T) {
+	t.Run("concurrent change password race detection", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MinLength = 8
+		cfg.HistoryDepth = 5
+		engine, _ := NewEngineWithConfig(cfg)
+
+		pass0 := "OriginalPass1!"
+		pass1 := "PasswordOne1!"
+
+		err := engine.SetPassword("race_user", pass0)
+		if err != nil {
+			t.Fatalf("SetPassword failed: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			errs[0] = engine.ChangePassword("race_user", pass0, pass1)
+		}()
+
+		go func() {
+			defer wg.Done()
+			errs[1] = engine.ChangePassword("race_user", pass0, pass1)
+		}()
+
+		wg.Wait()
+
+		successCount := 0
+		failureCount := 0
+		for _, e := range errs {
+			if e == nil {
+				successCount++
+			} else if errors.Is(e, ErrPasswordHistoryReused) || errors.Is(e, ErrPasswordMismatch) {
+				failureCount++
+			}
+		}
+
+		if successCount != 1 {
+			t.Errorf("expected exactly 1 success, got %d successes, errors: %v", successCount, errs)
+		}
+
+		history, err := engine.GetHistoryEntries("race_user")
+		if err != nil {
+			t.Fatalf("GetHistoryEntries failed: %v", err)
+		}
+		if len(history) != 1 {
+			t.Errorf("expected 1 history entry, got %d", len(history))
+		}
+	})
+
+	t.Run("reuse password set by concurrent goroutine", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MinLength = 8
+		cfg.HistoryDepth = 5
+		engine, _ := NewEngineWithConfig(cfg)
+
+		initial := "StartPass0!"
+		passA := "PasswordAAA1!"
+		passB := "PasswordBBB2@"
+
+		err := engine.SetPassword("concurrent_user", initial)
+		if err != nil {
+			t.Fatalf("SetPassword failed: %v", err)
+		}
+
+		barrier := make(chan struct{})
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		results := make([]error, 2)
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-barrier
+			err := engine.ChangePassword("concurrent_user", initial, passA)
+			mu.Lock()
+			results[0] = err
+			mu.Unlock()
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-barrier
+			err := engine.ChangePassword("concurrent_user", initial, passB)
+			mu.Lock()
+			results[1] = err
+			mu.Unlock()
+		}()
+
+		close(barrier)
+		wg.Wait()
+
+		err = engine.SetPassword("concurrent_user", passA)
+		if !errors.Is(err, ErrPasswordHistoryReused) {
+			t.Errorf("SetPassword should detect passA in history, got %v", err)
+		}
+
+		err = engine.SetPassword("concurrent_user", passB)
+		if !errors.Is(err, ErrPasswordHistoryReused) {
+			t.Errorf("SetPassword should detect passB in history, got %v", err)
+		}
+	})
+}
+
+func TestErrors_IsCheck(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{"ErrMustChangePassword", ErrMustChangePassword},
+		{"ErrPasswordExpired", ErrPasswordExpired},
+		{"ErrPasswordHistoryReused", ErrPasswordHistoryReused},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !errors.Is(tt.err, tt.err) {
+				t.Errorf("errors.Is should match same error")
+			}
+		})
+	}
+
+	if errors.Is(ErrMustChangePassword, ErrPasswordExpired) {
+		t.Error("ErrMustChangePassword should not match ErrPasswordExpired")
+	}
+	if errors.Is(ErrPasswordExpired, ErrMustChangePassword) {
+		t.Error("ErrPasswordExpired should not match ErrMustChangePassword")
 	}
 }

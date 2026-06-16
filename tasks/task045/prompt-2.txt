@@ -1,0 +1,5 @@
+你实现的 API 密钥管理器模块存在一些实现问题，需要修复：
+1. CreateKey 方法中 TTL 过期时间的计算（expiresAt = time.Now().Add(opts.TTL)）与密钥创建时间记录（CreatedAt: time.Now()）使用了两次独立的 time.Now() 调用，两个时间点之间存在微小偏差。对于短 TTL 场景，密钥的实际可用时长与用户设置的 TTL 值不一致，CreatedAt 也比实际过期计算基准晚。
+2. VerifyKey 方法中存在一段永不可达的全量扫描 fallback 路径：当前缀索引 byPrefix 未命中时，代码遍历全部密钥做哈希匹配。但每个密钥在 CreateKey 时都同步注册到 byPrefix 索引，前缀不匹配意味着该密钥一定不存在，哈希匹配永远不会产生有效结果。密钥数量大时每次 VerifyKey 调用若前缀不匹配就会触发无意义的 O(n) 遍历。
+3. 修复后需要为上述问题调整对应的单元测试，确保修正后的行为正确。
+4. 运行 go test ./internal/apikey/ -v，需要让所有测试通过。

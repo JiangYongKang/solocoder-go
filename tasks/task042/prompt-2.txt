@@ -1,0 +1,8 @@
+你实现的密码策略引擎模块存在一些并发安全和逻辑缺陷，需要修复：
+1. SetPassword 方法在为用户设置新密码时没有检查新密码是否在用户的历史密码中出现过，管理员重置路径完全绕过了历史复用限制，攻击者可通过说服管理员将密码重置为近期使用过的已知密码来绕过安全策略。
+2. ValidatePassword 方法直接读取引擎配置中的复杂度字段（MinLength、RequireUppercase 等），但没有获取读锁保护，与 UpdateBcryptCost 的写操作存在数据竞态。
+3. VerifyPassword 方法末尾的 rehash 逻辑段在释放读锁之后读取 BcryptCost 配置值，而另一个 goroutine 可能在此期间通过 UpdateBcryptCost 修改该值，存在数据竞态导致 cost 升级判断不准确。
+4. VerifyPassword 中管理员通过 ForcePasswordChange 设置的 MustChange 标记与密码自然过期共用同一个 ErrPasswordExpired 错误码，调用方无法区分两种不同的业务场景。
+5. ChangePassword 方法中历史复用检测在持有读锁期间完成，释放读锁后重新获取写锁执行更新，但写锁内仅检查用户是否存在而未重新执行历史复用检测，并发场景下新密码可能与另一个 goroutine 刚刚写入的最新密码重复而未被拦截。
+6. 修复后需要为上述每个问题补充或修改对应的单元测试，覆盖并发安全路径和 TOCTOU 场景。
+7. 运行 go test ./internal/passpolicy/ -v，需要让所有测试通过。

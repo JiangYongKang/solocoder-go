@@ -53,7 +53,7 @@ type CertificateLoader interface {
 }
 
 type ConnectionTracker interface {
-	TrackConnection(certID string) func()
+	TrackConnection(certID string, conn interface{}, closeFn func() error) func()
 	ActiveConnections(certID string) int
 	CloseConnections(certID string)
 }

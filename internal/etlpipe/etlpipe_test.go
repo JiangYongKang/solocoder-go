@@ -1127,9 +1127,8 @@ func TestPipelineWriteTimeout(t *testing.T) {
 	source := NewMemorySource(records)
 
 	slowTarget := &slowMemoryTarget{
-		target:    NewMemoryTarget(),
-		delay:     200 * time.Millisecond,
-		onceDelay: true,
+		target: NewMemoryTarget(),
+		delay:  200 * time.Millisecond,
 	}
 
 	cfg := DefaultConfig()
@@ -1147,8 +1146,38 @@ func TestPipelineWriteTimeout(t *testing.T) {
 	}
 
 	stats := pipeline.Stats()
-	if stats.WriteErrorCount < 0 {
-		t.Errorf("expected some write errors due to timeout")
+	if stats.WriteErrorCount <= 0 {
+		t.Errorf("expected WriteErrorCount > 0 due to timeout, got %d", stats.WriteErrorCount)
+	}
+	if stats.WriteErrorCount != 10 {
+		t.Errorf("expected WriteErrorCount == 10 (all records failed on timeout), got %d", stats.WriteErrorCount)
+	}
+	if stats.WrittenCount != 0 {
+		t.Errorf("expected WrittenCount == 0 on timeout, got %d", stats.WrittenCount)
+	}
+	if stats.TransformedCount != 10 {
+		t.Errorf("expected TransformedCount == 10 (transform succeeds before write), got %d", stats.TransformedCount)
+	}
+
+	eq := pipeline.GetErrorQueue()
+	if eq.WriteErrorCount() != 10 {
+		t.Errorf("expected 10 write errors in queue, got %d", eq.WriteErrorCount())
+	}
+
+	writeErrors := eq.GetWriteErrors()
+	if len(writeErrors) != 10 {
+		t.Fatalf("expected 10 write error entries, got %d", len(writeErrors))
+	}
+	for _, we := range writeErrors {
+		if !errors.Is(we.Err, ErrWriteTimeout) {
+			t.Errorf("expected error should wrap ErrWriteTimeout, got: %v", we.Err)
+		}
+		if we.Record == nil {
+			t.Error("write error record should not be nil")
+		}
+		if we.Timestamp.IsZero() {
+			t.Error("write error timestamp should be set")
+		}
 	}
 }
 
@@ -1392,5 +1421,427 @@ func TestErrorUnwrap(t *testing.T) {
 	}
 	if !errors.Is(we, cause) {
 		t.Error("WriteError should unwrap to cause")
+	}
+}
+
+func TestMemorySourceIncrementalByID(t *testing.T) {
+	records := generateTestRecords(20)
+	source := NewMemorySource(records)
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeID, LastValue: nil, LastOffset: 0}
+	batch1, err := source.Fetch(context.Background(), cursor, 5)
+	if err != nil {
+		t.Fatalf("fetch1 failed: %v", err)
+	}
+	if batch1.Size() != 5 {
+		t.Fatalf("expected batch size 5, got %d", batch1.Size())
+	}
+	if batch1.FirstSeq != 1 {
+		t.Errorf("expected FirstSeq=1, got %d", batch1.FirstSeq)
+	}
+	if batch1.LastSeq != 5 {
+		t.Errorf("expected LastSeq=5, got %d", batch1.LastSeq)
+	}
+
+	cursor.LastValue = int64(5)
+	cursor.LastOffset = 5
+	batch2, err := source.Fetch(context.Background(), cursor, 5)
+	if err != nil {
+		t.Fatalf("fetch2 failed: %v", err)
+	}
+	if batch2.Size() != 5 {
+		t.Fatalf("expected batch size 5, got %d", batch2.Size())
+	}
+	if batch2.FirstSeq != 6 {
+		t.Errorf("expected FirstSeq=6 after last ID 5, got %d", batch2.FirstSeq)
+	}
+	if batch2.LastSeq != 10 {
+		t.Errorf("expected LastSeq=10, got %d", batch2.LastSeq)
+	}
+
+	cursor.LastValue = int64(20)
+	cursor.LastOffset = 20
+	batch3, err := source.Fetch(context.Background(), cursor, 5)
+	if err != nil {
+		t.Fatalf("fetch3 failed: %v", err)
+	}
+	if batch3.Size() != 0 {
+		t.Errorf("expected empty batch after last ID 20, got %d", batch3.Size())
+	}
+}
+
+func TestMemorySourceIncrementalByTimestamp(t *testing.T) {
+	records := generateTestRecords(15)
+	source := NewMemorySource(records)
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeTimestamp, LastValue: nil, LastOffset: 0}
+	batch1, err := source.Fetch(context.Background(), cursor, 5)
+	if err != nil {
+		t.Fatalf("fetch1 failed: %v", err)
+	}
+	if batch1.Size() != 5 {
+		t.Fatalf("expected batch size 5, got %d", batch1.Size())
+	}
+
+	lastTs := batch1.EndTs
+	cursor.LastValue = lastTs
+	cursor.LastOffset = 5
+
+	batch2, err := source.Fetch(context.Background(), cursor, 5)
+	if err != nil {
+		t.Fatalf("fetch2 failed: %v", err)
+	}
+	if batch2.Size() != 5 {
+		t.Fatalf("expected batch size 5, got %d", batch2.Size())
+	}
+	if !batch2.StartTs.After(lastTs) {
+		t.Errorf("expected batch2 start after last timestamp")
+	}
+
+	cursor.LastValue = records[14].Timestamp
+	cursor.LastOffset = 15
+	batch3, err := source.Fetch(context.Background(), cursor, 5)
+	if err != nil {
+		t.Fatalf("fetch3 failed: %v", err)
+	}
+	if batch3.Size() != 0 {
+		t.Errorf("expected empty batch after last timestamp, got %d", batch3.Size())
+	}
+}
+
+func TestMemorySourceIncrementalWrongType(t *testing.T) {
+	records := generateTestRecords(10)
+	source := NewMemorySource(records)
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeID, LastValue: "not_an_int64", LastOffset: 0}
+	batch, err := source.Fetch(context.Background(), cursor, 5)
+	if err != nil {
+		t.Fatalf("fetch should not fail with wrong cursor value type: %v", err)
+	}
+	if batch.Size() != 5 {
+		t.Errorf("expected fallback to offset-based fetch with 5 records, got %d", batch.Size())
+	}
+
+	cursor2 := &Cursor{Mode: ExtractModeTimestamp, LastValue: 12345, LastOffset: 0}
+	batch2, err := source.Fetch(context.Background(), cursor2, 5)
+	if err != nil {
+		t.Fatalf("fetch should not fail with wrong timestamp type: %v", err)
+	}
+	if batch2.Size() != 5 {
+		t.Errorf("expected fallback to offset-based fetch with 5 records, got %d", batch2.Size())
+	}
+}
+
+func TestMemorySourceIncrementalNilCursor(t *testing.T) {
+	records := generateTestRecords(10)
+	source := NewMemorySource(records)
+	defer source.Close(context.Background())
+
+	batch, err := source.Fetch(context.Background(), nil, 5)
+	if err != nil {
+		t.Fatalf("fetch with nil cursor should not fail: %v", err)
+	}
+	if batch.Size() != 5 {
+		t.Errorf("expected 5 records with nil cursor, got %d", batch.Size())
+	}
+}
+
+func TestPipelineIncrementalByID_NoDuplicatesOnSecondRun(t *testing.T) {
+	records := generateTestRecords(20)
+	source := NewMemorySource(records)
+	target := NewMemoryTarget()
+
+	cfg := Config{
+		BatchSize:         5,
+		WriteTimeout:      30 * time.Second,
+		ExtractMode:       ExtractModeID,
+		IncrementalField:  "seq_id",
+		MaxErrorQueueSize: 100,
+	}
+
+	pipeline, err := NewPipeline(cfg, source, target)
+	if err != nil {
+		t.Fatalf("failed to create pipeline: %v", err)
+	}
+
+	err = pipeline.Run(context.Background())
+	if err != nil {
+		t.Fatalf("first run failed: %v", err)
+	}
+
+	if target.Count() != 20 {
+		t.Fatalf("expected 20 records after first run, got %d", target.Count())
+	}
+
+	cursorAfterFirst := pipeline.GetCursor()
+	if cursorAfterFirst.LastValue == nil {
+		t.Fatal("cursor LastValue should be set after incremental run")
+	}
+	lastID, ok := cursorAfterFirst.LastValue.(int64)
+	if !ok {
+		t.Fatalf("cursor LastValue should be int64, got %T", cursorAfterFirst.LastValue)
+	}
+	if lastID != 20 {
+		t.Errorf("expected LastValue=20, got %d", lastID)
+	}
+	if cursorAfterFirst.LastOffset != 20 {
+		t.Errorf("expected LastOffset=20, got %d", cursorAfterFirst.LastOffset)
+	}
+
+	allRecords := target.GetAll()
+	seenIDs := make(map[string]bool)
+	for _, r := range allRecords {
+		if seenIDs[r.ID] {
+			t.Errorf("duplicate record ID in first run: %s", r.ID)
+		}
+		seenIDs[r.ID] = true
+	}
+
+	source2 := NewMemorySource(records)
+	pipeline2, err := NewPipeline(cfg, source2, target)
+	if err != nil {
+		t.Fatalf("failed to create second pipeline: %v", err)
+	}
+
+	savedCursor := pipeline.GetCursor()
+	totalBefore := target.Count()
+
+	err = runPipelineWithCursor(pipeline2, savedCursor)
+	if err != nil {
+		t.Fatalf("second run failed: %v", err)
+	}
+
+	totalAfter := target.Count()
+	newRecords := totalAfter - totalBefore
+	if newRecords != 0 {
+		t.Errorf("expected 0 new records on second run (incremental), got %d", newRecords)
+	}
+}
+
+func runPipelineWithCursor(p *Pipeline, cursor *Cursor) error {
+	p.mu.Lock()
+	if p.status == PipelineStatusRunning {
+		p.mu.Unlock()
+		return ErrPipelineRunning
+	}
+	p.cursor = &Cursor{
+		Mode:       cursor.Mode,
+		LastValue:  cursor.LastValue,
+		LastOffset: cursor.LastOffset,
+		UpdateTime: cursor.UpdateTime,
+	}
+	p.mu.Unlock()
+	return p.Run(context.Background())
+}
+
+func TestPipelineIncrementalByTimestamp_NoDuplicatesOnSecondRun(t *testing.T) {
+	records := generateTestRecords(15)
+	source := NewMemorySource(records)
+	target := NewMemoryTarget()
+
+	cfg := Config{
+		BatchSize:         7,
+		WriteTimeout:      30 * time.Second,
+		ExtractMode:       ExtractModeTimestamp,
+		IncrementalField:  "created_at",
+		MaxErrorQueueSize: 100,
+	}
+
+	pipeline, err := NewPipeline(cfg, source, target)
+	if err != nil {
+		t.Fatalf("failed to create pipeline: %v", err)
+	}
+
+	err = pipeline.Run(context.Background())
+	if err != nil {
+		t.Fatalf("first run failed: %v", err)
+	}
+
+	if target.Count() != 15 {
+		t.Fatalf("expected 15 records after first run, got %d", target.Count())
+	}
+
+	cursorAfterFirst := pipeline.GetCursor()
+	if cursorAfterFirst.LastValue == nil {
+		t.Fatal("cursor LastValue should be set after timestamp incremental run")
+	}
+	_, ok := cursorAfterFirst.LastValue.(time.Time)
+	if !ok {
+		t.Fatalf("cursor LastValue should be time.Time, got %T", cursorAfterFirst.LastValue)
+	}
+
+	source2 := NewMemorySource(records)
+	pipeline2, err := NewPipeline(cfg, source2, target)
+	if err != nil {
+		t.Fatalf("failed to create second pipeline: %v", err)
+	}
+
+	savedCursor := pipeline.GetCursor()
+	totalBefore := target.Count()
+
+	err = runPipelineWithCursor(pipeline2, savedCursor)
+	if err != nil {
+		t.Fatalf("second run failed: %v", err)
+	}
+
+	totalAfter := target.Count()
+	newRecords := totalAfter - totalBefore
+	if newRecords != 0 {
+		t.Errorf("expected 0 new records on second timestamp-incremental run, got %d", newRecords)
+	}
+}
+
+func TestMemorySourceIncrementalFullModeStillWorks(t *testing.T) {
+	records := generateTestRecords(25)
+	source := NewMemorySource(records)
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeFull, LastOffset: 10}
+	batch, err := source.Fetch(context.Background(), cursor, 10)
+	if err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+	if batch.Size() != 10 {
+		t.Errorf("expected 10 records in full mode from offset 10, got %d", batch.Size())
+	}
+	if batch.FirstSeq != 11 {
+		t.Errorf("expected FirstSeq=11, got %d", batch.FirstSeq)
+	}
+}
+
+func TestNewMemorySourceFactory_OnlyTimestampField(t *testing.T) {
+	factory := NewMemorySourceFactory()
+	records := generateTestRecords(5)
+
+	source, err := factory(map[string]interface{}{
+		"records":          records,
+		"timestamp_field":  "created_at",
+	})
+	if err != nil {
+		t.Fatalf("factory should not fail: %v", err)
+	}
+	if source == nil {
+		t.Fatal("source should not be nil")
+	}
+
+	memSource, ok := source.(*MemorySource)
+	if !ok {
+		t.Fatal("source should be *MemorySource")
+	}
+	if memSource.timestampField != "created_at" {
+		t.Errorf("expected timestampField='created_at', got '%s'", memSource.timestampField)
+	}
+}
+
+func TestNewMemorySourceFactory_OnlyIDField(t *testing.T) {
+	factory := NewMemorySourceFactory()
+	records := generateTestRecords(5)
+
+	source, err := factory(map[string]interface{}{
+		"records":   records,
+		"id_field":  "user_id",
+	})
+	if err != nil {
+		t.Fatalf("factory should not fail: %v", err)
+	}
+
+	memSource, ok := source.(*MemorySource)
+	if !ok {
+		t.Fatal("source should be *MemorySource")
+	}
+	if memSource.idField != "user_id" {
+		t.Errorf("expected idField='user_id', got '%s'", memSource.idField)
+	}
+}
+
+func TestNewMemorySourceFactory_BothFields(t *testing.T) {
+	factory := NewMemorySourceFactory()
+	records := generateTestRecords(5)
+
+	source, err := factory(map[string]interface{}{
+		"records":          records,
+		"timestamp_field":  "updated_at",
+		"id_field":         "row_id",
+	})
+	if err != nil {
+		t.Fatalf("factory should not fail: %v", err)
+	}
+
+	memSource, ok := source.(*MemorySource)
+	if !ok {
+		t.Fatal("source should be *MemorySource")
+	}
+	if memSource.timestampField != "updated_at" {
+		t.Errorf("expected timestampField='updated_at', got '%s'", memSource.timestampField)
+	}
+	if memSource.idField != "row_id" {
+		t.Errorf("expected idField='row_id', got '%s'", memSource.idField)
+	}
+}
+
+func TestNewMemorySourceFactory_NoFields(t *testing.T) {
+	factory := NewMemorySourceFactory()
+	records := generateTestRecords(5)
+
+	source, err := factory(map[string]interface{}{
+		"records": records,
+	})
+	if err != nil {
+		t.Fatalf("factory should not fail: %v", err)
+	}
+
+	memSource, ok := source.(*MemorySource)
+	if !ok {
+		t.Fatal("source should be *MemorySource")
+	}
+	if memSource.timestampField != "" {
+		t.Errorf("expected empty timestampField, got '%s'", memSource.timestampField)
+	}
+	if memSource.idField != "" {
+		t.Errorf("expected empty idField, got '%s'", memSource.idField)
+	}
+}
+
+func TestNewMemorySourceFactory_InvalidRecordsType(t *testing.T) {
+	factory := NewMemorySourceFactory()
+
+	source, err := factory(map[string]interface{}{
+		"records": "not a slice",
+	})
+	if err != nil {
+		t.Fatalf("factory should not fail with invalid records type: %v", err)
+	}
+	if source == nil {
+		t.Fatal("source should not be nil (empty records is ok)")
+	}
+}
+
+func TestMemorySourceIncremental_IDModeWithMixedSeqIDs(t *testing.T) {
+	records := []*Record{
+		{ID: "a", SeqID: 10, Timestamp: time.Now()},
+		{ID: "b", SeqID: 20, Timestamp: time.Now()},
+		{ID: "c", SeqID: 30, Timestamp: time.Now()},
+		{ID: "d", SeqID: 40, Timestamp: time.Now()},
+		{ID: "e", SeqID: 50, Timestamp: time.Now()},
+	}
+	source := NewMemorySource(records)
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeID, LastValue: int64(25), LastOffset: 0}
+	batch, err := source.Fetch(context.Background(), cursor, 10)
+	if err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+	if batch.Size() != 3 {
+		t.Fatalf("expected 3 records (seq > 25), got %d", batch.Size())
+	}
+	if batch.FirstSeq != 30 {
+		t.Errorf("expected FirstSeq=30, got %d", batch.FirstSeq)
+	}
+	if batch.LastSeq != 50 {
+		t.Errorf("expected LastSeq=50, got %d", batch.LastSeq)
 	}
 }

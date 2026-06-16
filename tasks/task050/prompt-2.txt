@@ -1,0 +1,7 @@
+你实现的数据校验引擎模块存在一些实现问题，需要修复：
+1. ValidateWithRules 方法在遍历 StructRules 指定的字段规则后仍然调用了 validateStruct 对整个结构体进行递归校验。当用户通过编程接口传递 StructRules 时，结构体标签上声明的规则也会被同时执行，两种校验方式的结果被强制合并而非由调用方选择，导致重复的错误信息。
+2. buildCondition 函数在处理取反表达式时，当目标字段不存在于结构体中时 findFieldByName 返回 false，取反后条件函数返回 true 导致规则被无条件执行。用户字段名拼写错误时无法被检测，条件校验行为异常但没有任何告警信号。
+3. validateRequired 函数对 `*string` 等指针类型的判空逻辑仅检查指针是否为 nil，不检查指针指向的值是否为零值。当 JSON 反序列化产生 `"name": ""` 时，非 nil 指针指向空字符串仍会通过必填校验。
+4. validatePositive 函数对 uint、uint8 等无符号整数类型实现了独立分支但语义上仅在做零值检查，且错误消息"value must be positive"对无符号类型不够精确——值不可能为负，提示应为"值不能为零"。
+5. 修复后需要为上述每个问题补充对应的单元测试，覆盖条件校验字段缺失时行为、指针类型值透传以及 ValidateWithRules 与标签规则的交互。
+6. 运行 go test ./internal/validator/ -v，需要让所有测试通过。

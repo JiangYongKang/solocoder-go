@@ -1,6 +1,7 @@
 package csrf
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1190,4 +1191,427 @@ func TestTokenFromCookie_SynchronizerMode(t *testing.T) {
 		t.Errorf("POST with cookie token status = %d, want %d. Body: %s",
 			rr.Code, http.StatusOK, rr.Body.String())
 	}
+}
+
+func TestRotateToken_Concurrent_Atomicity(t *testing.T) {
+	c := NewCSRF()
+	sessionID := "concurrent-rotate-session"
+	initialToken, err := c.GenerateToken(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	numGoroutines := 100
+	errorCount := 0
+	var mu sync.Mutex
+
+	wg.Add(numGoroutines)
+
+	currentToken := initialToken
+	for i := 0; i < numGoroutines; i++ {
+		go func(idx int) {
+			defer wg.Done()
+
+			c.mu.RLock()
+			tokenToUse := currentToken
+			c.mu.RUnlock()
+
+			newToken, err := c.RotateToken(tokenToUse, sessionID)
+			if err == nil {
+				c.mu.Lock()
+				currentToken = newToken
+				c.mu.Unlock()
+			} else {
+				mu.Lock()
+				errorCount++
+				mu.Unlock()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	if c.TokenCount() != 1 {
+		t.Errorf("After concurrent rotations, TokenCount = %d, want 1. Possible orphan tokens!", c.TokenCount())
+	}
+
+	if c.SessionCount() != 1 {
+		t.Errorf("After concurrent rotations, SessionCount = %d, want 1", c.SessionCount())
+	}
+
+	finalToken, err := c.GetToken(sessionID)
+	if err != nil {
+		t.Fatalf("GetToken after concurrent rotations failed: %v", err)
+	}
+
+	err = c.ValidateToken(finalToken, sessionID)
+	if err != nil {
+		t.Errorf("Final token validation failed: %v", err)
+	}
+
+	t.Logf("Concurrent rotations: %d successes, %d failures (expected failures due to racing on stale tokens)",
+		numGoroutines-errorCount, errorCount)
+}
+
+func TestRotateToken_Atomicity_NoOrphanTokens(t *testing.T) {
+	c := NewCSRF()
+	sessionID := "no-orphan-test"
+
+	numIterations := 1000
+	var wg sync.WaitGroup
+
+	for i := 0; i < numIterations; i++ {
+		token, err := c.GenerateToken(sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			_, _ = c.RotateToken(token, sessionID)
+		}()
+
+		go func() {
+			defer wg.Done()
+			_ = c.InvalidateSession(sessionID)
+		}()
+
+		wg.Wait()
+
+		c.mu.RLock()
+		orphanCount := 0
+		for tok, st := range c.tokens {
+			expectedTok, exists := c.sessions[st.SessionID]
+			if !exists || expectedTok != tok {
+				orphanCount++
+			}
+		}
+		c.mu.RUnlock()
+
+		if orphanCount > 0 {
+			t.Fatalf("Found %d orphan tokens in iteration %d! tokens map size: %d, sessions map size: %d",
+				orphanCount, i, c.TokenCount(), c.SessionCount())
+		}
+
+		if c.TokenCount() != c.SessionCount() {
+			t.Fatalf("Map size mismatch in iteration %d: tokens=%d, sessions=%d",
+				i, c.TokenCount(), c.SessionCount())
+		}
+
+		c.InvalidateSession(sessionID)
+	}
+
+	if c.TokenCount() != 0 {
+		t.Errorf("Final TokenCount = %d, want 0", c.TokenCount())
+	}
+	if c.SessionCount() != 0 {
+		t.Errorf("Final SessionCount = %d, want 0", c.SessionCount())
+	}
+}
+
+func TestGetToken_CleansExpiredTokens(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.TokenTTL = 50 * time.Millisecond
+	c, err := NewCSRFWithConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session1 := "expire-session-1"
+	session2 := "expire-session-2"
+	session3 := "active-session"
+
+	token1, _ := c.GenerateToken(session1)
+	token2, _ := c.GenerateToken(session2)
+	_ = token1
+	_ = token2
+
+	if c.TokenCount() != 2 {
+		t.Fatalf("Initial TokenCount = %d, want 2", c.TokenCount())
+	}
+	if c.SessionCount() != 2 {
+		t.Fatalf("Initial SessionCount = %d, want 2", c.SessionCount())
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	token3, _ := c.GenerateToken(session3)
+	_ = token3
+
+	if c.TokenCount() != 3 {
+		t.Fatalf("After adding session3, TokenCount = %d, want 3", c.TokenCount())
+	}
+	if c.SessionCount() != 3 {
+		t.Fatalf("After adding session3, SessionCount = %d, want 3", c.SessionCount())
+	}
+
+	_, err = c.GetToken(session1)
+	if err != ErrTokenNotFound {
+		t.Errorf("GetToken(expired session1) error = %v, want %v", err, ErrTokenNotFound)
+	}
+
+	_, err = c.GetToken(session2)
+	if err != ErrTokenNotFound {
+		t.Errorf("GetToken(expired session2) error = %v, want %v", err, ErrTokenNotFound)
+	}
+
+	if c.TokenCount() != 1 {
+		t.Errorf("After GetToken on expired sessions, TokenCount = %d, want 1 (only active session remains)", c.TokenCount())
+	}
+	if c.SessionCount() != 1 {
+		t.Errorf("After GetToken on expired sessions, SessionCount = %d, want 1", c.SessionCount())
+	}
+
+	_, err = c.GetToken(session3)
+	if err != nil {
+		t.Errorf("GetToken(active session3) unexpected error: %v", err)
+	}
+
+	activeToken, err := c.GetToken(session3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activeToken != token3 {
+		t.Errorf("Active session token changed unexpectedly")
+	}
+}
+
+func TestGetToken_ExpiredCleanup_Concurrent(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.TokenTTL = 50 * time.Millisecond
+	c, err := NewCSRFWithConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	numSessions := 50
+	for i := 0; i < numSessions; i++ {
+		sessionID := fmt.Sprintf("expire-concurrent-%d", i)
+		_, err := c.GenerateToken(sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	var wg sync.WaitGroup
+	wg.Add(numSessions)
+
+	for i := 0; i < numSessions; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			sessionID := fmt.Sprintf("expire-concurrent-%d", idx)
+			_, _ = c.GetToken(sessionID)
+		}(i)
+	}
+
+	wg.Wait()
+
+	if c.TokenCount() != 0 {
+		t.Errorf("After concurrent GetToken on expired sessions, TokenCount = %d, want 0. Memory leak detected!", c.TokenCount())
+	}
+	if c.SessionCount() != 0 {
+		t.Errorf("After concurrent GetToken on expired sessions, SessionCount = %d, want 0", c.SessionCount())
+	}
+}
+
+func TestMiddleware_SynchronizerMode_CookieRotation_ClosedLoop(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Mode = SynchronizerTokenMode
+	cfg.EnableOriginCheck = false
+	cfg.EnableRefererCheck = false
+	cfg.EnableTokenRotation = true
+	c, err := NewCSRFWithConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := c.Middleware(setupTestHandler())
+	sessionID := "cookie-rotation-loop"
+
+	initialToken, err := c.GenerateToken(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	numRequests := 5
+	currentToken := initialToken
+
+	for i := 0; i < numRequests; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/test", nil)
+		req.Header.Set(cfg.SessionIDHeader, sessionID)
+		req.AddCookie(&http.Cookie{Name: cfg.CookieName, Value: currentToken})
+
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("Request %d failed: status = %d, want %d. Body: %s. Current token: %s",
+				i, rr.Code, http.StatusOK, rr.Body.String(), currentToken)
+		}
+
+		newTokenHeader := rr.Header().Get(cfg.HeaderName)
+		if newTokenHeader == "" {
+			t.Fatalf("Request %d: no new token in response header", i)
+		}
+
+		var cookieToken string
+		for _, ck := range rr.Result().Cookies() {
+			if ck.Name == cfg.CookieName {
+				cookieToken = ck.Value
+				break
+			}
+		}
+		if cookieToken == "" {
+			t.Fatalf("Request %d: no new token cookie in response. Cookie was not updated!", i)
+		}
+
+		if cookieToken != newTokenHeader {
+			t.Fatalf("Request %d: cookie token (%s) != header token (%s)",
+				i, cookieToken, newTokenHeader)
+		}
+
+		if cookieToken == currentToken {
+			t.Fatalf("Request %d: token was not rotated! Cookie still has old value", i)
+		}
+
+		err = c.ValidateToken(currentToken, sessionID)
+		if err == nil {
+			t.Fatalf("Request %d: old token should be invalid after rotation", i)
+		}
+
+		err = c.ValidateToken(cookieToken, sessionID)
+		if err != nil {
+			t.Fatalf("Request %d: new token should be valid, got error: %v", i, err)
+		}
+
+		currentToken = cookieToken
+		t.Logf("Request %d succeeded, token rotated: %s -> %s", i, currentToken[:8]+"...", currentToken[:8]+"...")
+	}
+
+	if c.TokenCount() != 1 {
+		t.Errorf("After %d rotations, TokenCount = %d, want 1. Orphan tokens exist!",
+			numRequests, c.TokenCount())
+	}
+
+	verifyToken, err := c.GetToken(sessionID)
+	if err != nil {
+		t.Fatalf("Final GetToken failed: %v", err)
+	}
+	if verifyToken != currentToken {
+		t.Errorf("Final session token mismatch: stored=%s, expected=%s", verifyToken, currentToken)
+	}
+}
+
+func TestMiddleware_SynchronizerMode_CookieToken_AfterRotation_Success(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Mode = SynchronizerTokenMode
+	cfg.EnableOriginCheck = false
+	cfg.EnableRefererCheck = false
+	cfg.EnableTokenRotation = true
+	c, err := NewCSRFWithConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := c.Middleware(setupTestHandler())
+	sessionID := "cookie-after-rotation"
+
+	initialToken, _ := c.GenerateToken(sessionID)
+
+	req1 := httptest.NewRequest(http.MethodPost, "/test", nil)
+	req1.Header.Set(cfg.SessionIDHeader, sessionID)
+	req1.AddCookie(&http.Cookie{Name: cfg.CookieName, Value: initialToken})
+	rr1 := httptest.NewRecorder()
+	handler.ServeHTTP(rr1, req1)
+
+	if rr1.Code != http.StatusOK {
+		t.Fatalf("First request failed: %s", rr1.Body.String())
+	}
+
+	var rotatedCookieToken string
+	for _, ck := range rr1.Result().Cookies() {
+		if ck.Name == cfg.CookieName {
+			rotatedCookieToken = ck.Value
+			break
+		}
+	}
+	if rotatedCookieToken == "" {
+		t.Fatal("No rotated token cookie in first response")
+	}
+	if rotatedCookieToken == initialToken {
+		t.Fatal("Token was not rotated")
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/test", nil)
+	req2.Header.Set(cfg.SessionIDHeader, sessionID)
+	req2.AddCookie(&http.Cookie{Name: cfg.CookieName, Value: rotatedCookieToken})
+	rr2 := httptest.NewRecorder()
+	handler.ServeHTTP(rr2, req2)
+
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("Second request with rotated cookie token failed: status=%d, body=%s. "+
+			"This proves the bug: Cookie not updated after rotation causes 403.",
+			rr2.Code, rr2.Body.String())
+	}
+
+	t.Log("Success: Client using updated cookie token after rotation works correctly!")
+}
+
+func TestGetToken_ValidateToken_Consistency_AfterExpiry(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.TokenTTL = 30 * time.Millisecond
+	c, err := NewCSRFWithConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionID := "consistency-test"
+	token, _ := c.GenerateToken(sessionID)
+
+	time.Sleep(60 * time.Millisecond)
+
+	initialTokenCount := c.TokenCount()
+	initialSessionCount := c.SessionCount()
+
+	_, err1 := c.GetToken(sessionID)
+	afterGetTokenTokenCount := c.TokenCount()
+	afterGetTokenSessionCount := c.SessionCount()
+
+	_, err2 := c.GenerateToken(sessionID)
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	newToken, _ := c.GetToken(sessionID)
+
+	err3 := c.ValidateToken(token, sessionID)
+	afterValidateTokenCount := c.TokenCount()
+	afterValidateSessionCount := c.SessionCount()
+
+	if err1 != ErrTokenNotFound {
+		t.Errorf("GetToken expired error = %v, want %v", err1, ErrTokenNotFound)
+	}
+	if err3 != ErrTokenInvalid {
+		t.Errorf("ValidateToken expired error = %v, want %v", err3, ErrTokenInvalid)
+	}
+
+	if afterGetTokenTokenCount != initialTokenCount-1 {
+		t.Errorf("GetToken did not clean up: before=%d, after=%d", initialTokenCount, afterGetTokenTokenCount)
+	}
+	if afterGetTokenSessionCount != initialSessionCount-1 {
+		t.Errorf("GetToken did not clean up sessions: before=%d, after=%d", initialSessionCount, afterGetTokenSessionCount)
+	}
+
+	if afterValidateTokenCount != 1 {
+		t.Errorf("After all operations, TokenCount = %d, want 1 (only new token)", afterValidateTokenCount)
+	}
+	if afterValidateSessionCount != 1 {
+		t.Errorf("After all operations, SessionCount = %d, want 1", afterValidateSessionCount)
+	}
+
+	_ = newToken
 }

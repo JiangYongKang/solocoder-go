@@ -18,4 +18,5 @@ var (
 	ErrInvalidRefreshToken    = errors.New("jwtmgr: invalid refresh token")
 	ErrMissingKey             = errors.New("jwtmgr: missing signing key")
 	ErrEmptyToken             = errors.New("jwtmgr: empty token")
+	ErrBlacklistClosed        = errors.New("jwtmgr: blacklist is closed")
 )

@@ -200,9 +200,10 @@ func TestCreateKeyWithNegativeMaxUses(t *testing.T) {
 func TestCreateKeyWithTTL(t *testing.T) {
 	m := NewManager()
 
+	ttl := 24 * time.Hour
 	opts := CreateKeyOptions{
 		Name: "TTL Key",
-		TTL:  24 * time.Hour,
+		TTL:  ttl,
 	}
 
 	created, err := m.CreateKey(opts)
@@ -218,8 +219,9 @@ func TestCreateKeyWithTTL(t *testing.T) {
 	if !meta.HasExpiration {
 		t.Error("expected HasExpiration to be true")
 	}
-	if meta.ExpiresAt.Before(time.Now().Add(23*time.Hour)) || meta.ExpiresAt.After(time.Now().Add(25*time.Hour)) {
-		t.Errorf("unexpected ExpiresAt: %v", meta.ExpiresAt)
+	actualTTL := meta.ExpiresAt.Sub(meta.CreatedAt)
+	if actualTTL != ttl {
+		t.Errorf("expected ExpiresAt - CreatedAt == TTL (%v), got %v", ttl, actualTTL)
 	}
 	if meta.Status != StatusActive {
 		t.Errorf("expected StatusActive, got %s", meta.Status)
@@ -1503,7 +1505,7 @@ func TestEdgeCases(t *testing.T) {
 		}
 	})
 
-	t.Run("verify key with full scan", func(t *testing.T) {
+	t.Run("verify key via prefix index", func(t *testing.T) {
 		m2 := NewManager()
 		for i := 0; i < 10; i++ {
 			m2.CreateKey(CreateKeyOptions{})
@@ -1511,7 +1513,30 @@ func TestEdgeCases(t *testing.T) {
 		target, _ := m2.CreateKey(CreateKeyOptions{})
 		result := m2.VerifyKey(target.Secret)
 		if !result.Valid {
-			t.Errorf("expected valid key via full scan: %v", result.Reason)
+			t.Errorf("expected valid key via prefix index: %v", result.Reason)
+		}
+	})
+
+	t.Run("verify key with too short secret", func(t *testing.T) {
+		m2 := NewManager()
+		created, _ := m2.CreateKey(CreateKeyOptions{})
+
+		shortSecret := created.Secret[:5]
+		result := m2.VerifyKey(shortSecret)
+		if result.Valid {
+			t.Error("expected invalid for too short secret")
+		}
+		if !errors.Is(result.Reason, ErrInvalidSecret) {
+			t.Errorf("expected ErrInvalidSecret, got %v", result.Reason)
+		}
+
+		wrongPrefix := "xx_" + created.Secret[3:]
+		result2 := m2.VerifyKey(wrongPrefix)
+		if result2.Valid {
+			t.Error("expected invalid for secret with wrong prefix")
+		}
+		if !errors.Is(result2.Reason, ErrInvalidSecret) {
+			t.Errorf("expected ErrInvalidSecret for wrong prefix, got %v", result2.Reason)
 		}
 	})
 

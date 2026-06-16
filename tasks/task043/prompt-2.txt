@@ -1,0 +1,6 @@
+你实现的 CSRF 防护中间件模块存在一些并发安全和一致性问题，需要修复：
+1. RotateToken 的"验证-删除-创建"三个步骤跨越两次锁操作执行，ValidateToken 释放读锁后与 RotateToken 获取写锁之间存在时间窗口，并发场景下可能创建出在 tokens map 中存在但 sessions map 中不可达的孤儿 Token，造成内存泄漏。
+2. GetToken 方法在检测到 Token 已过期后仅返回错误而不清理内存中过期的 Token，而 ValidateToken 在同样场景下会主动删除过期条目，两个方法行为不一致导致过期 Token 持续占用内存。
+3. Middleware 在 SynchronizerTokenMode 路径下，Token 轮换成功后仅将新 Token 设置到响应头而没有同步更新 Cookie。extractToken 按请求头- Cookie-表单字段三级优先级提取 Token，如果客户端通过 Cookie 传递 Token，轮换后 Cookie 仍持有已失效的旧 Token，下次请求会收到 403。
+4. 修复后需要为上述问题补充并发场景下的单元测试，验证 RotateToken 的原子性、GetToken 清理行为一致性以及 Cookie 更新闭环。
+5. 运行 go test ./internal/csrf/ -v，需要让所有测试通过。

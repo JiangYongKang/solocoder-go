@@ -1,0 +1,7 @@
+你实现的流式数据处理器模块存在一些逻辑缺陷，需要修复：
+1. window.go 的 Stop 方法在停止窗口聚合器时只对时间窗口执行 flush，对于计数窗口（滚动和滑动）完全不处理。管道运行时停止一个已累计部分记录的计数窗口时，这些中间聚合状态直接丢失，既不生成窗口结果也不保存到检查点，恢复后无法从之前的中间状态继续。
+2. pipeline.go 的 recordProcessor 方法将 Filter 过滤记录、FlatMap 展开为空、算子执行出错三种不同语义的丢弃都累加到同一个 RecordsDropped 计数器。调用方通过 Stats 获取的 RecordsDropped 数值无法区分是正常业务过滤丢弃还是系统错误丢弃。
+3. pipeline.go 的 handleBackpressure 方法在背压达到 Critical 级别时采用 10ms 轮询阻塞等待，数据源在暂停状态下继续向 sourceOutput channel 写入，如果 channel 满导致数据源 goroutine 卡住，可能无法及时响应 Stop 信号或 context 取消。
+4. 测试文件中滑动时间窗口测试完全缺失，现有测试只覆盖了滑动计数窗口和滚动时间窗口，getSlidingTimeBuckets 和 checkTimeWindowsLocked 中的滑动时间桶分配和关闭逻辑从未被验证过正确性。
+5. 修复后需要为上述每个问题补充对应的单元测试，特别是滑动时间窗口的完整测试覆盖。
+6. 运行 go test ./internal/streamproc/ -v，需要让所有测试通过。

@@ -26,6 +26,7 @@ var (
 	ErrEmptyPassword             = errors.New("passpolicy: password cannot be empty")
 	ErrUserNotFound              = errors.New("passpolicy: user not found")
 	ErrPasswordExpired           = errors.New("passpolicy: password has expired")
+	ErrMustChangePassword        = errors.New("passpolicy: password must be changed")
 	ErrPasswordHistoryReused     = errors.New("passpolicy: password cannot reuse recent passwords")
 	ErrInvalidBcryptCost         = errors.New("passpolicy: invalid bcrypt cost")
 	ErrInvalidMinLength          = errors.New("passpolicy: invalid min length, must be >= 1")
@@ -180,14 +181,22 @@ func (e *Engine) UpdateBcryptCost(cost int) error {
 func (e *Engine) ValidatePassword(password string) ValidationResult {
 	var violations []PolicyViolation
 
-	if len(password) < e.config.MinLength {
+	e.mu.RLock()
+	minLength := e.config.MinLength
+	requireUpper := e.config.Complexity.RequireUppercase
+	requireLower := e.config.Complexity.RequireLowercase
+	requireDigit := e.config.Complexity.RequireDigit
+	requireSpecial := e.config.Complexity.RequireSpecial
+	e.mu.RUnlock()
+
+	if len(password) < minLength {
 		violations = append(violations, PolicyViolation{
 			Err:     ErrPasswordTooShort,
-			Message: fmt.Sprintf("password must be at least %d characters long (got %d)", e.config.MinLength, len(password)),
+			Message: fmt.Sprintf("password must be at least %d characters long (got %d)", minLength, len(password)),
 		})
 	}
 
-	if e.config.Complexity.RequireUppercase {
+	if requireUpper {
 		if !containsUpper(password) {
 			violations = append(violations, PolicyViolation{
 				Err:     ErrPasswordMissingUppercase,
@@ -196,7 +205,7 @@ func (e *Engine) ValidatePassword(password string) ValidationResult {
 		}
 	}
 
-	if e.config.Complexity.RequireLowercase {
+	if requireLower {
 		if !containsLower(password) {
 			violations = append(violations, PolicyViolation{
 				Err:     ErrPasswordMissingLowercase,
@@ -205,7 +214,7 @@ func (e *Engine) ValidatePassword(password string) ValidationResult {
 		}
 	}
 
-	if e.config.Complexity.RequireDigit {
+	if requireDigit {
 		if !containsDigit(password) {
 			violations = append(violations, PolicyViolation{
 				Err:     ErrPasswordMissingDigit,
@@ -214,7 +223,7 @@ func (e *Engine) ValidatePassword(password string) ValidationResult {
 		}
 	}
 
-	if e.config.Complexity.RequireSpecial {
+	if requireSpecial {
 		if !containsSpecial(password) {
 			violations = append(violations, PolicyViolation{
 				Err:     ErrPasswordMissingSpecial,
@@ -247,6 +256,27 @@ func (e *Engine) SetPassword(userID, password string) error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	historyDepth := e.config.HistoryDepth
+	if historyDepth > 0 {
+		state, exists := e.users[userID]
+		if exists {
+			if state.Current != nil {
+				if bcrypt.CompareHashAndPassword(state.Current.Hash, []byte(password)) == nil {
+					return ErrPasswordHistoryReused
+				}
+			}
+			startIdx := len(state.History) - historyDepth
+			if startIdx < 0 {
+				startIdx = 0
+			}
+			for i := startIdx; i < len(state.History); i++ {
+				if bcrypt.CompareHashAndPassword(state.History[i].Hash, []byte(password)) == nil {
+					return ErrPasswordHistoryReused
+				}
+			}
+		}
+	}
 
 	now := e.now()
 	cost := e.config.BcryptCost
@@ -311,12 +341,17 @@ func (e *Engine) ChangePassword(userID, oldPassword, newPassword string) error {
 		return ErrPasswordMismatch
 	}
 
-	if e.config.HistoryDepth > 0 {
+	historyDepth := e.config.HistoryDepth
+	if historyDepth > 0 {
 		if bcrypt.CompareHashAndPassword(state.Current.Hash, []byte(newPassword)) == nil {
 			e.mu.RUnlock()
 			return ErrPasswordHistoryReused
 		}
-		for i := len(state.History) - 1; i >= 0 && i >= len(state.History)-e.config.HistoryDepth; i-- {
+		startIdx := len(state.History) - historyDepth
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		for i := startIdx; i < len(state.History); i++ {
 			if bcrypt.CompareHashAndPassword(state.History[i].Hash, []byte(newPassword)) == nil {
 				e.mu.RUnlock()
 				return ErrPasswordHistoryReused
@@ -339,6 +374,22 @@ func (e *Engine) ChangePassword(userID, oldPassword, newPassword string) error {
 	state, exists = e.users[userID]
 	if !exists || state.Current == nil {
 		return ErrUserNotFound
+	}
+
+	historyDepth = e.config.HistoryDepth
+	if historyDepth > 0 {
+		if bcrypt.CompareHashAndPassword(state.Current.Hash, []byte(newPassword)) == nil {
+			return ErrPasswordHistoryReused
+		}
+		startIdx := len(state.History) - historyDepth
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		for i := startIdx; i < len(state.History); i++ {
+			if bcrypt.CompareHashAndPassword(state.History[i].Hash, []byte(newPassword)) == nil {
+				return ErrPasswordHistoryReused
+			}
+		}
 	}
 
 	now := e.now()
@@ -387,8 +438,11 @@ func (e *Engine) VerifyPassword(userID, password string) (VerifyResult, error) {
 
 	current := state.Current
 	currentCopy := *current
-	historyCopy := make([]HistoryEntry, len(state.History))
-	copy(historyCopy, state.History)
+	mustChange := state.MustChange
+	expiryDays := e.config.ExpiryDays
+	warningDays := e.config.WarningDays
+	currentCost := e.config.BcryptCost
+	now := e.now()
 	e.mu.RUnlock()
 
 	err := bcrypt.CompareHashAndPassword(currentCopy.Hash, []byte(password))
@@ -396,12 +450,10 @@ func (e *Engine) VerifyPassword(userID, password string) (VerifyResult, error) {
 		return result, ErrPasswordMismatch
 	}
 
-	e.mu.RLock()
-	now := e.now()
 	daysSinceChanged := int(now.Sub(currentCopy.CreatedAt).Hours() / 24)
-	daysRemaining := e.config.ExpiryDays - daysSinceChanged
-	isExpired := e.config.ExpiryDays > 0 && daysRemaining <= 0
-	isWarningPeriod := e.config.ExpiryDays > 0 && !isExpired && daysRemaining <= e.config.WarningDays
+	daysRemaining := expiryDays - daysSinceChanged
+	isExpired := expiryDays > 0 && daysRemaining <= 0
+	isWarningPeriod := expiryDays > 0 && !isExpired && daysRemaining <= warningDays
 
 	result.PasswordState = &PasswordStatus{
 		UserID:           userID,
@@ -409,11 +461,9 @@ func (e *Engine) VerifyPassword(userID, password string) (VerifyResult, error) {
 		DaysRemaining:    daysRemaining,
 		DaysSinceChanged: daysSinceChanged,
 		IsWarningPeriod:  isWarningPeriod,
-		MustChange:       state.MustChange,
+		MustChange:       mustChange,
 		CreatedAt:        currentCopy.CreatedAt,
 	}
-	mustChange := state.MustChange
-	e.mu.RUnlock()
 
 	if isExpired {
 		result.Valid = false
@@ -421,13 +471,12 @@ func (e *Engine) VerifyPassword(userID, password string) (VerifyResult, error) {
 	}
 	if mustChange {
 		result.Valid = false
-		return result, ErrPasswordExpired
+		return result, ErrMustChangePassword
 	}
 
 	result.Valid = true
 
 	storedCost := currentCopy.Cost
-	currentCost := e.config.BcryptCost
 	if storedCost < currentCost {
 		newHash, hashErr := bcrypt.GenerateFromPassword([]byte(password), currentCost)
 		if hashErr == nil {

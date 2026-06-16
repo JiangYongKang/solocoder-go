@@ -73,7 +73,8 @@ type FieldRules struct {
 }
 
 type StructRules struct {
-	Fields map[string][]Rule
+	Fields      map[string][]Rule
+	IncludeTags bool
 }
 
 type Validator struct {
@@ -176,6 +177,7 @@ func (v *Validator) ValidateWithRules(s interface{}, rules StructRules) Validati
 	}
 
 	errs := make(ValidationErrors, 0)
+
 	for fieldName, fieldRules := range rules.Fields {
 		fieldVal, ok := findFieldByName(val, fieldName)
 		if !ok {
@@ -186,7 +188,11 @@ func (v *Validator) ValidateWithRules(s interface{}, rules StructRules) Validati
 			v.applyRules(fieldVal, fieldPath, fieldRules, s, &errs)
 		}
 	}
-	v.validateStruct(val, "", s, &errs)
+
+	if rules.IncludeTags {
+		v.validateStruct(val, "", s, &errs)
+	}
+
 	return errs
 }
 
@@ -246,6 +252,19 @@ func (v *Validator) validateFieldValue(fieldVal reflect.Value, fieldPath string,
 
 func (v *Validator) applyRules(fieldVal reflect.Value, fieldPath string, rules []Rule, structPtr interface{}, errs *ValidationErrors) {
 	for _, rule := range rules {
+		if rule.ConditionName != "" {
+			if !v.isRegisteredCondition(rule.ConditionName) {
+				fieldName := extractFieldNameFromCondition(rule.ConditionName)
+				if !v.structHasField(structPtr, fieldName) {
+					*errs = append(*errs, &ValidationError{
+						Field:   fieldPath,
+						Message: fmt.Sprintf("condition references unknown field '%s'", fieldName),
+					})
+					continue
+				}
+			}
+		}
+
 		cond := v.resolveCondition(&rule)
 		if cond != nil {
 			if !cond(structPtr) {
@@ -264,7 +283,14 @@ func (v *Validator) applyRules(fieldVal reflect.Value, fieldPath string, rules [
 
 		var value interface{}
 		if fieldVal.IsValid() && fieldVal.CanInterface() {
-			value = fieldVal.Interface()
+			actualVal := dereferenceValue(fieldVal)
+			if actualVal.IsValid() && actualVal.CanInterface() {
+				value = actualVal.Interface()
+			} else if fieldVal.Kind() == reflect.Ptr && fieldVal.IsNil() {
+				value = nil
+			} else {
+				value = fieldVal.Interface()
+			}
 		}
 
 		valid, msg := fn(value, rule.Params)
@@ -278,6 +304,52 @@ func (v *Validator) applyRules(fieldVal reflect.Value, fieldPath string, rules [
 			})
 		}
 	}
+}
+
+func (v *Validator) isRegisteredCondition(name string) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	_, ok := v.conditions[name]
+	return ok
+}
+
+func extractFieldNameFromCondition(expr string) string {
+	if strings.HasPrefix(expr, "!") {
+		return strings.TrimPrefix(expr, "!")
+	}
+	eqIdx := strings.Index(expr, "=")
+	if eqIdx != -1 {
+		return strings.TrimSpace(expr[:eqIdx])
+	}
+	return expr
+}
+
+func (v *Validator) structHasField(s interface{}, fieldName string) bool {
+	if s == nil {
+		return false
+	}
+	val := reflect.ValueOf(s)
+	if val.Kind() == reflect.Ptr {
+		if val.IsNil() {
+			return false
+		}
+		val = val.Elem()
+	}
+	if val.Kind() != reflect.Struct {
+		return false
+	}
+	_, ok := findFieldByName(val, fieldName)
+	return ok
+}
+
+func dereferenceValue(v reflect.Value) reflect.Value {
+	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return reflect.Value{}
+		}
+		v = v.Elem()
+	}
+	return v
 }
 
 func (v *Validator) resolveCondition(rule *Rule) ConditionFunc {
@@ -407,7 +479,7 @@ func buildCondition(expr string) ConditionFunc {
 			fieldName := strings.TrimPrefix(expr, "!")
 			fv, ok := findFieldByName(val, fieldName)
 			if !ok {
-				return true
+				return false
 			}
 			return isEmptyValue(fv)
 		}
@@ -444,7 +516,10 @@ func isEmptyValue(v reflect.Value) bool {
 	case reflect.Float32, reflect.Float64:
 		return v.Float() == 0
 	case reflect.Interface, reflect.Ptr:
-		return v.IsNil()
+		if v.IsNil() {
+			return true
+		}
+		return isEmptyValue(v.Elem())
 	}
 	return false
 }
@@ -794,24 +869,28 @@ func validatePositive(value interface{}, params string) (bool, string) {
 			return false, "value must be positive"
 		}
 	case uint:
-		if v <= 0 {
-			return false, "value must be positive"
+		if v == 0 {
+			return false, "value must not be zero"
 		}
 	case uint8:
-		if v <= 0 {
-			return false, "value must be positive"
+		if v == 0 {
+			return false, "value must not be zero"
 		}
 	case uint16:
-		if v <= 0 {
-			return false, "value must be positive"
+		if v == 0 {
+			return false, "value must not be zero"
 		}
 	case uint32:
-		if v <= 0 {
-			return false, "value must be positive"
+		if v == 0 {
+			return false, "value must not be zero"
 		}
 	case uint64:
-		if v <= 0 {
-			return false, "value must be positive"
+		if v == 0 {
+			return false, "value must not be zero"
+		}
+	case uintptr:
+		if v == 0 {
+			return false, "value must not be zero"
 		}
 	case float32:
 		if v <= 0 {

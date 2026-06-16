@@ -509,6 +509,7 @@ func (s *HTMLSanitizer) processTag(tagStr string, cfg *SanitizerConfig) string {
 
 	parts := strings.Fields(tagContent)
 	tagName := strings.ToLower(parts[0])
+	tagName = strings.TrimSuffix(tagName, "/")
 
 	if !cfg.AllowedTags[tagName] {
 		return ""
@@ -545,6 +546,27 @@ func (s *HTMLSanitizer) processAttributes(attrStr string, cfg *SanitizerConfig) 
 	re := regexp.MustCompile(`(\w+)\s*=\s*("([^"]*)"|'([^']*)'|(\S+))`)
 	matches := re.FindAllStringSubmatch(attrStr, -1)
 
+	urlAttrs := map[string]bool{
+		"href":   true,
+		"src":    true,
+		"action": true,
+		"data":   true,
+		"formaction": true,
+	}
+
+	safeProtocols := map[string]bool{
+		"http:":  true,
+		"https:": true,
+		"mailto:": true,
+		"tel:":    true,
+		"ftp:":    true,
+		"sftp:":   true,
+		"#":      true,
+		"/":      true,
+		"./":     true,
+		"../":    true,
+	}
+
 	for _, match := range matches {
 		attrName := strings.ToLower(match[1])
 		if !cfg.AllowedAttributes[attrName] {
@@ -558,6 +580,25 @@ func (s *HTMLSanitizer) processAttributes(attrStr string, cfg *SanitizerConfig) 
 			attrValue = match[4]
 		} else {
 			attrValue = match[5]
+		}
+
+		if urlAttrs[attrName] {
+			trimmed := strings.TrimSpace(strings.ToLower(attrValue))
+			isSafe := false
+			colonIdx := strings.Index(trimmed, ":")
+			if colonIdx == -1 {
+				isSafe = true
+			} else {
+				for prefix := range safeProtocols {
+					if strings.HasPrefix(trimmed, prefix) {
+						isSafe = true
+						break
+					}
+				}
+			}
+			if !isSafe {
+				continue
+			}
 		}
 
 		attrValue = html.EscapeString(attrValue)
@@ -651,8 +692,6 @@ func (e *OutputEncoder) EncodeJavaScript(input string) string {
 			result.WriteString(`\b`)
 		case '\f':
 			result.WriteString(`\f`)
-		case '/':
-			result.WriteString(`\/`)
 		case '<':
 			result.WriteString(`\u003c`)
 		case '>':
@@ -691,13 +730,13 @@ func (e *OutputEncoder) EncodeCSS(input string) string {
 		case r == '\t':
 			result.WriteString(`\9 `)
 		case r == '<':
-			result.WriteString(`\\3C `)
+			result.WriteString(`\3C `)
 		case r == '>':
-			result.WriteString(`\\3E `)
+			result.WriteString(`\3E `)
 		case r == '&':
-			result.WriteString(`\\26 `)
+			result.WriteString(`\26 `)
 		case r < 32 || r == 0x7f:
-			result.WriteString(fmt.Sprintf(`\\%X `, r))
+			result.WriteString(fmt.Sprintf(`\%X `, r))
 		default:
 			result.WriteRune(r)
 		}
@@ -845,6 +884,14 @@ func (m *DataMasker) Mask(input string) string {
 	for _, p := range m.patterns {
 		patterns = append(patterns, p)
 	}
+	sort.Slice(patterns, func(i, j int) bool {
+		lenI := len(patterns[i].Pattern.String())
+		lenJ := len(patterns[j].Pattern.String())
+		if lenI != lenJ {
+			return lenI > lenJ
+		}
+		return patterns[i].Name < patterns[j].Name
+	})
 	m.mu.RUnlock()
 
 	result := input

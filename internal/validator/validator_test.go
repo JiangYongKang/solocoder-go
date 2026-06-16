@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -1450,8 +1451,8 @@ func TestNotConditionNotFoundField(t *testing.T) {
 	cond := buildCondition("!NonExistentField")
 	s := TestStruct{Name: "test"}
 	result := cond(&s)
-	if !result {
-		t.Error("not condition should return true for nonexistent field")
+	if result {
+		t.Error("not condition should return false for nonexistent field (field not found => skip rule)")
 	}
 }
 
@@ -1738,5 +1739,592 @@ func TestResolveConditionNoName(t *testing.T) {
 	cond := v.resolveCondition(rule)
 	if cond != nil {
 		t.Error("expected nil condition for rule with no condition name")
+	}
+}
+
+// ========== Issue #1: ValidateWithRules 不应该执行标签规则 ==========
+
+func TestValidateWithRulesDoesNotApplyStructTags(t *testing.T) {
+	type Inner struct {
+		Value string `validate:"required"`
+	}
+	type TestStruct struct {
+		Name  string `validate:"required,minLen=5"`
+		Age   int    `validate:"min=18"`
+		Inner Inner
+	}
+
+	s := TestStruct{
+		Name:  "",
+		Age:   0,
+		Inner: Inner{Value: ""},
+	}
+
+	rules := StructRules{
+		Fields: map[string][]Rule{
+			"Name": {
+				{Validator: "required", Message: "custom name required"},
+			},
+		},
+	}
+
+	v := New()
+	registerBuiltinValidators(v)
+	errs := v.ValidateWithRules(&s, rules)
+
+	if len(errs) != 1 {
+		t.Fatalf("expected exactly 1 error (from StructRules only), got %d errors: %v", len(errs), errs)
+	}
+	if errs[0].Field != "Name" {
+		t.Errorf("expected error field 'Name', got '%s'", errs[0].Field)
+	}
+	if errs[0].Message != "custom name required" {
+		t.Errorf("expected custom message, got '%s'", errs[0].Message)
+	}
+}
+
+func TestValidateWithRulesEmptyRulesGivesNoErrors(t *testing.T) {
+	type TestStruct struct {
+		Name string `validate:"required"`
+		Age  int    `validate:"required,min=18"`
+	}
+	s := TestStruct{Name: "", Age: 0}
+	rules := StructRules{Fields: map[string][]Rule{}}
+
+	v := New()
+	registerBuiltinValidators(v)
+	errs := v.ValidateWithRules(&s, rules)
+
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for empty StructRules (tags should not run), got: %v", errs)
+	}
+}
+
+func TestValidateMixedExplicit(t *testing.T) {
+	type TestStruct struct {
+		Name string `validate:"required"`
+		Age  int    `validate:"min=18"`
+	}
+
+	s := TestStruct{Name: "", Age: 10}
+	rules := StructRules{
+		Fields: map[string][]Rule{
+			"Age": {{Validator: "max", Params: "120"}},
+		},
+	}
+
+	v := New()
+	registerBuiltinValidators(v)
+
+	tagErrs := v.Validate(&s)
+	if len(tagErrs) < 2 {
+		t.Errorf("expected at least 2 tag errors, got %d", len(tagErrs))
+	}
+
+	ruleErrs := v.ValidateWithRules(&s, rules)
+	if ruleErrs.HasErrors() {
+		t.Errorf("expected no StructRules errors, got: %v", ruleErrs)
+	}
+
+	mergedErrs := append(tagErrs, ruleErrs...)
+	if len(mergedErrs) < 2 {
+		t.Errorf("merged should have at least 2 errors, got %d", len(mergedErrs))
+	}
+}
+
+// ========== Issue #2: 条件校验字段缺失时行为 ==========
+
+func TestConditionMissingFieldSkipsRule(t *testing.T) {
+	type TestStruct struct {
+		Name    string
+		Address string `validate:"required|when=TypoFieldName"`
+	}
+
+	s := TestStruct{Name: "test", Address: ""}
+	errs := Validate(&s)
+
+	if !errs.HasErrors() {
+		t.Fatal("expected error when condition references missing field")
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "Address" && strings.Contains(e.Message, "unknown field") && strings.Contains(e.Message, "TypoFieldName") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected error about unknown field 'TypoFieldName', got: %v", errs)
+	}
+}
+
+func TestConditionMissingFieldWithEqualsSkipsRule(t *testing.T) {
+	type TestStruct struct {
+		Name    string
+		Address string `validate:"required|when=TypoField=abc"`
+	}
+
+	s := TestStruct{Name: "test", Address: ""}
+	errs := Validate(&s)
+
+	if !errs.HasErrors() {
+		t.Fatal("expected error when equals-condition references missing field")
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "Address" && strings.Contains(e.Message, "unknown field") && strings.Contains(e.Message, "TypoField") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected error about unknown field 'TypoField', got: %v", errs)
+	}
+}
+
+func TestConditionPresentFieldWithNegationExecutesRule(t *testing.T) {
+	type TestStruct struct {
+		IsActive bool
+		Name     string `validate:"required|when=!IsActive"`
+	}
+
+	s := TestStruct{IsActive: false, Name: ""}
+	errs := Validate(&s)
+
+	if !errs.HasErrors() {
+		t.Error("expected error when !IsActive is true and Name is empty")
+	}
+
+	s.IsActive = true
+	s.Name = ""
+	errs = Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors when !IsActive is false, got: %v", errs)
+	}
+}
+
+// ========== Issue #3: 指针类型必填校验 ==========
+
+func TestRequiredPointerStringNilFails(t *testing.T) {
+	type TestStruct struct {
+		Name *string `validate:"required"`
+	}
+	s := TestStruct{Name: nil}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for nil *string with required")
+	}
+}
+
+func strPtr(s string) *string { return &s }
+func intPtr(i int) *int       { return &i }
+
+func TestRequiredPointerStringEmptyFails(t *testing.T) {
+	type TestStruct struct {
+		Name *string `validate:"required"`
+	}
+	s := TestStruct{Name: strPtr("")}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for non-nil *string pointing to empty string")
+	}
+}
+
+func TestRequiredPointerStringValidPasses(t *testing.T) {
+	type TestStruct struct {
+		Name *string `validate:"required"`
+	}
+	s := TestStruct{Name: strPtr("hello")}
+	errs := Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for valid *string, got: %v", errs)
+	}
+}
+
+func TestRequiredPointerIntNilFails(t *testing.T) {
+	type TestStruct struct {
+		Age *int `validate:"required"`
+	}
+	s := TestStruct{Age: nil}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for nil *int with required")
+	}
+}
+
+func TestRequiredPointerIntZeroFails(t *testing.T) {
+	type TestStruct struct {
+		Age *int `validate:"required"`
+	}
+	s := TestStruct{Age: intPtr(0)}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for non-nil *int pointing to 0")
+	}
+}
+
+func TestRequiredPointerIntValidPasses(t *testing.T) {
+	type TestStruct struct {
+		Age *int `validate:"required"`
+	}
+	s := TestStruct{Age: intPtr(42)}
+	errs := Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for valid *int, got: %v", errs)
+	}
+}
+
+func TestRequiredPointerToStructNilFails(t *testing.T) {
+	type Inner struct {
+		Value string
+	}
+	type TestStruct struct {
+		Inner *Inner `validate:"required"`
+	}
+	s := TestStruct{Inner: nil}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for nil *Inner struct with required")
+	}
+}
+
+// ========== Issue #4: 无符号类型 positive 校验错误消息 ==========
+
+func TestPositiveUintZeroErrorMessage(t *testing.T) {
+	type TestStruct struct {
+		Val uint `validate:"positive"`
+	}
+	s := TestStruct{Val: 0}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Fatal("expected error for uint == 0 with positive validator")
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "Val" && e.Message == "value must not be zero" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected 'value must not be zero' message, got errors: %v", errs)
+	}
+}
+
+func TestPositiveUint8ZeroErrorMessage(t *testing.T) {
+	type TestStruct struct {
+		Val uint8 `validate:"positive"`
+	}
+	s := TestStruct{Val: 0}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Fatal("expected error for uint8 == 0")
+	}
+	if errs[0].Message != "value must not be zero" {
+		t.Errorf("expected 'value must not be zero', got '%s'", errs[0].Message)
+	}
+}
+
+func TestPositiveUint16NonZeroPasses(t *testing.T) {
+	type TestStruct struct {
+		Val uint16 `validate:"positive"`
+	}
+	s := TestStruct{Val: 1}
+	errs := Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for uint16 == 1, got: %v", errs)
+	}
+}
+
+func TestPositiveIntZeroErrorMessage(t *testing.T) {
+	type TestStruct struct {
+		Val int `validate:"positive"`
+	}
+	s := TestStruct{Val: 0}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Fatal("expected error for int == 0")
+	}
+	if errs[0].Message != "value must be positive" {
+		t.Errorf("expected 'value must be positive' for signed int, got '%s'", errs[0].Message)
+	}
+}
+
+func TestPositiveUint64MaxPasses(t *testing.T) {
+	type TestStruct struct {
+		Val uint64 `validate:"positive"`
+	}
+	s := TestStruct{Val: ^uint64(0)}
+	errs := Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for max uint64, got: %v", errs)
+	}
+}
+
+func TestPositiveUint32ErrorMessage(t *testing.T) {
+	type TestStruct struct {
+		Val uint32 `validate:"positive"`
+	}
+	s := TestStruct{Val: 0}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Fatal("expected error for uint32 == 0")
+	}
+	if errs[0].Message != "value must not be zero" {
+		t.Errorf("expected 'value must not be zero' for uint32, got '%s'", errs[0].Message)
+	}
+}
+
+// ========== Additional tests for fixes ==========
+
+func TestPositiveUintptrZeroErrorMessage(t *testing.T) {
+	type TestStruct struct {
+		Val uintptr `validate:"positive"`
+	}
+	s := TestStruct{Val: 0}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Fatal("expected error for uintptr == 0")
+	}
+	if errs[0].Message != "value must not be zero" {
+		t.Errorf("expected 'value must not be zero' for uintptr, got '%s'", errs[0].Message)
+	}
+}
+
+func TestPositiveUintptrNonZeroPasses(t *testing.T) {
+	type TestStruct struct {
+		Val uintptr `validate:"positive"`
+	}
+	s := TestStruct{Val: 100}
+	errs := Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for uintptr == 100, got: %v", errs)
+	}
+}
+
+func TestValidateWithRulesIncludeTagsMergesResults(t *testing.T) {
+	type TestStruct struct {
+		Name string `validate:"required"`
+		Age  int    `validate:"min=18"`
+	}
+
+	s := TestStruct{Name: "", Age: 10}
+	rules := StructRules{
+		Fields: map[string][]Rule{
+			"Age": {{Validator: "max", Params: "120"}},
+		},
+		IncludeTags: false,
+	}
+
+	v := New()
+	registerBuiltinValidators(v)
+
+	errs := v.ValidateWithRules(&s, rules)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors when IncludeTags=false, got: %v", errs)
+	}
+
+	rules.IncludeTags = true
+	errs = v.ValidateWithRules(&s, rules)
+	if len(errs) < 2 {
+		t.Errorf("expected at least 2 errors when IncludeTags=true, got %d: %v", len(errs), errs)
+	}
+
+	hasRequired := false
+	hasMin := false
+	for _, e := range errs {
+		if e.Field == "Name" {
+			hasRequired = true
+		}
+		if e.Field == "Age" && strings.Contains(e.Message, "at least") {
+			hasMin = true
+		}
+	}
+	if !hasRequired {
+		t.Error("expected Name required error from tag rules")
+	}
+	if !hasMin {
+		t.Error("expected Age min error from tag rules")
+	}
+}
+
+func TestValidateWithRulesIncludeTagsWithValidData(t *testing.T) {
+	type TestStruct struct {
+		Name string `validate:"required"`
+		Age  int    `validate:"min=18"`
+	}
+
+	s := TestStruct{Name: "test", Age: 25}
+	rules := StructRules{
+		Fields: map[string][]Rule{
+			"Age": {{Validator: "max", Params: "120"}},
+		},
+		IncludeTags: true,
+	}
+
+	v := New()
+	registerBuiltinValidators(v)
+	errs := v.ValidateWithRules(&s, rules)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for valid data with IncludeTags=true, got: %v", errs)
+	}
+}
+
+func TestDereferencePointerForMinValidator(t *testing.T) {
+	type TestStruct struct {
+		Age *int `validate:"min=18"`
+	}
+
+	s := TestStruct{Age: intPtr(10)}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for *int pointing to 10 with min=18")
+	}
+
+	s.Age = intPtr(25)
+	errs = Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for *int pointing to 25, got: %v", errs)
+	}
+}
+
+func TestDereferencePointerForMaxValidator(t *testing.T) {
+	type TestStruct struct {
+		Score *int `validate:"max=100"`
+	}
+
+	s := TestStruct{Score: intPtr(150)}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for *int pointing to 150 with max=100")
+	}
+
+	s.Score = intPtr(80)
+	errs = Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for *int pointing to 80, got: %v", errs)
+	}
+}
+
+func TestDereferencePointerForMinLenValidator(t *testing.T) {
+	type TestStruct struct {
+		Name *string `validate:"minLen=3"`
+	}
+
+	s := TestStruct{Name: strPtr("ab")}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for *string pointing to 'ab' with minLen=3")
+	}
+
+	s.Name = strPtr("abc")
+	errs = Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for *string pointing to 'abc', got: %v", errs)
+	}
+}
+
+func TestDereferencePointerForPositiveValidator(t *testing.T) {
+	type TestStruct struct {
+		Val *int `validate:"positive"`
+	}
+
+	s := TestStruct{Val: intPtr(-5)}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for *int pointing to -5 with positive")
+	}
+
+	s.Val = intPtr(5)
+	errs = Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for *int pointing to 5, got: %v", errs)
+	}
+}
+
+func TestDereferencePointerNilSkipsNonRequiredValidators(t *testing.T) {
+	type TestStruct struct {
+		Age *int `validate:"min=18"`
+	}
+
+	s := TestStruct{Age: nil}
+	errs := Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for nil *int with min=18 (non-required validators skip nil), got: %v", errs)
+	}
+}
+
+func TestDereferencePointerNilWithRequiredReturnsError(t *testing.T) {
+	type TestStruct struct {
+		Age *int `validate:"required,min=18"`
+	}
+
+	s := TestStruct{Age: nil}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for nil *int with required validator")
+	}
+}
+
+func TestConditionMissingFieldWithNegationReportsError(t *testing.T) {
+	type TestStruct struct {
+		Name    string
+		Address string `validate:"required|when=!TypoField"`
+	}
+
+	s := TestStruct{Name: "test", Address: ""}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Fatal("expected error for negation condition with missing field")
+	}
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Message, "TypoField") && strings.Contains(e.Message, "unknown field") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected error about unknown field 'TypoField', got: %v", errs)
+	}
+}
+
+func TestRegisteredConditionSkipsFieldCheck(t *testing.T) {
+	type TestStruct struct {
+		Name string `validate:"required|when=my_custom_cond"`
+	}
+
+	v := New()
+	registerBuiltinValidators(v)
+	v.RegisterCondition("my_custom_cond", func(s interface{}) bool {
+		return true
+	})
+
+	s := TestStruct{Name: ""}
+	errs := v.Validate(&s)
+	if !errs.HasErrors() {
+		t.Fatal("expected required error when custom condition returns true")
+	}
+	if len(errs) != 1 {
+		t.Errorf("expected only 1 error (no unknown field error), got: %v", errs)
+	}
+}
+
+func TestValidateWithRulesIncludeTagsNestedStruct(t *testing.T) {
+	type Inner struct {
+		Value string `validate:"required"`
+	}
+	type Outer struct {
+		Name  string `validate:"required"`
+		Inner Inner
+	}
+
+	s := Outer{Name: "", Inner: Inner{Value: ""}}
+	rules := StructRules{
+		Fields:      map[string][]Rule{},
+		IncludeTags: true,
+	}
+
+	v := New()
+	registerBuiltinValidators(v)
+	errs := v.ValidateWithRules(&s, rules)
+	if len(errs) < 2 {
+		t.Errorf("expected at least 2 errors from nested struct tags, got %d: %v", len(errs), errs)
 	}
 }

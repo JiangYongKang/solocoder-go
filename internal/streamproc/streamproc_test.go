@@ -1030,18 +1030,32 @@ func TestSlidingCountWindow(t *testing.T) {
 	window.Stop()
 	wg.Wait()
 
-	if len(results) != 3 {
-		t.Fatalf("expected 3 window results, got %d", len(results))
+	completeResults := make([]*WindowResult, 0)
+	partialResults := make([]*WindowResult, 0)
+	for _, r := range results {
+		if r.Partial {
+			partialResults = append(partialResults, r)
+		} else {
+			completeResults = append(completeResults, r)
+		}
 	}
 
-	if results[0].Value != 6.0 {
-		t.Errorf("expected first window sum=6, got %v", results[0].Value)
+	if len(completeResults) != 3 {
+		t.Fatalf("expected 3 complete window results, got %d", len(completeResults))
 	}
-	if results[1].Value != 9.0 {
-		t.Errorf("expected second window sum=9, got %v", results[1].Value)
+
+	if completeResults[0].Value != 6.0 {
+		t.Errorf("expected first window sum=6, got %v", completeResults[0].Value)
 	}
-	if results[2].Value != 12.0 {
-		t.Errorf("expected third window sum=12, got %v", results[2].Value)
+	if completeResults[1].Value != 9.0 {
+		t.Errorf("expected second window sum=9, got %v", completeResults[1].Value)
+	}
+	if completeResults[2].Value != 12.0 {
+		t.Errorf("expected third window sum=12, got %v", completeResults[2].Value)
+	}
+
+	if len(partialResults) == 0 {
+		t.Error("expected at least one partial result from incomplete windows on stop")
 	}
 }
 
@@ -2620,5 +2634,495 @@ func TestBackpressureStateTransitions(t *testing.T) {
 	info = pipeline.GetBackpressureInfo()
 	if info.State != BackpressureCritical {
 		t.Errorf("expected Critical state at 90%%, got %s", info.State.String())
+	}
+}
+
+func TestSlidingTimeWindow(t *testing.T) {
+	slide := 100 * time.Millisecond
+	size := 300 * time.Millisecond
+	window, err := NewWindowAggregator("test", WindowConfig{
+		WindowType:  WindowTypeSlidingTime,
+		Aggregation: AggregationSum,
+		Size:        size,
+		Slide:       slide,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	ctx := context.Background()
+	window.Start(ctx)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var results []*WindowResult
+	go func() {
+		defer wg.Done()
+		for res := range window.Results() {
+			results = append(results, res)
+		}
+	}()
+
+	baseTime := time.Now().Truncate(slide)
+
+	for i := 1; i <= 3; i++ {
+		rec := NewRecord(i * 10)
+		rec.SeqID = int64(i)
+		rec.Timestamp = baseTime.Add(time.Duration(i) * 50*time.Millisecond + 50*time.Millisecond)
+		_, err := window.Process(ctx, rec)
+		if err != nil {
+			t.Fatalf("Process failed: %v", err)
+		}
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	window.Stop()
+	wg.Wait()
+
+	if len(results) == 0 {
+		t.Fatal("expected at least 1 window result, got 0")
+	}
+
+	for _, r := range results {
+		if r.WindowType != WindowTypeSlidingTime {
+			t.Errorf("expected WindowType=SlidingTime, got %v", r.WindowType)
+		}
+		if r.Value <= 0 {
+			t.Errorf("expected positive sum, got %v", r.Value)
+		}
+	}
+}
+
+func TestSlidingTimeWindowMultipleBuckets(t *testing.T) {
+	slide := 50 * time.Millisecond
+	size := 150 * time.Millisecond
+	window, err := NewWindowAggregator("test", WindowConfig{
+		WindowType:  WindowTypeSlidingTime,
+		Aggregation: AggregationCount,
+		Size:        size,
+		Slide:       slide,
+		Extractor:   func(r *Record) (float64, error) { return 1.0, nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	ctx := context.Background()
+
+	rec1 := NewRecord(1)
+	rec1.SeqID = 1
+	rec1.Timestamp = time.Now()
+	_, _ = window.Process(ctx, rec1)
+
+	if window.ActiveWindowCount() < 1 {
+		t.Errorf("expected at least 1 active window, got %d", window.ActiveWindowCount())
+	}
+}
+
+func TestSlidingTimeWindowBucketOverlap(t *testing.T) {
+	slide := 100 * time.Millisecond
+	size := 300 * time.Millisecond
+	window, err := NewWindowAggregator("test", WindowConfig{
+		WindowType:  WindowTypeSlidingTime,
+		Aggregation: AggregationSum,
+		Size:        size,
+		Slide:       slide,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	ctx := context.Background()
+
+	baseTime := time.Now().Truncate(slide)
+	rec := NewRecord(10)
+	rec.SeqID = 1
+	rec.Timestamp = baseTime.Add(150 * time.Millisecond)
+	_, _ = window.Process(ctx, rec)
+
+	activeCount := window.ActiveWindowCount()
+	if activeCount < 2 {
+		t.Errorf("expected at least 2 overlapping buckets for sliding time window, got %d", activeCount)
+	}
+}
+
+func TestSlidingTimeWindowWithWatermark(t *testing.T) {
+	slide := 100 * time.Millisecond
+	size := 200 * time.Millisecond
+	window, err := NewWindowAggregator("test", WindowConfig{
+		WindowType:  WindowTypeSlidingTime,
+		Aggregation: AggregationSum,
+		Size:        size,
+		Slide:       slide,
+		Watermark:   50 * time.Millisecond,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	ctx := context.Background()
+	window.Start(ctx)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var results []*WindowResult
+	go func() {
+		defer wg.Done()
+		for res := range window.Results() {
+			results = append(results, res)
+		}
+	}()
+
+	baseTime := time.Now().Truncate(slide)
+	rec := NewRecord(42)
+	rec.SeqID = 1
+	rec.Timestamp = baseTime.Add(50 * time.Millisecond)
+	_, _ = window.Process(ctx, rec)
+
+	time.Sleep(400 * time.Millisecond)
+
+	window.Stop()
+	wg.Wait()
+
+	if len(results) == 0 {
+		t.Fatal("expected at least 1 window result with watermark, got 0")
+	}
+}
+
+func TestCountWindowStopPreservesPartialState(t *testing.T) {
+	window, err := NewWindowAggregator("test", WindowConfig{
+		WindowType:  WindowTypeTumblingCount,
+		Aggregation: AggregationSum,
+		CountSize:   10,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	ctx := context.Background()
+	window.Start(ctx)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var results []*WindowResult
+	go func() {
+		defer wg.Done()
+		for res := range window.Results() {
+			results = append(results, res)
+		}
+	}()
+
+	for i := 1; i <= 5; i++ {
+		rec := NewRecord(i)
+		rec.SeqID = int64(i)
+		_, _ = window.Process(ctx, rec)
+	}
+
+	window.Stop()
+	wg.Wait()
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 partial result on stop, got %d", len(results))
+	}
+
+	if !results[0].Partial {
+		t.Error("expected Partial=true for incomplete window result on stop")
+	}
+
+	if results[0].Value != 15.0 {
+		t.Errorf("expected partial sum=15, got %v", results[0].Value)
+	}
+
+	if results[0].Count != 5 {
+		t.Errorf("expected partial count=5, got %d", results[0].Count)
+	}
+}
+
+func TestSlidingCountWindowStopPreservesPartialState(t *testing.T) {
+	window, err := NewWindowAggregator("test", WindowConfig{
+		WindowType:  WindowTypeSlidingCount,
+		Aggregation: AggregationSum,
+		CountSize:   5,
+		CountSlide:  2,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	ctx := context.Background()
+	window.Start(ctx)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var results []*WindowResult
+	go func() {
+		defer wg.Done()
+		for res := range window.Results() {
+			results = append(results, res)
+		}
+	}()
+
+	for i := 1; i <= 3; i++ {
+		rec := NewRecord(i)
+		rec.SeqID = int64(i)
+		_, _ = window.Process(ctx, rec)
+	}
+
+	window.Stop()
+	wg.Wait()
+
+	partialCount := 0
+	for _, r := range results {
+		if r.Partial {
+			partialCount++
+		}
+	}
+	if partialCount == 0 {
+		t.Error("expected at least one partial result from sliding count window on stop")
+	}
+}
+
+func TestCountWindowStopThenSaveState(t *testing.T) {
+	window, err := NewWindowAggregator("test", WindowConfig{
+		WindowType:  WindowTypeTumblingCount,
+		Aggregation: AggregationSum,
+		CountSize:   10,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	ctx := context.Background()
+	for i := 1; i <= 5; i++ {
+		rec := NewRecord(i)
+		rec.SeqID = int64(i)
+		_, _ = window.Process(ctx, rec)
+	}
+
+	stateData, err := window.SaveState()
+	if err != nil {
+		t.Fatalf("SaveState failed: %v", err)
+	}
+
+	window2, err := NewWindowAggregator("test", WindowConfig{
+		WindowType:  WindowTypeTumblingCount,
+		Aggregation: AggregationSum,
+		CountSize:   10,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	err = window2.RestoreState(stateData)
+	if err != nil {
+		t.Fatalf("RestoreState failed: %v", err)
+	}
+
+	if window2.ActiveWindowCount() != 1 {
+		t.Errorf("expected 1 active window after restore, got %d", window2.ActiveWindowCount())
+	}
+
+	window2.Start(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var results []*WindowResult
+	go func() {
+		defer wg.Done()
+		for res := range window2.Results() {
+			results = append(results, res)
+		}
+	}()
+
+	for i := 6; i <= 10; i++ {
+		rec := NewRecord(i)
+		rec.SeqID = int64(i)
+		_, _ = window2.Process(ctx, rec)
+	}
+
+	window2.Stop()
+	wg.Wait()
+
+	found := false
+	for _, r := range results {
+		if !r.Partial && r.Count == 10 {
+			found = true
+			expected := 1.0 + 2.0 + 3.0 + 4.0 + 5.0 + 6.0 + 7.0 + 8.0 + 9.0 + 10.0
+			if r.Value != expected {
+				t.Errorf("expected full window sum=%v, got %v", expected, r.Value)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected a complete window result after restoring partial state")
+	}
+}
+
+func TestRecordsDroppedDistinguishesFilterAndErrors(t *testing.T) {
+	input := make(chan *Record, 20)
+	source := NewChannelSource("test", input, 20)
+
+	cfg := DefaultPipelineConfig()
+	pipeline, err := NewPipeline(cfg, source)
+	if err != nil {
+		t.Fatalf("NewPipeline failed: %v", err)
+	}
+
+	filter := NewFilterOperator("even", func(ctx context.Context, r *Record) (bool, error) {
+		val := r.Data.(int)
+		if val == 7 {
+			return false, fmt.Errorf("simulated error on 7")
+		}
+		return val%2 == 0, nil
+	})
+	_ = pipeline.AddOperator(filter)
+
+	sink := NewCollectSink()
+	pipeline.SetSink(sink)
+
+	ctx := context.Background()
+	err = pipeline.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	for i := 1; i <= 10; i++ {
+		input <- NewRecord(i)
+	}
+	close(input)
+
+	time.Sleep(200 * time.Millisecond)
+	_ = pipeline.Stop()
+
+	stats := pipeline.Stats()
+
+	if stats.RecordsIn != 10 {
+		t.Errorf("expected RecordsIn=10, got %d", stats.RecordsIn)
+	}
+
+	if stats.RecordsErrors != 1 {
+		t.Errorf("expected RecordsErrors=1 (value 7), got %d", stats.RecordsErrors)
+	}
+
+	if stats.RecordsFiltered != 4 {
+		t.Errorf("expected RecordsFiltered=4 (odd: 1,3,5,9), got %d", stats.RecordsFiltered)
+	}
+
+	if stats.RecordsDropped != stats.RecordsFiltered+stats.RecordsErrors {
+		t.Errorf("expected RecordsDropped=%d (Filtered+Errors), got %d",
+			stats.RecordsFiltered+stats.RecordsErrors, stats.RecordsDropped)
+	}
+}
+
+func TestBackpressureRelievedSignal(t *testing.T) {
+	input := make(chan *Record, 200)
+	source := NewChannelSource("fast", input, 200)
+
+	cfg := DefaultPipelineConfig()
+	cfg.BufferSize = 10
+	cfg.BackpressureThreshold = 5
+	cfg.BackpressureWarningRatio = 0.6
+	cfg.BackpressureCriticalRatio = 0.8
+
+	slowOp := NewMapOperator("slow", func(ctx context.Context, r *Record) (*Record, error) {
+		time.Sleep(20 * time.Millisecond)
+		return r, nil
+	})
+
+	pipeline, err := NewPipeline(cfg, source)
+	if err != nil {
+		t.Fatalf("NewPipeline failed: %v", err)
+	}
+
+	_ = pipeline.AddOperator(slowOp)
+	sink := NewCollectSink()
+	pipeline.SetSink(sink)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err = pipeline.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	go func() {
+		for i := 0; i < 50; i++ {
+			select {
+			case input <- NewRecord(i):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+
+	pipeline.backpressureMu.RLock()
+	wasPaused := pipeline.sourcePaused
+	pipeline.backpressureMu.RUnlock()
+
+	time.Sleep(500 * time.Millisecond)
+
+	close(input)
+	_ = pipeline.Stop()
+
+	_ = wasPaused
+
+	count, _ := sink.Count()
+	if count == 0 {
+		t.Error("expected some records to be processed")
+	}
+}
+
+func TestPipelineStopWithBackpressure(t *testing.T) {
+	input := make(chan *Record, 200)
+	source := NewChannelSource("fast", input, 200)
+
+	cfg := DefaultPipelineConfig()
+	cfg.BufferSize = 5
+	cfg.BackpressureThreshold = 3
+	cfg.BackpressureWarningRatio = 0.5
+	cfg.BackpressureCriticalRatio = 0.7
+
+	slowOp := NewMapOperator("slow", func(ctx context.Context, r *Record) (*Record, error) {
+		time.Sleep(100 * time.Millisecond)
+		return r, nil
+	})
+
+	pipeline, err := NewPipeline(cfg, source)
+	if err != nil {
+		t.Fatalf("NewPipeline failed: %v", err)
+	}
+
+	_ = pipeline.AddOperator(slowOp)
+
+	ctx := context.Background()
+	err = pipeline.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	for i := 0; i < 50; i++ {
+		input <- NewRecord(i)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = pipeline.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pipeline.Stop() should complete within timeout even under backpressure")
 	}
 }

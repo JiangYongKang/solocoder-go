@@ -1,0 +1,7 @@
+你实现的审计日志系统模块存在一些生命周期管理和并发安全问题，需要修复：
+1. LogSync 方法只检查了 stopped 状态而缺少 started 状态检查，与 Log 方法不一致。Log 同时校验 started 和 stopped，LogSync 仅校验 stopped，调用方在 Logger 创建后但未 Start 时通过 LogSync 仍能写入审计日志，绕过了生命周期管控。
+2. Log 方法与 Stop 方法之间存在向 buffer channel 写入的竞态条件。Log 释放锁后向 channel 发送数据的时间窗口内，Stop 可能已完成 close(l.buffer) 操作，导致向已关闭 channel 发送数据时触发 send on closed channel panic，造成进程崩溃。
+3. Log 方法在 buffer 满时通过 go l.persistWithRetry(log) 启动的降级 goroutine 没有纳入 WaitGroup 追踪。Stop 的 wg.Wait 只等待 worker goroutine 退出，降级 goroutine 可能仍在执行重试，若 Stop 返回后进程立即退出则审计日志会丢失。
+4. VerifyIntegrity 方法只校验 Logger 内部内存日志切片的哈希链完整性，没有对比 Writer 持久化数据是否一致。如果 Writer 实现存在数据损坏或静默修改，当前校验逻辑无法检测持久化层的篡改。
+5. 修复后需要为上述每个问题补充对应的单元测试，特别是并发竞态场景和降级 goroutine 生命周期追踪。
+6. 运行 go test ./internal/auditlog/ -v，需要让所有测试通过。

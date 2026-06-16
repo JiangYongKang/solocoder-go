@@ -198,12 +198,62 @@ func (w *WindowAggregator) Stop() {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	if w.windowType == WindowTypeTumblingTime || w.windowType == WindowTypeSlidingTime {
 		for _, id := range w.bucketOrder {
-			w.closeBucketLocked(id)
+			b := w.buckets[id]
+			if b != nil && b.Count > 0 {
+				w.closeBucketLocked(id)
+			}
+		}
+	} else {
+		for _, id := range w.bucketOrder {
+			b := w.buckets[id]
+			if b != nil && b.Count > 0 {
+				w.emitPartialResultLocked(b)
+			}
 		}
 	}
 	close(w.results)
+}
+
+func (w *WindowAggregator) emitPartialResultLocked(b *windowBucket) {
+	result := &WindowResult{
+		WindowID:    b.ID,
+		WindowType:  w.windowType,
+		Start:       b.Start,
+		End:         b.End,
+		StartSeq:    b.StartSeq,
+		EndSeq:      b.EndSeq,
+		Aggregation: w.aggregation,
+		Count:       b.Count,
+		RecordIDs:   b.RecordIDs,
+		Partial:     true,
+	}
+
+	switch w.aggregation {
+	case AggregationSum:
+		result.Value = b.Sum
+	case AggregationCount:
+		result.Value = float64(b.Count)
+	case AggregationAvg:
+		if b.Count > 0 {
+			result.Value = b.Sum / float64(b.Count)
+		}
+	case AggregationMin:
+		if b.Count > 0 {
+			result.Value = b.Min
+		}
+	case AggregationMax:
+		if b.Count > 0 {
+			result.Value = b.Max
+		}
+	}
+
+	select {
+	case w.results <- result:
+	default:
+	}
 }
 
 func (w *WindowAggregator) getTimeBucketID(t time.Time) string {

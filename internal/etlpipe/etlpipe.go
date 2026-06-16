@@ -1095,20 +1095,17 @@ func (s *MemorySource) Fetch(_ context.Context, cursor *Cursor, batchSize int) (
 		return nil, s.fetchError
 	}
 
-	offset := int(cursor.LastOffset)
-	if offset > s.currentOffset {
-		s.currentOffset = offset
-	}
-	if s.currentOffset >= len(s.records) {
+	startIdx := s.findStartIndex(cursor)
+	if startIdx >= len(s.records) {
 		return &Batch{Records: []*Record{}}, nil
 	}
 
-	end := s.currentOffset + batchSize
-	if end > len(s.records) {
-		end = len(s.records)
+	endIdx := startIdx + batchSize
+	if endIdx > len(s.records) {
+		endIdx = len(s.records)
 	}
 
-	records := s.records[s.currentOffset:end]
+	records := s.records[startIdx:endIdx]
 	batchRecords := make([]*Record, len(records))
 	for i, r := range records {
 		data := make(map[string]interface{}, len(r.Data))
@@ -1131,8 +1128,56 @@ func (s *MemorySource) Fetch(_ context.Context, cursor *Cursor, batchSize int) (
 		EndTs:    records[len(records)-1].Timestamp,
 	}
 
-	s.currentOffset = end
+	s.currentOffset = endIdx
 	return batch, nil
+}
+
+func (s *MemorySource) findStartIndex(cursor *Cursor) int {
+	if cursor == nil {
+		return s.currentOffset
+	}
+
+	switch cursor.Mode {
+	case ExtractModeFull:
+		offset := int(cursor.LastOffset)
+		if offset > s.currentOffset {
+			s.currentOffset = offset
+		}
+		return s.currentOffset
+
+	case ExtractModeID:
+		if cursor.LastValue == nil {
+			return s.currentOffset
+		}
+		lastID, ok := cursor.LastValue.(int64)
+		if !ok {
+			return s.currentOffset
+		}
+		for i := s.currentOffset; i < len(s.records); i++ {
+			if s.records[i].SeqID > lastID {
+				return i
+			}
+		}
+		return len(s.records)
+
+	case ExtractModeTimestamp:
+		if cursor.LastValue == nil {
+			return s.currentOffset
+		}
+		lastTs, ok := cursor.LastValue.(time.Time)
+		if !ok {
+			return s.currentOffset
+		}
+		for i := s.currentOffset; i < len(s.records); i++ {
+			if s.records[i].Timestamp.After(lastTs) {
+				return i
+			}
+		}
+		return len(s.records)
+
+	default:
+		return s.currentOffset
+	}
 }
 
 func (s *MemorySource) Count(_ context.Context, _ *Cursor) (int64, error) {
@@ -1156,10 +1201,11 @@ func NewMemorySourceFactory() SourceFactory {
 	return func(config map[string]interface{}) (Source, error) {
 		records, _ := config["records"].([]*Record)
 		source := NewMemorySource(records)
-		if tf, ok := config["timestamp_field"].(string); ok {
-			if idf, ok2 := config["id_field"].(string); ok2 {
-				source.SetIncrementalFields(tf, idf)
-			}
+
+		timestampField, _ := config["timestamp_field"].(string)
+		idField, _ := config["id_field"].(string)
+		if timestampField != "" || idField != "" {
+			source.SetIncrementalFields(timestampField, idField)
 		}
 		return source, nil
 	}

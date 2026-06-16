@@ -30,7 +30,7 @@ type CertRotator struct {
 	loader  CertificateLoader
 
 	connections map[string]map[*trackedConn]struct{}
-	connMu      sync.Mutex
+	connMu      sync.RWMutex
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -47,7 +47,7 @@ func New(issuer CertificateIssuer, loader CertificateLoader, config *Config) (*C
 		return nil, ErrIssuerNil
 	}
 	if loader == nil {
-		return nil, ErrLoadCertificateFailed
+		return nil, ErrLoaderNil
 	}
 	if config == nil {
 		config = DefaultConfig()
@@ -155,21 +155,25 @@ func (cr *CertRotator) VerifyCertificateChain(tlsCert *tls.Certificate) error {
 		}
 	}
 
-	intermediates := x509.NewCertPool()
+	var chainIntermediates []*x509.Certificate
 	for i := 1; i < len(tlsCert.Certificate); i++ {
 		intermediate, err := x509.ParseCertificate(tlsCert.Certificate[i])
 		if err != nil {
 			return fmt.Errorf("parse intermediate certificate %d failed: %w", i, err)
 		}
-		intermediates.AddCert(intermediate)
+		chainIntermediates = append(chainIntermediates, intermediate)
 	}
 
+	var intermediates *x509.CertPool
 	if cr.config.IntermediateCAs != nil {
-		for _, cert := range cr.config.IntermediateCAs.Subjects() {
-			if cert != nil {
-				// We can't easily add from subjects, so we assume the intermediates are already in the pool
-				_ = cert
-			}
+		intermediates = cr.config.IntermediateCAs
+		for _, cert := range chainIntermediates {
+			intermediates.AddCert(cert)
+		}
+	} else {
+		intermediates = x509.NewCertPool()
+		for _, cert := range chainIntermediates {
+			intermediates.AddCert(cert)
 		}
 	}
 
@@ -181,16 +185,12 @@ func (cr *CertRotator) VerifyCertificateChain(tlsCert *tls.Certificate) error {
 		return fmt.Errorf("%w: leaf certificate not valid until %v", ErrCertNotYetValid, leaf.NotBefore)
 	}
 
-	for i := 1; i < len(tlsCert.Certificate); i++ {
-		intermediate, err := x509.ParseCertificate(tlsCert.Certificate[i])
-		if err != nil {
-			return fmt.Errorf("parse intermediate certificate %d failed: %w", i, err)
-		}
+	for i, intermediate := range chainIntermediates {
 		if now.After(intermediate.NotAfter) {
-			return fmt.Errorf("%w: intermediate certificate %d expired at %v", ErrCertExpired, i, intermediate.NotAfter)
+			return fmt.Errorf("%w: intermediate certificate %d expired at %v", ErrCertExpired, i+1, intermediate.NotAfter)
 		}
 		if now.Before(intermediate.NotBefore) {
-			return fmt.Errorf("%w: intermediate certificate %d not valid until %v", ErrCertNotYetValid, i, intermediate.NotBefore)
+			return fmt.Errorf("%w: intermediate certificate %d not valid until %v", ErrCertNotYetValid, i+1, intermediate.NotBefore)
 		}
 	}
 
@@ -272,6 +272,10 @@ func (cr *CertRotator) checkAndRenew() {
 			cr.emitEvent("RENEWAL_FAILED", active.ID, fmt.Sprintf("Renewal failed: %v", err))
 			return
 		}
+
+		if err := cr.switchToPendingCert(); err != nil {
+			cr.emitEvent("SWITCH_FAILED", active.ID, fmt.Sprintf("Switch to pending cert failed: %v", err))
+		}
 	}
 }
 
@@ -295,10 +299,6 @@ func (cr *CertRotator) renewCertificate() error {
 	cr.certMu.Unlock()
 
 	cr.emitEvent("CERT_PENDING", certInfo.ID, "New certificate issued and validated, pending activation")
-
-	if err := cr.switchToPendingCert(); err != nil {
-		return fmt.Errorf("switch to pending certificate failed: %w", err)
-	}
 
 	return nil
 }
@@ -437,8 +437,8 @@ func (cr *CertRotator) TrackConnection(certID string, conn interface{}, closeFn 
 }
 
 func (cr *CertRotator) ActiveConnections(certID string) int {
-	cr.connMu.Lock()
-	defer cr.connMu.Unlock()
+	cr.connMu.RLock()
+	defer cr.connMu.RUnlock()
 	if conns, exists := cr.connections[certID]; exists {
 		return len(conns)
 	}

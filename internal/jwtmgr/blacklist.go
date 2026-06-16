@@ -63,7 +63,7 @@ func (b *MemoryBlacklist) Add(tokenID string, ttl time.Duration) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
-		return nil
+		return ErrBlacklistClosed
 	}
 	expiresAt := time.Now().Add(ttl)
 	b.items[tokenID] = expiresAt
@@ -72,7 +72,7 @@ func (b *MemoryBlacklist) Add(tokenID string, ttl time.Duration) error {
 
 func (b *MemoryBlacklist) Contains(tokenID string) (bool, error) {
 	if tokenID == "" {
-		return false, nil
+		return false, ErrInvalidToken
 	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()

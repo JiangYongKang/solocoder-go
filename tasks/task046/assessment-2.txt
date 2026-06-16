@@ -1,0 +1,6 @@
+产物不满意：
+1. certrotator_test.go 的 TestForceRenew_PendingStatePersists 测试中用 `time.Sleep(2 * time.Millisecond)` 来规避两次证书生成产生的 SerialNumber 碰撞问题。根因是 generateTestCertificate 辅助函数使用 `big.NewInt(time.Now().UnixNano())` 生成序列号，在同一纳秒内连续调用两次会生成相同序列号导致 pending cert 的比较逻辑失败。模型第一次运行测试时报错后选择加 2ms 等待来绕过问题，而不是修复序列号生成策略。正确做法是在辅助函数中使用独立的计数器或显式传入序列号来确保每次生成的证书序列号不同，这样可以消除对环境计时的依赖，避免在慢速或虚拟化环境下测试仍然不稳定的风险。
+2. certrotator_test.go 的 TestActiveConnections_ConcurrentRead 测试虽然启动了 100 个并发协程调用 ActiveConnections 方法，但测试只验证了最终连接计数一致且未 panic，完全没有验证 RWMutex 确实提供了读并行能力。该测试即使换回普通的 sync.Mutex 也能通过，并未真正覆盖提示词第 4 条要求的高并发下只读查询不被串行化的性能语义。正确的验证方式应该在并发读期间同时进行写操作如 TrackConnection，通过测量耗时或使用 race detector 来证明读锁之间互不阻塞，从而确证 RWMutex 的使用是有效且有意义的。
+过程不满意：
+1. 模型在收到提示词后的第 3 到第 29 步仅阅读了 certrotator.go，types.go，errors.go 三个源文件，第 31 步就直接用 todo_write 创建了 7 项子任务计划，此时尚未阅读测试文件 certrotator_test.go 也尚未理解各修复之间的交互关系。这导致后续在第 421 步首次运行测试时 3 个原有测试失败，模型才意识到 ForceRenew 解耦后现有测试需要增加 ForceSwitch 调用。正确做法是先完整阅读所有源代码和测试文件，充分理解每项修复对现有测试的影响范围，将测试适配作为计划的一部分提前纳入，而不是在修复生产代码后才被动调整测试。
+2. 模型在阅读 certrotator_test.go 时采用了零散的分段读取方式，第 220 步读取文件开头 242 行，第 237 步继续读取后续内容，第 255 步用 search_by_regex 搜索 TestNewWithNil，第 274 步搜索 TestForceRenew，第 297 步又回到 view_files 读取 test 文件，整个过程累计 3 次 view_files 和 3 次 search_by_regex 调用。这种读一段搜一段的模式效率较低，尤其是在同一个测试文件上反复横跳。正确做法是在修改代码前一次性完整阅读测试文件，用 Read 工具获取全部内容建立全局认识，再根据理解定位需要修改的具体函数，避免在查看和搜索之间来回切换。

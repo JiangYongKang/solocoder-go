@@ -1008,3 +1008,292 @@ func TestEngineFullWorkflow(t *testing.T) {
 		t.Error("HTML tags should be encoded for final HTML output")
 	}
 }
+
+// ==================== Regression Tests for Bug Fixes ====================
+
+func TestEncodeCSSAngleBracketsSingleBackslash(t *testing.T) {
+	e := NewOutputEncoder()
+	input := "<test>&"
+	result := e.EncodeCSS(input)
+
+	if strings.Contains(result, `\\3C`) {
+		t.Errorf("< should use single backslash, got double backslash: %s", result)
+	}
+	if strings.Contains(result, `\\3E`) {
+		t.Errorf("> should use single backslash, got double backslash: %s", result)
+	}
+	if strings.Contains(result, `\\26`) {
+		t.Errorf("& should use single backslash, got double backslash: %s", result)
+	}
+
+	if !strings.Contains(result, `\3C`) {
+		t.Errorf("< should be encoded as \\3C, got: %s", result)
+	}
+	if !strings.Contains(result, `\3E`) {
+		t.Errorf("> should be encoded as \\3E, got: %s", result)
+	}
+	if !strings.Contains(result, `\26`) {
+		t.Errorf("& should be encoded as \\26, got: %s", result)
+	}
+}
+
+func TestEncodeCSSConsistentBackslash(t *testing.T) {
+	e := NewOutputEncoder()
+	input := "\n<>"
+	result := e.EncodeCSS(input)
+
+	if strings.Count(result, `\A`) != strings.Count(result, `\3C`) {
+		t.Errorf("newline and < should use same backslash style, got: %s", result)
+	}
+	if strings.Count(result, `\A`) != strings.Count(result, `\3E`) {
+		t.Errorf("newline and > should use same backslash style, got: %s", result)
+	}
+}
+
+func TestSanitizeSelfClosingTagNoSpace(t *testing.T) {
+	s := NewHTMLSanitizer()
+
+	tests := []string{"<br/>", "<br />", "<hr/>", "<hr />", "<img/>", "<img />"}
+	for _, input := range tests {
+		result := s.Sanitize(input)
+		if result == "" {
+			t.Errorf("self-closing tag %q should not be discarded, got empty string", input)
+		}
+		if !strings.Contains(result, "br") && !strings.Contains(result, "hr") && !strings.Contains(result, "img") {
+			t.Errorf("self-closing tag %q should preserve tag name, got: %s", input, result)
+		}
+	}
+}
+
+func TestSanitizeBrTagPreservesNewlineSemantic(t *testing.T) {
+	s := NewHTMLSanitizer()
+	input := "line1<br/>line2<br />line3"
+	result := s.Sanitize(input)
+
+	if !strings.Contains(result, "line1") || !strings.Contains(result, "line2") || !strings.Contains(result, "line3") {
+		t.Errorf("text content should be preserved, got: %s", result)
+	}
+	if strings.Count(result, "<br") != 2 {
+		t.Errorf("both <br/> and <br /> should be preserved, got: %s", result)
+	}
+	if strings.Contains(result, "br/") {
+		t.Errorf("tag name should not include trailing slash, got: %s", result)
+	}
+}
+
+func TestSanitizeSelfClosingTagWithAttributes(t *testing.T) {
+	s := NewHTMLSanitizer()
+	input := `<img src="test.jpg" alt="test"/>`
+	result := s.Sanitize(input)
+
+	if !strings.Contains(result, `<img`) {
+		t.Errorf("img tag should be preserved, got: %s", result)
+	}
+	if !strings.Contains(result, `src="test.jpg"`) {
+		t.Errorf("src attribute should be preserved, got: %s", result)
+	}
+	if !strings.Contains(result, `alt="test"`) {
+		t.Errorf("alt attribute should be preserved, got: %s", result)
+	}
+	if strings.Contains(result, "img/") {
+		t.Errorf("tag name should not include trailing slash, got: %s", result)
+	}
+}
+
+func TestDataMaskerConsistentOrder(t *testing.T) {
+	m := NewDataMasker()
+
+	idCard := "110101199003076578"
+	inputs := []string{
+		"身份证: " + idCard,
+		"ID: " + idCard + " 电话: 13812345678",
+		"多个证件: " + idCard + " 和 110101199003071234",
+	}
+
+	for i := 0; i < 10; i++ {
+		first := m.Mask(inputs[0])
+		for _, input := range inputs {
+			result := m.Mask(input)
+			if result != m.Mask(input) {
+				t.Errorf("masking should be deterministic, got different results on iteration %d", i)
+			}
+		}
+		_ = first
+	}
+}
+
+func TestDataMaskerIdCardNotTreatedAsBankCard(t *testing.T) {
+	m := NewDataMasker()
+
+	idCard := "110101199003076578"
+	result := m.Mask(idCard)
+
+	if strings.Contains(result, "**** ****") {
+		t.Errorf("ID card should use ID mask format (********), not bank card format (**** ****), got: %s", result)
+	}
+	if !strings.Contains(result, "********") {
+		t.Errorf("ID card should be masked with 8 asterisks in middle, got: %s", result)
+	}
+	if !strings.HasPrefix(result, "110101") {
+		t.Errorf("ID card should keep first 6 digits, got: %s", result)
+	}
+	if !strings.HasSuffix(result, "6578") {
+		t.Errorf("ID card should keep last 4 digits, got: %s", result)
+	}
+}
+
+func TestSanitizeHrefJavaScriptProtocolBlocked(t *testing.T) {
+	s := NewHTMLSanitizer()
+
+	tests := []struct {
+		input    string
+		contains string
+		excludes string
+	}{
+		{`<a href="javascript:alert(1)">click</a>`, "<a>", "javascript"},
+		{`<a href='javascript:alert(1)'>click</a>`, "<a>", "javascript"},
+		{`<a href="  javascript:alert(1)">click</a>`, "<a>", "javascript"},
+		{`<a href="JAVASCRIPT:alert(1)">click</a>`, "<a>", "javascript"},
+		{`<a href="vbscript:msgbox(1)">click</a>`, "<a>", "vbscript"},
+		{`<a href="data:text/html,alert(1)">click</a>`, "<a>", "data:text/html"},
+	}
+
+	for _, tt := range tests {
+		result := s.Sanitize(tt.input)
+		if tt.contains != "" && !strings.Contains(result, tt.contains) {
+			t.Errorf("input %q: expected %q in result, got: %s", tt.input, tt.contains, result)
+		}
+		if tt.excludes != "" && strings.Contains(strings.ToLower(result), tt.excludes) {
+			t.Errorf("input %q: expected no %q in result, got: %s", tt.input, tt.excludes, result)
+		}
+	}
+}
+
+func TestSanitizeHrefSafeProtocolsAllowed(t *testing.T) {
+	s := NewHTMLSanitizer()
+
+	tests := []struct {
+		input    string
+		contains string
+	}{
+		{`<a href="http://example.com">link</a>`, `href="http://example.com"`},
+		{`<a href="https://example.com">link</a>`, `href="https://example.com"`},
+		{`<a href="mailto:user@example.com">email</a>`, `href="mailto:user@example.com"`},
+		{`<a href="tel:13812345678">call</a>`, `href="tel:13812345678"`},
+		{`<a href="/path/to/page">link</a>`, `href="/path/to/page"`},
+		{`<a href="./relative/path">link</a>`, `href="./relative/path"`},
+		{`<a href="../parent/path">link</a>`, `href="../parent/path"`},
+		{`<a href="#section">anchor</a>`, `href="#section"`},
+		{`<img src="https://example.com/image.jpg" alt="test">`, `src="https://example.com/image.jpg"`},
+	}
+
+	for _, tt := range tests {
+		result := s.Sanitize(tt.input)
+		if !strings.Contains(result, tt.contains) {
+			t.Errorf("input %q: expected %q in result, got: %s", tt.input, tt.contains, result)
+		}
+	}
+}
+
+func TestSanitizeSrcJavaScriptBlocked(t *testing.T) {
+	s := NewHTMLSanitizer()
+
+	input := `<img src="javascript:alert(1)" alt="test">`
+	result := s.Sanitize(input)
+
+	if strings.Contains(result, "javascript") {
+		t.Errorf("javascript protocol in src should be blocked, got: %s", result)
+	}
+	if strings.Contains(result, "src=") {
+		t.Errorf("src attribute with javascript should be removed, got: %s", result)
+	}
+	if !strings.Contains(result, `<img`) {
+		t.Errorf("img tag should be preserved even if src is removed, got: %s", result)
+	}
+}
+
+func TestEncodeJavaScriptForwardSlashNotEscaped(t *testing.T) {
+	e := NewOutputEncoder()
+
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"/", "/"},
+		{"http://example.com/path", "http://example.com/path"},
+		{"https://example.com/path/to/page", "https://example.com/path/to/page"},
+		{`/^test$/`, `/^test$/`},
+		{`/\d+/g`, `/\\d+/g`},
+		{"a/b/c", "a/b/c"},
+	}
+
+	for _, tt := range tests {
+		result := e.EncodeJavaScript(tt.input)
+		if strings.Contains(result, `\/`) {
+			t.Errorf("input %q: forward slash should not be escaped, got: %s", tt.input, result)
+		}
+		if result != tt.expected {
+			t.Errorf("input %q: expected %q, got %q", tt.input, tt.expected, result)
+		}
+	}
+}
+
+func TestEncodeJavaScriptPreservesRegexAndUrls(t *testing.T) {
+	e := NewOutputEncoder()
+
+	url := "https://api.example.com/v1/users/123"
+	result := e.EncodeJavaScript(url)
+
+	if strings.Contains(result, `\/`) {
+		t.Errorf("URL should not have escaped slashes, got: %s", result)
+	}
+	if result != url {
+		t.Errorf("URL should be preserved exactly, expected %q, got %q", url, result)
+	}
+
+	regex := `/^[a-z0-9]+@[a-z0-9]+\.[a-z]+$/i`
+	expectedRegex := `/^[a-z0-9]+@[a-z0-9]+\\.[a-z]+$/i`
+	result2 := e.EncodeJavaScript(regex)
+	if strings.Contains(result2, `\/`) {
+		t.Errorf("regex should not have escaped slashes, got: %s", result2)
+	}
+	if result2 != expectedRegex {
+		t.Errorf("regex backslashes should be escaped, expected %q, got %q", expectedRegex, result2)
+	}
+}
+
+func TestEncodeJavaScriptStillEscapesQuotesAndBackslashes(t *testing.T) {
+	e := NewOutputEncoder()
+
+	input := `test"quote'and\backslash`
+	result := e.EncodeJavaScript(input)
+
+	if !strings.Contains(result, `\"`) {
+		t.Errorf("double quote should still be escaped, got: %s", result)
+	}
+	if !strings.Contains(result, `\'`) {
+		t.Errorf("single quote should still be escaped, got: %s", result)
+	}
+	if !strings.Contains(result, `\\`) {
+		t.Errorf("backslash should still be escaped, got: %s", result)
+	}
+}
+
+func TestEncodeCSSControlCharsSingleBackslash(t *testing.T) {
+	e := NewOutputEncoder()
+	input := "\x00\x7f"
+	result := e.EncodeCSS(input)
+
+	if strings.Contains(result, `\\0`) {
+		t.Errorf("null char should use single backslash, got double backslash: %s", result)
+	}
+	if strings.Contains(result, `\\7F`) {
+		t.Errorf("DEL char should use single backslash, got double backslash: %s", result)
+	}
+	if !strings.Contains(result, `\0`) {
+		t.Errorf("null char should be encoded as \\0, got: %s", result)
+	}
+	if !strings.Contains(result, `\7F`) {
+		t.Errorf("DEL char should be encoded as \\7F, got: %s", result)
+	}
+}

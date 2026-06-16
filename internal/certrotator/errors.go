@@ -17,6 +17,7 @@ var (
 	ErrInvalidConfig             = fmt.Errorf("invalid configuration")
 	ErrRotatorClosed             = fmt.Errorf("certificate rotator is closed")
 	ErrIssuerNil                 = fmt.Errorf("certificate issuer is nil")
+	ErrLoaderNil                 = fmt.Errorf("certificate loader is nil")
 	ErrLoadCertificateFailed     = fmt.Errorf("failed to load certificate")
 	ErrRetirementTimeout         = fmt.Errorf("old certificate retirement timed out")
 )

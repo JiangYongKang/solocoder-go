@@ -649,11 +649,11 @@ func TestBlacklist(t *testing.T) {
 		defer bl.Close()
 
 		exists, err := bl.Contains("")
-		if err != nil {
-			t.Fatalf("Contains failed: %v", err)
+		if !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("expected ErrInvalidToken, got %v", err)
 		}
 		if exists {
-			t.Error("expected empty token id to not exist")
+			t.Error("expected false for empty token id")
 		}
 	})
 
@@ -719,8 +719,8 @@ func TestBlacklist(t *testing.T) {
 		}
 
 		err = bl.Add("token1", time.Hour)
-		if err != nil {
-			t.Errorf("expected no error adding to closed blacklist, got %v", err)
+		if !errors.Is(err, ErrBlacklistClosed) {
+			t.Errorf("expected ErrBlacklistClosed after Close, got %v", err)
 		}
 	})
 
@@ -733,6 +733,80 @@ func TestBlacklist(t *testing.T) {
 		err = bl.Close()
 		if err != nil {
 			t.Fatalf("second Close failed: %v", err)
+		}
+	})
+
+	t.Run("Add and Contains consistency for empty tokenID", func(t *testing.T) {
+		bl := NewMemoryBlacklist(0)
+		defer bl.Close()
+
+		addErr := bl.Add("", time.Hour)
+		containsExists, containsErr := bl.Contains("")
+
+		if !errors.Is(addErr, ErrInvalidToken) {
+			t.Errorf("Add('') expected ErrInvalidToken, got %v", addErr)
+		}
+		if !errors.Is(containsErr, ErrInvalidToken) {
+			t.Errorf("Contains('') expected ErrInvalidToken, got %v", containsErr)
+		}
+		if addErr == nil && containsErr != nil {
+			t.Error("Add returned nil but Contains returned error for same empty input")
+		}
+		if addErr != nil && containsErr == nil {
+			t.Error("Add returned error but Contains returned nil for same empty input")
+		}
+		if containsExists {
+			t.Error("Contains('') should return false")
+		}
+	})
+
+	t.Run("Close then Add rejects with ErrBlacklistClosed", func(t *testing.T) {
+		bl := NewMemoryBlacklist(0)
+		bl.Close()
+
+		err := bl.Add("token1", time.Hour)
+		if !errors.Is(err, ErrBlacklistClosed) {
+			t.Errorf("expected ErrBlacklistClosed, got %v", err)
+		}
+
+		exists, err := bl.Contains("token1")
+		if err != nil {
+			t.Errorf("Contains should not error after Close, got %v", err)
+		}
+		if exists {
+			t.Error("token added after Close should not be found")
+		}
+	})
+
+	t.Run("Close then Add does not store data", func(t *testing.T) {
+		bl := NewMemoryBlacklist(0)
+
+		bl.Add("before-close", time.Hour)
+		bl.Close()
+
+		err := bl.Add("after-close", time.Hour)
+		if !errors.Is(err, ErrBlacklistClosed) {
+			t.Errorf("expected ErrBlacklistClosed, got %v", err)
+		}
+
+		exists, _ := bl.Contains("after-close")
+		if exists {
+			t.Error("token added after Close should not be stored")
+		}
+
+		exists, _ = bl.Contains("before-close")
+		if !exists {
+			t.Error("token added before Close should still exist")
+		}
+	})
+
+	t.Run("Remove empty token id", func(t *testing.T) {
+		bl := NewMemoryBlacklist(0)
+		defer bl.Close()
+
+		err := bl.Remove("")
+		if err != nil {
+			t.Errorf("Remove('') should not error, got %v", err)
 		}
 	})
 }

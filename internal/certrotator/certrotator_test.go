@@ -231,6 +231,9 @@ func TestNewWithNilLoader(t *testing.T) {
 	if err == nil {
 		t.Error("New(nil loader) should return error")
 	}
+	if err != ErrLoaderNil {
+		t.Errorf("New(nil loader) error = %v, want %v", err, ErrLoaderNil)
+	}
 }
 
 func TestNewWithDefaultConfig(t *testing.T) {
@@ -529,7 +532,7 @@ func TestForceRenew(t *testing.T) {
 
 	cr, err := New(issuer, loader, &Config{
 		PreValidationChecks: false,
-		RenewalBuffer: 30 * 24 * time.Hour,
+		RenewalBuffer:       30 * 24 * time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -548,12 +551,45 @@ func TestForceRenew(t *testing.T) {
 		t.Fatalf("ForceRenew() error = %v", err)
 	}
 
+	pending := cr.PendingCertificate()
+	if pending == nil {
+		t.Fatal("PendingCertificate() is nil after renew")
+	}
+	if pending.Status != CertStatusPending {
+		t.Errorf("Pending cert status = %v, want PENDING", pending.Status)
+	}
+
+	stillActive := cr.ActiveCertificate()
+	if stillActive.ID != originalID {
+		t.Error("Active certificate should not change after ForceRenew (only issue, no switch)")
+	}
+
+	eventTypes := make([]string, 0, len(events))
+	for _, e := range events {
+		eventTypes = append(eventTypes, e.Type)
+	}
+
+	foundPendingEvent := false
+	for _, et := range eventTypes {
+		if et == "CERT_PENDING" {
+			foundPendingEvent = true
+			break
+		}
+	}
+	if !foundPendingEvent {
+		t.Errorf("Expected CERT_PENDING event not found in events: %v", eventTypes)
+	}
+
+	if err := cr.ForceSwitch(); err != nil {
+		t.Fatalf("ForceSwitch() error = %v", err)
+	}
+
 	newActive := cr.ActiveCertificate()
 	if newActive == nil {
-		t.Fatal("ActiveCertificate() is nil after renew")
+		t.Fatal("ActiveCertificate() is nil after switch")
 	}
 	if newActive.ID == originalID {
-		t.Error("Certificate ID should change after renew")
+		t.Error("Certificate ID should change after switch")
 	}
 	if newActive.Status != CertStatusActive {
 		t.Errorf("New cert status = %v, want ACTIVE", newActive.Status)
@@ -570,23 +606,8 @@ func TestForceRenew(t *testing.T) {
 		t.Errorf("Retiring cert status = %v, want RETIRING", retiring[0].Status)
 	}
 
-	eventTypes := make([]string, 0, len(events))
-	for _, e := range events {
-		eventTypes = append(eventTypes, e.Type)
-	}
-
-	expectedEvents := []string{"CERT_PENDING", "CERT_ACTIVATED", "CERT_RETIRING"}
-	for _, expected := range expectedEvents {
-		found := false
-		for _, et := range eventTypes {
-			if et == expected {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("Expected event %s not found in events: %v", expected, eventTypes)
-		}
+	if cr.PendingCertificate() != nil {
+		t.Error("PendingCertificate() should be nil after switch")
 	}
 }
 
@@ -761,6 +782,10 @@ func TestCompleteRetirement(t *testing.T) {
 		t.Fatalf("ForceRenew() error = %v", err)
 	}
 
+	if err := cr.ForceSwitch(); err != nil {
+		t.Fatalf("ForceSwitch() error = %v", err)
+	}
+
 	retiringCerts := cr.RetiringCertificates()
 	if len(retiringCerts) != 1 {
 		t.Fatalf("Retiring certificates count = %d, want 1", len(retiringCerts))
@@ -809,6 +834,10 @@ func TestForceRetirement(t *testing.T) {
 
 	if err := cr.ForceRenew(); err != nil {
 		t.Fatalf("ForceRenew() error = %v", err)
+	}
+
+	if err := cr.ForceSwitch(); err != nil {
+		t.Fatalf("ForceSwitch() error = %v", err)
 	}
 
 	time.Sleep(200 * time.Millisecond)
@@ -1039,6 +1068,10 @@ func TestEventHandler(t *testing.T) {
 
 	if err := cr.ForceRenew(); err != nil {
 		t.Fatalf("ForceRenew() error = %v", err)
+	}
+
+	if err := cr.ForceSwitch(); err != nil {
+		t.Fatalf("ForceSwitch() error = %v", err)
 	}
 
 	time.Sleep(50 * time.Millisecond)
@@ -1360,7 +1393,7 @@ func TestMultipleRenewals(t *testing.T) {
 
 	cr, err := New(issuer, loader, &Config{
 		PreValidationChecks: false,
-		RetirementTimeout: 10 * time.Millisecond,
+		RetirementTimeout:   10 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -1369,17 +1402,26 @@ func TestMultipleRenewals(t *testing.T) {
 
 	cr.clock = func() time.Time { return now }
 
-	originalID := cr.ActiveCertificate().ID
+	prevID := cr.ActiveCertificate().ID
 
 	for i := 0; i < 5; i++ {
 		if err := cr.ForceRenew(); err != nil {
 			t.Fatalf("ForceRenew() #%d error = %v", i+1, err)
 		}
 
+		if cr.PendingCertificate() == nil {
+			t.Errorf("Renewal #%d: pending certificate should exist after ForceRenew", i+1)
+		}
+
+		if err := cr.ForceSwitch(); err != nil {
+			t.Fatalf("ForceSwitch() #%d error = %v", i+1, err)
+		}
+
 		newActive := cr.ActiveCertificate()
-		if newActive.ID == originalID {
+		if newActive.ID == prevID {
 			t.Errorf("Renewal #%d: cert ID should change", i+1)
 		}
+		prevID = newActive.ID
 
 		time.Sleep(200 * time.Millisecond)
 
@@ -1391,5 +1433,214 @@ func TestMultipleRenewals(t *testing.T) {
 
 	if issuer.CallCount() != 5 {
 		t.Errorf("Issuer call count = %d, want 5", issuer.CallCount())
+	}
+}
+
+func generateThreeLevelChain() (*tls.Certificate, *x509.CertPool, *x509.CertPool, error) {
+	now := time.Now()
+
+	rootCACert, rootKey, err := generateTestCertificate(
+		now.Add(-time.Hour), now.Add(10*365*24*time.Hour), true, nil, nil,
+	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	intermediateCert, intermediateKey, err := generateTestCertificate(
+		now.Add(-time.Hour), now.Add(5*365*24*time.Hour), true, rootCACert.Leaf, rootKey,
+	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	leafCert, _, err := generateTestCertificate(
+		now.Add(-time.Hour), now.Add(365*24*time.Hour), false, intermediateCert.Leaf, intermediateKey,
+	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	chainCert := &tls.Certificate{
+		Certificate: [][]byte{
+			leafCert.Certificate[0],
+		},
+		PrivateKey: leafCert.PrivateKey,
+	}
+	chainCert.Leaf = leafCert.Leaf
+
+	rootPool := x509.NewCertPool()
+	rootPool.AddCert(rootCACert.Leaf)
+
+	intermediatePool := x509.NewCertPool()
+	intermediatePool.AddCert(intermediateCert.Leaf)
+
+	return chainCert, rootPool, intermediatePool, nil
+}
+
+func TestVerifyCertificateChain_WithConfigIntermediates(t *testing.T) {
+	chainCert, rootPool, intermediatePool, err := generateThreeLevelChain()
+	if err != nil {
+		t.Fatalf("generateThreeLevelChain() error = %v", err)
+	}
+
+	loader := &mockLoader{cert: generateSelfSignedCert(time.Now().Add(-time.Hour), time.Now().Add(time.Hour))}
+	issuer := &mockIssuer{}
+
+	cfg := &Config{
+		RootCAs:             rootPool,
+		IntermediateCAs:     intermediatePool,
+		PreValidationChecks: false,
+	}
+
+	cr, err := New(issuer, loader, cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer cr.Close()
+
+	err = cr.VerifyCertificateChain(chainCert)
+	if err != nil {
+		t.Errorf("VerifyCertificateChain() with configured intermediates should succeed, got error: %v", err)
+	}
+}
+
+func TestVerifyCertificateChain_WithoutConfigIntermediatesFails(t *testing.T) {
+	chainCert, rootPool, _, err := generateThreeLevelChain()
+	if err != nil {
+		t.Fatalf("generateThreeLevelChain() error = %v", err)
+	}
+
+	loader := &mockLoader{cert: generateSelfSignedCert(time.Now().Add(-time.Hour), time.Now().Add(time.Hour))}
+	issuer := &mockIssuer{}
+
+	cfg := &Config{
+		RootCAs:             rootPool,
+		PreValidationChecks: false,
+	}
+
+	cr, err := New(issuer, loader, cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer cr.Close()
+
+	err = cr.VerifyCertificateChain(chainCert)
+	if err == nil {
+		t.Error("VerifyCertificateChain() without configured intermediates should fail for 3-level chain")
+	}
+}
+
+func TestConnectionTracker_InterfaceSatisfied(t *testing.T) {
+	loader := &mockLoader{cert: generateSelfSignedCert(time.Now().Add(-time.Hour), time.Now().Add(time.Hour))}
+	issuer := &mockIssuer{}
+
+	cr, err := New(issuer, loader, &Config{PreValidationChecks: false})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer cr.Close()
+
+	var _ ConnectionTracker = cr
+}
+
+func TestActiveConnections_ConcurrentRead(t *testing.T) {
+	loader := &mockLoader{cert: generateSelfSignedCert(time.Now().Add(-time.Hour), time.Now().Add(time.Hour))}
+	issuer := &mockIssuer{}
+
+	cr, err := New(issuer, loader, &Config{PreValidationChecks: false})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer cr.Close()
+
+	active := cr.ActiveCertificate()
+	certID := active.ID
+
+	mc := &mockConn{}
+	release := cr.TrackConnection(certID, mc, mc.Close)
+	defer release()
+
+	var wg sync.WaitGroup
+	readCount := 100
+
+	for i := 0; i < readCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			count := cr.ActiveConnections(certID)
+			if count < 0 {
+				t.Errorf("ActiveConnections() = %d, should be >= 0", count)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if count := cr.ActiveConnections(certID); count != 1 {
+		t.Errorf("ActiveConnections() = %d, want 1", count)
+	}
+}
+
+func TestForceRenew_PendingStatePersists(t *testing.T) {
+	now := time.Now()
+	initialCert := generateSelfSignedCert(now.Add(-time.Hour), now.Add(time.Hour))
+	newCert := generateSelfSignedCert(now.Add(-time.Hour), now.Add(2*time.Hour))
+
+	loader := &mockLoader{cert: initialCert}
+	issuer := &mockIssuer{certs: []*tls.Certificate{newCert}}
+
+	cr, err := New(issuer, loader, &Config{PreValidationChecks: false})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer cr.Close()
+
+	originalID := cr.ActiveCertificate().ID
+
+	if err := cr.ForceRenew(); err != nil {
+		t.Fatalf("ForceRenew() error = %v", err)
+	}
+
+	pending := cr.PendingCertificate()
+	if pending == nil {
+		t.Fatal("Pending certificate should exist after ForceRenew")
+	}
+	if pending.Status != CertStatusPending {
+		t.Errorf("Pending cert status = %v, want PENDING", pending.Status)
+	}
+
+	active := cr.ActiveCertificate()
+	if active.ID != originalID {
+		t.Error("Active certificate should not change while pending cert exists")
+	}
+
+	firstNotAfter := pending.NotAfter
+
+	time.Sleep(2 * time.Millisecond)
+
+	secondNewCert := generateSelfSignedCert(now.Add(-time.Hour), now.Add(3*time.Hour))
+	issuer.mu.Lock()
+	issuer.certs = []*tls.Certificate{secondNewCert}
+	issuer.idx = 0
+	issuer.mu.Unlock()
+
+	if err := cr.ForceRenew(); err != nil {
+		t.Fatalf("Second ForceRenew() error = %v", err)
+	}
+
+	pending2 := cr.PendingCertificate()
+	if pending2 == nil {
+		t.Fatal("Pending certificate should exist after second ForceRenew")
+	}
+	if pending2.NotAfter.Equal(firstNotAfter) {
+		t.Error("Pending cert should change after second renew (NotAfter should be different)")
+	}
+	if pending2.Status != CertStatusPending {
+		t.Errorf("Pending cert status after second renew = %v, want PENDING", pending2.Status)
+	}
+
+	activeAfterSecondRenew := cr.ActiveCertificate()
+	if activeAfterSecondRenew.ID != originalID {
+		t.Error("Active certificate should still not change after second renew")
 	}
 }

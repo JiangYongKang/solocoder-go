@@ -1288,3 +1288,528 @@ func TestLogger_SyncWrite_TamperAfterWrite(t *testing.T) {
 		t.Errorf("expected TamperedIndex 1, got %d", result2.TamperedIndex)
 	}
 }
+
+func TestFix_Issue1_LogSync_NotStarted(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger, err := NewLogger(writer)
+	if err != nil {
+		t.Fatalf("NewLogger failed: %v", err)
+	}
+
+	err = logger.LogSync(makeEntry("user1", "res1", OpCreate, ResultSuccess))
+	if !errors.Is(err, ErrLoggerStopped) {
+		t.Errorf("LogSync before Start should return ErrLoggerStopped, got %v", err)
+	}
+
+	err = logger.Log(makeEntry("user1", "res1", OpCreate, ResultSuccess))
+	if !errors.Is(err, ErrLoggerStopped) {
+		t.Errorf("Log before Start should return ErrLoggerStopped, got %v", err)
+	}
+
+	if logger.Count() != 0 {
+		t.Errorf("expected 0 logs, got %d", logger.Count())
+	}
+}
+
+func TestFix_Issue1_LogSync_AfterStop(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger := startLogger(t, writer)
+	logger.Stop()
+
+	err := logger.LogSync(makeEntry("user1", "res1", OpCreate, ResultSuccess))
+	if !errors.Is(err, ErrLoggerStopped) {
+		t.Errorf("LogSync after Stop should return ErrLoggerStopped, got %v", err)
+	}
+
+	err = logger.Log(makeEntry("user1", "res1", OpCreate, ResultSuccess))
+	if !errors.Is(err, ErrLoggerStopped) {
+		t.Errorf("Log after Stop should return ErrLoggerStopped, got %v", err)
+	}
+}
+
+func TestFix_Issue2_ConcurrentLogAndStop_NoPanic(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		cfg := Config{
+			MaxRetries:      0,
+			RetryInterval:   0,
+			BufferSize:      16,
+			WorkerCount:     2,
+			EnableHashChain: true,
+		}
+		writer := NewMemoryWriter()
+		logger, err := NewLoggerWithConfig(writer, cfg)
+		if err != nil {
+			t.Fatalf("NewLoggerWithConfig failed: %v", err)
+		}
+		if err := logger.Start(); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+
+		go func() {
+			for i := 0; i < 100; i++ {
+				_ = logger.Log(&Entry{
+					SubjectID:    "u",
+					Operation:    OpCreate,
+					ResourceID:   fmt.Sprintf("r%d", i),
+					ResourceType: "concurrent",
+					Result:       ResultSuccess,
+					SourceIP:     "127.0.0.1",
+				})
+			}
+		}()
+
+		time.Sleep(1 * time.Millisecond)
+		logger.Stop()
+	}
+}
+
+func TestFix_Issue2_StopFlushesAllPendingLogs(t *testing.T) {
+	cfg := Config{
+		MaxRetries:      0,
+		RetryInterval:   0,
+		BufferSize:      1000,
+		WorkerCount:     1,
+		EnableHashChain: true,
+	}
+	slow := &slowWriter{delay: 5 * time.Millisecond}
+	logger := startLoggerWithConfig(t, slow, cfg)
+
+	total := 50
+	for i := 0; i < total; i++ {
+		err := logger.Log(makeEntry("u", fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+		if err != nil {
+			t.Fatalf("Log failed at %d: %v", i, err)
+		}
+	}
+
+	logger.Stop()
+
+	if slow.Count() != total {
+		t.Errorf("expected all %d logs flushed after Stop, got %d", total, slow.Count())
+	}
+}
+
+func TestFix_Issue2_SendToClosedChannel_NoPanic(t *testing.T) {
+	cfg := Config{
+		MaxRetries:      0,
+		RetryInterval:   0,
+		BufferSize:      1,
+		WorkerCount:     1,
+		EnableHashChain: true,
+	}
+
+	blocking := &blockingWriter{}
+	logger, err := NewLoggerWithConfig(blocking, cfg)
+	if err != nil {
+		t.Fatalf("NewLoggerWithConfig failed: %v", err)
+	}
+	if err := logger.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	blocking.blockWrites()
+
+	_ = logger.Log(makeEntry("u", "r1", OpCreate, ResultSuccess))
+	_ = logger.Log(makeEntry("u", "r2", OpCreate, ResultSuccess))
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		blocking.unblockWrites()
+	}()
+
+	logger.Stop()
+}
+
+type blockingWriter struct {
+	mu       sync.Mutex
+	blockCh  chan struct{}
+	logs     []*AuditLog
+}
+
+func (bw *blockingWriter) Write(log *AuditLog) error {
+	if bw.blockCh != nil {
+		<-bw.blockCh
+	}
+	bw.mu.Lock()
+	defer bw.mu.Unlock()
+	cp := *log
+	bw.logs = append(bw.logs, &cp)
+	return nil
+}
+
+func (bw *blockingWriter) blockWrites() {
+	bw.blockCh = make(chan struct{})
+}
+
+func (bw *blockingWriter) unblockWrites() {
+	if bw.blockCh != nil {
+		close(bw.blockCh)
+		bw.blockCh = nil
+	}
+}
+
+func (bw *blockingWriter) Count() int {
+	bw.mu.Lock()
+	defer bw.mu.Unlock()
+	return len(bw.logs)
+}
+
+func TestFix_Issue3_StopWaitsForAsyncDegradeGoroutines(t *testing.T) {
+	cfg := Config{
+		MaxRetries:      0,
+		RetryInterval:   0,
+		BufferSize:      1,
+		WorkerCount:     1,
+		EnableHashChain: true,
+	}
+
+	slowFail := &slowFailingWriter{delay: 50 * time.Millisecond}
+	logger := startLoggerWithConfig(t, slowFail, cfg)
+
+	var degradeCalled int32
+	var degradeCompleted int32
+	logger.SetDegradeHandler(func(entry *Entry, err error) {
+		atomic.AddInt32(&degradeCalled, 1)
+		time.Sleep(30 * time.Millisecond)
+		atomic.AddInt32(&degradeCompleted, 1)
+	})
+
+	slowFail.blockWrites()
+
+	for i := 0; i < 5; i++ {
+		_ = logger.Log(makeEntry("u", fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	slowFail.unblockWrites()
+
+	logger.Stop()
+
+	called := atomic.LoadInt32(&degradeCalled)
+	completed := atomic.LoadInt32(&degradeCompleted)
+	if called == 0 {
+		t.Fatal("expected degrade handler to be called")
+	}
+	if called != completed {
+		t.Errorf("degrade handler not all completed before Stop returned: called=%d, completed=%d", called, completed)
+	}
+}
+
+type slowFailingWriter struct {
+	mu       sync.Mutex
+	blockCh  chan struct{}
+	delay    time.Duration
+	fail     bool
+	callCnt  int32
+}
+
+func (sfw *slowFailingWriter) Write(log *AuditLog) error {
+	atomic.AddInt32(&sfw.callCnt, 1)
+	if sfw.blockCh != nil {
+		<-sfw.blockCh
+	}
+	time.Sleep(sfw.delay)
+	if sfw.fail {
+		return errors.New("simulated failure")
+	}
+	return errors.New("simulated failure for degrade test")
+}
+
+func (sfw *slowFailingWriter) blockWrites() {
+	sfw.blockCh = make(chan struct{})
+}
+
+func (sfw *slowFailingWriter) unblockWrites() {
+	if sfw.blockCh != nil {
+		close(sfw.blockCh)
+		sfw.blockCh = nil
+	}
+}
+
+func TestFix_Issue3_AsyncGoroutineWithoutDegrade(t *testing.T) {
+	cfg := Config{
+		MaxRetries:      0,
+		RetryInterval:   0,
+		BufferSize:      1,
+		WorkerCount:     1,
+		EnableHashChain: true,
+	}
+
+	slow := &slowWriter{delay: 20 * time.Millisecond}
+	logger := startLoggerWithConfig(t, slow, cfg)
+
+	for i := 0; i < 10; i++ {
+		_ = logger.Log(makeEntry("u", fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	logger.Stop()
+
+	if slow.Count() != 10 {
+		t.Errorf("expected all 10 async writes to complete before Stop returns, got %d", slow.Count())
+	}
+}
+
+func TestFix_Issue4_VerifyIntegrity_DetectsWriterTamper(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger := startLogger(t, writer)
+	defer logger.Stop()
+
+	for i := 0; i < 5; i++ {
+		logger.LogSync(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	waitForCondition(t, func() bool { return writer.Count() == 5 }, 2*time.Second, "all logs written")
+
+	result := logger.VerifyIntegrity()
+	if !result.Valid {
+		t.Fatalf("initial integrity check failed: %s", result.Message)
+	}
+
+	writer.TamperLog(2, "TAMPERED in writer")
+
+	result2 := logger.VerifyIntegrity()
+	if result2.Valid {
+		t.Fatal("integrity check should fail after writer tamper")
+	}
+	if result2.TamperedIndex != 2 {
+		t.Errorf("expected TamperedIndex 2 for writer tamper, got %d (msg: %s)", result2.TamperedIndex, result2.Message)
+	}
+}
+
+func TestFix_Issue4_VerifyIntegrity_DetectsWriterExtraLog(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger := startLogger(t, writer)
+	defer logger.Stop()
+
+	for i := 0; i < 3; i++ {
+		logger.LogSync(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	waitForCondition(t, func() bool { return writer.Count() == 3 }, 2*time.Second, "all logs written")
+
+	spoof := &AuditLog{
+		EventID:       "spoofed-event-id",
+		SubjectID:     "hacker",
+		Operation:     OpDelete,
+		OperationDesc: "DELETE",
+		Result:        ResultSuccess,
+		CurrentHash:   "fake-hash",
+	}
+	writer.AppendSpoofedLog(spoof)
+
+	result := logger.VerifyIntegrity()
+	if result.Valid {
+		t.Fatal("integrity check should fail with extra writer log")
+	}
+	if result.TamperedIndex != 3 {
+		t.Errorf("expected TamperedIndex 3 for extra log, got %d (msg: %s)", result.TamperedIndex, result.Message)
+	}
+}
+
+func TestFix_Issue4_VerifyIntegrity_DetectsWriterHashMismatch(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger := startLogger(t, writer)
+	defer logger.Stop()
+
+	for i := 0; i < 3; i++ {
+		logger.LogSync(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	waitForCondition(t, func() bool { return writer.Count() == 3 }, 2*time.Second, "all logs written")
+
+	logs := writer.ReadAll()
+	logs[1].CurrentHash = "manipulated-hash"
+	writer.mu.Lock()
+	cp := *logs[1]
+	writer.logs[1] = &cp
+	writer.mu.Unlock()
+
+	result := logger.VerifyIntegrity()
+	if result.Valid {
+		t.Fatal("integrity check should fail for hash mismatch")
+	}
+	if result.TamperedIndex != 1 {
+		t.Errorf("expected TamperedIndex 1 for hash mismatch, got %d (msg: %s)", result.TamperedIndex, result.Message)
+	}
+}
+
+func TestFix_Issue4_VerifyIntegrity_DetectsWriterBrokenChain(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger := startLogger(t, writer)
+	defer logger.Stop()
+
+	for i := 0; i < 4; i++ {
+		logger.LogSync(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	waitForCondition(t, func() bool { return writer.Count() == 4 }, 2*time.Second, "all logs written")
+
+	writer.BreakChain(2)
+
+	result := logger.VerifyIntegrity()
+	if result.Valid {
+		t.Fatal("integrity check should fail for broken chain in writer")
+	}
+}
+
+func TestFix_Issue4_VerifyIntegrity_WriterLogNotInMemory(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger := startLogger(t, writer)
+	defer logger.Stop()
+
+	for i := 0; i < 2; i++ {
+		logger.LogSync(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	waitForCondition(t, func() bool { return writer.Count() == 2 }, 2*time.Second, "all logs written")
+
+	spoof := &AuditLog{
+		EventID:       "audit-9999999999999999999-999",
+		SubjectID:     "ghost",
+		Operation:     OpCreate,
+		OperationDesc: "CREATE",
+		Result:        ResultSuccess,
+		CurrentHash:   computeHash(&AuditLog{
+			EventID:       "audit-9999999999999999999-999",
+			SubjectID:     "ghost",
+			Operation:     OpCreate,
+			OperationDesc: "CREATE",
+			Result:        ResultSuccess,
+			CurrentHash:   "",
+		}),
+	}
+	spoof.CurrentHash = computeHash(spoof)
+	writer.AppendSpoofedLog(spoof)
+
+	result := logger.VerifyIntegrity()
+	if result.Valid {
+		t.Fatal("integrity check should fail for writer log not in memory")
+	}
+}
+
+func TestFix_Issue4_MultipleWorkers_VerifyIntegrity(t *testing.T) {
+	cfg := Config{
+		MaxRetries:      0,
+		RetryInterval:   0,
+		BufferSize:      100,
+		WorkerCount:     4,
+		EnableHashChain: true,
+	}
+	writer := NewMemoryWriter()
+	logger := startLoggerWithConfig(t, writer, cfg)
+
+	for i := 0; i < 50; i++ {
+		logger.Log(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	waitForCondition(t, func() bool { return writer.Count() == 50 }, 3*time.Second, "all writes complete")
+
+	result := logger.VerifyIntegrity()
+	if !result.Valid {
+		t.Errorf("integrity check failed with multiple workers: %s", result.Message)
+	}
+
+	logger.Stop()
+
+	result2 := logger.VerifyIntegrity()
+	if !result2.Valid {
+		t.Errorf("integrity check after Stop failed: %s", result2.Message)
+	}
+	if result2.TamperedIndex != -1 {
+		t.Errorf("expected TamperedIndex -1, got %d", result2.TamperedIndex)
+	}
+}
+
+func TestFix_Issue4_WriterWithDuplicateLogs(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger := startLogger(t, writer)
+	defer logger.Stop()
+
+	logger.LogSync(makeEntry("u1", "r1", OpCreate, ResultSuccess))
+	logger.LogSync(makeEntry("u2", "r2", OpCreate, ResultSuccess))
+
+	waitForCondition(t, func() bool { return writer.Count() == 2 }, 2*time.Second, "all logs written")
+
+	logs := writer.ReadAll()
+	writer.AppendSpoofedLog(logs[0])
+
+	result := logger.VerifyIntegrity()
+	if result.Valid {
+		t.Fatal("integrity check should fail for duplicate writer log")
+	}
+	if result.TamperedIndex != 2 {
+		t.Errorf("expected TamperedIndex 2 for duplicate, got %d (msg: %s)", result.TamperedIndex, result.Message)
+	}
+}
+
+type nonReadableWriter struct {
+	mu   sync.Mutex
+	logs []*AuditLog
+}
+
+func (nw *nonReadableWriter) Write(log *AuditLog) error {
+	nw.mu.Lock()
+	defer nw.mu.Unlock()
+	cp := *log
+	nw.logs = append(nw.logs, &cp)
+	return nil
+}
+
+func TestFix_Issue4_NonReadableWriter_OnlyMemoryCheck(t *testing.T) {
+	sw := &nonReadableWriter{}
+
+	logger := startLogger(t, sw)
+	defer logger.Stop()
+
+	for i := 0; i < 3; i++ {
+		logger.LogSync(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	result := logger.VerifyIntegrity()
+	if !result.Valid {
+		t.Errorf("integrity check should pass with non-ReadableWriter: %s", result.Message)
+	}
+}
+
+func TestLogger_LogSync_StartedStoppedConsistency(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger, err := NewLogger(writer)
+	if err != nil {
+		t.Fatalf("NewLogger failed: %v", err)
+	}
+
+	logErr := logger.Log(makeEntry("u", "r", OpCreate, ResultSuccess))
+	syncErr := logger.LogSync(makeEntry("u", "r", OpCreate, ResultSuccess))
+
+	if !errors.Is(logErr, ErrLoggerStopped) {
+		t.Errorf("Log before Start: expected ErrLoggerStopped, got %v", logErr)
+	}
+	if !errors.Is(syncErr, ErrLoggerStopped) {
+		t.Errorf("LogSync before Start: expected ErrLoggerStopped, got %v", syncErr)
+	}
+
+	if err := logger.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	logErr = logger.Log(makeEntry("u", "r", OpCreate, ResultSuccess))
+	if logErr != nil {
+		t.Errorf("Log after Start: expected nil, got %v", logErr)
+	}
+	syncErr = logger.LogSync(makeEntry("u", "r", OpCreate, ResultSuccess))
+	if syncErr != nil {
+		t.Errorf("LogSync after Start: expected nil, got %v", syncErr)
+	}
+
+	logger.Stop()
+
+	logErr = logger.Log(makeEntry("u", "r", OpCreate, ResultSuccess))
+	syncErr = logger.LogSync(makeEntry("u", "r", OpCreate, ResultSuccess))
+
+	if !errors.Is(logErr, ErrLoggerStopped) {
+		t.Errorf("Log after Stop: expected ErrLoggerStopped, got %v", logErr)
+	}
+	if !errors.Is(syncErr, ErrLoggerStopped) {
+		t.Errorf("LogSync after Stop: expected ErrLoggerStopped, got %v", syncErr)
+	}
+}
+

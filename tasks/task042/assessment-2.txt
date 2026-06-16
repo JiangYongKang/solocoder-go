@@ -1,0 +1,8 @@
+产物不满意：
+1. TestValidatePassword_ConcurrentConfigUpdate 测试在第1173-1175行创建了一个仅监听 done channel 后立即退出的 goroutine，该 goroutine 内部无任何断言或验证逻辑，对并发测试结果完全不产生任何贡献。提示词第6条要求为每个问题补充覆盖并发安全路径的单元测试，这个无意义的 goroutine 并未增强并发安全验证的覆盖度，属于冗余代码。
+2. TestVerifyPassword_ConcurrentCostUpdate 测试中 cost 更新 goroutine 使用的表达式 `MinBcryptCost + (i % 3)` 产生的 cost 范围仅为 4、5、6 三个值。初始 cost 为 `MinBcryptCost`（即 4），这意味着 rehash 触发场景只覆盖了从 4 升级到 5 或 6 这两种极其有限的梯度，当 BcryptCost 在更大范围内变动时（如从 MinBcryptCost 直接跳转到 MaxBcryptCost）的并发安全性完全没有被覆盖到。提示词第3条描述了 rehash 逻辑段的数据竞态，如此窄的成本变化范围无法充分验证修复的有效性。
+3. ChangePassword 方法中历史复用检查逻辑在第344-360行（读锁段）和第379-393行（写锁段）完全重复，两处代码除错误处理方式外结构一致。将同一段业务逻辑复制粘贴到两个位置增加了后续维护的风险，如果历史复用检查的规则发生变化需要同步修改两处代码，容易因遗漏而产生不一致。正确做法是将历史复用检查抽取为一个独立方法在两端复用。
+过程不满意：
+1. 模型在收到提示词后仅阅读了一遍 passpolicy.go 的代码，立即在第16步用 todo_write 创建了 7 项子任务计划，随后才开始逐一修复。模型没有先逐一分析 6 个问题之间的关联性（例如问题3与问题4都与 VerifyPassword 相关可以合并修改），也没有梳理每个修复涉及的具体代码范围。这导致后续修复中出现了多个来回查看 passpolicy_test.go 的情况，任务规划中对测试代码的预估不足。
+2. 模型在第282步首次运行 `go test ./internal/passpolicy/ -v -count=1` 时出现了两个编译错误需要回退修复，说明模型在完成 passpolicy.go 的多处编辑后未在本地验证代码是否能够编译就直接进入了测试阶段。正确做法是在每次大的代码修改后先运行 `go build` 或语法检查确认代码可编译，再进入测试环节，避免编译错误打断调试流程。
+3. 模型在第346步到第382步之间连续使用了三次不同的 shell 命令来查找失败的测试用例名称（先用 Select-Object -Last 80、再用 Select-String -Pattern "FAIL|--- FAIL"、最后用 Select-String -Pattern "--- FAIL"），却没有直接阅读第一次的完整测试输出。这种逐步缩小 grep 匹配条件的做法效率较低，正确做法是直接分析第一次的完整测试输出定位到具体的失败用例和错误信息，然后有针对性地查看对应代码。

@@ -176,18 +176,30 @@ func (c *CSRF) GetToken(sessionID string) (string, error) {
 	}
 
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	token, exists := c.sessions[sessionID]
 	if !exists {
+		c.mu.RUnlock()
 		return "", ErrTokenNotFound
 	}
 
 	st, exists := c.tokens[token]
-	if !exists || time.Now().After(st.ExpiresAt) {
+	if !exists {
+		c.mu.RUnlock()
 		return "", ErrTokenNotFound
 	}
 
+	if time.Now().After(st.ExpiresAt) {
+		c.mu.RUnlock()
+		c.mu.Lock()
+		if curToken, ok := c.sessions[sessionID]; ok && curToken == token {
+			delete(c.sessions, sessionID)
+		}
+		delete(c.tokens, token)
+		c.mu.Unlock()
+		return "", ErrTokenNotFound
+	}
+
+	c.mu.RUnlock()
 	return token, nil
 }
 
@@ -225,8 +237,11 @@ func (c *CSRF) ValidateToken(token, sessionID string) error {
 }
 
 func (c *CSRF) RotateToken(token, sessionID string) (string, error) {
-	if err := c.ValidateToken(token, sessionID); err != nil {
-		return "", err
+	if token == "" {
+		return "", ErrTokenNotFound
+	}
+	if sessionID == "" {
+		return "", ErrSessionNotFound
 	}
 
 	newToken, err := c.generateToken()
@@ -237,10 +252,29 @@ func (c *CSRF) RotateToken(token, sessionID string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	delete(c.tokens, token)
-	if curToken, ok := c.sessions[sessionID]; ok && curToken == token {
-		delete(c.sessions, sessionID)
+	st, exists := c.tokens[token]
+	if !exists {
+		return "", ErrTokenInvalid
 	}
+
+	if time.Now().After(st.ExpiresAt) {
+		delete(c.tokens, token)
+		if curToken, ok := c.sessions[st.SessionID]; ok && curToken == token {
+			delete(c.sessions, st.SessionID)
+		}
+		return "", ErrTokenInvalid
+	}
+
+	if st.SessionID != sessionID {
+		return "", ErrSessionMismatch
+	}
+
+	if curToken, ok := c.sessions[sessionID]; !ok || curToken != token {
+		return "", ErrTokenInvalid
+	}
+
+	delete(c.tokens, token)
+	delete(c.sessions, sessionID)
 
 	c.tokens[newToken] = &sessionToken{
 		Token:     newToken,
@@ -535,6 +569,7 @@ func (c *CSRF) Middleware(next http.Handler) http.Handler {
 			if validateErr == nil && c.cfg.EnableTokenRotation {
 				newToken, rotErr := c.RotateToken(token, sessionID)
 				if rotErr == nil {
+					c.setTokenCookie(w, newToken)
 					w.Header().Set(c.cfg.HeaderName, newToken)
 				}
 			}

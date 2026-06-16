@@ -1,0 +1,8 @@
+你实现的 TLS 证书自动轮换模块存在一些实现问题，需要修复：
+1. VerifyCertificateChain 方法中 IntermediateCAs 处理逻辑是无效死代码。当配置了中间 CA 证书时，代码仅遍历 Subjects 但从未将任何中间证书添加到验证池中，配置注入的中间 CA 证书被完全忽略，缺少中间证书的场景下会误报验证失败。
+2. renewCertificate 方法将证书签发和切换两步操作紧耦合在一个方法内，调用者无法控制"只签发不切换"的场景，pendingCert 从不存在真正的"待切换"状态。
+3. types.go 中定义的 ConnectionTracker 接口签名与 CertRotator 的实际方法签名不匹配，TrackConnection 方法参数数量不一致导致 CertRotator 无法隐式满足该接口。
+4. ActiveConnections 方法使用普通互斥锁 Lock 来做纯读取的查询操作，高并发下大量只读查询被不必要地串行化。
+5. New 函数在 loader 为 nil 时返回 ErrLoadCertificateFailed（含义为加载证书失败），而实际原因是 loader 接口参数未注入，错误语义与实际故障不匹配。对比 issuer 为 nil 时有专用的 ErrIssuerNil 错误，loader 的 nil 检查缺乏专用错误变量。
+6. 修复后需要为上述问题补充对应的单元测试。
+7. 运行 go test ./internal/certrotator/ -v，需要让所有测试通过。

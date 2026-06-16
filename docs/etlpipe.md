@@ -367,4 +367,84 @@ source, err := registry.Create("memory", map[string]interface{}{
 ```go
 // 模拟写入失败
 target.SetFailRecord("user-15")
-target.SetFailRecord("user-
+target.SetFailRecord("user-42")
+
+err = pipeline.Run(ctx)
+// 注意：单条写入失败不会中断整体流程，err 仍然为 nil
+
+stats := pipeline.Stats()
+// stats.WriteErrorCount 应为 2
+// stats.WrittenCount 应为 98
+
+// 查看失败详情
+writeErrors := pipeline.GetErrorQueue().GetWriteErrors()
+for _, we := range writeErrors {
+    fmt.Printf("Failed record %s: %v\n", we.Record.ID, we.Err)
+}
+```
+
+### 4.4 停止运行中的管道
+
+```go
+// 在 goroutine 中运行
+go func() {
+    _ = pipeline.Run(ctx)
+}()
+
+// 一段时间后主动停止
+time.Sleep(100 * time.Millisecond)
+pipeline.Stop()
+
+// 状态应为 Stopped
+fmt.Println(pipeline.Status()) // "stopped"
+```
+
+### 4.5 动态编排转换顺序
+
+```go
+// 初始添加 A、B、C
+_ = pipeline.AddTransformer(transformerA)
+_ = pipeline.AddTransformer(transformerB)
+_ = pipeline.AddTransformer(transformerC)
+pipeline.ListTransformers() // ["A", "B", "C"]
+
+// 在最前面插入 Preprocessor
+_ = pipeline.InsertTransformer(0, preprocessor)
+pipeline.ListTransformers() // ["Preprocessor", "A", "B", "C"]
+
+// 移除 B（索引为 2）
+_ = pipeline.RemoveTransformer(2)
+pipeline.ListTransformers() // ["Preprocessor", "A", "C"]
+```
+
+## 五、边界条件与异常处理
+
+| 场景 | 处理方式 |
+|------|---------|
+| 数据源为空 | 正常完成，所有计数为 0 |
+| 提取批次报错 | 管道标记为 Failed，错误向上传播 |
+| 单条记录转换失败 | 记录 TransformError，继续处理后续 |
+| 写入超时 | 批次内所有记录标记 WriteError |
+| 部分记录写入失败 | 仅失败记录入错误队列，成功记录计数 |
+| 错误队列超过容量 | 丢弃最早的错误记录（FIFO） |
+| 主动 Stop 管道 | 状态标记为 Stopped，等待当前批次完成 |
+| Context 取消 | 状态标记为 Failed，立即终止 |
+| 重复 Run 管道 | 返回 ErrPipelineRunning 错误 |
+
+## 六、单元测试覆盖
+
+模块提供了 **30 个测试函数**，覆盖以下方面：
+
+| 测试分类 | 测试用例 |
+|---------|--------|
+| 基础数据结构 | Record 字段操作、Clone |
+| 数据源 | SourceRegistry 注册/创建/查询、MemorySource 提取分批/错误注入/重置 |
+| 类型转换 | 18 种类型转换场景（成功/失败） |
+| 转换器 | 字段映射、类型转换、值替换、字段过滤、字段计算、nil 记录 |
+| 转换链 | 添加/插入/移除/列表/越界、错误隔离封装 |
+| 错误队列 | 添加/计数/获取/容量限制/清空 |
+| 目标端 | 正常写入、指定记录失败、数据查询 |
+| 管道验证 | nil Source/Target、无效 BatchSize、增量模式缺字段 |
+| 管道核心 | 全量提取多批次、增量（ID/Timestamp）、4 阶段完整流程 |
+| 容错场景 | 转换错误隔离、写入错误隔离、提取失败、主动 Stop、Context 取消 |
+| 边界场景 | 空数据源、重复运行、写入超时、状态字符串、Error Unwrap |

@@ -56,7 +56,9 @@ type Pipeline struct {
 	recordCh      chan *Record
 	windowResults chan *WindowResult
 
-	backpressureMu sync.RWMutex
+	backpressureMu       sync.RWMutex
+	backpressureRelieved chan struct{}
+	sourcePaused         bool
 
 	checkpointTicker *time.Ticker
 	stopCh           chan struct{}
@@ -94,17 +96,18 @@ func NewPipeline(cfg PipelineConfig, source Source) (*Pipeline, error) {
 	}
 
 	return &Pipeline{
-		cfg:          cfg,
-		source:       source,
-		operators:    NewOperatorChain(),
-		window:       cfg.WindowAggregator,
-		sink:         cfg.Sink,
-		checkpoint:   cfg.CheckpointStore,
-		status:       PipelineStatusIdle,
-		recordCh:     make(chan *Record, cfg.BufferSize),
-		windowResults: make(chan *WindowResult, cfg.BufferSize),
-		processedSeq: make(map[int64]bool),
-		stopCh:     make(chan struct{}),
+		cfg:                cfg,
+		source:             source,
+		operators:          NewOperatorChain(),
+		window:             cfg.WindowAggregator,
+		sink:               cfg.Sink,
+		checkpoint:         cfg.CheckpointStore,
+		status:             PipelineStatusIdle,
+		recordCh:           make(chan *Record, cfg.BufferSize),
+		windowResults:      make(chan *WindowResult, cfg.BufferSize),
+		processedSeq:       make(map[int64]bool),
+		stopCh:             make(chan struct{}),
+		backpressureRelieved: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -154,6 +157,7 @@ func (p *Pipeline) Stats() PipelineStats {
 	p.statsMu.RLock()
 	defer p.statsMu.RUnlock()
 	stats := p.stats
+	stats.RecordsDropped = stats.RecordsFiltered + stats.RecordsErrors
 	if !stats.StartTime.IsZero() {
 		stats.Elapsed = time.Since(stats.StartTime)
 	}
@@ -168,8 +172,12 @@ func (p *Pipeline) incrementRecordsOut() {
 	atomic.AddInt64(&p.stats.RecordsOut, 1)
 }
 
-func (p *Pipeline) incrementRecordsDropped() {
-	atomic.AddInt64(&p.stats.RecordsDropped, 1)
+func (p *Pipeline) incrementRecordsFiltered() {
+	atomic.AddInt64(&p.stats.RecordsFiltered, 1)
+}
+
+func (p *Pipeline) incrementRecordsErrors() {
+	atomic.AddInt64(&p.stats.RecordsErrors, 1)
 }
 
 func (p *Pipeline) incrementWindowsClosed() {
@@ -210,19 +218,46 @@ func (p *Pipeline) shouldApplyBackpressure() bool {
 	return info.State == BackpressureCritical
 }
 
-func (p *Pipeline) handleBackpressure() {
-	for p.shouldApplyBackpressure() {
-		state := p.source.State()
-		if state == SourceStateRunning {
-			_ = p.source.Pause()
-		}
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-p.stopCh:
-			return
-		case <-time.After(10 * time.Millisecond):
-		}
+func (p *Pipeline) isBackpressureRelieved() bool {
+	info := p.GetBackpressureInfo()
+	return info.State == BackpressureNormal
+}
+
+func (p *Pipeline) applyBackpressurePause() {
+	p.backpressureMu.Lock()
+	alreadyPaused := p.sourcePaused
+	p.backpressureMu.Unlock()
+
+	if alreadyPaused {
+		return
+	}
+	state := p.source.State()
+	if state == SourceStateRunning {
+		_ = p.source.Pause()
+		p.backpressureMu.Lock()
+		p.sourcePaused = true
+		p.backpressureMu.Unlock()
+	}
+}
+
+func (p *Pipeline) tryResumeFromBackpressure() {
+	p.backpressureMu.Lock()
+	paused := p.sourcePaused
+	if !paused {
+		p.backpressureMu.Unlock()
+		return
+	}
+	if !p.isBackpressureRelieved() {
+		p.backpressureMu.Unlock()
+		return
+	}
+
+	p.sourcePaused = false
+	p.backpressureMu.Unlock()
+
+	select {
+	case p.backpressureRelieved <- struct{}{}:
+	default:
 	}
 
 	state := p.source.State()
@@ -282,6 +317,21 @@ func (p *Pipeline) sourceReader() {
 	sourceOutput := p.source.Output()
 
 	for {
+		p.backpressureMu.RLock()
+		paused := p.sourcePaused
+		p.backpressureMu.RUnlock()
+
+		if paused {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-p.stopCh:
+				return
+			case <-p.backpressureRelieved:
+			}
+			continue
+		}
+
 		select {
 		case <-p.ctx.Done():
 			return
@@ -312,7 +362,7 @@ func (p *Pipeline) sourceReader() {
 			}
 
 			if p.shouldApplyBackpressure() {
-				p.handleBackpressure()
+				p.applyBackpressurePause()
 			}
 		}
 	}
@@ -346,12 +396,12 @@ func (p *Pipeline) recordProcessor() {
 			results, err := p.operators.Process(p.ctx, rec)
 			if err != nil {
 				p.incrementErrors()
-				p.incrementRecordsDropped()
+				p.incrementRecordsErrors()
 				continue
 			}
 
 			if results == nil || len(results) == 0 {
-				p.incrementRecordsDropped()
+				p.incrementRecordsFiltered()
 				continue
 			}
 
@@ -360,6 +410,7 @@ func (p *Pipeline) recordProcessor() {
 					_, err := p.window.Process(p.ctx, r)
 					if err != nil {
 						p.incrementErrors()
+						p.incrementRecordsErrors()
 						continue
 					}
 				}
@@ -372,6 +423,8 @@ func (p *Pipeline) recordProcessor() {
 
 				p.incrementRecordsOut()
 			}
+
+			p.tryResumeFromBackpressure()
 		}
 	}
 }
@@ -574,22 +627,22 @@ func (p *Pipeline) Stop() error {
 		}
 	}
 
-	if p.window != nil {
-		p.window.Stop()
-	}
-
 	if p.cancel != nil {
 		p.cancel()
 	}
 
 	p.wg.Wait()
 
-	if p.sink != nil {
-		_ = p.sink.Close(p.ctx)
-	}
-
 	if p.cfg.EnableCheckpoint && p.stats.CheckpointsMade == 0 {
 		_ = p.SaveCheckpoint()
+	}
+
+	if p.window != nil {
+		p.window.Stop()
+	}
+
+	if p.sink != nil {
+		_ = p.sink.Close(p.ctx)
 	}
 
 	return nil

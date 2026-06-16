@@ -170,6 +170,7 @@ type WindowResult struct {
 	Value          float64
 	Count          int64
 	RecordIDs      []string
+	Partial        bool
 }
 
 type BackpressureState int
@@ -259,6 +260,8 @@ type PipelineStats struct {
 	RecordsIn       int64
 	RecordsOut      int64
 	RecordsDropped  int64
+	RecordsFiltered int64
+	RecordsErrors   int64
 	WindowsClosed   int64
 	CheckpointsMade int64
 	Errors          int64
