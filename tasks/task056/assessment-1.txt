@@ -1,0 +1,5 @@
+产物不满意：
+1. retry.go 的 nextInterval 方法中抖动计算在间隔封顶至 MaxInterval 之后叠加，当 MaxInterval 为 10s、JitterFactor 为 0.2 时抖动可产生正负 2 秒偏移使实际等待时间达到 12 秒。这与提示词第 1 条"达到最大间隔后不再增加，此后的重试均使用最大间隔"直接矛盾，抖动叠加后的实际间隔超出了最大间隔限制。根因是抖动计算放在封顶之后且没有二次约束，应在抖动计算完成后再次对结果做封顶或在间隔已封顶时将抖动限制为仅负向偏移。
+2. retry_test.go 的 TestDo_WithAllOptions 中 RetryableFunc 固定返回 nil 导致重试流程从不触发，beforeCalled、afterCalled、isRetryableCalled 的回调逻辑从未被执行，而最终断言用空白标识符 _ 丢弃了这些变量值使得测试形同虚设。测试名字暗示验证所有 Option 生效但实际只验证了首次成功返回 nil，提示词第 6 条要求的重试回调钩子功能路径未被测试实际覆盖。根因是测试设计时只关注了传参能编译通过而没设计触发重试的数据路径，应让 RetryableFunc 先失败一次再成功使重试流程真正触发后再对回调执行标志做断言。
+过程不满意：
+1. 模型在编写 retry.go 的 nextInterval 方法时思考过程中没有任何关于"抖动叠加后是否超出 MaxInterval"的推理或边界分析。从 session-cot-1.md 可以看到模型在探索项目结构后直接写出了完整代码，在设计测试时另外编写了 TestRetryer_nextInterval_MaxIntervalCap 和 TestRetryer_nextInterval_JitterInRange 两个独立测试分别验证封顶和抖动，但两个测试的设计恰好绕过了"封顶后的间隔再叠加抖动"这个组合边界场景，说明模型对边界条件的覆盖意识不足，应主动设计组合边界测试而非将两种属性割裂验证。
