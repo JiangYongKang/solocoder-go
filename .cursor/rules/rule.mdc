@@ -12,7 +12,7 @@ alwaysApply: true
 1. 每个会话交付一份 prompt-N.txt 给被测模型（N 为会话序号，从 1 开始），被测模型按提示词完成代码开发。
 2. 被测模型完成后，会将其思考过程生成到 tasks/taskXXX/session-cot-N.md。
 3. 标注人员用 Git diff 查看代码变更，用 go test -v 验证模型产物，然后结合思考过程编写 assessment-N.txt，识别产物错误和过程问题。
-4. 标注完成后，必须验证 assessment-N.txt 中引用的所有包路径、文件名、函数名是否全部属于当前 task 对应的包，防止多任务批量标注时内容写入错误目录。
+4. 标注完成后，必须验证 assessment-N.txt 中引用的所有包路径是否全部属于当前 task 对应的包，防止多任务批量标注时内容写入错误目录。
 5. 标注人员将 assessment-N.txt 中的标注以自然语言提交到标注平台。
 
 任务生命周期
