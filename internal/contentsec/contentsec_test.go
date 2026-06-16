@@ -1,0 +1,1010 @@
+package contentsec
+
+import (
+	"strings"
+	"sync"
+	"testing"
+)
+
+// ==================== XSS Detector Tests ====================
+
+func TestNewXSSDetector(t *testing.T) {
+	d := NewXSSDetector()
+	if d == nil {
+		t.Fatal("NewXSSDetector returned nil")
+	}
+	if d.FilterCount() == 0 {
+		t.Error("expected builtin filters to be registered")
+	}
+	if !d.HasFilter("script_tag") {
+		t.Error("expected builtin script_tag filter to exist")
+	}
+	if !d.HasFilter("event_handler") {
+		t.Error("expected builtin event_handler filter to exist")
+	}
+}
+
+func TestXSSDetectScriptTag(t *testing.T) {
+	d := NewXSSDetector()
+	input := `<script>alert('xss')</script>Hello`
+	violations := d.Detect(input)
+
+	found := false
+	for _, v := range violations {
+		if v.Type == "script_tag" {
+			found = true
+			if v.Position != 0 {
+				t.Errorf("expected position 0, got %d", v.Position)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected script_tag violation")
+	}
+}
+
+func TestXSSDetectEventHandler(t *testing.T) {
+	d := NewXSSDetector()
+	input := `<img src="test.jpg" onerror="alert('xss')">`
+	violations := d.Detect(input)
+
+	found := false
+	for _, v := range violations {
+		if v.Type == "event_handler" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected event_handler violation")
+	}
+}
+
+func TestXSSDetectJavaScriptProtocol(t *testing.T) {
+	d := NewXSSDetector()
+	input := `<a href="javascript:alert('xss')">click</a>`
+	violations := d.Detect(input)
+
+	found := false
+	for _, v := range violations {
+		if v.Type == "javascript_protocol" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected javascript_protocol violation")
+	}
+}
+
+func TestXSSDetectIframe(t *testing.T) {
+	d := NewXSSDetector()
+	input := `<iframe src="http://evil.com"></iframe>`
+	violations := d.Detect(input)
+
+	found := false
+	for _, v := range violations {
+		if v.Type == "iframe_tag" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected iframe_tag violation")
+	}
+}
+
+func TestXSSDetectEval(t *testing.T) {
+	d := NewXSSDetector()
+	input := `eval("alert('xss')")`
+	violations := d.Detect(input)
+
+	found := false
+	for _, v := range violations {
+		if v.Type == "eval_expression" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected eval_expression violation")
+	}
+}
+
+func TestXSSDetectVBScript(t *testing.T) {
+	d := NewXSSDetector()
+	input := `<a href="vbscript:msgbox('xss')">click</a>`
+	violations := d.Detect(input)
+
+	found := false
+	for _, v := range violations {
+		if v.Type == "vbscript_protocol" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected vbscript_protocol violation")
+	}
+}
+
+func TestXSSDetectEmptyInput(t *testing.T) {
+	d := NewXSSDetector()
+	violations := d.Detect("")
+	if violations != nil {
+		t.Errorf("expected nil violations for empty input, got %v", violations)
+	}
+}
+
+func TestXSSDetectSafeInput(t *testing.T) {
+	d := NewXSSDetector()
+	input := `<p>Hello <b>World</b></p>`
+	violations := d.Detect(input)
+	if len(violations) != 0 {
+		t.Errorf("expected no violations for safe input, got %d", len(violations))
+	}
+}
+
+func TestXSSRegisterFilter(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.RegisterFilter("custom", func(input string) []XSSViolation {
+		if strings.Contains(input, "badword") {
+			return []XSSViolation{{Position: 0, Type: "custom", Content: "badword"}}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterFilter failed: %v", err)
+	}
+	if !d.HasFilter("custom") {
+		t.Error("custom filter should exist after registration")
+	}
+
+	violations := d.Detect("this has badword in it")
+	found := false
+	for _, v := range violations {
+		if v.Type == "custom" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("custom filter should detect badword")
+	}
+}
+
+func TestXSSRegisterFilterDuplicate(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.RegisterFilter("script_tag", func(input string) []XSSViolation {
+		return nil
+	})
+	if err != ErrFilterExists {
+		t.Errorf("expected ErrFilterExists, got %v", err)
+	}
+}
+
+func TestXSSRegisterFilterEmptyName(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.RegisterFilter("", func(input string) []XSSViolation {
+		return nil
+	})
+	if err == nil {
+		t.Error("expected error for empty filter name")
+	}
+}
+
+func TestXSSRegisterFilterNil(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.RegisterFilter("nil_filter", nil)
+	if err != ErrNilFilter {
+		t.Errorf("expected ErrNilFilter, got %v", err)
+	}
+}
+
+func TestXSSUnregisterFilter(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.UnregisterFilter("script_tag")
+	if err != nil {
+		t.Fatalf("UnregisterFilter failed: %v", err)
+	}
+	if d.HasFilter("script_tag") {
+		t.Error("script_tag filter should not exist after unregister")
+	}
+}
+
+func TestXSSUnregisterFilterNotFound(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.UnregisterFilter("nonexistent")
+	if err != ErrFilterNotFound {
+		t.Errorf("expected ErrFilterNotFound, got %v", err)
+	}
+}
+
+func TestXSSUnregisterFilterEmptyName(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.UnregisterFilter("")
+	if err == nil {
+		t.Error("expected error for empty filter name")
+	}
+}
+
+func TestXSSRegisterPatternFilter(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.RegisterPatternFilter("custom_pattern", `custom_\d+`, "custom_violation")
+	if err != nil {
+		t.Fatalf("RegisterPatternFilter failed: %v", err)
+	}
+
+	violations := d.Detect("test custom_123 end")
+	found := false
+	for _, v := range violations {
+		if v.Type == "custom_violation" && v.Content == "custom_123" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("pattern filter should detect custom_123")
+	}
+}
+
+func TestXSSRegisterPatternFilterInvalidPattern(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.RegisterPatternFilter("invalid", `[invalid`, "")
+	if err == nil {
+		t.Error("expected error for invalid regex pattern")
+	}
+}
+
+func TestXSSRegisterPatternFilterEmptyName(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.RegisterPatternFilter("", `test`, "")
+	if err == nil {
+		t.Error("expected error for empty name")
+	}
+}
+
+func TestXSSRegisterPatternFilterEmptyPattern(t *testing.T) {
+	d := NewXSSDetector()
+	err := d.RegisterPatternFilter("test", "", "")
+	if err == nil {
+		t.Error("expected error for empty pattern")
+	}
+}
+
+func TestXSSDetectMultipleViolations(t *testing.T) {
+	d := NewXSSDetector()
+	input := `<script>xss</script><img onerror="alert(1)">`
+	violations := d.Detect(input)
+
+	if len(violations) < 2 {
+		t.Errorf("expected at least 2 violations, got %d", len(violations))
+	}
+
+	for i := 1; i < len(violations); i++ {
+		if violations[i].Position < violations[i-1].Position {
+			t.Error("violations should be sorted by position")
+		}
+	}
+}
+
+func TestXSSDetectorConcurrent(t *testing.T) {
+	d := NewXSSDetector()
+	var wg sync.WaitGroup
+	numGoroutines := 50
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.Detect(`<script>alert(1)</script>`)
+		}()
+	}
+	wg.Wait()
+}
+
+// ==================== HTML Sanitizer Tests ====================
+
+func TestNewHTMLSanitizer(t *testing.T) {
+	s := NewHTMLSanitizer()
+	if s == nil {
+		t.Fatal("NewHTMLSanitizer returned nil")
+	}
+	cfg := s.GetConfig()
+	if cfg == nil {
+		t.Fatal("GetConfig returned nil")
+	}
+	if !cfg.AllowedTags["p"] {
+		t.Error("p tag should be allowed by default")
+	}
+	if !cfg.AllowedAttributes["href"] {
+		t.Error("href attribute should be allowed by default")
+	}
+}
+
+func TestNewHTMLSanitizerWithConfig(t *testing.T) {
+	cfg := &SanitizerConfig{
+		AllowedTags:       map[string]bool{"b": true},
+		AllowedAttributes: map[string]bool{"class": true},
+		EscapeCharacters:  map[rune]string{'<': "&lt;"},
+		StripComments:     true,
+	}
+	s, err := NewHTMLSanitizerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewHTMLSanitizerWithConfig failed: %v", err)
+	}
+	if !s.GetConfig().AllowedTags["b"] {
+		t.Error("b tag should be allowed")
+	}
+}
+
+func TestNewHTMLSanitizerWithNilConfig(t *testing.T) {
+	_, err := NewHTMLSanitizerWithConfig(nil)
+	if err != ErrNilSanitizerRule {
+		t.Errorf("expected ErrNilSanitizerRule, got %v", err)
+	}
+}
+
+func TestSanitizeRemoveScriptTag(t *testing.T) {
+	s := NewHTMLSanitizer()
+	input := `<p>Hello<script>alert('xss')</script>World</p>`
+	result := s.Sanitize(input)
+	if strings.Contains(result, "<script") {
+		t.Errorf("script tag should be removed, got: %s", result)
+	}
+	if !strings.Contains(result, "Hello") {
+		t.Errorf("text content should be preserved, got: %s", result)
+	}
+}
+
+func TestSanitizeKeepAllowedTags(t *testing.T) {
+	s := NewHTMLSanitizer()
+	input := `<p>Hello <b>World</b></p>`
+	result := s.Sanitize(input)
+	if !strings.Contains(result, "<p>") {
+		t.Errorf("p tag should be preserved, got: %s", result)
+	}
+	if !strings.Contains(result, "<b>") {
+		t.Errorf("b tag should be preserved, got: %s", result)
+	}
+}
+
+func TestSanitizeRemoveDisallowedAttributes(t *testing.T) {
+	s := NewHTMLSanitizer()
+	input := `<p onclick="alert(1)" class="test">Hello</p>`
+	result := s.Sanitize(input)
+	if strings.Contains(result, "onclick") {
+		t.Errorf("onclick attribute should be removed, got: %s", result)
+	}
+	if !strings.Contains(result, "class=\"test\"") {
+		t.Errorf("class attribute should be preserved, got: %s", result)
+	}
+}
+
+func TestSanitizeEscapeSpecialChars(t *testing.T) {
+	s := NewHTMLSanitizer()
+	input := `<p>a & b</p>`
+	result := s.Sanitize(input)
+	if !strings.Contains(result, "&amp;") {
+		t.Errorf("& should be escaped, got: %s", result)
+	}
+}
+
+func TestSanitizeStripComments(t *testing.T) {
+	s := NewHTMLSanitizer()
+	input := `<p>Hello<!-- comment -->World</p>`
+	result := s.Sanitize(input)
+	if strings.Contains(result, "<!--") || strings.Contains(result, "-->") {
+		t.Errorf("comments should be stripped, got: %s", result)
+	}
+	if !strings.Contains(result, "HelloWorld") {
+		t.Errorf("text should be preserved, got: %s", result)
+	}
+}
+
+func TestSanitizeEmptyInput(t *testing.T) {
+	s := NewHTMLSanitizer()
+	result := s.Sanitize("")
+	if result != "" {
+		t.Errorf("expected empty string, got: %s", result)
+	}
+}
+
+func TestSanitizeSelfClosingTag(t *testing.T) {
+	s := NewHTMLSanitizer()
+	input := `<br><img src="test.jpg" alt="test">`
+	result := s.Sanitize(input)
+	if !strings.Contains(result, "<br") {
+		t.Errorf("br tag should be preserved, got: %s", result)
+	}
+	if !strings.Contains(result, "<img") {
+		t.Errorf("img tag should be preserved, got: %s", result)
+	}
+}
+
+func TestSanitizeEscapeAttributeValues(t *testing.T) {
+	s := NewHTMLSanitizer()
+	input := `<a href="test&url">link</a>`
+	result := s.Sanitize(input)
+	if !strings.Contains(result, "test&amp;url") {
+		t.Errorf("attribute value should be escaped, got: %s", result)
+	}
+}
+
+func TestSanitizeAddRemoveAllowedTag(t *testing.T) {
+	s := NewHTMLSanitizer()
+	s.AddAllowedTag("custom")
+	if !s.GetConfig().AllowedTags["custom"] {
+		t.Error("custom tag should be allowed after adding")
+	}
+
+	s.RemoveAllowedTag("custom")
+	if s.GetConfig().AllowedTags["custom"] {
+		t.Error("custom tag should not be allowed after removal")
+	}
+}
+
+func TestSanitizeAddRemoveAllowedAttribute(t *testing.T) {
+	s := NewHTMLSanitizer()
+	s.AddAllowedAttribute("data-test")
+	if !s.GetConfig().AllowedAttributes["data-test"] {
+		t.Error("data-test attribute should be allowed after adding")
+	}
+
+	s.RemoveAllowedAttribute("data-test")
+	if s.GetConfig().AllowedAttributes["data-test"] {
+		t.Error("data-test attribute should not be allowed after removal")
+	}
+}
+
+func TestSanitizeSetConfig(t *testing.T) {
+	s := NewHTMLSanitizer()
+	newCfg := &SanitizerConfig{
+		AllowedTags:       map[string]bool{"span": true},
+		AllowedAttributes: map[string]bool{"id": true},
+		EscapeCharacters:  map[rune]string{},
+		StripComments:     false,
+	}
+	err := s.SetConfig(newCfg)
+	if err != nil {
+		t.Fatalf("SetConfig failed: %v", err)
+	}
+	if !s.GetConfig().AllowedTags["span"] {
+		t.Error("span tag should be allowed after SetConfig")
+	}
+}
+
+func TestSanitizeSetNilConfig(t *testing.T) {
+	s := NewHTMLSanitizer()
+	err := s.SetConfig(nil)
+	if err != ErrNilSanitizerRule {
+		t.Errorf("expected ErrNilSanitizerRule, got %v", err)
+	}
+}
+
+func TestSanitizeGetConfigReturnsCopy(t *testing.T) {
+	s := NewHTMLSanitizer()
+	cfg := s.GetConfig()
+	cfg.AllowedTags["newtag"] = true
+	if s.GetConfig().AllowedTags["newtag"] {
+		t.Error("GetConfig should return a copy, modifying it should not affect sanitizer")
+	}
+}
+
+func TestSanitizeUnclosedTag(t *testing.T) {
+	s := NewHTMLSanitizer()
+	input := `<p>Hello`
+	result := s.Sanitize(input)
+	if !strings.Contains(result, "Hello") {
+		t.Errorf("text should be preserved, got: %s", result)
+	}
+}
+
+func TestSanitizerConcurrent(t *testing.T) {
+	s := NewHTMLSanitizer()
+	var wg sync.WaitGroup
+	numGoroutines := 50
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.Sanitize(`<p>test<script>x</script></p>`)
+		}()
+	}
+	wg.Wait()
+}
+
+// ==================== Output Encoder Tests ====================
+
+func TestNewOutputEncoder(t *testing.T) {
+	e := NewOutputEncoder()
+	if e == nil {
+		t.Fatal("NewOutputEncoder returned nil")
+	}
+}
+
+func TestEncodeHTML(t *testing.T) {
+	e := NewOutputEncoder()
+	input := `<script>alert("xss") & 'test'</script>`
+	result := e.EncodeHTML(input)
+	expected := `&lt;script&gt;alert(&#34;xss&#34;) &amp; &#39;test&#39;&lt;/script&gt;`
+	if result != expected {
+		t.Errorf("HTML encoding failed:\n got: %s\nwant: %s", result, expected)
+	}
+}
+
+func TestEncodeJavaScript(t *testing.T) {
+	e := NewOutputEncoder()
+	input := `alert("xss");\ntest`
+	result := e.EncodeJavaScript(input)
+	if !strings.Contains(result, `\"`) {
+		t.Errorf("quotes should be escaped, got: %s", result)
+	}
+	if !strings.Contains(result, `\\`) {
+		t.Errorf("backslashes should be escaped, got: %s", result)
+	}
+	if !strings.Contains(result, `\n`) {
+		t.Errorf("newlines should be escaped, got: %s", result)
+	}
+}
+
+func TestEncodeJavaScriptAngleBrackets(t *testing.T) {
+	e := NewOutputEncoder()
+	input := `<script>test</script>`
+	result := e.EncodeJavaScript(input)
+	if !strings.Contains(result, `\u003c`) {
+		t.Errorf("< should be unicode escaped, got: %s", result)
+	}
+	if !strings.Contains(result, `\u003e`) {
+		t.Errorf("> should be unicode escaped, got: %s", result)
+	}
+}
+
+func TestEncodeJavaScriptControlChars(t *testing.T) {
+	e := NewOutputEncoder()
+	input := "\x00\x1f"
+	result := e.EncodeJavaScript(input)
+	if !strings.Contains(result, `\u0000`) {
+		t.Errorf("null char should be escaped, got: %s", result)
+	}
+	if !strings.Contains(result, `\u001f`) {
+		t.Errorf("control char should be escaped, got: %s", result)
+	}
+}
+
+func TestEncodeURL(t *testing.T) {
+	e := NewOutputEncoder()
+	input := `hello world&test=value`
+	result := e.EncodeURL(input)
+	if !strings.Contains(result, "hello+world") && !strings.Contains(result, "hello%20world") {
+		t.Errorf("spaces should be encoded, got: %s", result)
+	}
+	if !strings.Contains(result, "%26") {
+		t.Errorf("& should be encoded, got: %s", result)
+	}
+}
+
+func TestEncodeCSS(t *testing.T) {
+	e := NewOutputEncoder()
+	input := `content: "test";`
+	result := e.EncodeCSS(input)
+	if !strings.Contains(result, `\"`) {
+		t.Errorf("quotes should be escaped in CSS, got: %s", result)
+	}
+}
+
+func TestEncodeCSSNewlineTab(t *testing.T) {
+	e := NewOutputEncoder()
+	input := "\n\t"
+	result := e.EncodeCSS(input)
+	if !strings.Contains(result, `\A`) {
+		t.Errorf("newline should be escaped in CSS, got: %s", result)
+	}
+	if !strings.Contains(result, `\9`) {
+		t.Errorf("tab should be escaped in CSS, got: %s", result)
+	}
+}
+
+func TestEncodeCSSAngleBrackets(t *testing.T) {
+	e := NewOutputEncoder()
+	input := "<test>"
+	result := e.EncodeCSS(input)
+	if !strings.Contains(result, `\3C`) {
+		t.Errorf("< should be escaped in CSS, got: %s", result)
+	}
+	if !strings.Contains(result, `\3E`) {
+		t.Errorf("> should be escaped in CSS, got: %s", result)
+	}
+}
+
+func TestEncodeByContext(t *testing.T) {
+	e := NewOutputEncoder()
+	input := `<test>`
+
+	htmlResult := e.Encode(input, ContextHTML)
+	if htmlResult != e.EncodeHTML(input) {
+		t.Error("ContextHTML should use EncodeHTML")
+	}
+
+	jsResult := e.Encode(input, ContextJavaScript)
+	if jsResult != e.EncodeJavaScript(input) {
+		t.Error("ContextJavaScript should use EncodeJavaScript")
+	}
+
+	urlResult := e.Encode(input, ContextURL)
+	if urlResult != e.EncodeURL(input) {
+		t.Error("ContextURL should use EncodeURL")
+	}
+
+	cssResult := e.Encode(input, ContextCSS)
+	if cssResult != e.EncodeCSS(input) {
+		t.Error("ContextCSS should use EncodeCSS")
+	}
+
+	unknownResult := e.Encode(input, OutputContext(999))
+	if unknownResult != input {
+		t.Error("unknown context should return input unchanged")
+	}
+}
+
+func TestEncodeEmptyString(t *testing.T) {
+	e := NewOutputEncoder()
+	contexts := []OutputContext{ContextHTML, ContextJavaScript, ContextURL, ContextCSS}
+	for _, ctx := range contexts {
+		result := e.Encode("", ctx)
+		if result != "" {
+			t.Errorf("empty string should remain empty for context %d, got: %s", ctx, result)
+		}
+	}
+}
+
+func TestEncoderConcurrent(t *testing.T) {
+	e := NewOutputEncoder()
+	var wg sync.WaitGroup
+	numGoroutines := 50
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.EncodeHTML("<test>")
+			e.EncodeJavaScript("alert(1)")
+			e.EncodeURL("test url")
+			e.EncodeCSS("content: 'test'")
+		}()
+	}
+	wg.Wait()
+}
+
+// ==================== Data Masker Tests ====================
+
+func TestNewDataMasker(t *testing.T) {
+	m := NewDataMasker()
+	if m == nil {
+		t.Fatal("NewDataMasker returned nil")
+	}
+	if m.PatternCount() < 4 {
+		t.Errorf("expected at least 4 builtin patterns, got %d", m.PatternCount())
+	}
+	if !m.HasPattern("id_card") {
+		t.Error("id_card pattern should exist")
+	}
+	if !m.HasPattern("phone") {
+		t.Error("phone pattern should exist")
+	}
+	if !m.HasPattern("bank_card") {
+		t.Error("bank_card pattern should exist")
+	}
+	if !m.HasPattern("email") {
+		t.Error("email pattern should exist")
+	}
+}
+
+func TestMaskIDCard(t *testing.T) {
+	m := NewDataMasker()
+	input := "身份证号: 110101199003076578"
+	result := m.Mask(input)
+	if !strings.Contains(result, "110101********6578") {
+		t.Errorf("ID card should be masked, got: %s", result)
+	}
+	if strings.Contains(result, "19900307") {
+		t.Errorf("ID card middle digits should be hidden, got: %s", result)
+	}
+}
+
+func TestMaskPhone(t *testing.T) {
+	m := NewDataMasker()
+	input := "手机号: 13812345678"
+	result := m.Mask(input)
+	if !strings.Contains(result, "138****5678") {
+		t.Errorf("phone should be masked, got: %s", result)
+	}
+}
+
+func TestMaskBankCard(t *testing.T) {
+	m := NewDataMasker()
+	input := "银行卡号: 6222021234567890123"
+	result := m.Mask(input)
+	if !strings.Contains(result, "6222 **** **** 0123") {
+		t.Errorf("bank card should be masked, got: %s", result)
+	}
+}
+
+func TestMaskEmail(t *testing.T) {
+	m := NewDataMasker()
+	input := "邮箱: testuser@example.com"
+	result := m.Mask(input)
+	if !strings.Contains(result, "te******@example.com") {
+		t.Errorf("email should be masked, got: %s", result)
+	}
+}
+
+func TestMaskEmailShortUsername(t *testing.T) {
+	m := NewDataMasker()
+	input := "ab@example.com"
+	result := m.Mask(input)
+	if !strings.Contains(result, "a*@example.com") {
+		t.Errorf("short email should be masked, got: %s", result)
+	}
+}
+
+func TestMaskMultipleSensitiveData(t *testing.T) {
+	m := NewDataMasker()
+	input := "联系电话: 13812345678, 邮箱: test@example.com, 身份证: 110101199003076578"
+	result := m.Mask(input)
+
+	if strings.Contains(result, "13812345678") {
+		t.Error("phone should be masked")
+	}
+	if strings.Contains(result, "test@example.com") {
+		t.Error("email should be masked")
+	}
+	if strings.Contains(result, "19900307") {
+		t.Error("ID card should be masked")
+	}
+}
+
+func TestMaskNoSensitiveData(t *testing.T) {
+	m := NewDataMasker()
+	input := "Hello World, this is safe text."
+	result := m.Mask(input)
+	if result != input {
+		t.Errorf("text without sensitive data should not change, got: %s", result)
+	}
+}
+
+func TestMaskEmptyInput(t *testing.T) {
+	m := NewDataMasker()
+	result := m.Mask("")
+	if result != "" {
+		t.Errorf("empty input should return empty, got: %s", result)
+	}
+}
+
+func TestMaskRegisterPattern(t *testing.T) {
+	m := NewDataMasker()
+	err := m.RegisterPattern(
+		"ssn",
+		`\b\d{3}-\d{2}-\d{4}\b`,
+		func(s string) string {
+			return "***-**-" + s[len(s)-4:]
+		},
+		"US Social Security Number",
+	)
+	if err != nil {
+		t.Fatalf("RegisterPattern failed: %v", err)
+	}
+	if !m.HasPattern("ssn") {
+		t.Error("ssn pattern should exist after registration")
+	}
+
+	input := "SSN: 123-45-6789"
+	result := m.Mask(input)
+	if !strings.Contains(result, "***-**-6789") {
+		t.Errorf("SSN should be masked, got: %s", result)
+	}
+}
+
+func TestMaskRegisterPatternDuplicate(t *testing.T) {
+	m := NewDataMasker()
+	err := m.RegisterPattern("phone", `\d+`, func(s string) string { return s }, "duplicate")
+	if err != ErrMaskPatternExists {
+		t.Errorf("expected ErrMaskPatternExists, got %v", err)
+	}
+}
+
+func TestMaskRegisterPatternEmptyName(t *testing.T) {
+	m := NewDataMasker()
+	err := m.RegisterPattern("", `\d+`, func(s string) string { return s }, "")
+	if err == nil {
+		t.Error("expected error for empty pattern name")
+	}
+}
+
+func TestMaskRegisterPatternEmptyPattern(t *testing.T) {
+	m := NewDataMasker()
+	err := m.RegisterPattern("test", "", func(s string) string { return s }, "")
+	if err == nil {
+		t.Error("expected error for empty pattern")
+	}
+}
+
+func TestMaskRegisterPatternNilFunc(t *testing.T) {
+	m := NewDataMasker()
+	err := m.RegisterPattern("test", `\d+`, nil, "")
+	if err != ErrNilMaskPattern {
+		t.Errorf("expected ErrNilMaskPattern, got %v", err)
+	}
+}
+
+func TestMaskRegisterPatternInvalidRegex(t *testing.T) {
+	m := NewDataMasker()
+	err := m.RegisterPattern("test", `[invalid`, func(s string) string { return s }, "")
+	if err == nil {
+		t.Error("expected error for invalid regex")
+	}
+}
+
+func TestMaskUnregisterPattern(t *testing.T) {
+	m := NewDataMasker()
+	err := m.UnregisterPattern("email")
+	if err != nil {
+		t.Fatalf("UnregisterPattern failed: %v", err)
+	}
+	if m.HasPattern("email") {
+		t.Error("email pattern should not exist after unregister")
+	}
+
+	input := "test@example.com"
+	result := m.Mask(input)
+	if result != input {
+		t.Errorf("after unregister, email should not be masked, got: %s", result)
+	}
+}
+
+func TestMaskUnregisterPatternNotFound(t *testing.T) {
+	m := NewDataMasker()
+	err := m.UnregisterPattern("nonexistent")
+	if err != ErrMaskPatternNotFound {
+		t.Errorf("expected ErrMaskPatternNotFound, got %v", err)
+	}
+}
+
+func TestMaskUnregisterPatternEmptyName(t *testing.T) {
+	m := NewDataMasker()
+	err := m.UnregisterPattern("")
+	if err == nil {
+		t.Error("expected error for empty pattern name")
+	}
+}
+
+func TestMaskWithPatterns(t *testing.T) {
+	m := NewDataMasker()
+	input := "phone: 13812345678, email: test@example.com"
+
+	result, err := m.MaskWithPatterns(input, []string{"phone"})
+	if err != nil {
+		t.Fatalf("MaskWithPatterns failed: %v", err)
+	}
+	if strings.Contains(result, "13812345678") {
+		t.Error("phone should be masked")
+	}
+	if !strings.Contains(result, "test@example.com") {
+		t.Error("email should NOT be masked when only phone pattern is used")
+	}
+}
+
+func TestMaskWithPatternsNotFound(t *testing.T) {
+	m := NewDataMasker()
+	_, err := m.MaskWithPatterns("test", []string{"nonexistent"})
+	if err == nil {
+		t.Error("expected error for nonexistent pattern")
+	}
+}
+
+func TestMaskWithPatternsEmptyInput(t *testing.T) {
+	m := NewDataMasker()
+	result, err := m.MaskWithPatterns("", []string{"phone"})
+	if err != nil {
+		t.Fatalf("MaskWithPatterns empty input should not error, got: %v", err)
+	}
+	if result != "" {
+		t.Errorf("expected empty result, got: %s", result)
+	}
+}
+
+func TestMaskerConcurrent(t *testing.T) {
+	m := NewDataMasker()
+	var wg sync.WaitGroup
+	numGoroutines := 50
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.Mask("13812345678 test@example.com")
+		}()
+	}
+	wg.Wait()
+}
+
+// ==================== Content Security Engine Tests ====================
+
+func TestNewContentSecurityEngine(t *testing.T) {
+	engine := NewContentSecurityEngine()
+	if engine == nil {
+		t.Fatal("NewContentSecurityEngine returned nil")
+	}
+	if engine.XSSDetector == nil {
+		t.Error("XSSDetector should not be nil")
+	}
+	if engine.Sanitizer == nil {
+		t.Error("Sanitizer should not be nil")
+	}
+	if engine.Encoder == nil {
+		t.Error("Encoder should not be nil")
+	}
+	if engine.Masker == nil {
+		t.Error("Masker should not be nil")
+	}
+}
+
+func TestCheckAndSanitize(t *testing.T) {
+	engine := NewContentSecurityEngine()
+	input := `<p>Hello<script>alert(1)</script>World</p>`
+	sanitized, violations := engine.CheckAndSanitize(input)
+
+	if len(violations) == 0 {
+		t.Error("expected at least one XSS violation")
+	}
+	if strings.Contains(sanitized, "<script") {
+		t.Errorf("script tag should be sanitized, got: %s", sanitized)
+	}
+	if !strings.Contains(sanitized, "Hello") {
+		t.Errorf("text content should be preserved, got: %s", sanitized)
+	}
+}
+
+func TestSecureOutput(t *testing.T) {
+	engine := NewContentSecurityEngine()
+	input := `<test>`
+	result := engine.SecureOutput(input, ContextHTML)
+	if result != `&lt;test&gt;` {
+		t.Errorf("SecureOutput HTML encoding failed, got: %s", result)
+	}
+}
+
+func TestMaskSensitiveData(t *testing.T) {
+	engine := NewContentSecurityEngine()
+	input := "电话: 13812345678"
+	result := engine.MaskSensitiveData(input)
+	if strings.Contains(result, "13812345678") {
+		t.Errorf("phone should be masked, got: %s", result)
+	}
+}
+
+func TestEngineFullWorkflow(t *testing.T) {
+	engine := NewContentSecurityEngine()
+
+	userInput := `<p onclick="alert(1)">联系我: 13812345678 或 test@example.com</p>`
+
+	sanitized, violations := engine.CheckAndSanitize(userInput)
+	if len(violations) == 0 {
+		t.Error("should detect XSS violations")
+	}
+
+	masked := engine.MaskSensitiveData(sanitized)
+	if strings.Contains(masked, "13812345678") {
+		t.Error("phone should be masked in final output")
+	}
+	if strings.Contains(masked, "test@example.com") {
+		t.Error("email should be masked in final output")
+	}
+
+	htmlEncoded := engine.SecureOutput(masked, ContextHTML)
+	if strings.Contains(htmlEncoded, "<p") {
+		t.Error("HTML tags should be encoded for final HTML output")
+	}
+}
