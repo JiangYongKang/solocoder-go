@@ -1,0 +1,12 @@
+产物不满意：
+1. 在 protobuf.go 的 getPBFieldInfo 函数中，解析 serialize 标签中 protobuf 字段号的逻辑完全失效。函数使用 strings.HasPrefix(tag, "protobuf:") 判断标签中是否包含 protobuf 字段号声明，但测试结构体实际使用的标签格式为 `serialize:"id,protobuf:2"` 这种逗号分隔的多段形式，HasPrefix 永远匹配不到，导致用户声明的 protobuf 字段号被静默忽略。结合 Marshal 方法中 info.fieldNum+1 的双重偏移，最终字段号恰好与声明值一致纯属巧合，提示词要求 Protobuf 格式支持实际未正确实现。
+2. 在 msgpack.go 的 decodeBytes 方法中零拷贝优化路径 `zeroCopyBytes(string(b))` 存在隐式内存拷贝。Go 语言中 string(b) 将字节切片转换为字符串时会分配新内存并拷贝数据，然后再通过 zeroCopyBytes 从该字符串创建字节切片。整个流程中数据实际经历了一次完整的拷贝操作，与提示词要求的"复用底层缓冲区避免不必要的内存分配"目标相悖。MessagePack 的零拷贝优化对于字节数组字段实质上没有生效。
+3. 在 serialize_test.go 的 TestMsgPackEdgeCases 函数中，表驱动测试循环通过 t.Run 创建了 bool_true、bool_false、small_int 等 12 个子测试，但每个子测试的函数体均为空，既没有调用 Marshal 也没有调用 Unmarshal，更没有任何断言语句。这 12 个子测试全部因为它们不做任何事而通过，实际没有覆盖任何一个边界条件，形成了虚假的测试覆盖率。
+4. 在 protobuf.go 的 setLengthDelimValue 方法中，当 rv.Kind() 为 reflect.Slice 且元素类型非 uint8 时通过 fallthrough 进入 Array 分支。Array 分支中混合了 rv.SetLen() 和 reflect.MakeSlice() 等仅适用于切片的反射操作，在反序列化到 Go 数组类型时会因 reflect.MakeSlice 接收数组类型参数而 panic。该问题在测试中未被触发因为测试结构体均使用切片而非数组。
+5. 在 json.go 的 Marshal 方法中，当 opts.Version 大于 0 时走特殊分支将结构体转换为 map[string]interface{} 再序列化，此分支中 []byte 字段通过 rv.Field(i).Interface() 获取后由 json.Marshal 处理，与 Unmarshal 分支中 unmarshalField 对字节切片的 base64 解码逻辑不一致。在实际使用中如果 version 模式和非 version 模式的编码结果不同，会导致同一结构体在不同模式下反序列化结果不一致。
+过程不满意：
+1. 模型在刚收到提示词后第一步就通过 todo_write 创建了包含 10 项子任务的计划，之后才开始阅读 go.mod、现有代码风格和文档目录结构。任务计划的粒度划分与实际模块边界不匹配，后续在 json、msgpack、protobuf 三者之间反复调整架构。正确做法是先分析需求文档和代码骨架，理清模块职责边界后再制定执行计划。
+2. 模型在编写 msgpack.go 后经历了至少 10 轮编译-修复循环，每轮只针对编译器报告的具体行号做字符串替换而不先阅读完整函数上下文理解问题本质。同一类语法错误如多余右括号产生了 5 轮以上的往返修复，函数返回值类型不匹配的错误也经历了 3 轮调整才修正。这是典型的试错式调试，正确的做法应该是先完整阅读出错函数再一次性定位和修复所有问题。
+3. 模型在编写序列化测试时创建了 TestMsgPackEdgeCases 的表驱动框架，完成了 testCases 数据定义和 t.Run 调用框架后即停止编写，12 个子测试全部以空函数体提交。之后运行 go test 看到所有子测试显示 PASS，模型便认为边界条件已覆盖完成，未意识到空测试体的虚假通过。这属于幻觉完成，正确做法是确保每个子测试都有实际的编解码逻辑和断言。
+4. 模型在首次运行 JSON 测试遇到 `reflect.MakeSlice` panic 后，没有先分析调用栈理解不可寻址值的根本原因，而是先后在 json.go、protobuf.go 中分散查看和修改同样的问题点。同一类问题跨三个文件修复而没有总结出统一的修复模式，表现出定位问题后缺乏归纳抽象的意识。
+5. 模型在运行所有测试前执行了 `go build ./internal/serialize/` 验证编译但测试文件中的 MarshalWith 返回值错误未被编译器捕获，说明模型对 Go 编译器的检查范围理解不足。Go build 只编译非测试文件，测试文件中的签名错误不会被检测到，应当直接用 go test -c 或 go vet 做完整的编译检查。

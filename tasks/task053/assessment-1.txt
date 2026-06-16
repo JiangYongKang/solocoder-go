@@ -1,0 +1,113 @@
+产物不满意：
+1. 在 simhash.go 的 NewFuzzyDedup 函数中，当传入 SimilarityAlgorithmMinHash 时直接返回 ErrUnsupportedSimAlgo，而 types.go 明确定义了 SimilarityAlgorithmMinHash 常量，整个包没有任何 MinHash 的实现代码。提示词要求"支持基于 MinHash 或 SimHash 等局部敏感哈希算法"，虽然采用 SimHash 作为唯一实现可以接受，但定义常量却不提供实现方案导致了接口与实现的不一致。如果用户通过常量创建模糊去重引擎会得到一个运行时错误，而非编译期或清晰的文档提示。根因是接口设计时过早声明了 MinHash 常量，但实现阶段只完成 SimHash，应在 types.go 中移除 MinHash 常量或为 MinHash 提供实现。
+
+2. 在 persistence.go 的 Append 方法中，当文件已存在时先调用 loadLocked 将整个索引完整读入内存，然后在内存中添加新指纹，再调用 saveLocked 全量写回磁盘。这与提示词要求的"增量写入避免每次全量刷新整个索引"直接矛盾，本质上做的是读取-修改-全量重写而非真正的增量追加。当索引包含大量指纹时每次 Append 都会触发全量 I/O，性能和提示词意图完全背离。根因是实现时直接把 Append 设计为 Load + 内存修改 + Save 的复合操作而没在文件层面实现真正的尾部追加写入，正确做法是在文件末尾追加单个 entry 并更新校验和。
+
+3. 在 chunker.go 的 contentBasedChunker 结构体中定义了 hasher、windowSize、targetBits 三个字段，两个构造函数也都为它们赋了初始值（fnv.New64、48、13），但在 Chunk 方法中从未使用这些字段，实际的 findBoundary 方法只是在字节数组中线性扫描 boundary 字节的位置。这意味着 contentBasedChunker 的名字具有误导性，它实际实现的只是基于分隔符的分块而非真正的 Content-Defined Chunking（CDC）算法，CDC 所需的滚动哈希窗口分界点计算完全没有实现，hasher 等字段成为无用的死代码。根因是在设计结构体时预留了 CDC 算法所需的参数但实现阶段仅完成了简易版的分隔符查找，应将死代码字段删除或补全 CDC 算法实现。
+
+4. 在 persistence.go 的 persistEntry 结构体中定义了 Timestamp 字段，但在 Save 方法的 saveLocked 中所有 entry 的 Timestamp 都被硬编码为 0，Load 方法虽然解析了 Timestamp 字段但从不使用。这个字段在持久化格式中占用了 8 字节却完全没有发挥任何作用，也没有在需求文档中说明预留意图。根因是在定义持久化格式时盲目地添加了 Timestamp 字段但实现中既没有维护它的值也没有用它做任何逻辑判断，应从格式中移除或在业务中使用它。
+
+过程不满意：
+1. 模型在收到提示词后未经分析就直接使用 todo_write 创建了 9 项子任务计划，然后才开始读取 go.mod 和现有代码结构了解项目规范。根据标注规范应先分析需求文档和项目结构再制定计划，模型把计划排在认知之前，导致后续 persistence.go 因架构不合理被完全重写了一次。
+
+2. 模型在编写 persistence.go 时第一次实现存在死锁问题（因为在持锁的 saveLocked 内部又调用了持锁的 loadLocked），模型在 COT 中声称"让我完全重写 persistence.go 来修复死锁和文件损坏问题"后直接用 Write 整个文件覆盖重写。这是典型的试错式调试，一遇到问题就全量重写而非分析死锁原因做最小范围的修正，合理做法是先定位死锁路径（Append 持锁调用 loadLocked 又尝试持锁），然后只修改 Append 的实现方式。
+
+3. 模型在 simhash.go 和 persistence.go 两次出现未使用的 import 导致 go test 编译失败，分别通过 edit_file_search_replace 修复。这种先写代码后让编译器发现 import 问题再修的操作模式体现了缺乏对代码正确性的前置检查意识，应该在写文件时就用 IDE 或 linter 检查或写好后再自查一遍 import 声明。
+
+4. 模型在 COT 总结中声称"所有 50+ 个测试用例全部通过"，实际测试文件中有 14 个顶层测试函数共包含约 60 余个子测试，50+ 这个描述虽然数量上不算虚假，但模型没有给出精确数字而是用了一个模糊表述，从质量审查的角度看缺乏严谨性。同时模型在未查看完整测试输出的情况下就对测试结果进行了概括性描述。
+
+测试结果：
+=== RUN   TestHashProvider
+--- PASS: TestHashProvider (0.00s)
+    --- PASS: TestHashProvider/SHA256
+    --- PASS: TestHashProvider/SHA1
+    --- PASS: TestHashProvider/MD5
+    --- PASS: TestHashProvider/UnsupportedAlgorithm
+    --- PASS: TestHashProvider/EmptyData
+=== RUN   TestExactDedup
+--- PASS: TestExactDedup (0.00s)
+    --- PASS: TestExactDedup/NewExactDedup
+    --- PASS: TestExactDedup/NewExactDedupWithProvider
+    --- PASS: TestExactDedup/CheckAndAdd
+    --- PASS: TestExactDedup/Check
+    --- PASS: TestExactDedup/Add
+    --- PASS: TestExactDedup/Contains
+    --- PASS: TestExactDedup/Delete
+    --- PASS: TestExactDedup/Clear
+    --- PASS: TestExactDedup/EmptyDataErrors
+    --- PASS: TestExactDedup/ClosedEngine
+    --- PASS: TestExactDedup/GetIndexSetIndex
+=== RUN   TestSimHashCalculator
+--- PASS: TestSimHashCalculator (0.00s)
+    --- PASS: TestSimHashCalculator/Calculate
+    --- PASS: TestSimHashCalculator/Similarity
+    --- PASS: TestSimHashCalculator/EmptyData
+    --- PASS: TestSimHashCalculator/InvalidFingerprint
+=== RUN   TestFuzzyDedup
+--- PASS: TestFuzzyDedup (0.00s)
+    --- PASS: TestFuzzyDedup/NewFuzzyDedup
+    --- PASS: TestFuzzyDedup/NewFuzzyDedupWithCalculator
+    --- PASS: TestFuzzyDedup/UnsupportedAlgorithm
+    --- PASS: TestFuzzyDedup/CheckAndAdd
+    --- PASS: TestFuzzyDedup/Delete
+    --- PASS: TestFuzzyDedup/Clear
+=== RUN   TestFixedSizeChunker
+--- PASS: TestFixedSizeChunker (0.00s)
+    --- PASS: TestFixedSizeChunker/NewFixedSizeChunker
+    --- PASS: TestFixedSizeChunker/Chunk
+    --- PASS: TestFixedSizeChunker/ChunkEmptyData
+    --- PASS: TestFixedSizeChunker/ChunkSingleByte
+=== RUN   TestContentBasedChunker
+--- PASS: TestContentBasedChunker (0.00s)
+    --- PASS: TestContentBasedChunker/NewContentBasedChunker
+    --- PASS: TestContentBasedChunker/ChunkWithBoundary
+    --- PASS: TestContentBasedChunker/ChunkNoBoundary
+=== RUN   TestChunkedDedup
+--- PASS: TestChunkedDedup (0.00s)
+    --- PASS: TestChunkedDedup/NewChunkedDedupFixedSize
+    --- PASS: TestChunkedDedup/NewChunkedDedupContentBased
+    --- PASS: TestChunkedDedup/UnsupportedStrategy
+    --- PASS: TestChunkedDedup/CheckAndAddPartialDuplicate
+    --- PASS: TestChunkedDedup/DeleteAndClear
+=== RUN   TestPersistence
+--- PASS: TestPersistence (0.02s)
+    --- PASS: TestPersistence/SaveAndLoad
+    --- PASS: TestPersistence/Append
+    --- PASS: TestPersistence/AppendNewFile
+    --- PASS: TestPersistence/Verify
+    --- PASS: TestPersistence/VerifyCorrupted
+    --- PASS: TestPersistence/LoadNonExistent
+    --- PASS: TestPersistence/VerifyNonExistent
+=== RUN   TestDedupEngine
+--- PASS: TestDedupEngine (0.01s)
+    --- PASS: TestDedupEngine/NewExactMode
+    --- PASS: TestDedupEngine/NewFuzzyMode
+    --- PASS: TestDedupEngine/NewChunkedMode
+    --- PASS: TestDedupEngine/InvalidConfig
+    --- PASS: TestDedupEngine/SaveAndLoad
+    --- PASS: TestDedupEngine/AutoPersist
+    --- PASS: TestDedupEngine/ConcurrentAccess
+    --- PASS: TestDedupEngine/DeleteAndContains
+    --- PASS: TestDedupEngine/Clear
+=== RUN   TestConfig
+--- PASS: TestConfig (0.00s)
+    --- PASS: TestConfig/DefaultConfig
+    --- PASS: TestConfig/Validate
+    --- PASS: TestConfig/WithMethods
+=== RUN   TestEdgeCases
+--- PASS: TestEdgeCases (0.00s)
+    --- PASS: TestEdgeCases/LargeData
+    --- PASS: TestEdgeCases/SingleByte
+    --- PASS: TestEdgeCases/AllZeros
+    --- PASS: TestEdgeCases/BinaryData
+    --- PASS: TestEdgeCases/UnicodeData
+=== RUN   TestCustomSimilarityCalculator
+--- PASS: TestCustomSimilarityCalculator (0.00s)
+=== RUN   TestCustomChunker
+--- PASS: TestCustomChunker (0.00s)
+=== RUN   TestCustomPersister
+--- PASS: TestCustomPersister (0.00s)
+PASS
+ok  solocoder-go/internal/datadedup  (cached)
+
+总结：模型完成了数据去重引擎模块的核心功能，精确去重、SimHash模糊去重、分块去重和持久化的可编译代码都已产出，全部 14 个测试套件共 65 个子测试通过。但存在四个代码产物缺陷：Append 方法没有实现真正的增量写入而是全量重写、contentBasedChunker 包含未使用的死代码字段、MinHash 常量定义了却没提供实现、Timestamp 字段在持久化格式中占空间但从未实际使用。过程方面，模型在没分析需求前就预先制定了 9 项子任务计划、遇到持久化死锁后选择全量重写文件而非最小修正、两次出现未使用 import 通过编译报错才修复。整体实现满足提示词的功能要求但工程细节和过程规范性有待提升。
