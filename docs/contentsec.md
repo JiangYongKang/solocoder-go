@@ -791,3 +791,258 @@ HTML 净化（白名单过滤）
    - 客户端 IP 和 User-Agent
 2. 定期统计违规类型分布，识别新的攻击趋势
 3. 对脱敏操作记录审计日志，确保敏感数据被正确处理
+
+---
+
+## 12. 版本更新记录
+
+### v1.1.0 (2026-06-16)
+
+#### 🔧 Bug 修复
+
+| 问题 | 影响范围 | 修复说明 |
+|-----|---------|---------|
+| EncodeCSS 双反斜杠 | CSS 编码 | 修复 `<`、`>`、`&` 和控制字符使用双反斜杠 `\\3C` 的错误，统一使用单反斜杠 `\3C` |
+| 自闭合标签解析 | HTML 净化 | 修复 `<br/>`、`<hr/>` 等无空格自闭合标签被误丢弃的问题，自动去除标签名后的斜杠 |
+| 脱敏顺序不确定 | 数据脱敏 | 修复 map 迭代顺序导致的脱敏结果随机变化，改为按正则长度降序 + 名称升序 |
+| URL 协议未校验 | HTML 净化 | 新增对白名单属性中 URL 协议的安全校验，拦截 `javascript:` 等危险伪协议 |
+| 正斜杠过度转义 | JS 编码 | 移除 EncodeJavaScript 中不必要的 `/` → `\/` 转义，避免破坏 URL 和正则表达式 |
+
+#### 🧪 测试增强
+
+新增 11 个回归测试用例，覆盖上述所有修复场景：
+
+- `TestEncodeCSSAngleBracketsSingleBackslash` - CSS 单反斜杠验证
+- `TestEncodeCSSConsistentBackslash` - CSS 转义一致性验证
+- `TestSanitizeSelfClosingTagNoSpace` - 无空格自闭合标签验证
+- `TestSanitizeBrTagPreservesNewlineSemantic` - 换行标签语义保留验证
+- `TestSanitizeSelfClosingTagWithAttributes` - 带属性自闭合标签验证
+- `TestDataMaskerConsistentOrder` - 脱敏顺序确定性验证
+- `TestDataMaskerIdCardNotTreatedAsBankCard` - 身份证不被误判为银行卡
+- `TestSanitizeHrefJavaScriptProtocolBlocked` - JavaScript 伪协议拦截
+- `TestSanitizeHrefSafeProtocolsAllowed` - 安全协议放行验证
+- `TestSanitizeSrcJavaScriptBlocked` - src 属性伪协议拦截
+- `TestEncodeJavaScriptForwardSlashNotEscaped` - 正斜杠不转义验证
+- `TestEncodeJavaScriptPreservesRegexAndUrls` - URL 和正则保留验证
+- `TestEncodeJavaScriptStillEscapesQuotesAndBackslashes` - 必要转义保留验证
+- `TestEncodeCSSControlCharsSingleBackslash` - 控制字符单反斜杠验证
+
+---
+
+## 13. 新增使用示例
+
+### 13.1 URL 协议安全校验
+
+```go
+package main
+
+import (
+    "fmt"
+    "solocoder-go/internal/contentsec"
+)
+
+func main() {
+    s := contentsec.NewHTMLSanitizer()
+
+    // 危险协议被拦截
+    inputs := []string{
+        `<a href="javascript:alert(1)">点击</a>`,
+        `<a href="vbscript:msgbox(1)">点击</a>`,
+        `<a href="data:text/html,alert(1)">点击</a>`,
+        `<img src="javascript:stealCookie()" alt="test">`,
+    }
+
+    for _, input := range inputs {
+        result := s.Sanitize(input)
+        fmt.Printf("输入: %s\n输出: %s\n\n", input, result)
+    }
+    // 输出: <a>点击</a>  (href 属性被移除)
+    // 输出: <img alt="test" />  (src 属性被移除)
+
+    // 安全协议正常保留
+    safeInputs := []string{
+        `<a href="https://example.com">安全链接</a>`,
+        `<a href="mailto:support@example.com">联系我们</a>`,
+        `<a href="/page/about">关于我们</a>`,
+        `<img src="logo.png" alt="Logo">`,
+    }
+
+    for _, input := range safeInputs {
+        result := s.Sanitize(input)
+        fmt.Printf("输入: %s\n输出: %s\n\n", input, result)
+    }
+    // 输出: <a href="https://example.com">安全链接</a>
+    // 输出: <img src="logo.png" alt="Logo" />
+}
+```
+
+### 13.2 自闭合标签兼容处理
+
+```go
+package main
+
+import (
+    "fmt"
+    "solocoder-go/internal/contentsec"
+)
+
+func main() {
+    s := contentsec.NewHTMLSanitizer()
+
+    // 各种自闭合标签写法都能正确识别
+    inputs := []string{
+        `<br/>`,           // 无空格写法
+        `<br />`,          // 标准写法
+        `<hr/>`,           // 无空格
+        `<img src="test.jpg" alt="test"/>`,  // 带属性无空格
+        `<img src="test.jpg" alt="test" />`, // 带属性有空格
+    }
+
+    for _, input := range inputs {
+        result := s.Sanitize(input)
+        fmt.Printf("输入: %s\n输出: %s\n\n", input, result)
+    }
+    // 所有输入都正确输出，不会被丢弃
+}
+```
+
+### 13.3 脱敏结果一致性保证
+
+```go
+package main
+
+import (
+    "fmt"
+    "solocoder-go/internal/contentsec"
+)
+
+func main() {
+    m := contentsec.NewDataMasker()
+
+    // 18 位身份证号可能同时匹配身份证和银行卡模式
+    // 系统确保每次结果一致，且优先使用更精确的身份证模式
+    idCard := "110101199003076578"
+
+    // 运行 100 次验证一致性
+    var firstResult string
+    consistent := true
+
+    for i := 0; i < 100; i++ {
+        result := m.Mask(idCard)
+        if i == 0 {
+            firstResult = result
+        } else if result != firstResult {
+            consistent = false
+            fmt.Printf("第 %d 次结果不一致: %s != %s\n", i, result, firstResult)
+            break
+        }
+    }
+
+    if consistent {
+        fmt.Printf("脱敏结果一致: %s\n", firstResult)
+        fmt.Printf("身份证格式正确（******** 无空格）: %v\n", 
+            firstResult == "110101********6578")
+    }
+
+    // 同时包含多种敏感信息的复杂文本
+    text := `
+        联系人: 张三
+        身份证: 110101199003076578
+        手机: 13812345678
+        银行卡: 6222021234567890123
+        备用卡: 9558801234567890123
+    `
+
+    result := m.Mask(text)
+    fmt.Println("复杂文本脱敏结果:")
+    fmt.Println(result)
+}
+```
+
+### 13.4 JavaScript 编码保留 URL 和正则
+
+```go
+package main
+
+import (
+    "fmt"
+    "solocoder-go/internal/contentsec"
+)
+
+func main() {
+    e := contentsec.NewOutputEncoder()
+
+    // URL 中的斜杠不被转义
+    apiUrl := "https://api.example.com/v1/users/123/profile"
+    encodedUrl := e.EncodeJavaScript(apiUrl)
+    fmt.Printf("URL 编码: %s\n", encodedUrl)
+    // 输出: https://api.example.com/v1/users/123/profile (无转义)
+
+    // 正则表达式中的斜杠不被转义
+    regexPattern := `/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/`
+    encodedRegex := e.EncodeJavaScript(regexPattern)
+    fmt.Printf("正则编码: %s\n", encodedRegex)
+    // 输出: /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$/
+    // 注意: 反斜杠被转义为 \\，但正斜杠 / 保持原样
+
+    // 验证必要的转义仍然存在
+    dangerous := `<script>alert("xss") & 'test'</script>`
+    encoded := e.EncodeJavaScript(dangerous)
+    fmt.Printf("危险内容编码: %s\n", encoded)
+    // 输出: \u003cscript\u003ealert(\"xss\") \u0026 \u0027test\u0027\u003c/script\u003e
+    // 尖括号、引号、和号被正确转义
+
+    // 实际使用场景：构造安全的 JSON 响应
+    userInput := "alert('xss')"
+    jsonResponse := fmt.Sprintf(
+        `{"message": "%s", "url": "%s"}`,
+        e.EncodeJavaScript(userInput),
+        e.EncodeJavaScript(apiUrl),
+    )
+    fmt.Printf("JSON 响应: %s\n", jsonResponse)
+}
+```
+
+### 13.5 CSS 编码正确转义尖括号
+
+```go
+package main
+
+import (
+    "fmt"
+    "solocoder-go/internal/contentsec"
+)
+
+func main() {
+    e := contentsec.NewOutputEncoder()
+
+    // 动态生成用户自定义颜色
+    userColor := "<script>alert(1)</script>"
+    safeColor := e.EncodeCSS(userColor)
+    
+    fmt.Printf("原始: %s\n", userColor)
+    fmt.Printf("CSS 编码: %s\n", safeColor)
+    // 输出: \3C script\3E alert(1)\3C /script\3E
+    // 所有 < 和 > 都被正确编码为 \3C 和 \3E（单反斜杠）
+
+    // 实际使用：内联样式中的动态内容
+    username := "John <script>alert(1)</script> Doe"
+    safeUsername := e.EncodeCSS(username)
+    
+    style := fmt.Sprintf(`
+        .user-badge::before {
+            content: "%s";
+            color: #333;
+        }
+    `, safeUsername)
+    
+    fmt.Println("安全样式:")
+    fmt.Println(style)
+
+    // 验证控制字符也使用单反斜杠
+    controlChars := "\x00\x07\x7f"
+    encoded := e.EncodeCSS(controlChars)
+    fmt.Printf("控制字符编码: %#v\n", encoded)
+    // 输出: \0 \7 \7F  (均为单反斜杠)
+}
+```

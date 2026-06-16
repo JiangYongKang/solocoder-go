@@ -502,14 +502,20 @@ func (l *Logger) GetByEventID(eventID string) (*AuditLog, error) {
 }
 
 type VerificationResult struct {
-	Valid         bool
-	TamperedIndex int
-	Message       string
+	Valid             bool
+	TamperedIndex     int
+	Message           string
+	FullySynchronized bool
 }
 
 func verifyLogChainStrict(logs []*AuditLog, label string) VerificationResult {
 	if len(logs) == 0 {
-		return VerificationResult{Valid: true, TamperedIndex: -1, Message: label + ": no logs"}
+		return VerificationResult{
+			Valid:             true,
+			TamperedIndex:     -1,
+			Message:           label + ": no logs",
+			FullySynchronized: true,
+		}
 	}
 
 	if logs[0].PreviousHash != "" {
@@ -542,22 +548,20 @@ func verifyLogChainStrict(logs []*AuditLog, label string) VerificationResult {
 		}
 	}
 	return VerificationResult{
-		Valid:         true,
-		TamperedIndex: -1,
-		Message:       fmt.Sprintf("%s: all %d logs are intact", label, len(logs)),
+		Valid:             true,
+		TamperedIndex:     -1,
+		Message:           fmt.Sprintf("%s: all %d logs are intact", label, len(logs)),
+		FullySynchronized: true,
 	}
 }
 
-func verifyLogSetConsistency(writerLogs []*AuditLog, memLogs []*AuditLog) VerificationResult {
+func verifyLogSetConsistency(writerLogs []*AuditLog, memLogs []*AuditLog, strictCount bool) VerificationResult {
 	if len(writerLogs) == 0 && len(memLogs) == 0 {
-		return VerificationResult{Valid: true, TamperedIndex: -1, Message: "no logs"}
-	}
-
-	if len(writerLogs) > len(memLogs) {
 		return VerificationResult{
-			Valid:         false,
-			TamperedIndex: len(memLogs),
-			Message:       fmt.Sprintf("%v: writer has %d logs but memory only has %d (extra logs in writer)", ErrWriterIntegrityFailed, len(writerLogs), len(memLogs)),
+			Valid:             true,
+			TamperedIndex:     -1,
+			Message:           "no logs",
+			FullySynchronized: true,
 		}
 	}
 
@@ -567,6 +571,7 @@ func verifyLogSetConsistency(writerLogs []*AuditLog, memLogs []*AuditLog) Verifi
 	}
 
 	seenEvents := make(map[string]bool, len(writerLogs))
+	writerByEvent := make(map[string]*AuditLog, len(writerLogs))
 	for wi, wl := range writerLogs {
 		if seenEvents[wl.EventID] {
 			return VerificationResult{
@@ -576,45 +581,130 @@ func verifyLogSetConsistency(writerLogs []*AuditLog, memLogs []*AuditLog) Verifi
 			}
 		}
 		seenEvents[wl.EventID] = true
+		writerByEvent[wl.EventID] = wl
 
-		ml, exists := memByEvent[wl.EventID]
-		if !exists {
+		if _, exists := memByEvent[wl.EventID]; !exists {
 			return VerificationResult{
 				Valid:         false,
 				TamperedIndex: wi,
 				Message:       fmt.Sprintf("%v: writer log at index %d (EventID=%s) does not exist in memory", ErrWriterIntegrityFailed, wi, wl.EventID),
 			}
 		}
+	}
 
+	fullySynced := len(writerLogs) == len(memLogs)
+
+	if fullySynced {
+		sortedWriterLogs := make([]*AuditLog, 0, len(memLogs))
+		for _, ml := range memLogs {
+			if wl, ok := writerByEvent[ml.EventID]; ok {
+				sortedWriterLogs = append(sortedWriterLogs, wl)
+			}
+		}
+
+		if len(sortedWriterLogs) > 0 && sortedWriterLogs[0].PreviousHash != "" {
+			origIdx := -1
+			for wi, wl := range writerLogs {
+				if wl.EventID == sortedWriterLogs[0].EventID {
+					origIdx = wi
+					break
+				}
+			}
+			reportIdx := origIdx
+			if reportIdx == -1 {
+				reportIdx = 0
+			}
+			return VerificationResult{
+				Valid:         false,
+				TamperedIndex: reportIdx,
+				Message:       fmt.Sprintf("%v: writer hash chain broken at index %d (EventID=%s): earliest log should have empty previous hash", ErrWriterIntegrityFailed, reportIdx, sortedWriterLogs[0].EventID),
+			}
+		}
+
+		for i := 1; i < len(sortedWriterLogs); i++ {
+			curr := sortedWriterLogs[i]
+			prev := sortedWriterLogs[i-1]
+			if curr.PreviousHash != prev.CurrentHash {
+				origIdx := -1
+				for wi, wl := range writerLogs {
+					if wl.EventID == curr.EventID {
+						origIdx = wi
+						break
+					}
+				}
+				reportIdx := origIdx
+				if reportIdx == -1 {
+					reportIdx = i
+				}
+				return VerificationResult{
+					Valid:         false,
+					TamperedIndex: reportIdx,
+					Message:       fmt.Sprintf("%v: writer hash chain broken at index %d (EventID=%s): previous hash does not match preceding log's hash", ErrWriterIntegrityFailed, reportIdx, curr.EventID),
+				}
+			}
+		}
+	}
+
+	for wi, wl := range writerLogs {
+		ml := memByEvent[wl.EventID]
+		if ml.CurrentHash != wl.CurrentHash {
+			return VerificationResult{
+				Valid:         false,
+				TamperedIndex: wi,
+				Message:       fmt.Sprintf("%v: writer log at index %d (EventID=%s) hash differs from memory version (writer content has been tampered)", ErrWriterIntegrityFailed, wi, wl.EventID),
+			}
+		}
+	}
+
+	for wi, wl := range writerLogs {
 		expectedHash := computeHash(wl)
 		if wl.CurrentHash != expectedHash {
 			return VerificationResult{
 				Valid:         false,
 				TamperedIndex: wi,
-				Message:       fmt.Sprintf("%v: writer log at index %d (EventID=%s) has been tampered: hash mismatch", ErrWriterIntegrityFailed, wi, wl.EventID),
-			}
-		}
-
-		if ml.CurrentHash != wl.CurrentHash {
-			return VerificationResult{
-				Valid:         false,
-				TamperedIndex: wi,
-				Message:       fmt.Sprintf("%v: writer log at index %d (EventID=%s) hash differs from memory version", ErrWriterIntegrityFailed, wi, wl.EventID),
+				Message:       fmt.Sprintf("%v: writer log at index %d (EventID=%s) has been tampered: hash mismatch (self-consistency check failed)", ErrWriterIntegrityFailed, wi, wl.EventID),
 			}
 		}
 	}
 
+	if strictCount && !fullySynced {
+		return VerificationResult{
+			Valid:         false,
+			TamperedIndex: len(writerLogs),
+			Message:       fmt.Sprintf("%v: strict mode: writer has %d logs but memory has %d (data loss detected, expected fully synchronized)", ErrWriterIntegrityFailed, len(writerLogs), len(memLogs)),
+		}
+	}
+
+	if fullySynced {
+		return VerificationResult{
+			Valid:             true,
+			TamperedIndex:     -1,
+			Message:           fmt.Sprintf("all %d logs intact in memory and writer (fully synchronized)", len(memLogs)),
+			FullySynchronized: true,
+		}
+	}
+
 	return VerificationResult{
-		Valid:         true,
-		TamperedIndex: -1,
-		Message:       fmt.Sprintf("writer has %d logs, memory has %d logs (all consistent; %d pending flush)", len(writerLogs), len(memLogs), len(memLogs)-len(writerLogs)),
+		Valid:             true,
+		TamperedIndex:     -1,
+		Message:           fmt.Sprintf("writer has %d logs, memory has %d logs (all consistent; %d pending flush)", len(writerLogs), len(memLogs), len(memLogs)-len(writerLogs)),
+		FullySynchronized: false,
 	}
 }
 
 func (l *Logger) VerifyIntegrity() VerificationResult {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.verifyIntegrityLocked(false)
+}
 
+func (l *Logger) VerifyIntegrityStrict() VerificationResult {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.verifyIntegrityLocked(true)
+}
+
+func (l *Logger) verifyIntegrityLocked(strictCount bool) VerificationResult {
 	memLogs := make([]*AuditLog, len(l.logs))
 	for i, log := range l.logs {
 		cp := *log
@@ -629,18 +719,11 @@ func (l *Logger) VerifyIntegrity() VerificationResult {
 	if rw, ok := l.writer.(ReadableWriter); ok {
 		writerLogs := rw.ReadAll()
 
-		writerResult := verifyLogSetConsistency(writerLogs, memLogs)
+		writerResult := verifyLogSetConsistency(writerLogs, memLogs, strictCount)
 		if !writerResult.Valid {
 			return writerResult
 		}
 
-		if len(writerLogs) == len(memLogs) {
-			return VerificationResult{
-				Valid:         true,
-				TamperedIndex: -1,
-				Message:       fmt.Sprintf("all %d logs intact in memory and writer (fully synchronized)", len(memLogs)),
-			}
-		}
 		return writerResult
 	}
 
@@ -690,4 +773,30 @@ func (mw *MemoryWriter) AppendSpoofedLog(log *AuditLog) {
 	defer mw.mu.Unlock()
 	cp := *log
 	mw.logs = append(mw.logs, &cp)
+}
+
+func (mw *MemoryWriter) DeleteLog(index int) bool {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	if index < 0 || index >= len(mw.logs) {
+		return false
+	}
+	mw.logs = append(mw.logs[:index], mw.logs[index+1:]...)
+	return true
+}
+
+func (mw *MemoryWriter) Truncate(count int) int {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	if count <= 0 || len(mw.logs) == 0 {
+		return 0
+	}
+	if count >= len(mw.logs) {
+		removed := len(mw.logs)
+		mw.logs = mw.logs[:0]
+		return removed
+	}
+	removed := count
+	mw.logs = mw.logs[:len(mw.logs)-count]
+	return removed
 }

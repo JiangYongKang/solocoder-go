@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -2326,5 +2327,201 @@ func TestValidateWithRulesIncludeTagsNestedStruct(t *testing.T) {
 	errs := v.ValidateWithRules(&s, rules)
 	if len(errs) < 2 {
 		t.Errorf("expected at least 2 errors from nested struct tags, got %d: %v", len(errs), errs)
+	}
+}
+
+// ========== Issue: extractFieldNameFromCondition 空格处理 ==========
+
+func TestExtractFieldNameFromConditionNegationWithSpaces(t *testing.T) {
+	type TestStruct struct {
+		IsActive bool
+		Name     string `validate:"required|when=! IsActive"`
+	}
+
+	s := TestStruct{IsActive: false, Name: ""}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error when ! IsActive (with space) is true and Name is empty")
+	}
+
+	s.IsActive = true
+	s.Name = ""
+	errs = Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors when ! IsActive (with space) is false, got: %v", errs)
+	}
+}
+
+func TestExtractFieldNameFromConditionSimpleWithSpaces(t *testing.T) {
+	type TestStruct struct {
+		HasPhone bool
+		Phone    string `validate:"required|when= HasPhone "`
+	}
+
+	s := TestStruct{HasPhone: true, Phone: ""}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error when HasPhone (with spaces) is true and Phone is empty")
+	}
+
+	s.HasPhone = false
+	s.Phone = ""
+	errs = Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors when HasPhone (with spaces) is false, got: %v", errs)
+	}
+}
+
+func TestExtractFieldNameFromConditionEqualsWithSpaces(t *testing.T) {
+	type TestStruct struct {
+		Type  string
+		Code  string `validate:"required|when= Type = admin "`
+	}
+
+	s := TestStruct{Type: "admin", Code: ""}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error when Type = admin (with spaces) and Code is empty")
+	}
+
+	s.Type = "user"
+	s.Code = ""
+	errs = Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors when Type != admin, got: %v", errs)
+	}
+}
+
+func TestExtractFieldNameFromConditionNegationNoUnknownFieldError(t *testing.T) {
+	type TestStruct struct {
+		IsValid bool
+		Name    string `validate:"required|when=! IsValid"`
+	}
+
+	s := TestStruct{IsValid: false, Name: "test"}
+	errs := Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors, got: %v", errs)
+	}
+
+	hasUnknownField := false
+	for _, e := range errs {
+		if strings.Contains(e.Message, "unknown field") {
+			hasUnknownField = true
+		}
+	}
+	if hasUnknownField {
+		t.Error("should not report unknown field when field exists with space after !")
+	}
+}
+
+// ========== Issue: isEmptyValue 与 dereferenceValue 统一解引用逻辑 ==========
+
+func TestIsEmptyValueUsesDereferenceValue(t *testing.T) {
+	type Inner struct {
+		Value string
+	}
+
+	tests := []struct {
+		name     string
+		value    interface{}
+		expected bool
+	}{
+		{"nil pointer", (*string)(nil), true},
+		{"pointer to empty string", strPtr(""), true},
+		{"pointer to non-empty string", strPtr("hello"), false},
+		{"pointer to zero int", intPtr(0), true},
+		{"pointer to non-zero int", intPtr(42), false},
+		{"nil interface", interface{}(nil), true},
+		{"double pointer to empty string", func() **string { s := ""; p := &s; return &p }(), true},
+		{"double pointer to non-empty string", func() **string { s := "hi"; p := &s; return &p }(), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := reflect.ValueOf(tt.value)
+			result := isEmptyValue(v)
+			if result != tt.expected {
+				t.Errorf("isEmptyValue() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDereferenceValueAndIsEmptyValueConsistency(t *testing.T) {
+	vals := []interface{}{
+		(*string)(nil),
+		strPtr(""),
+		strPtr("test"),
+		intPtr(0),
+		intPtr(100),
+		(*struct{})(nil),
+		&struct{ Name string }{},
+		&struct{ Name string }{Name: "x"},
+	}
+
+	for _, val := range vals {
+		v := reflect.ValueOf(val)
+		deref := dereferenceValue(v)
+		empty := isEmptyValue(v)
+
+		if !deref.IsValid() {
+			if !empty {
+				t.Errorf("dereferenceValue returned invalid for %T, but isEmptyValue returned false", val)
+			}
+		} else {
+			if empty != isEmptyValue(deref) {
+				t.Errorf("inconsistent: isEmptyValue(val)=%v vs isEmptyValue(deref)=%v for %T",
+					empty, isEmptyValue(deref), val)
+			}
+		}
+	}
+}
+
+func TestIsEmptyValueNestedPointer(t *testing.T) {
+	s := ""
+	p1 := &s
+	p2 := &p1
+	p3 := &p2
+
+	v := reflect.ValueOf(p3)
+	if !isEmptyValue(v) {
+		t.Error("expected triple-nested pointer to empty string to be empty")
+	}
+
+	*p1 = "hello"
+	v = reflect.ValueOf(p3)
+	if isEmptyValue(v) {
+		t.Error("expected triple-nested pointer to non-empty string to be non-empty")
+	}
+}
+
+func TestRequiredWithDoublePointerString(t *testing.T) {
+	type TestStruct struct {
+		Name **string `validate:"required"`
+	}
+
+	empty := ""
+	pEmpty := &empty
+
+	valid := "hello"
+	pValid := &valid
+
+	s := TestStruct{Name: nil}
+	errs := Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for nil **string with required")
+	}
+
+	s.Name = &pEmpty
+	errs = Validate(&s)
+	if !errs.HasErrors() {
+		t.Error("expected error for **string pointing to empty string with required")
+	}
+
+	s.Name = &pValid
+	errs = Validate(&s)
+	if errs.HasErrors() {
+		t.Errorf("expected no errors for **string pointing to non-empty string, got: %v", errs)
 	}
 }

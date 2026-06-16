@@ -1,0 +1,5 @@
+你实现的数据校验引擎模块修复后仍存在一些实现问题，需要修复：
+1. extractFieldNameFromCondition 函数在处理取反表达式分支时只调用了 strings.TrimPrefix 去掉 `!` 前缀，但没有对去掉前缀后的字段名做 TrimSpace 处理。当用户写 `when=! FieldName` 即感叹号与字段名之间有空格时，函数返回的是带前导空格的字段名，导致 structHasField 中找不到该字段，applyRules 误报 "condition references unknown field" 错误而实际字段是存在的。
+2. applyRules 方法中的 dereferenceValue 和 isEmptyValue 函数各自实现了独立的指针递归解引用逻辑，两处代码对指针解引用的权责划分不清晰。如果将来有人只修改其中一处的解引用行为而忘记同步调整另一处，会导致两个路径产生不一致的校验结果。
+3. 修复后需要为上述每个问题补充对应的单元测试。
+4. 运行 go test ./internal/validator/ -v，需要让所有测试通过。

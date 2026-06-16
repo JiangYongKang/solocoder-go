@@ -261,6 +261,7 @@ type PipelineStats struct {
 	RecordsOut      int64
 	RecordsDropped  int64
 	RecordsFiltered int64
+	RecordsExpanded int64
 	RecordsErrors   int64
 	WindowsClosed   int64
 	CheckpointsMade int64

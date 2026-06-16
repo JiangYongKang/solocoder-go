@@ -315,13 +315,13 @@ func (v *Validator) isRegisteredCondition(name string) bool {
 
 func extractFieldNameFromCondition(expr string) string {
 	if strings.HasPrefix(expr, "!") {
-		return strings.TrimPrefix(expr, "!")
+		return strings.TrimSpace(strings.TrimPrefix(expr, "!"))
 	}
 	eqIdx := strings.Index(expr, "=")
 	if eqIdx != -1 {
 		return strings.TrimSpace(expr[:eqIdx])
 	}
-	return expr
+	return strings.TrimSpace(expr)
 }
 
 func (v *Validator) structHasField(s interface{}, fieldName string) bool {
@@ -476,7 +476,7 @@ func buildCondition(expr string) ConditionFunc {
 		}
 
 		if strings.HasPrefix(expr, "!") {
-			fieldName := strings.TrimPrefix(expr, "!")
+			fieldName := strings.TrimSpace(strings.TrimPrefix(expr, "!"))
 			fv, ok := findFieldByName(val, fieldName)
 			if !ok {
 				return false
@@ -495,7 +495,7 @@ func buildCondition(expr string) ConditionFunc {
 			return fmt.Sprintf("%v", fv.Interface()) == expected
 		}
 
-		fv, ok := findFieldByName(val, expr)
+		fv, ok := findFieldByName(val, strings.TrimSpace(expr))
 		if !ok {
 			return false
 		}
@@ -504,6 +504,10 @@ func buildCondition(expr string) ConditionFunc {
 }
 
 func isEmptyValue(v reflect.Value) bool {
+	v = dereferenceValue(v)
+	if !v.IsValid() {
+		return true
+	}
 	switch v.Kind() {
 	case reflect.String, reflect.Array, reflect.Map, reflect.Slice:
 		return v.Len() == 0
@@ -515,11 +519,6 @@ func isEmptyValue(v reflect.Value) bool {
 		return v.Uint() == 0
 	case reflect.Float32, reflect.Float64:
 		return v.Float() == 0
-	case reflect.Interface, reflect.Ptr:
-		if v.IsNil() {
-			return true
-		}
-		return isEmptyValue(v.Elem())
 	}
 	return false
 }

@@ -654,7 +654,7 @@ func TestOperatorChain(t *testing.T) {
 
 	ctx := context.Background()
 	rec := NewRecord(4)
-	res, err := chain.Process(ctx, rec)
+	res, _, err := chain.Process(ctx, rec)
 	if err != nil {
 		t.Fatalf("Process failed: %v", err)
 	}
@@ -666,12 +666,15 @@ func TestOperatorChain(t *testing.T) {
 	}
 
 	rec2 := NewRecord(3)
-	res, err = chain.Process(ctx, rec2)
+	res, filtered, err := chain.Process(ctx, rec2)
 	if err != nil {
 		t.Fatalf("Process failed: %v", err)
 	}
 	if res != nil {
 		t.Error("expected nil result for odd number")
+	}
+	if !filtered {
+		t.Error("expected filtered=true for FilterOperator")
 	}
 }
 
@@ -735,7 +738,7 @@ func TestOperatorChainStates(t *testing.T) {
 
 	ctx := context.Background()
 	for i := 0; i < 10; i++ {
-		_, _ = chain.Process(ctx, NewRecord(i))
+		_, _, _ = chain.Process(ctx, NewRecord(i))
 	}
 
 	states, err := chain.SaveStates()
@@ -3015,9 +3018,9 @@ func TestRecordsDroppedDistinguishesFilterAndErrors(t *testing.T) {
 		t.Errorf("expected RecordsFiltered=4 (odd: 1,3,5,9), got %d", stats.RecordsFiltered)
 	}
 
-	if stats.RecordsDropped != stats.RecordsFiltered+stats.RecordsErrors {
-		t.Errorf("expected RecordsDropped=%d (Filtered+Errors), got %d",
-			stats.RecordsFiltered+stats.RecordsErrors, stats.RecordsDropped)
+	if stats.RecordsDropped != stats.RecordsFiltered+stats.RecordsExpanded+stats.RecordsErrors {
+		t.Errorf("expected RecordsDropped=%d (Filtered+Expanded+Errors), got %d",
+			stats.RecordsFiltered+stats.RecordsExpanded+stats.RecordsErrors, stats.RecordsDropped)
 	}
 }
 
@@ -3124,5 +3127,444 @@ func TestPipelineStopWithBackpressure(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("pipeline.Stop() should complete within timeout even under backpressure")
+	}
+}
+
+func TestCountWindowStopResultsNotLost(t *testing.T) {
+	input := make(chan *Record, 50)
+	source := NewChannelSource("test", input, 50)
+
+	window, err := NewWindowAggregator("sum", WindowConfig{
+		WindowType:  WindowTypeTumblingCount,
+		Aggregation: AggregationSum,
+		CountSize:   10,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	cfg := DefaultPipelineConfig()
+	cfg.WindowAggregator = window
+
+	sink := NewCollectSink()
+	cfg.Sink = sink
+
+	pipeline, err := NewPipeline(cfg, source)
+	if err != nil {
+		t.Fatalf("NewPipeline failed: %v", err)
+	}
+
+	ctx := context.Background()
+	err = pipeline.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	for i := 1; i <= 7; i++ {
+		input <- NewRecord(i)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	err = pipeline.Stop()
+	if err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+
+	_, windowCount := sink.Count()
+	if windowCount != 1 {
+		t.Fatalf("expected 1 window result (partial) from incomplete count window, got %d", windowCount)
+	}
+
+	results := sink.WindowResults()
+	if len(results) != 1 {
+		t.Fatalf("expected 1 window result, got %d", len(results))
+	}
+
+	if !results[0].Partial {
+		t.Error("expected Partial=true for incomplete count window")
+	}
+
+	if results[0].Value != 28.0 {
+		t.Errorf("expected partial sum=28 (1+2+...+7), got %v", results[0].Value)
+	}
+
+	if results[0].Count != 7 {
+		t.Errorf("expected partial count=7, got %d", results[0].Count)
+	}
+}
+
+func TestTimeWindowStopResultsNotLost(t *testing.T) {
+	input := make(chan *Record, 50)
+	source := NewChannelSource("test", input, 50)
+
+	window, err := NewWindowAggregator("sum", WindowConfig{
+		WindowType:  WindowTypeTumblingTime,
+		Aggregation: AggregationSum,
+		Size:        500 * time.Millisecond,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	cfg := DefaultPipelineConfig()
+	cfg.WindowAggregator = window
+
+	sink := NewCollectSink()
+	cfg.Sink = sink
+
+	pipeline, err := NewPipeline(cfg, source)
+	if err != nil {
+		t.Fatalf("NewPipeline failed: %v", err)
+	}
+
+	ctx := context.Background()
+	err = pipeline.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	for i := 1; i <= 5; i++ {
+		rec := NewRecord(i)
+		rec.Timestamp = time.Now()
+		input <- rec
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	err = pipeline.Stop()
+	if err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+
+	_, windowCount := sink.Count()
+	if windowCount != 1 {
+		t.Fatalf("expected 1 window result from incomplete time window, got %d", windowCount)
+	}
+
+	results := sink.WindowResults()
+	if results[0].Value != 15.0 {
+		t.Errorf("expected sum=15 (1+2+...+5), got %v", results[0].Value)
+	}
+}
+
+func TestSlidingTimeWindowStopResultsNotLost(t *testing.T) {
+	input := make(chan *Record, 50)
+	source := NewChannelSource("test", input, 50)
+
+	window, err := NewWindowAggregator("avg", WindowConfig{
+		WindowType:  WindowTypeSlidingTime,
+		Aggregation: AggregationAvg,
+		Size:        300 * time.Millisecond,
+		Slide:       100 * time.Millisecond,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	cfg := DefaultPipelineConfig()
+	cfg.WindowAggregator = window
+
+	sink := NewCollectSink()
+	cfg.Sink = sink
+
+	pipeline, err := NewPipeline(cfg, source)
+	if err != nil {
+		t.Fatalf("NewPipeline failed: %v", err)
+	}
+
+	ctx := context.Background()
+	err = pipeline.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	baseTime := time.Now()
+	for i := 1; i <= 3; i++ {
+		rec := NewRecord(i * 10)
+		rec.Timestamp = baseTime.Add(time.Duration(i) * 50 * time.Millisecond)
+		input <- rec
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	err = pipeline.Stop()
+	if err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+
+	_, windowCount := sink.Count()
+	if windowCount == 0 {
+		t.Fatal("expected at least 1 window result from sliding time window on stop, got 0")
+	}
+}
+
+func TestRecordsFilteredVsRecordsExpanded(t *testing.T) {
+	input := make(chan *Record, 50)
+	source := NewChannelSource("test", input, 50)
+
+	cfg := DefaultPipelineConfig()
+	pipeline, err := NewPipeline(cfg, source)
+	if err != nil {
+		t.Fatalf("NewPipeline failed: %v", err)
+	}
+
+	filter := NewFilterOperator("filter-gt5", func(ctx context.Context, r *Record) (bool, error) {
+		val := r.Data.(int)
+		return val > 5, nil
+	})
+	_ = pipeline.AddOperator(filter)
+
+	flatMap := NewFlatMapOperator("expand", func(ctx context.Context, r *Record) ([]*Record, error) {
+		val := r.Data.(int)
+		if val == 8 {
+			return []*Record{}, nil
+		}
+		return []*Record{NewRecord(val), NewRecord(val * 2)}, nil
+	})
+	_ = pipeline.AddOperator(flatMap)
+
+	sink := NewCollectSink()
+	pipeline.SetSink(sink)
+
+	ctx := context.Background()
+	err = pipeline.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	for i := 1; i <= 10; i++ {
+		input <- NewRecord(i)
+	}
+	close(input)
+
+	time.Sleep(200 * time.Millisecond)
+	_ = pipeline.Stop()
+
+	stats := pipeline.Stats()
+
+	if stats.RecordsIn != 10 {
+		t.Errorf("expected RecordsIn=10, got %d", stats.RecordsIn)
+	}
+
+	if stats.RecordsFiltered != 5 {
+		t.Errorf("expected RecordsFiltered=5 (values 1,2,3,4,5), got %d", stats.RecordsFiltered)
+	}
+
+	if stats.RecordsExpanded != 1 {
+		t.Errorf("expected RecordsExpanded=1 (value 8 expands to empty), got %d", stats.RecordsExpanded)
+	}
+
+	if stats.RecordsErrors != 0 {
+		t.Errorf("expected RecordsErrors=0, got %d", stats.RecordsErrors)
+	}
+
+	expectedDropped := stats.RecordsFiltered + stats.RecordsExpanded + stats.RecordsErrors
+	if stats.RecordsDropped != expectedDropped {
+		t.Errorf("expected RecordsDropped=%d (Filtered+Expanded+Errors), got %d", expectedDropped, stats.RecordsDropped)
+	}
+
+	if stats.RecordsOut != 8 {
+		t.Errorf("expected RecordsOut=8 (values 6,7,9,10 each produce 2 outputs; 8 produces 0), got %d", stats.RecordsOut)
+	}
+}
+
+func TestOperatorChainProcessDiscriminatesFilterVsFlatMap(t *testing.T) {
+	chain := NewOperatorChain()
+
+	filter := NewFilterOperator("even", func(ctx context.Context, r *Record) (bool, error) {
+		return r.Data.(int)%2 == 0, nil
+	})
+	_ = chain.Add(filter)
+
+	flatMap := NewFlatMapOperator("expand", func(ctx context.Context, r *Record) ([]*Record, error) {
+		if r.Data.(int) == 8 {
+			return []*Record{}, nil
+		}
+		return []*Record{r}, nil
+	})
+	_ = chain.Add(flatMap)
+
+	ctx := context.Background()
+
+	rec1 := NewRecord(3)
+	_, filtered, err := chain.Process(ctx, rec1)
+	if err != nil {
+		t.Fatalf("Process failed: %v", err)
+	}
+	if !filtered {
+		t.Error("expected filtered=true for FilterOperator discarding odd number")
+	}
+
+	rec2 := NewRecord(8)
+	_, filtered, err = chain.Process(ctx, rec2)
+	if err != nil {
+		t.Fatalf("Process failed: %v", err)
+	}
+	if filtered {
+		t.Error("expected filtered=false for FlatMapOperator expanding to empty")
+	}
+
+	rec3 := NewRecord(6)
+	res, _, err := chain.Process(ctx, rec3)
+	if err != nil {
+		t.Fatalf("Process failed: %v", err)
+	}
+	if len(res) != 1 {
+		t.Errorf("expected 1 result for value 6, got %d", len(res))
+	}
+}
+
+func TestPipelineStopOrderNoDeadlock(t *testing.T) {
+	input := make(chan *Record, 20)
+	source := NewChannelSource("test", input, 20)
+
+	slowOp := NewMapOperator("slow", func(ctx context.Context, r *Record) (*Record, error) {
+		time.Sleep(50 * time.Millisecond)
+		return r, nil
+	})
+
+	cfg := DefaultPipelineConfig()
+	cfg.BufferSize = 20
+
+	pipeline, err := NewPipeline(cfg, source)
+	if err != nil {
+		t.Fatalf("NewPipeline failed: %v", err)
+	}
+
+	_ = pipeline.AddOperator(slowOp)
+
+	ctx := context.Background()
+	err = pipeline.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	for i := 0; i < 20; i++ {
+		input <- NewRecord(i)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- pipeline.Stop()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Stop returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pipeline.Stop() deadlocked - should complete within 3 seconds")
+	}
+}
+
+func TestPipelineStopPreservesSinkOrder(t *testing.T) {
+	input := make(chan *Record, 50)
+	source := NewChannelSource("test", input, 50)
+
+	window, err := NewWindowAggregator("count", WindowConfig{
+		WindowType:  WindowTypeTumblingCount,
+		Aggregation: AggregationCount,
+		CountSize:   3,
+		Extractor:   func(r *Record) (float64, error) { return 1.0, nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	cfg := DefaultPipelineConfig()
+	cfg.WindowAggregator = window
+
+	sink := NewCollectSink()
+	cfg.Sink = sink
+
+	pipeline, err := NewPipeline(cfg, source)
+	if err != nil {
+		t.Fatalf("NewPipeline failed: %v", err)
+	}
+
+	ctx := context.Background()
+	err = pipeline.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	for i := 1; i <= 7; i++ {
+		input <- NewRecord(i)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	_ = pipeline.Stop()
+
+	recCount, winCount := sink.Count()
+	if recCount != 7 {
+		t.Errorf("expected 7 records consumed by sink, got %d", recCount)
+	}
+	if winCount != 3 {
+		t.Errorf("expected 3 window results (2 complete + 1 partial), got %d", winCount)
+	}
+
+	results := sink.WindowResults()
+	if results[2].Partial != true {
+		t.Error("expected last window result to be partial")
+	}
+}
+
+func TestTumblingTimeWindowStopPartialResults(t *testing.T) {
+	input := make(chan *Record, 50)
+	source := NewChannelSource("test", input, 50)
+
+	window, err := NewWindowAggregator("sum", WindowConfig{
+		WindowType:  WindowTypeTumblingTime,
+		Aggregation: AggregationSum,
+		Size:        1 * time.Second,
+		Extractor:   func(r *Record) (float64, error) { return float64(r.Data.(int)), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewWindowAggregator failed: %v", err)
+	}
+
+	cfg := DefaultPipelineConfig()
+	cfg.WindowAggregator = window
+
+	sink := NewCollectSink()
+	cfg.Sink = sink
+
+	pipeline, err := NewPipeline(cfg, source)
+	if err != nil {
+		t.Fatalf("NewPipeline failed: %v", err)
+	}
+
+	ctx := context.Background()
+	err = pipeline.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	for i := 1; i <= 5; i++ {
+		rec := NewRecord(i)
+		rec.Timestamp = time.Now()
+		input <- rec
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	_ = pipeline.Stop()
+
+	_, winCount := sink.Count()
+	if winCount != 1 {
+		t.Fatalf("expected 1 partial window result from tumbling time window, got %d", winCount)
+	}
+
+	results := sink.WindowResults()
+	if results[0].Value != 15.0 {
+		t.Errorf("expected partial sum=15, got %v", results[0].Value)
 	}
 }

@@ -1122,14 +1122,53 @@ func (s *MemorySource) Fetch(_ context.Context, cursor *Cursor, batchSize int) (
 
 	batch := &Batch{
 		Records:  batchRecords,
-		FirstSeq: records[0].SeqID,
-		LastSeq:  records[len(records)-1].SeqID,
-		StartTs:  records[0].Timestamp,
-		EndTs:    records[len(records)-1].Timestamp,
+		FirstSeq: s.getRecordSeqID(records[0]),
+		LastSeq:  s.getRecordSeqID(records[len(records)-1]),
+		StartTs:  s.getRecordTimestamp(records[0]),
+		EndTs:    s.getRecordTimestamp(records[len(records)-1]),
 	}
 
 	s.currentOffset = endIdx
 	return batch, nil
+}
+
+func (s *MemorySource) getRecordSeqID(record *Record) int64 {
+	if s.idField != "" && record.Data != nil {
+		if v, ok := record.Data[s.idField]; ok {
+			switch val := v.(type) {
+			case int64:
+				return val
+			case int:
+				return int64(val)
+			case float64:
+				return int64(val)
+			case string:
+				if parsed, err := strconv.ParseInt(val, 10, 64); err == nil {
+					return parsed
+				}
+			}
+		}
+	}
+	return record.SeqID
+}
+
+func (s *MemorySource) getRecordTimestamp(record *Record) time.Time {
+	if s.timestampField != "" && record.Data != nil {
+		if v, ok := record.Data[s.timestampField]; ok {
+			switch val := v.(type) {
+			case time.Time:
+				return val
+			case string:
+				if parsed, err := time.Parse(time.RFC3339, val); err == nil {
+					return parsed
+				}
+				if parsed, err := time.Parse("2006-01-02 15:04:05", val); err == nil {
+					return parsed
+				}
+			}
+		}
+	}
+	return record.Timestamp
 }
 
 func (s *MemorySource) findStartIndex(cursor *Cursor) int {
@@ -1154,7 +1193,7 @@ func (s *MemorySource) findStartIndex(cursor *Cursor) int {
 			return s.currentOffset
 		}
 		for i := s.currentOffset; i < len(s.records); i++ {
-			if s.records[i].SeqID > lastID {
+			if s.getRecordSeqID(s.records[i]) > lastID {
 				return i
 			}
 		}
@@ -1169,7 +1208,7 @@ func (s *MemorySource) findStartIndex(cursor *Cursor) int {
 			return s.currentOffset
 		}
 		for i := s.currentOffset; i < len(s.records); i++ {
-			if s.records[i].Timestamp.After(lastTs) {
+			if s.getRecordTimestamp(s.records[i]).After(lastTs) {
 				return i
 			}
 		}

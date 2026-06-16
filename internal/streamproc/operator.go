@@ -278,19 +278,21 @@ func (c *OperatorChain) List() []string {
 	return names
 }
 
-func (c *OperatorChain) Process(ctx context.Context, input *Record) ([]*Record, error) {
+func (c *OperatorChain) Process(ctx context.Context, input *Record) ([]*Record, bool, error) {
 	c.mu.RLock()
 	operators := make([]Operator, len(c.operators))
 	copy(operators, c.operators)
 	c.mu.RUnlock()
 
 	current := []*Record{input}
-	for _, op := range operators {
+	filteredByFilter := false
+
+	for i, op := range operators {
 		nextBatch := make([]*Record, 0, len(current))
 		for _, rec := range current {
 			results, err := op.Process(ctx, rec)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if results != nil {
 				nextBatch = append(nextBatch, results...)
@@ -298,10 +300,16 @@ func (c *OperatorChain) Process(ctx context.Context, input *Record) ([]*Record, 
 		}
 		current = nextBatch
 		if len(current) == 0 {
-			return nil, nil
+			if _, ok := op.(*FilterOperator); ok {
+				filteredByFilter = true
+			} else {
+				filteredByFilter = false
+			}
+			return nil, filteredByFilter, nil
 		}
+		_ = i
 	}
-	return current, nil
+	return current, false, nil
 }
 
 func (c *OperatorChain) SaveStates() (map[string][]byte, error) {

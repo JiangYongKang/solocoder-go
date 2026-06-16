@@ -1,0 +1,7 @@
+产物不满意：
+1. 模型仅修复了 extractFieldNameFromCondition 中取反表达式的 TrimSpace 缺失，却忽略了 buildCondition 内取反分支和简单表达式分支同样缺少 TrimSpace 处理。提示词描述的缺陷是条件表达式解析的通用模式遗漏而非单一函数的局部问题，模型未做全局排查就认为修复完成，导致 buildCondition 的空格处理缺陷直到新测试失败后才被动发现，交付的修复产物不完整。
+2. 修复后 extractFieldNameFromCondition 和 buildCondition 各自独立实现了条件表达式中取反、等值、简单三种模式的字段名解析逻辑。这与提示词指出的 isEmptyValue 和 dereferenceValue 重复解引用问题本质相同：同一模块内两处独立维护的解析规则，未来修改条件语法时必须同步改动两处。虽然二者返回类型不同不能简单合并，但字段名提取部分可抽取为共用辅助函数以消除重复。
+过程不满意：
+1. 模型在收到提示词后没有先阅读任何代码就立即用 todo_write 创建了 6 项子任务计划，然后才通过 search_by_regex 搜索函数名。提示词中已明确给出两个修复方向，此时最优先的动作是打开 validator.go 阅读三处相关代码确认缺陷形态，再根据实际代码规模制定合理的执行计划，而非在分析前凭猜测设定任务粒度。
+2. 模型用 search_by_regex 按函数名逐个搜索了四个目标函数，但没有以代码模式作为搜索线索。提示词描述的缺陷模式是 TrimPrefix 后缺 TrimSpace，模型应搜索 validator.go 中所有 strings.TrimPrefix 调用点来定位潜在受影响的代码段。如果能以代码模式而非函数名进行搜索，就能在第一次修改时发现 buildCondition 中相同的遗漏，无需等测试失败再补修。
+3. 模型修复 extractFieldNameFromCondition 后运行测试通过就认为完成，接着添加新测试才发现 buildCondition 也需同步修改。这种修一处测一次、失败后再补另一处的行为属于试错式修复而非系统性分析。正确做法是在修改 extractFieldNameFromCondition 时评估条件表达式解析的完整调用链，一次性找出所有需要同步改动的位置。

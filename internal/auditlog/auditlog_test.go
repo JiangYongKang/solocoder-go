@@ -1111,6 +1111,17 @@ func (sw *slowWriter) Count() int {
 	return len(sw.logs)
 }
 
+func (sw *slowWriter) ReadAll() []*AuditLog {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	result := make([]*AuditLog, len(sw.logs))
+	for i, log := range sw.logs {
+		cp := *log
+		result[i] = &cp
+	}
+	return result
+}
+
 func TestLogger_QueryBySubjectWithTime(t *testing.T) {
 	writer := NewMemoryWriter()
 	logger := startLogger(t, writer)
@@ -1498,7 +1509,6 @@ type slowFailingWriter struct {
 	mu       sync.Mutex
 	blockCh  chan struct{}
 	delay    time.Duration
-	fail     bool
 	callCnt  int32
 }
 
@@ -1508,9 +1518,6 @@ func (sfw *slowFailingWriter) Write(log *AuditLog) error {
 		<-sfw.blockCh
 	}
 	time.Sleep(sfw.delay)
-	if sfw.fail {
-		return errors.New("simulated failure")
-	}
 	return errors.New("simulated failure for degrade test")
 }
 
@@ -1617,18 +1624,25 @@ func TestFix_Issue4_VerifyIntegrity_DetectsWriterHashMismatch(t *testing.T) {
 	waitForCondition(t, func() bool { return writer.Count() == 3 }, 2*time.Second, "all logs written")
 
 	logs := writer.ReadAll()
-	logs[1].CurrentHash = "manipulated-hash"
+	targetIdx := len(logs) - 1
+	logs[targetIdx].CurrentHash = "manipulated-hash"
 	writer.mu.Lock()
-	cp := *logs[1]
-	writer.logs[1] = &cp
+	cp := *logs[targetIdx]
+	writer.logs[targetIdx] = &cp
 	writer.mu.Unlock()
 
 	result := logger.VerifyIntegrity()
 	if result.Valid {
 		t.Fatal("integrity check should fail for hash mismatch")
 	}
-	if result.TamperedIndex != 1 {
-		t.Errorf("expected TamperedIndex 1 for hash mismatch, got %d (msg: %s)", result.TamperedIndex, result.Message)
+	if result.TamperedIndex != targetIdx {
+		t.Errorf("expected TamperedIndex %d for hash mismatch on last log, got %d (msg: %s)", targetIdx, result.TamperedIndex, result.Message)
+	}
+	if !containsSubstring(result.Message, "hash") {
+		t.Errorf("expected Message to contain 'hash' to indicate hash-related failure, got: %s", result.Message)
+	}
+	if result.FullySynchronized {
+		t.Error("expected FullySynchronized to be false when hash mismatch detected")
 	}
 }
 
@@ -1648,6 +1662,147 @@ func TestFix_Issue4_VerifyIntegrity_DetectsWriterBrokenChain(t *testing.T) {
 	result := logger.VerifyIntegrity()
 	if result.Valid {
 		t.Fatal("integrity check should fail for broken chain in writer")
+	}
+	if result.TamperedIndex != 2 {
+		t.Errorf("expected TamperedIndex 2 for broken chain at index 2, got %d", result.TamperedIndex)
+	}
+	if result.Message == "" {
+		t.Fatal("expected non-empty Message")
+	}
+	if !containsSubstring(result.Message, "broken") {
+		t.Errorf("expected Message to contain 'broken' to indicate chain break, got: %s", result.Message)
+	}
+	if !containsSubstring(result.Message, "chain") {
+		t.Errorf("expected Message to contain 'chain' to indicate hash chain issue, got: %s", result.Message)
+	}
+	if result.FullySynchronized {
+		t.Error("expected FullySynchronized to be false when chain is broken")
+	}
+}
+
+func TestFix_Issue4_VerifyIntegrity_DetectsWriterDataLoss_AfterStop(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger := startLogger(t, writer)
+
+	total := 6
+	for i := 0; i < total; i++ {
+		logger.LogSync(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	logger.Stop()
+
+	result := logger.VerifyIntegrityStrict()
+	if !result.Valid {
+		t.Fatalf("integrity check should pass before data loss: %s", result.Message)
+	}
+	if !result.FullySynchronized {
+		t.Error("expected FullySynchronized to be true after Stop")
+	}
+	if writer.Count() != total {
+		t.Fatalf("expected writer to have %d logs, got %d", total, writer.Count())
+	}
+
+	removed := writer.Truncate(2)
+	if removed != 2 {
+		t.Fatalf("expected to truncate 2 logs, removed %d", removed)
+	}
+
+	result2 := logger.VerifyIntegrityStrict()
+	if result2.Valid {
+		t.Fatal("integrity check should fail after writer data loss")
+	}
+	if result2.TamperedIndex != total-2 {
+		t.Errorf("expected TamperedIndex %d (after 4 remaining), got %d", total-2, result2.TamperedIndex)
+	}
+	if !containsSubstring(result2.Message, "data loss") {
+		t.Errorf("expected Message to contain 'data loss', got: %s", result2.Message)
+	}
+	if result2.FullySynchronized {
+		t.Error("expected FullySynchronized to be false after data loss")
+	}
+}
+
+func TestFix_Issue4_VerifyIntegrity_PendingFlush_BeforeStop(t *testing.T) {
+	cfg := Config{
+		MaxRetries:      0,
+		RetryInterval:   0,
+		BufferSize:      100,
+		WorkerCount:     1,
+		EnableHashChain: true,
+	}
+	slow := &slowWriter{delay: 50 * time.Millisecond}
+	logger, err := NewLoggerWithConfig(slow, cfg)
+	if err != nil {
+		t.Fatalf("NewLoggerWithConfig failed: %v", err)
+	}
+	if err := logger.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		_ = logger.Log(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	result := logger.VerifyIntegrity()
+	if !result.Valid {
+		t.Fatalf("integrity check should pass with pending flush (before Stop): %s", result.Message)
+	}
+	if !containsSubstring(result.Message, "pending flush") {
+		t.Errorf("expected Message to contain 'pending flush' while running, got: %s", result.Message)
+	}
+
+	logger.Stop()
+
+	result2 := logger.VerifyIntegrity()
+	if !result2.Valid {
+		t.Fatalf("integrity check should pass after Stop (fully synced): %s", result2.Message)
+	}
+	if !containsSubstring(result2.Message, "fully synchronized") {
+		t.Errorf("expected Message to contain 'fully synchronized' after Stop, got: %s", result2.Message)
+	}
+}
+
+func containsSubstring(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || containsSubstrHelper(s, sub))
+}
+
+func containsSubstrHelper(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func TestFix_Issue4_VerifyIntegrity_WriterDeleteSpecificLog(t *testing.T) {
+	writer := NewMemoryWriter()
+	logger := startLogger(t, writer)
+
+	for i := 0; i < 5; i++ {
+		logger.LogSync(makeEntry(fmt.Sprintf("u%d", i), fmt.Sprintf("r%d", i), OpCreate, ResultSuccess))
+	}
+
+	logger.Stop()
+
+	result := logger.VerifyIntegrityStrict()
+	if !result.Valid {
+		t.Fatalf("initial integrity check failed: %s", result.Message)
+	}
+
+	ok := writer.DeleteLog(2)
+	if !ok {
+		t.Fatal("DeleteLog returned false")
+	}
+
+	result2 := logger.VerifyIntegrityStrict()
+	if result2.Valid {
+		t.Fatal("integrity check should fail after deleting a log from writer")
+	}
+	if !containsSubstring(result2.Message, "data loss") {
+		t.Errorf("expected 'data loss' in message, got: %s", result2.Message)
 	}
 }
 

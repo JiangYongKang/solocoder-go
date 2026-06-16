@@ -157,7 +157,7 @@ func (p *Pipeline) Stats() PipelineStats {
 	p.statsMu.RLock()
 	defer p.statsMu.RUnlock()
 	stats := p.stats
-	stats.RecordsDropped = stats.RecordsFiltered + stats.RecordsErrors
+	stats.RecordsDropped = stats.RecordsFiltered + stats.RecordsExpanded + stats.RecordsErrors
 	if !stats.StartTime.IsZero() {
 		stats.Elapsed = time.Since(stats.StartTime)
 	}
@@ -174,6 +174,10 @@ func (p *Pipeline) incrementRecordsOut() {
 
 func (p *Pipeline) incrementRecordsFiltered() {
 	atomic.AddInt64(&p.stats.RecordsFiltered, 1)
+}
+
+func (p *Pipeline) incrementRecordsExpanded() {
+	atomic.AddInt64(&p.stats.RecordsExpanded, 1)
 }
 
 func (p *Pipeline) incrementRecordsErrors() {
@@ -393,7 +397,7 @@ func (p *Pipeline) recordProcessor() {
 
 			atomic.StoreInt64(&p.sourceOffset, rec.SeqID)
 
-			results, err := p.operators.Process(p.ctx, rec)
+			results, filteredByFilter, err := p.operators.Process(p.ctx, rec)
 			if err != nil {
 				p.incrementErrors()
 				p.incrementRecordsErrors()
@@ -401,7 +405,11 @@ func (p *Pipeline) recordProcessor() {
 			}
 
 			if results == nil || len(results) == 0 {
-				p.incrementRecordsFiltered()
+				if filteredByFilter {
+					p.incrementRecordsFiltered()
+				} else {
+					p.incrementRecordsExpanded()
+				}
 				continue
 			}
 
@@ -608,10 +616,6 @@ func (p *Pipeline) Resume() error {
 }
 
 func (p *Pipeline) Stop() error {
-	p.stopOnce.Do(func() {
-		close(p.stopCh)
-	})
-
 	p.statusMu.Lock()
 	if p.status == PipelineStatusStopped || p.status == PipelineStatusCompleted {
 		p.statusMu.Unlock()
@@ -621,10 +625,16 @@ func (p *Pipeline) Stop() error {
 	p.status = PipelineStatusStopped
 	p.statusMu.Unlock()
 
-	if prevStatus == PipelineStatusRunning || prevStatus == PipelineStatusPaused {
-		if err := p.source.Stop(); err != nil {
-			return err
-		}
+	if p.window != nil {
+		p.window.Stop()
+	}
+
+	p.stopOnce.Do(func() {
+		close(p.stopCh)
+	})
+
+	if p.cfg.EnableCheckpoint && p.stats.CheckpointsMade == 0 {
+		_ = p.SaveCheckpoint()
 	}
 
 	if p.cancel != nil {
@@ -633,12 +643,10 @@ func (p *Pipeline) Stop() error {
 
 	p.wg.Wait()
 
-	if p.cfg.EnableCheckpoint && p.stats.CheckpointsMade == 0 {
-		_ = p.SaveCheckpoint()
-	}
-
-	if p.window != nil {
-		p.window.Stop()
+	if prevStatus == PipelineStatusRunning || prevStatus == PipelineStatusPaused {
+		if err := p.source.Stop(); err != nil {
+			return err
+		}
 	}
 
 	if p.sink != nil {
@@ -713,6 +721,10 @@ func (s *CollectSink) GetResults() []*WindowResult {
 	result := make([]*WindowResult, len(s.Results))
 	copy(result, s.Results)
 	return result
+}
+
+func (s *CollectSink) WindowResults() []*WindowResult {
+	return s.GetResults()
 }
 
 func (s *CollectSink) Count() (int, int) {

@@ -1,0 +1,5 @@
+你实现的 ETL 数据管道模块修复后仍存在一些实现问题，需要修复：
+1. MemorySource 的 findStartIndex 方法在 ExtractModeID 和 ExtractModeTimestamp 两个增量提取分支中，直接使用 s.records[i].SeqID 和 s.records[i].Timestamp 来与游标的 LastValue 做比较，完全忽略了 MemorySource 上的 timestampField 和 idField 配置字段。工厂函数 SetIncrementalFields 已将用户配置的字段名正确存储到 MemorySource 实例中，但增量提取逻辑始终走 Record 结构体的硬编码字段而非 Data map 中的用户指定字段，配置项成为静默无效的死数据。
+2. etlpipe_test.go 中的 slowMemoryTarget 结构体在修改时移除了 onceDelay 字段的赋值但保留了结构体定义中的 onceDelay 和 hasDelayed 两个字段。onceDelay 字段已不存在任何设置路径，成为死字段，后续维护者会误以为它仍参与延迟控制逻辑。
+3. 修复后需要为上述问题补充对应的单元测试。
+4. 运行 go test ./internal/etlpipe/ -v，需要让所有测试通过。

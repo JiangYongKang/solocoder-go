@@ -588,6 +588,32 @@ func (s *HTMLSanitizer) processAttributes(attrStr string, cfg *SanitizerConfig) 
 			colonIdx := strings.Index(trimmed, ":")
 			if colonIdx == -1 {
 				isSafe = true
+			} else if strings.HasPrefix(trimmed, "data:") {
+				dataRest := trimmed[5:]
+				semicolonIdx := strings.Index(dataRest, ";")
+				commaIdx := strings.Index(dataRest, ",")
+				var mimeEnd int
+				if semicolonIdx != -1 && (commaIdx == -1 || semicolonIdx < commaIdx) {
+					mimeEnd = semicolonIdx
+				} else if commaIdx != -1 {
+					mimeEnd = commaIdx
+				} else {
+					mimeEnd = len(dataRest)
+				}
+				mimeType := dataRest[:mimeEnd]
+				if strings.HasPrefix(mimeType, "image/") ||
+					strings.HasPrefix(mimeType, "audio/") ||
+					strings.HasPrefix(mimeType, "video/") ||
+					strings.HasPrefix(mimeType, "font/") ||
+					mimeType == "application/pdf" ||
+					mimeType == "application/json" ||
+					mimeType == "text/plain" ||
+					mimeType == "text/css" ||
+					mimeType == "application/octet-stream" ||
+					strings.HasPrefix(mimeType, "image/") ||
+					strings.HasPrefix(mimeType, "application/vnd.") {
+					isSafe = true
+				}
 			} else {
 				for prefix := range safeProtocols {
 					if strings.HasPrefix(trimmed, prefix) {

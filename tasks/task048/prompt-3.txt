@@ -1,0 +1,6 @@
+你实现的流式数据处理器模块修复后仍存在一些实现问题，需要修复：
+1. pipeline.go 的 Stop 方法中将 window.Stop() 调用移动到了 wg.Wait() 之后执行。这导致 ctx 被 cancel 后 windowResultReader 的消费协程先退出，window.Stop() 随后调用时产出的计数窗口 Partial 结果和时间窗口剩余桶结果已经没有消费者接收，窗口聚合结果直接丢失。
+2. pipeline.go 的 recordProcessor 方法中 FlatMap 展开为空和 Filter 过滤记录这两种不同语义的丢弃仍被合并计入同一个 RecordsFiltered 计数器。调用方通过 Stats 获取的 RecordsFiltered 数值无法区分一条记录是被 Filter 的过滤逻辑显式丢弃还是被 FlatMap 展开后被动为空丢弃。
+3. pipeline.go 的 Stop 方法先调用 source.Stop() 停止上游数据源，然后才 cancel 上下文和等待下游协程退出。在 source 的输出 channel 和 pipeline 内部 channel 同时满的极端场景下，source.Stop() 可能阻塞在等待 source goroutine 写入，而 source goroutine 又阻塞在向下游写入，形成死锁。
+4. 修复后需要为上述每个问题补充对应的单元测试，覆盖 Stop 期间窗口结果的完整性、FlatMap 与 Filter 丢弃语义的区分以及停止顺序的正确性。
+5. 运行 go test ./internal/streamproc/ -v，需要让所有测试通过。

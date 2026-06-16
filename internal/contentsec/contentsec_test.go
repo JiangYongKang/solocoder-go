@@ -1108,17 +1108,27 @@ func TestDataMaskerConsistentOrder(t *testing.T) {
 		"身份证: " + idCard,
 		"ID: " + idCard + " 电话: 13812345678",
 		"多个证件: " + idCard + " 和 110101199003071234",
+		"复杂混合: 手机 13812345678 邮箱 test@example.com 身份证 " + idCard + " 银行卡 6222021234567890123",
 	}
 
-	for i := 0; i < 10; i++ {
-		first := m.Mask(inputs[0])
-		for _, input := range inputs {
+	baselineResults := make([]string, len(inputs))
+	for i, input := range inputs {
+		baselineResults[i] = m.Mask(input)
+	}
+
+	for iter := 0; iter < 50; iter++ {
+		for i, input := range inputs {
 			result := m.Mask(input)
-			if result != m.Mask(input) {
-				t.Errorf("masking should be deterministic, got different results on iteration %d", i)
+			if result != baselineResults[i] {
+				t.Errorf("跨迭代一致性校验失败: 迭代 %d, 输入索引 %d\n基准: %s\n当前: %s",
+					iter, i, baselineResults[i], result)
+			}
+			sameCall := m.Mask(input)
+			if result != sameCall {
+				t.Errorf("同迭代内两次调用不一致: 迭代 %d, 输入索引 %d\n首次: %s\n再次: %s",
+					iter, i, result, sameCall)
 			}
 		}
-		_ = first
 	}
 }
 
@@ -1209,6 +1219,128 @@ func TestSanitizeSrcJavaScriptBlocked(t *testing.T) {
 	}
 	if !strings.Contains(result, `<img`) {
 		t.Errorf("img tag should be preserved even if src is removed, got: %s", result)
+	}
+}
+
+func TestSanitizeDataURIImageAllowed(t *testing.T) {
+	s := NewHTMLSanitizer()
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+	}{
+		{
+			name:     "PNG image data URI",
+			input:    `<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" alt="test">`,
+			contains: `src="data:image/png;base64,`,
+		},
+		{
+			name:     "JPEG image data URI",
+			input:    `<img src="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEAAAAAAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oACAEBAAA/APn+iiiv/9k=" alt="photo">`,
+			contains: `src="data:image/jpeg;base64,`,
+		},
+		{
+			name:     "SVG image data URI without base64",
+			input:    `<img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E" alt="svg">`,
+			contains: `src="data:image/svg+xml,`,
+		},
+		{
+			name:     "GIF image data URI",
+			input:    `<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="gif">`,
+			contains: `src="data:image/gif;base64,`,
+		},
+		{
+			name:     "WebP image data URI",
+			input:    `<img src="data:image/webp;base64,UklGRkoAAABXRUJQVlA4WAoAAAAQAAAAAAAAAAAAQUxQSAwAAAABBxAR/Q9ERP8DAABWUDggGAAAADABAJ0BKgEAAQADADQlpAADcAD++/1QAA==" alt="webp">`,
+			contains: `src="data:image/webp;base64,`,
+		},
+		{
+			name:     "PDF data URI in a tag",
+			input:    `<a href="data:application/pdf;base64,JVBERi0xLjQKJcOkw7zDts..." target="_blank">下载PDF</a>`,
+			contains: `href="data:application/pdf;base64,`,
+		},
+		{
+			name:     "Font data URI",
+			input:    `<img src="data:font/woff;base64,d09GRgABAAAAAB..." alt="font">`,
+			contains: `src="data:font/woff;base64,`,
+		},
+		{
+			name:     "Audio data URI",
+			input:    `<img src="data:audio/mpeg;base64,SUQzBAAAAAAAI1..." alt="audio">`,
+			contains: `src="data:audio/mpeg;base64,`,
+		},
+		{
+			name:     "Video data URI",
+			input:    `<img src="data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZm..." alt="video">`,
+			contains: `src="data:video/mp4;base64,`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.Sanitize(tt.input)
+			if !strings.Contains(result, tt.contains) {
+				t.Errorf("%s: expected data URI to be preserved, missing %q in result: %s", tt.name, tt.contains, result)
+			}
+		})
+	}
+}
+
+func TestSanitizeDataURIDangerousTypesBlocked(t *testing.T) {
+	s := NewHTMLSanitizer()
+
+	tests := []struct {
+		name     string
+		input    string
+		excludes string
+	}{
+		{
+			name:     "data:text/html blocked",
+			input:    `<a href="data:text/html,<script>alert(1)</script>">click</a>`,
+			excludes: "data:text/html",
+		},
+		{
+			name:     "data:text/javascript blocked",
+			input:    `<a href="data:text/javascript,alert(1)">click</a>`,
+			excludes: "data:text/javascript",
+		},
+		{
+			name:     "data:application/javascript blocked",
+			input:    `<a href="data:application/javascript,alert(1)">click</a>`,
+			excludes: "data:application/javascript",
+		},
+		{
+			name:     "data:application/x-shockwave-flash blocked",
+			input:    `<embed src="data:application/x-shockwave-flash,base64,abc">`,
+			excludes: "data:application/x-shockwave-flash",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.Sanitize(tt.input)
+			if strings.Contains(result, tt.excludes) {
+				t.Errorf("%s: dangerous data URI should be blocked, but found %q in result: %s", tt.name, tt.excludes, result)
+			}
+		})
+	}
+}
+
+func TestSanitizeDataURIRegressionImage(t *testing.T) {
+	s := NewHTMLSanitizer()
+
+	input := `<p>这是一张内联图片: <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" alt="测试图"></p>`
+	result := s.Sanitize(input)
+
+	if !strings.Contains(result, "data:image/png") {
+		t.Errorf("data URI 内联图片不应被拦截，这是回归缺陷。结果: %s", result)
+	}
+	if !strings.Contains(result, `alt="测试图"`) {
+		t.Errorf("alt 属性应被保留，结果: %s", result)
+	}
+	if !strings.Contains(result, "<p>") || !strings.Contains(result, "</p>") {
+		t.Errorf("p 标签应被保留，结果: %s", result)
 	}
 }
 

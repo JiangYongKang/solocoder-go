@@ -1182,23 +1182,12 @@ func TestPipelineWriteTimeout(t *testing.T) {
 }
 
 type slowMemoryTarget struct {
-	target    *MemoryTarget
-	delay     time.Duration
-	onceDelay bool
-	hasDelayed bool
-	mu        sync.Mutex
+	target *MemoryTarget
+	delay  time.Duration
 }
 
 func (s *slowMemoryTarget) WriteBatch(ctx context.Context, records []*Record) ([]int, error) {
-	s.mu.Lock()
-	shouldDelay := !s.hasDelayed || !s.onceDelay
-	if shouldDelay {
-		s.hasDelayed = true
-		s.mu.Unlock()
-		time.Sleep(s.delay)
-	} else {
-		s.mu.Unlock()
-	}
+	time.Sleep(s.delay)
 	return s.target.WriteBatch(ctx, records)
 }
 
@@ -1843,5 +1832,305 @@ func TestMemorySourceIncremental_IDModeWithMixedSeqIDs(t *testing.T) {
 	}
 	if batch.LastSeq != 50 {
 		t.Errorf("expected LastSeq=50, got %d", batch.LastSeq)
+	}
+}
+
+func TestMemorySource_CustomIDField_Incremental(t *testing.T) {
+	records := []*Record{
+		{ID: "r1", SeqID: 0, Data: map[string]interface{}{"user_id": 1001, "name": "Alice"}},
+		{ID: "r2", SeqID: 0, Data: map[string]interface{}{"user_id": 1002, "name": "Bob"}},
+		{ID: "r3", SeqID: 0, Data: map[string]interface{}{"user_id": 1003, "name": "Charlie"}},
+		{ID: "r4", SeqID: 0, Data: map[string]interface{}{"user_id": 1004, "name": "David"}},
+		{ID: "r5", SeqID: 0, Data: map[string]interface{}{"user_id": 1005, "name": "Eve"}},
+	}
+	source := NewMemorySource(records)
+	source.SetIncrementalFields("", "user_id")
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeID, LastValue: nil, LastOffset: 0}
+	batch1, err := source.Fetch(context.Background(), cursor, 2)
+	if err != nil {
+		t.Fatalf("fetch1 failed: %v", err)
+	}
+	if batch1.Size() != 2 {
+		t.Fatalf("expected batch size 2, got %d", batch1.Size())
+	}
+	if batch1.FirstSeq != 1001 {
+		t.Errorf("expected FirstSeq=1001 from user_id field, got %d", batch1.FirstSeq)
+	}
+	if batch1.LastSeq != 1002 {
+		t.Errorf("expected LastSeq=1002 from user_id field, got %d", batch1.LastSeq)
+	}
+
+	cursor.LastValue = int64(1002)
+	cursor.LastOffset = 2
+	batch2, err := source.Fetch(context.Background(), cursor, 10)
+	if err != nil {
+		t.Fatalf("fetch2 failed: %v", err)
+	}
+	if batch2.Size() != 3 {
+		t.Fatalf("expected 3 records after user_id 1002, got %d", batch2.Size())
+	}
+	if batch2.FirstSeq != 1003 {
+		t.Errorf("expected FirstSeq=1003, got %d", batch2.FirstSeq)
+	}
+	if batch2.LastSeq != 1005 {
+		t.Errorf("expected LastSeq=1005, got %d", batch2.LastSeq)
+	}
+}
+
+func TestMemorySource_CustomTimestampField_Incremental(t *testing.T) {
+	baseTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	records := []*Record{
+		{ID: "r1", Timestamp: time.Time{}, Data: map[string]interface{}{"created_at": baseTime.Add(1 * time.Hour)}},
+		{ID: "r2", Timestamp: time.Time{}, Data: map[string]interface{}{"created_at": baseTime.Add(2 * time.Hour)}},
+		{ID: "r3", Timestamp: time.Time{}, Data: map[string]interface{}{"created_at": baseTime.Add(3 * time.Hour)}},
+		{ID: "r4", Timestamp: time.Time{}, Data: map[string]interface{}{"created_at": baseTime.Add(4 * time.Hour)}},
+		{ID: "r5", Timestamp: time.Time{}, Data: map[string]interface{}{"created_at": baseTime.Add(5 * time.Hour)}},
+	}
+	source := NewMemorySource(records)
+	source.SetIncrementalFields("created_at", "")
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeTimestamp, LastValue: nil, LastOffset: 0}
+	batch1, err := source.Fetch(context.Background(), cursor, 2)
+	if err != nil {
+		t.Fatalf("fetch1 failed: %v", err)
+	}
+	if batch1.Size() != 2 {
+		t.Fatalf("expected batch size 2, got %d", batch1.Size())
+	}
+	if !batch1.StartTs.Equal(baseTime.Add(1 * time.Hour)) {
+		t.Errorf("unexpected StartTs: %v", batch1.StartTs)
+	}
+	if !batch1.EndTs.Equal(baseTime.Add(2 * time.Hour)) {
+		t.Errorf("unexpected EndTs: %v", batch1.EndTs)
+	}
+
+	cursor.LastValue = baseTime.Add(2 * time.Hour)
+	cursor.LastOffset = 2
+	batch2, err := source.Fetch(context.Background(), cursor, 10)
+	if err != nil {
+		t.Fatalf("fetch2 failed: %v", err)
+	}
+	if batch2.Size() != 3 {
+		t.Fatalf("expected 3 records after timestamp 2h, got %d", batch2.Size())
+	}
+	if !batch2.StartTs.Equal(baseTime.Add(3 * time.Hour)) {
+		t.Errorf("expected StartTs = 3h, got %v", batch2.StartTs)
+	}
+}
+
+func TestMemorySource_CustomIDField_StringType(t *testing.T) {
+	records := []*Record{
+		{ID: "r1", SeqID: 0, Data: map[string]interface{}{"row_id": "100", "name": "A"}},
+		{ID: "r2", SeqID: 0, Data: map[string]interface{}{"row_id": "200", "name": "B"}},
+		{ID: "r3", SeqID: 0, Data: map[string]interface{}{"row_id": "300", "name": "C"}},
+	}
+	source := NewMemorySource(records)
+	source.SetIncrementalFields("", "row_id")
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeID, LastValue: int64(150), LastOffset: 0}
+	batch, err := source.Fetch(context.Background(), cursor, 10)
+	if err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+	if batch.Size() != 2 {
+		t.Fatalf("expected 2 records (row_id > 150), got %d", batch.Size())
+	}
+	if batch.FirstSeq != 200 {
+		t.Errorf("expected FirstSeq=200, got %d", batch.FirstSeq)
+	}
+}
+
+func TestMemorySource_CustomTimestampField_StringType(t *testing.T) {
+	baseTime := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	records := []*Record{
+		{ID: "r1", Timestamp: time.Time{}, Data: map[string]interface{}{"updated_at": baseTime.Add(0 * time.Hour).Format(time.RFC3339)}},
+		{ID: "r2", Timestamp: time.Time{}, Data: map[string]interface{}{"updated_at": baseTime.Add(1 * time.Hour).Format(time.RFC3339)}},
+		{ID: "r3", Timestamp: time.Time{}, Data: map[string]interface{}{"updated_at": baseTime.Add(2 * time.Hour).Format(time.RFC3339)}},
+	}
+	source := NewMemorySource(records)
+	source.SetIncrementalFields("updated_at", "")
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeTimestamp, LastValue: baseTime.Add(30 * time.Minute), LastOffset: 0}
+	batch, err := source.Fetch(context.Background(), cursor, 10)
+	if err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+	if batch.Size() != 2 {
+		t.Fatalf("expected 2 records after 30min, got %d", batch.Size())
+	}
+}
+
+func TestMemorySource_CustomIDField_MissingFieldFallback(t *testing.T) {
+	records := []*Record{
+		{ID: "r1", SeqID: 10, Data: map[string]interface{}{"name": "Alice"}},
+		{ID: "r2", SeqID: 20, Data: map[string]interface{}{"name": "Bob"}},
+		{ID: "r3", SeqID: 30, Data: map[string]interface{}{"name": "Charlie"}},
+	}
+	source := NewMemorySource(records)
+	source.SetIncrementalFields("", "nonexistent_field")
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeID, LastValue: int64(15), LastOffset: 0}
+	batch, err := source.Fetch(context.Background(), cursor, 10)
+	if err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+	if batch.Size() != 2 {
+		t.Fatalf("expected 2 records (fallback to SeqID > 15), got %d", batch.Size())
+	}
+	if batch.FirstSeq != 20 {
+		t.Errorf("expected FirstSeq=20 (fallback to SeqID), got %d", batch.FirstSeq)
+	}
+}
+
+func TestMemorySource_CustomTimestampField_MissingFieldFallback(t *testing.T) {
+	ts1 := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	ts2 := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+	ts3 := time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC)
+	records := []*Record{
+		{ID: "r1", Timestamp: ts1, Data: map[string]interface{}{"name": "Alice"}},
+		{ID: "r2", Timestamp: ts2, Data: map[string]interface{}{"name": "Bob"}},
+		{ID: "r3", Timestamp: ts3, Data: map[string]interface{}{"name": "Charlie"}},
+	}
+	source := NewMemorySource(records)
+	source.SetIncrementalFields("nonexistent_field", "")
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeTimestamp, LastValue: ts1.Add(12 * time.Hour), LastOffset: 0}
+	batch, err := source.Fetch(context.Background(), cursor, 10)
+	if err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+	if batch.Size() != 2 {
+		t.Fatalf("expected 2 records (fallback to Timestamp), got %d", batch.Size())
+	}
+	if !batch.StartTs.Equal(ts2) {
+		t.Errorf("expected StartTs=ts2 (fallback to Timestamp), got %v", batch.StartTs)
+	}
+}
+
+func TestMemorySource_SetIncrementalFields_SeparateConfig(t *testing.T) {
+	records := generateTestRecords(5)
+	source := NewMemorySource(records)
+
+	if source.idField != "" {
+		t.Errorf("expected initial idField to be empty, got '%s'", source.idField)
+	}
+	if source.timestampField != "" {
+		t.Errorf("expected initial timestampField to be empty, got '%s'", source.timestampField)
+	}
+
+	source.SetIncrementalFields("ts_field", "")
+	if source.timestampField != "ts_field" {
+		t.Errorf("expected timestampField='ts_field', got '%s'", source.timestampField)
+	}
+	if source.idField != "" {
+		t.Errorf("expected idField to remain empty, got '%s'", source.idField)
+	}
+
+	source.SetIncrementalFields("", "id_field")
+	if source.idField != "id_field" {
+		t.Errorf("expected idField='id_field', got '%s'", source.idField)
+	}
+	if source.timestampField != "" {
+		t.Errorf("expected timestampField to be overwritten to empty, got '%s'", source.timestampField)
+	}
+
+	source.SetIncrementalFields("both_ts", "both_id")
+	if source.timestampField != "both_ts" || source.idField != "both_id" {
+		t.Errorf("expected both fields set, got ts='%s', id='%s'", source.timestampField, source.idField)
+	}
+}
+
+func TestPipeline_CustomIncrementalIDField(t *testing.T) {
+	records := []*Record{
+		{ID: "r1", SeqID: 0, Data: map[string]interface{}{"order_id": int64(1001), "amount": 10.0}},
+		{ID: "r2", SeqID: 0, Data: map[string]interface{}{"order_id": int64(1002), "amount": 20.0}},
+		{ID: "r3", SeqID: 0, Data: map[string]interface{}{"order_id": int64(1003), "amount": 30.0}},
+		{ID: "r4", SeqID: 0, Data: map[string]interface{}{"order_id": int64(1004), "amount": 40.0}},
+		{ID: "r5", SeqID: 0, Data: map[string]interface{}{"order_id": int64(1005), "amount": 50.0}},
+	}
+	source := NewMemorySource(records)
+	source.SetIncrementalFields("", "order_id")
+	target := NewMemoryTarget()
+
+	cfg := Config{
+		BatchSize:         2,
+		WriteTimeout:      30 * time.Second,
+		ExtractMode:       ExtractModeID,
+		IncrementalField:  "order_id",
+		MaxErrorQueueSize: 100,
+	}
+
+	pipeline, err := NewPipeline(cfg, source, target)
+	if err != nil {
+		t.Fatalf("failed to create pipeline: %v", err)
+	}
+
+	err = pipeline.Run(context.Background())
+	if err != nil {
+		t.Fatalf("first run failed: %v", err)
+	}
+
+	if target.Count() != 5 {
+		t.Fatalf("expected 5 records after first run, got %d", target.Count())
+	}
+
+	cursor := pipeline.GetCursor()
+	if cursor.LastValue == nil {
+		t.Fatal("cursor LastValue should not be nil")
+	}
+	lastOrderID, ok := cursor.LastValue.(int64)
+	if !ok {
+		t.Fatalf("expected LastValue to be int64, got %T", cursor.LastValue)
+	}
+	if lastOrderID != 1005 {
+		t.Errorf("expected LastValue=1005 (from order_id field), got %d", lastOrderID)
+	}
+
+	source2 := NewMemorySource(records)
+	source2.SetIncrementalFields("", "order_id")
+	pipeline2, err := NewPipeline(cfg, source2, target)
+	if err != nil {
+		t.Fatalf("failed to create second pipeline: %v", err)
+	}
+
+	totalBefore := target.Count()
+	err = runPipelineWithCursor(pipeline2, cursor)
+	if err != nil {
+		t.Fatalf("second run failed: %v", err)
+	}
+
+	newRecords := target.Count() - totalBefore
+	if newRecords != 0 {
+		t.Errorf("expected 0 new records on second run (custom id field incremental), got %d", newRecords)
+	}
+}
+
+func TestMemorySource_CustomIDField_Float64Type(t *testing.T) {
+	records := []*Record{
+		{ID: "r1", SeqID: 0, Data: map[string]interface{}{"id_num": 10.0}},
+		{ID: "r2", SeqID: 0, Data: map[string]interface{}{"id_num": 20.0}},
+		{ID: "r3", SeqID: 0, Data: map[string]interface{}{"id_num": 30.0}},
+	}
+	source := NewMemorySource(records)
+	source.SetIncrementalFields("", "id_num")
+	defer source.Close(context.Background())
+
+	cursor := &Cursor{Mode: ExtractModeID, LastValue: int64(15), LastOffset: 0}
+	batch, err := source.Fetch(context.Background(), cursor, 10)
+	if err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+	if batch.Size() != 2 {
+		t.Fatalf("expected 2 records, got %d", batch.Size())
+	}
+	if batch.FirstSeq != 20 {
+		t.Errorf("expected FirstSeq=20, got %d", batch.FirstSeq)
 	}
 }

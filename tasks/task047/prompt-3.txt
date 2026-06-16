@@ -1,0 +1,5 @@
+你实现的内容安全策略引擎模块修复后引入了一个回归缺陷，需要修复：
+1. processAttributes 方法新增的协议白名单机制过于激进，safeProtocols 中未包含 `data:` 协议前缀，导致合法的内联图片 `<img src="data:image/png;base64,...">` 的 src 属性被移除。修复前这类合法的 data URI 图片能正常通过，修复后因协议不在白名单中而被静默拦截，属于过度拦截的回归问题。提示词原本只要求拦截 javascript: 等伪协议，不应影响合法 data URI 的使用。
+2. TestDataMaskerConsistentOrder 测试函数中的 first 变量在多轮迭代间仅被计算但从未参与跨迭代一致性校验，测试实际只验证了同一轮迭代内两次调用的确定性，函数名 ConsistentOrder 所暗示的跨迭代一致性语义并未被覆盖。
+3. 修复后需要为上述问题补充对应的单元测试。
+4. 运行 go test ./internal/contentsec/ -v，需要让所有测试通过。

@@ -1,0 +1,6 @@
+你实现的审计日志系统模块修复后仍存在一些残留问题，需要进一步修复：
+1. verifyLogSetConsistency 函数对 Writer 层数据丢失场景存在检测盲区：当前只检查 Writer 日志多于内存日志的情况，当 Writer 因数据损坏静默丢失了部分日志条目时（Writer 日志数少于内存日志数），该函数会将数据丢失误判为正常的"pending flush"状态并返回 Valid=true，调用方无法区分真正的数据丢失与正常的异步写入延迟。
+2. TestFix_Issue4_VerifyIntegrity_DetectsWriterBrokenChain 测试用例的断言过于薄弱，仅检查 result.Valid 是否为 false，未验证 result.TamperedIndex 指向了正确的被篡改日志索引，也未校验 result.Message 中是否包含链断裂相关的错误描述，无法精确定位链断裂这一特定异常路径。
+3. slowFailingWriter 结构体的 Write 方法中，对 fail 字段的判空分支在该字段从未被赋值为 true 的情况下永远不会执行，属于不可达的死代码。
+4. 修复后需要为上述问题补充或修改对应的单元测试。
+5. 运行 go test ./internal/auditlog/ -v，需要让所有测试通过。
