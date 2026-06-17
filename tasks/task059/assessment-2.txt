@@ -1,7 +1,8 @@
 产物不满意：
-1. CleanupCallback 结构体的 order 字段和 Manager 的 nextCallbackOrder 是无效死代码，在 graceful.go 中只有赋值从不被任何方法读取。phaseExecuteCallbacks 通过 callbackOrder 切片确定回调执行顺序从未访问 order 字段。这些冗余状态增加了结构体复杂度却没有消费逻辑，移除 Priority 后直接依赖 callbackOrder 切片管理顺序即可无需引入额外字段。
-2. BeginRequest 修复后使用 m.mu.Lock 获取 RWMutex 的独占写锁保护请求计数递增，但 EndRequest 直接用 atomic.AddInt64 递减计数器不持锁，两个方法对同一计数器的并发保护策略不一致。全局写锁会阻塞所有并发的 IsAccepting 和 State 等读操作，高并发场景下请求准入检查与状态查询互相阻塞。提示词允许用 CAS 或互斥锁，模型却选了粒度最粗的 RWMutex 写锁使读写并发性能不必要退化。
+1. CleanupCallback 的 order 字段和 Manager 的 nextCallbackOrder 是无效死代码，只有赋值从不被任何方法读取。phaseExecuteCallbacks 通过 callbackOrder 切片确定顺序从未访问 order 字段。这些冗余状态增加了结构体复杂度却没有消费逻辑，移除 Priority 后直接依赖 callbackOrder 切片就够了不需要引入额外字段。
+2. BeginRequest 修复后用了 m.mu.Lock 获取 RWMutex 的独占写锁保护请求计数递增，但 EndRequest 直接用 atomic.AddInt64 递减不持锁，两个方法对同一计数器的并发保护策略不一致。全局写锁会阻塞所有并发 IsAccepting 和 State 等读操作，高并发下请求准入检查与状态查询互相阻塞。模型选了粒度最粗的 RWMutex 写锁让读写并发性能不必要地退化。
+
 过程不满意：
-1. 模型在刚收到提示词后未经任何代码分析就直接用 todo_write 创建了 5 项子任务计划，之后才阅读 graceful.go 文件。项目规范要求不能刚收到任务就创建 TodoList 应先分析再规划。这种前置规划导致模型将三项修复视为彼此独立的原子操作，忽略了移除 Priority 字段会对测试文件造成大面积连锁修改，规划粒度与实际重构范围不匹配。
-2. 模型对 graceful_test.go 的修改采用了低效的逐行替换策略，在步骤 250 到 609 之间执行了约 12 次独立的 edit_file_search_replace 调用，每次仅替换 1 到 2 处 RegisterCallback 调用。更严重的是第一轮修改完成后搜索发现仍有 4 处遗漏说明初始替换不彻底，反映出模型在动手前缺少对所有修改点的全局扫描。应使用 replace_all 批量替换或在修改前先搜索所有出现点。
-3. 模型执行测试的命令末尾多出了 `undefined` 字符串，说明命令构造不严谨存在格式错误。此外模型在所有代码修改完成后才一次性运行 go test，没有采用修复一处编译验证一处的增量策略，如果存在编译错误需要同时排查 graceful.go 和 graceful_test.go 两个文件的改动调试成本会显著增加。
+1. 模型没做代码分析就直接建了 5 项子任务后才读代码。规范要求不能刚收到任务就建 TodoList 应该先分析再规划。这种前置规划导致模型把三项修复视为彼此独立的原子操作忽略了移除 Priority 字段会对测试文件造成大面积连锁修改。
+2. 模型对 graceful_test.go 的修改采用了低效的逐行替换，执行了约 12 次独立编辑调用每次只换 1 到 2 处。第一轮改完后发现还有 4 处遗漏说明初始替换不彻底，反映出动手前缺少对所有修改点的全局扫描。应该用 replace_all 批量替换或先搜索所有出现点。
+3. 模型执行测试的命令末尾多了 `undefined` 字符串说明命令构造不严谨。此外所有代码修改完成后才一次性跑 go test 没有采用修一处验一处的增量策略。

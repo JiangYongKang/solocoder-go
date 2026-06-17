@@ -1,5 +1,5 @@
 ﻿产物不满意：
-本轮变更正确移除了 CleanupCallback 结构体中从未被读取的 order 字段和 Manager 中只自增不使用的 nextCallbackOrder 变量，RegisterCallback 中对应的赋值和自增逻辑也一并清理，消除了第一轮评估指出的无效死代码。BeginRequest 方法从原先的全局写锁实现改为 CAS 原子操作配合读锁双重检查，新的实现在 CAS 成功前只用 RLock 检查状态，CAS 成功后再次用 RLock 确认状态未变，若已变更则通过 atomic.AddInt64 回滚计数。该方案满足提示词要求，IsAccepting、State、Phase 等高频读路径不再被 BeginRequest 的写锁阻塞，35 个单元测试和并发测试全部通过，无产物缺陷。
+本轮正确移除了 CleanupCallback 的 order 字段和 Manager 的 nextCallbackOrder 变量以及 RegisterCallback 中的赋值逻辑，消除了评估指出的无效死代码。BeginRequest 从全局写锁改为 CAS 原子操作配合读锁双重检查，高频读路径不再被写锁阻塞，35 个测试全部通过无产物缺陷。
 
 过程不满意：
-模型在阅读 graceful.go 后连续执行了 4 次 edit_file_search_replace 分别移除 order 字段声明、nextCallbackOrder 字段声明、NewManager 中的 nextCallbackOrder 初始化、RegisterCallback 中的 order 赋值和自增逻辑。这四处修改位于同一文件且属于同一逻辑变更即移除死代码，每处改动都只有一行或两行，模型中分四次调用编辑工具属于碎片化操作，合并为一次或两次编辑即可完成。正确做法是在一次编辑中批量移除多个相关死代码位置，减少工具调用次数和中间状态的不确定性。
+模型读 graceful.go 后连续 4 次编辑分别移除 order 字段声明、nextCallbackOrder 声明、初始化、RegisterCallback 中的赋值和自增。四处修改位于同一文件且属于同一逻辑变更（移除死代码），每处只改一行或两行却分了四次调用，属于碎片化操作，合并为一次或两次编辑即可完成。

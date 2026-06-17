@@ -1,6 +1,8 @@
 产物不满意：
-1. persistence.go 的 appendLocked 方法在 O(1) 空间优化后，对旧文件中不存在 entriesDigest 条目的情况（edEntryOffset 为 -1）直接跳过了写入新 entriesDigest 条目，意味着由旧版本 saveLocked 保存的文件经 Append 追加后不会写入新格式的 entriesDigest 条目，但新条目的新 fileChecksum 仍然按包含 entriesDigest 的方式计算。loadLocked 在读取此类文件时 storedEntriesDigest 为空字符串故跳过 entriesDigest 一致性校验，仅依赖 fileChecksum 做整体验证。当文件在 Append 后再次被 Append 追加时，第二次 appendLocked 仍然找不到 entriesDigest 条目，每次 Append 后 entriesDigest 都不会被持久化，文件始终处于"半升级"状态。虽然校验能通过但 entriesDigest 提供的双重完整性保证实际上从未生效，等于追加链路中完全退化为仅 fileChecksum 单层校验。应在首次 Append 时主动将文件升级为新格式，补写 entriesDigest 条目。
-2. persistence.go 的 appendLocked 方法在第一遍扫描中同时维护 entriesChecksum 增量哈希和 duplicateFound 标志，当发现重复指纹时 duplicateFound 置为 true 但 entriesChecksum 仍然继续 feed 了当前 entry 的字节。后续在 duplicateFound 为 true 时直接 return nil，跳过了 entriesChecksum.Sum 和后续写入，没有造成实际危害但逻辑不清晰：对一个未使用的哈希对象继续写入数据是浪费且容易让维护者误以为 entriesChecksum 状态会被用于什么后续目的。应在检测到重复时直接跳过 entriesChecksum 的 feed 操作或提前返回避免无效计算。
+1. appendLocked 在 edEntryOffset >= 0 分支里 seek 后直接写 fpEntryBytes 会覆盖旧 ED 条目数据，虽然文件最终通过后续 write 和 truncate 保持格式正确，但这个覆盖语义对后续维护者不够透明，容易被误判为数据损坏。模型只关注了功能正确但忽略了可读性，应该在 seek 前加注释说明从旧 ED 位置开始覆盖写入新三元组的设计意图。
+2. appendLocked 里两个格式分支的写入代码完全重复，都是 seek 定位后依次写 fpEntryBytes、edEntryBytes、newCSEntryBytes，只是 seek 的目标偏移量不同。将来要调写入顺序或新增校验条目就必须两处同步改，漏一处就会导致文件格式不一致的硬 bug。应该把重复的写入逻辑抽成独立方法。
+
 过程不满意：
-1. 模型在设计 appendLocked 的 O(1) 空间方案时经历了至少五轮方向性变更：先从 entryBuffer 改为递归哈希 SHA256(oldDigest || newEntry)，发现 loadLocked 无法验证后又改为 entriesDigest 条目方案并修改了文件格式，随后测试失败反复修改 loadLocked 的校验逻辑，在 remove 和 restore entriesDigest 验证之间来回摇摆了三次，最后才回归到使用 entriesChecksum 增量哈希的方案。这五轮反复推翻既有设计的行为属于典型的试错式开发，模型在动手编码前没有先列出所有可能的校验和计算方案并评估各自的 loadLocked 兼容性，而是在每次测试失败后才被迫调整架构。正确做法是先建立校验和计算与验证的完整数学模型，明确 save/append/load 三端的公式后再实现。
-2. 模型在 appendLocked 中写入新文件内容时的顺序是先写 newHeaderBytes，再定位到 edEntryOffset 写 entriesDigest 条目，再定位到 csEntryOffset 写 fpEntry 和 csEntry。在第 2 步 Seek 到 edEntryOffset 写入 edEntryBytes 后没有后续 Seek 操作就直接在第 3 步 Seek 到 csEntryOffset，文件指针留在了 edEntry 写入结束的位置但随后立即被 Seek 覆盖了。虽然最终结果正确但这种不依赖顺序只依赖 Seek 的写入方式暗示模型对文件布局的空间关系理解模糊，更规范的做法是在写入每个条目后显式记录当前文件偏移而非依赖多次 Seek 来回跳转。
+1. 模型收到提示词第一个动作就是建 TodoList 后才打开代码看。提示词已经明确给定了两个要修的问题，模型应该先读 appendLocked 的完整实现理解扫描和写入流程再设计修改方案。先列计划再看代码导致后面采用重写整个方法的大改动而非针对两个问题做最小化精准修改。
+2. 模型选择一次性重写整个 appendLocked 而不是对两个问题分别增量修改，第一次重写后测试失败报文件 corrupted，原因是写入顺序颠倒了。如果用增量策略先修复一个验证通过再加另一个，改动范围小且每一步独立可验证，不会引入这种整体性错误。
+3. 测试失败后模型没读失败用例的断言信息定位问题，而是在包内创建了 debug_test.go 临时调试文件来隔离复现。这个文件以 _test.go 结尾会被 go test 默认执行，虽然事后删了但万一被遗忘就可能被 CI 误执行。不如直接分析测试失败输出做代码走读来得高效规范。

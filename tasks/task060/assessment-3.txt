@@ -1,9 +1,7 @@
 ﻿产物不满意：
-1. matchTriggerCondition 删除了 TriggerConditionErrorRate 死代码分支但未按提示词要求添加注释说明错误率检查的处理位置。代码中无任何注释指明 ErrorRate 触发条件由 shouldSkipByErrorRate 在 Execute 循环中处理，后续维护者看到常量存在却无对应 case 会误以为功能缺失。正确做法是添加注释说明错误率检查由 shouldSkipByErrorRate 负责而不走 matchTriggerCondition。
-
-2. TestCountRecentSuccessesWithAndWithoutWindow 测试名称暗示覆盖有窗和无窗两种模式但实际仅验证 PassiveSuccessWindow 为 0 的无窗口路径，有窗口模式下 countRecentSuccesses 的时间过滤行为完全未测试。且末尾被动恢复检查仅用 t.Logf 记录日志而非断言，一旦方法回归该测试无法发现。正确做法是增加 windows>0 子测试断言时间窗口过滤后的返回值准确性。
+1. matchTriggerCondition 删除了 ErrorRate 死代码分支但没加注释说明错误率检查的处理位置。代码里没有任何信息告诉维护者 ErrorRate 触发条件由 shouldSkipByErrorRate 在 Execute 循环中处理，后续看到常量存在却没对应 case 会误以为功能缺失。应该加注释说明清楚。
+2. TestCountRecentSuccessesWithAndWithoutWindow 测试名字暗示覆盖有窗和无窗两种模式但实际只验证了 PassiveSuccessWindow 为 0 的无窗口路径，有窗口时 countRecentSuccesses 的时间过滤行为完全没测试。末尾被动恢复检查仅用 t.Logf 记录日志而非断言，一旦方法回归测试发现不了。应该增加 window>0 子测试并做断言验证返回值的准确性。
 
 过程不满意：
-1. 模型收到提示词后未做代码分析就直接调用 todo_write 创建 6 项子任务计划，之后才读取 fallback.go 进行代码分析，违反了"不能在刚收到任务时就直接创建 TodoList，应先分析问题再规划"的标注规范。计划虽覆盖了三个修复点但未经分析制定存在规划与实际脱节的风险。正确做法是先阅读目标代码区域理清缺陷依赖后再定执行计划。
-
-2. 模型在 COT 总结中声称"添加了注释""错误率检查由 shouldSkipByErrorRate 处理"，但实际代码中 matchTriggerCondition 函数并无该注释，说明仅在思考过程中描述而未写入代码。这是思考过程与实际产物之间的不一致，属于在总结中描述未执行操作的幻觉行为。正确做法是编辑代码时确实添加注释后如实反映，或完成后对比 diff 确认修改与意图一致。
+1. 模型没做代码分析就建了 6 项子任务后才读代码，违反了"先分析再规划"的规范。虽然计划覆盖了三个修复点但未经过分析制定存在脱节风险。正确做法是先读目标代码理清缺陷依赖再定计划。
+2. 模型在思考总结里说"添加了注释""错误率检查由 shouldSkipByErrorRate 处理"，但实际代码中 matchTriggerCondition 函数并没有该注释。这说明只在思考里描述了但没写入代码，属于思考产物不一致的幻觉行为。应该确实编辑代码加上注释后再如实反映。

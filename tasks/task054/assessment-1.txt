@@ -1,99 +1,12 @@
 产物不满意：
-1. windowagg.go 的 evictLocked 方法中基于时间的窗口驱逐逻辑只使用了 Size 参数计算截止时间戳 `currentTime.Add(-time.Duration(sizeMs) * time.Millisecond)`，完全没有引用配置中的 Slide 参数。提示词需求第 2 条明确要求"基于时间或基于计数的滑动窗口，窗口大小和滑动步长均可独立配置"，但时间窗口只在 AddValue 时按 Size 做一次全量过期驱逐，Slide 成了无效参数，用户配置了时间窗口的步长后窗口行为与配置预期不一致。应该在时间窗口驱逐时根据 Slide 步长计算窗口边界，使时间窗口也支持重叠和不重叠两种语义，或用 Slide 作为窗口输出的触发间隔。
-2. windowagg.go 中时间窗口的过期驱逐仅发生在 AddValue 和 AddValueWithSeq 方法的写入路径中，Result 方法只返回聚合器当前状态不检查数据是否因时间流逝而过期。提示词需求第 3 条要求"聚合结果随窗口滑动持续更新而非每次都重新计算整个窗口"，当调用者在添加数据后等待超过窗口 Size 的时间再调用 Result 而不写入新数据时，返回的仍然是已过期的旧聚合值，与窗口语义矛盾。应在 Result 方法中增加时间窗口到期检查，或提供独立的 Tick/Advance 方法让外部定时驱动窗口滑动。
-3. windowagg.go 的 AddValueWithSeq 方法在设置 seqCounter 时仅做 `if seq > w.seqCounter { w.seqCounter = seq }`，即 seqCounter 始终取已见过的最大序列号而非最后添加元素的序列号。但 evictLocked 方法中计数窗口的驱逐公式 `((seq - 1) / slide) * slide + slide - size + 1` 使用的是 seqCounter 作为窗口当前位置来计算起始序号。当调用者通过 AddValueWithSeq 以非单调顺序添加数据时（如先添加 seq=100，再添加 seq=1,2,3），seq=1,2,3 的元素会因序号远小于基于 seq=100 计算出的 windowStart 而被立即驱逐，数据在窗口内零停留就被移除，导致期望的聚合结果完全错误。应在 AddValueWithSeq 中区分最大序号和当前窗口位置序号，或拒绝非单调递增的序列号输入。
-4. windowagg.go 中 WindowManager 的 AddWindow 和 RemoveWindow 方法对空名称的校验返回的是 `ErrInvalidWindowType` 错误，但空名称问题与窗口类型无关，这个错误语义具有误导性。当调用者传入空字符串作为窗口名称并收到 `ErrInvalidWindowType` 错误时，无法从错误信息中判断出真正的问题是名称缺失而非窗口类型配置错误。应定义一个专门的窗口名称校验错误如 `ErrInvalidWindowName`，或直接返回带有描述信息的 `fmt.Errorf`。
-5. windowagg.go 中存在两处死代码：SlidingWindow 结构体的 `currentStart int64` 字段声明后仅在 Reset 方法中被置零，从未在任何读写逻辑中被消费或用于窗口位置判断；文件末尾的 `validateConfig` 函数仅在测试中被调用，NewSlidingWindow 和 WindowManager.AddWindow 均用内联代码做了相同的检验而未复用该函数。这些未使用的代码增加了维护负担且容易让后续阅读者误认为它们参与了核心逻辑。应移除 currentStart 字段，或将 NewSlidingWindow 和 AddWindow 中对配置的校验统一改为调用 validateConfig 函数。
-6. windowagg_test.go 的 TestConcurrentWindowAccess 仅验证了 100 个并发 AddValue 和 100 个并发 Result/Count 调用无死锁无崩溃，但没有断言任何聚合结果或窗口计数的正确性。在并发场景下可能存在的计数窗口驱逐公式的整数溢出、聚合器状态部分更新等竞态问题，当前的测试只覆盖了"不 panic"这个最低要求而未验证数据一致性和计算正确性。应增加并发读写场景下的确定性校验，例如预设固定数量的并发写入后验证 Sum 结果是否等于预期值。
+1. evictLocked 里时间窗口驱逐只用了 Size 参数计算截止时间，完全没引用 Slide。提示词要求"窗口大小和滑动步长可独立配置"，但时间窗口只在 AddValue 时按 Size 做一次全量过期驱逐，Slide 成了无效参数。用户配置了步长但窗口行为跟配置预期不一样，应该用 Slide 步长计算窗口边界让时间窗口也支持重叠和不重叠两种语义。
+2. 时间窗口过期驱逐只在 AddValue 写路径上触发，Result 方法不检查数据是否因时间流逝过期了。提示词要求"聚合结果随窗口滑动持续更新"，但调用者在加了数据后等了超过窗口 Size 时间再调 Result 而不写新数据时，返回的还是已过期的旧值，跟窗口语义矛盾。应该在 Result 里增加时间窗口到期检查或提供独立的 Tick/Advance 方法。
+3. AddValueWithSeq 里 seqCounter 取的是已见过的最大序号而不是最后添加元素的序号，但计数窗口驱逐公式用 seqCounter 当窗口当前位置。当以非单调顺序添加数据时（比如先加 seq=100 再加 seq=1,2,3），seq=1,2,3 的元素因为序号远小于基于 seq=100 算出来的 windowStart 而被立即驱逐，数据在窗口里零停留就被移除。应该拒绝非单调递增的序列号。
+4. WindowManager 的 AddWindow 和 RemoveWindow 对空名称的校验返回的是 `ErrInvalidWindowType` 错误，但空名称跟窗口类型没关系，这个错误会误导调用方。应该定义一个专门的窗口名称校验错误比如 `ErrInvalidWindowName`。
+5. 有两处死代码：currentStart 字段只在 Reset 里被置零从未用于任何读写；validateConfig 函数只在测试里被调，NewSlidingWindow 和 AddWindow 都用内联代码做了相同校验没有复用。应该删掉 currentStart 字段并把校验统一改为调 validateConfig。
+6. TestConcurrentWindowAccess 只验证 100 个并发无死锁无崩溃，没断言聚合结果或计数正确性。并发场景下可能存在的计数窗口驱逐公式整数溢出、聚合器状态部分更新等竞态问题当前测试只覆盖了"不 panic"但没验证数据一致性。应该增加并发写入后的确定性校验，比如预设固定数量的写入后验证 Sum 结果。
 
 过程不满意：
-1. 模型在收到提示词后未先阅读 docs 目录下的需求文档或现有相关代码，直接在第 4 次工具调用就用 todo_write 创建了 8 项子任务计划。然后才去读取 streamproc/window.go、eventsrc/aggregate.go、healthagg/healthagg.go 等无关包的代码来了解项目风格，但提示词已明确要求代码放在 internal/windowagg/ 下且任务独立收敛在一个包内，查阅其他包的实现风格对理解本次需求无直接帮助。正确做法是先分析提示词中五条功能需求的内在关系，理清聚合算子接口、窗口配置、驱逐逻辑、多窗口管理器四个模块的边界和交互方式之后再制定分步计划。
-2. 模型在编写完初始代码后第一次运行 `go test ./internal/windowagg/ -v` 发现多项测试失败，此时没有阅读失败用例的具体报错信息就直接修改 windowagg.go 中的 evictLocked 函数。修改后第二次运行测试发现计数窗口通过但时间窗口仍失败，模型才重新阅读测试文件中的期望逻辑，随后将时间窗口的驱逐逻辑从复杂公式简化为直接保留最近 Size 毫秒数据，并同时修改了测试文件中的 TestSlidingWindowReset 所用聚合器类型。整个过程经历了"编码 -> 盲目修改 -> 再失败 -> 再重读测试 -> 再修改"的两个循环，属于典型的试错式调试。正确做法是在第一次测试失败后就逐个阅读失败用例的输出信息，定位到具体哪条断言失败、期望值多少、实际值多少，再对相应代码做最小范围的精准修复。
-3. 模型在完成代码和测试后直接声称"所有测试均通过"并编写了总结，但未执行 `go test ./internal/windowagg/ -v -count=1` 做确定性的最终验证（思考过程中只记录了 `go test ./internal/windowagg/ -v undefined` 的三次运行，其中第三次显示通过）。虽然最终测试全部通过，但模型在总结中罗列了"40+ 个测试用例"的覆盖范围描述，然而测试文件中实际只包含 34 个测试函数，存在数量上的夸大描述，属于虚假完成倾向。
-
-测试结果：
-```
-=== RUN   TestCountAggregator
---- PASS: TestCountAggregator (0.00s)
-=== RUN   TestSumAggregator
---- PASS: TestSumAggregator (0.00s)
-=== RUN   TestAvgAggregator
---- PASS: TestAvgAggregator (0.00s)
-=== RUN   TestMaxAggregator
---- PASS: TestMaxAggregator (0.00s)
-=== RUN   TestMinAggregator
---- PASS: TestMinAggregator (0.00s)
-=== RUN   TestNewAggregator
---- PASS: TestNewAggregator (0.00s)
-=== RUN   TestAggregatorTypeString
---- PASS: TestAggregatorTypeString (0.00s)
-=== RUN   TestNewSlidingWindow
---- PASS: TestNewSlidingWindow (0.00s)
-=== RUN   TestCountWindowTumbling
---- PASS: TestCountWindowTumbling (0.00s)
-=== RUN   TestCountWindowSliding
---- PASS: TestCountWindowSliding (0.00s)
-=== RUN   TestCountWindowSlidingOverlap
---- PASS: TestCountWindowSlidingOverlap (0.00s)
-=== RUN   TestTimeWindow
---- PASS: TestTimeWindow (0.00s)
-=== RUN   TestTimeWindowAllItemsEvicted
---- PASS: TestTimeWindowAllItemsEvicted (0.00s)
-=== RUN   TestSlidingWindowReset
---- PASS: TestSlidingWindowReset (0.00s)
-=== RUN   TestSlidingWindowConfig
---- PASS: TestSlidingWindowConfig (0.00s)
-=== RUN   TestWindowManager
---- PASS: TestWindowManager (0.00s)
-=== RUN   TestWindowManagerAddDuplicate
---- PASS: TestWindowManagerAddDuplicate (0.00s)
-=== RUN   TestWindowManagerAddInvalidConfig
---- PASS: TestWindowManagerAddInvalidConfig (0.00s)
-=== RUN   TestWindowManagerRemoveWindow
---- PASS: TestWindowManagerRemoveWindow (0.00s)
-=== RUN   TestWindowManagerRemoveNotFound
---- PASS: TestWindowManagerRemoveNotFound (0.00s)
-=== RUN   TestWindowManagerGetWindow
---- PASS: TestWindowManagerGetWindow (0.00s)
-=== RUN   TestWindowManagerGetWindowNotFound
---- PASS: TestWindowManagerGetWindowNotFound (0.00s)
-=== RUN   TestWindowManagerPushAndResults
---- PASS: TestWindowManagerPushAndResults (0.00s)
-=== RUN   TestWindowManagerGetResultNotFound
---- PASS: TestWindowManagerGetResultNotFound (0.00s)
-=== RUN   TestWindowManagerReset
---- PASS: TestWindowManagerReset (0.00s)
-=== RUN   TestWindowManagerResetWindow
---- PASS: TestWindowManagerResetWindow (0.00s)
-=== RUN   TestWindowManagerResetWindowNotFound
---- PASS: TestWindowManagerResetWindowNotFound (0.00s)
-=== RUN   TestMaxAggregatorRemoveNonMax
---- PASS: TestMaxAggregatorRemoveNonMax (0.00s)
-=== RUN   TestMinAggregatorRemoveNonMin
---- PASS: TestMinAggregatorRemoveNonMin (0.00s)
-=== RUN   TestAvgAggregatorRemoveAll
---- PASS: TestAvgAggregatorRemoveAll (0.00s)
-=== RUN   TestCountAggregatorUnderflow
---- PASS: TestCountAggregatorUnderflow (0.00s)
-=== RUN   TestSlidingWindowAddValueWithSeq
---- PASS: TestSlidingWindowAddValueWithSeq (0.00s)
-=== RUN   TestWindowManagerPushWithSeq
---- PASS: TestWindowManagerPushWithSeq (0.00s)
-=== RUN   TestValidateConfig
---- PASS: TestValidateConfig (0.00s)
-=== RUN   TestConcurrentWindowAccess
---- PASS: TestConcurrentWindowAccess (0.00s)
-=== RUN   TestConcurrentWindowManager
---- PASS: TestConcurrentWindowManager (0.00s)
-=== RUN   TestEmptyWindowResult
---- PASS: TestEmptyWindowResult (0.00s)
-=== RUN   TestMaxAggregatorRemoveMiddle
---- PASS: TestMaxAggregatorRemoveMiddle (0.00s)
-=== RUN   TestMinAggregatorRemoveMiddle
---- PASS: TestMinAggregatorRemoveMiddle (0.00s)
-PASS
-ok  	solocoder-go/internal/windowagg	0.204s
-```
-
-总结：
-本轮实现了滑动窗口聚合器模块，34 个测试用例全部通过，五种聚合算子（Count、Sum、Avg、Max、Min）均实现统一的 Aggregator 接口且支持增量式 Add/Remove 更新。基于计数的滑动窗口正确实现了滚动窗口（Slide==Size）、重叠窗口（Slide<Size）的驱逐语义，多窗口管理器通过 WindowManager 支持同一数据流上的并行聚合。整体代码结构清晰，测试覆盖了正常流程、边界条件和配置校验。但存在以下主要不足：时间窗口的 Slide 参数不被使用而成为死配置，违反了需求第 2 条对两种窗口类型均支持独立步长配置的要求；时间窗口的 Result 方法不触发过期驱逐可能导致返回已过期的聚合结果；AddValueWithSeq 对非单调序列号的处理不当会造成数据被错误驱逐；WindowManager 对空窗口名的错误类型选择存在语义混淆；以及 currentStart 字段和 validateConfig 函数两处死代码未清理。过程层面，模型存在先制定计划后分析需求的顺序问题、试错式调试经历两轮失败才定位根因、以及在总结中夸大测试用例数量的虚假完成倾向。
+1. 模型没读需求文档就直接建了 8 项子任务，然后才去读无关包的代码了解风格。提示词明确要求代码放 internal/windowagg/ 下且任务独立收敛在一个包内，读其他包的风格对理解需求没直接帮助。正确做法是先分析提示词中五条功能需求的内在关系再定计划。
+2. 模型第一次跑 go test 发现多项失败后没读具体报错就直接改 evictLocked，第二次跑发现计数窗口过了但时间窗口还失败后才去读测试里的期望逻辑。经历了两轮"盲目修改→再失败→再重读测试→再修改"的试错循环。正确做法是第一次失败后就逐个读失败用例的输出信息定位到具体哪条断言失败再精准修复。
+3. 模型完成代码后没跑 `-count=1` 做最终验证，总结里说"40+ 个测试用例"但测试文件实际只有 34 个测试函数，数量上夸大了，属于虚假完成倾向。

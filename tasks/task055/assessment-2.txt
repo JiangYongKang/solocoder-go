@@ -1,9 +1,9 @@
 产物不满意：
-1. Run 方法的 defer 闭包在任务以错误返回时将状态无条件设置为 TaskStatusCompleted，例如 TestRun_MapTaskRetry_Exhausted 场景中所有 Map 任务均重试耗尽后 shuffleSync 返回 `mapreduce: 1 map task(s) failed`，但 defer 检查到状态仍为 TaskStatusRunning 就直接将其改为 Completed，最终调用 Status() 看到的是 Completed 而非 Failed。根因是模型为了关闭 onComplete 通道添加了 defer 而没区分成功与失败路径，应该在 defer 中根据 Run 的返回值（成功为 Completed、失败为 Failed）来设置状态，或者不在 defer 中设置状态而是让各退出路径自己负责状态转换。
-2. 修复 onComplete 通道后引入了实例不可复用的问题：当 Run 正常结束后 defer 执行 close(mr.onComplete)，onComplete 即永久关闭。如果调用方随后调用 SetInput 设置新输入并再次调用 Run，第二次 Run 的 defer 会尝试对已关闭的通道再次 close，触发 panic。虽然现有测试每次创建新实例覆盖不到此场景，但 SetInput 和 Run 的 API 设计允许实例复用，close 已关闭通道会导致运行时崩溃。应在 NewMapReduce 或 Run 入口处确保 onComplete 每次重新创建通道，或者在 Run 的 AlreadyRunning 之外增加对已完成实例的拦截。
-3. shuffleAsync 中的 Reduce goroutine 虽然不再为空循环，但其内部的 finalizeAndRunReduce 仅在 allMapDone 通道关闭后才被调用，实际的 Reduce 计算函数从未在 Map 任务全部完成之前执行。TestRun_AsyncShuffle_ProcessesDataIncrementally 的日志输出显示 Reduce 计算启动时间为 200ms，与最慢 Map 的完成时间完全一致，说明 Reduce 计算本质上是全量 Map 完成后的批处理。提示词要求"Reduce 可以在 Map 尚未全部完成时就开始处理已到达的数据"，模型只实现了增量分组而没实现增量计算，异步模式和同步模式在 Reduce 计算时序上并无本质差异。应改为当某个 Reduce 分区收到其所依赖的全部 Map 结果后立即对该分区执行计算，而不必等待全局 allMapDone。
+1. Run 方法的 defer 里不管任务返回什么错误都把状态设成 TaskStatusCompleted。比如 TestRun_MapTaskRetry_Exhausted 场景里所有 Map 重试耗尽后返回 `mapreduce: 1 map task(s) failed`，但 defer 看到状态还是 TaskStatusRunning 就直接改成 Completed，最终 Status() 返回的是 Completed 而不是 Failed。应该在 defer 里根据 Run 的返回值来设置状态，或者让各退出路径自己负责状态转换。
+2. 修复 onComplete 后引入了实例不可复用的问题：第一次 Run 结束后 defer 执行了 close(mr.onComplete)，通道就永久关了。调用方再调 SetInput 设置新输入后调 Run，第二次的 defer 会对已关闭的通道再次 close 直接 panic。虽然现有测试每次创建新实例但 API 设计允许复用，应该在每次 Run 时重新创建 onComplete 通道。
+3. shuffleAsync 里的 Reduce goroutine 虽然不再空转，但 finalizeAndRunReduce 只在 allMapDone 关闭后才被调用，实际 Reduce 从未在 Map 全部完成之前执行。日志显示 Reduce 启动时间跟最慢 Map 完成时间一致，说明本质还是全量 Map 完成后的批处理。提示词要求 Reduce 在 Map 没全完时就能处理已到分区数据，模型只实现了增量分组没实现增量计算，应该某个分区收齐所有 Map 结果后立即对该分区执行而非等全局信号。
 
 过程不满意：
-1. 模型在收到提示词后第一件事就是调用 todo_write 创建了 3 项子任务计划，之后才开始用 view_files 查看 mapreduce.go 源码。这违反了标注示例中强调的"应先分析需求文档和代码骨架，理清模块职责边界后再制定执行计划"原则，模型在未理解 shuffleAsync 的现有架构和 onComplete 的定义上下文之前就制定了修复计划，导致后续对状态转换的 handle 考虑不周全。
-2. 模型在步骤 8 至步骤 11 之间连续 4 次对 mapreduce_test.go 执行 view_files，且每次读取的都是从头开始的大段文件内容而非定位到特定区域，之后在步骤 17 至 24 又对 docs/mapreduce.md 连续执行了 8 次 view_files。这是典型的高重复低效工具使用模式，说明模型缺乏先用搜索或目录浏览获得文件结构概览再精确定位修改位置的意识，反复加载相同文件内容大量浪费了推理资源并拖慢了整个修复流程。
-3. 模型在步骤 12 添加 Done 通道的测试代码后直接运行 go test，结果编译报错 `t declared and not used`（循环变量 t 覆盖了 testing 参数），说明模型写完代码后没有做基本的语法自检就提交测试。这属于粗心的编码习惯，正确做法是写入测试代码后先做一次编译检查再运行测试。
+1. 模型第一步就建了 3 项子任务后才看代码。规范要求先分析代码再规划，模型在没理解 shuffleAsync 现有架构和 onComplete 定义背景前就定了修复计划，导致后续对状态转换的处理不周全。
+2. 模型对 mapreduce_test.go 连续读了 4 次大段内容，又对 docs/mapreduce.md 连续读了 8 次。典型的高重复低效工具使用，说明缺少先用搜索或目录浏览获得概览再精确定位的意识，反复加载相同内容浪费了大量资源。
+3. 模型加完 Done 通道的测试代码后直接跑 go test，编译报 `t declared and not used`（循环变量 t 覆盖了测试参数），写完代码连基本语法检查都没做。正确的习惯是写完测试后先做一次编译检查再跑测试。

@@ -1,5 +1,6 @@
 产物不满意：
-1. healthagg.go 的 NewHealthAggregator 函数新增了 MajorityRatio 数值范围校验，但未同步校验 AggregatorConfig 的 Strategy 字段。当调用方传入 AggregationStrategy(99) 这类无效枚举值时 aggregateResults 的 default 分支直接返回 StatusHealthy，聚合器对外表现为健康且无任何错误反馈，调用方无法感知配置了无效策略。这与提示词第三条"等配置参数不合法时静默回退到默认值"不完全吻合，策略字段缺少校验使得 error 返回值仍有盲区，应将其纳入校验对未知策略值返回 ErrInvalidConfig。
+1. NewHealthAggregator 新增了 MajorityRatio 范围校验但没同步校验 Strategy 字段。当调用方传入 AggregationStrategy(99) 这类无效枚举值时 aggregateResults 的 default 分支直接返回 StatusHealthy，聚合器对外表现健康且无任何错误反馈。提示词提到的"配置参数不合法时静默回退"在策略字段上仍有盲区，应该对未知策略值也返回 ErrInvalidConfig。
+
 过程不满意：
-1. 模型在阅读 healthagg.go 和 healthagg_test.go 两个文件后未经分析就直接用 todo_write 创建了包含 5 项子任务的待办列表，COT 中虽有"仔细分析这 4 个问题"的表述但紧接着就是 todo_write 工具调用，中间没有任何关于根因定位、方案对比或影响范围的论证过程。按标注规范收到任务后应先分析问题再制定执行计划，而非立即将提示词内容拆解为待办列表。缺失分析环节导致后续对问题一直接选定了移除 Name 字段的方案而没有对"尊重探针函数返回的 Name"与"去掉 Name 字段"两种方案做任何权衡比较。
-2. 模型在整个修复过程中始终未查阅 docs/healthagg.md 需求文档。问题二的告警范围限定涉及对原始需求中"支持所有状态间转换"这一约束的修改，提示词中"提示词要求的告警范围"也暗示存在已知的需求参照。不阅读需求文档就直接在代码上添加过滤条件，缺少对需求全貌的理解，无法验证新增的 prevStatus != StatusUnhealthy && aggregated.Status != StatusUnhealthy 过滤逻辑是否准确覆盖了需求文档中"三级健康状态判定逻辑"和"告警回调机制"之间的语义关系，存在因理解偏差引入不正确过滤行为的风险。
+1. 模型读了两个文件后不做分析就直接建了 5 项子任务，思考里虽有"仔细分析这 4 个问题"的表述但紧接着就是 todo_write 调用，中间没有任何根因定位、方案对比或影响范围论证。按规范收到任务后应先分析再规划而非立即把提示词拆解为待办列表。缺失分析导致对第一个问题直接选了移除 Name 字段的方案而没有对"保留探针函数的 Name"和"去掉 Name 字段"两种方案做权衡。
+2. 模型整个修复过程始终没看 docs/healthagg.md 需求文档。问题二的告警范围限定涉及对原始需求中状态转换约束的修改，不读需求文档就直接在代码上添加过滤条件缺少对需求全貌的理解，无法验证新增的过滤逻辑是否准确覆盖了需求文档里状态判定和告警机制的语义关系。

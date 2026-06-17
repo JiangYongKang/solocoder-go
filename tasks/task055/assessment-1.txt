@@ -1,10 +1,11 @@
 产物不满意：
-1. mapreduce.go 的 shuffleAsync 方法中为每个 Reduce 分区启动了 reduce goroutine，但这批 goroutine 内部仅是一个空循环从 reduceReadyChs 接收信号后什么都不做就在 allMapDone 关闭后退出，从未调用 executeReduceWithRetry 或任何 Reduce 计算函数。提示词第 2 条要求 Shuffle 支持异步模式且 Reduce 应在收到分区数据后即可开始处理，但当前异步 goroutine 完全是空壳，使得异步模式与同步模式行为完全一致。根因是设计了信号通道和 goroutine 框架但没有将 Reduce 调用逻辑填入 goroutine 中，应在 goroutine 内部实际调用 Reduce 计算逻辑。
-2. mapreduce.go 的 MapReduce 结构体中定义了 onComplete 通道并在 NewMapReduce 中初始化，但整个模块无任何地方对该通道执行 close 或 select 监听。提示词第 4 条要求"在所有任务完成后通知调用方"，onComplete 显然为此而设计却被遗忘，当前调用方只能依赖 Run 的同步返回。根因是实现过程中遗漏了在最终合并阶段关闭该通道并导出给调用方使用的逻辑。
-3. mapreduce.go 的 shuffleSync 中完成了所有 Map 任务后才一次性 atomic.StoreInt64 写入 completedMapCount，而 shuffleAsync 中每完成一个 Map 任务就 atomic.AddInt64 递增，导致同步模式下 CompletedMapCount 在作业执行期间始终返回 0 直到所有 Map 完成后才跳到总数。根因是两种模式下采用了不同的计数策略未统一进度上报语义，应将同步模式也改为每完成一个 Map 任务就递增。
-4. mapreduce.go 的 shuffleAsync 将 reduceWg 直接指向 &mr.wg 后对空壳 Reduce goroutine 执行 Add，使 mr.wg 的计数混入了 Map goroutine 和占位 Reduce goroutine 两类不同语义的计数，虽然不导致死锁但模糊了 WaitGroup 的语义边界，为后续维护埋下隐患。
+1. shuffleAsync 为每个 Reduce 分区启动了 goroutine，但这些 goroutine 内部只是一个空循环，从 reduceReadyChs 收信号后什么都不做就在 allMapDone 关闭后退出了，从未调用 executeReduceWithRetry 或任何 Reduce 计算函数。提示词要求 Reduce 在收到分区数据后即可开始处理，但当前异步 goroutine 完全是空壳，异步和同步行为没区别。应该把 Reduce 调用逻辑填进去。
+2. MapReduce 结构体定义了 onComplete 通道并在构造函数里初始化了，但整个模块没任何地方对这个通道 close 或 select 监听。提示词要求"在所有任务完成后通知调用方"，onComplete 显然是为这个设计的却被遗忘了。应该在最终合并阶段关闭该通道并导出给调用方使用。
+3. shuffleSync 在完成所有 Map 任务后才一次性 atomic.StoreInt64 写入 completedMapCount，而 shuffleAsync 每完成一个 Map 就 atomic.AddInt64 递增，导致同步模式下 CompletedMapCount 在作业执行期间始终返回 0 直到全部 Map 完成后才跳到总数。应该把同步模式也改成每完成一个 Map 就递增。
+4. shuffleAsync 把 reduceWg 直接指向 &mr.wg 后对空壳 Reduce goroutine 执行 Add，使 mr.wg 的计数混入了 Map 和占位 Reduce 两类不同语义的计数，虽然不导致死锁但模糊了 WaitGroup 的语义边界，给后续维护埋坑。
+
 过程不满意：
-1. 模型在收到提示词后第一步就用 todo_write 创建了 10 项子任务计划，此时尚未阅读任何项目代码或需求文档。随后在阅读代码过程中又将计划推倒重建为 5 项新计划，说明初始计划是盲目的。按照标注规范应先分析需求和项目结构再制定计划。
-2. 模型第一次编写 mapreduce.go 时将 Reduce 任务输出设计为单个 interface{}，测试运行失败后在第 228 行将数据模型改为按分区返回 []KeyValue，整个测试文件也被重写了一次，此后又在第 282 行补充 panic 恢复再次修改生产代码。核心数据模型经历了"写错→重写→再补"三轮大的重构，正确做法是先设计完整的 Map 到 Shuffle 到 Reduce 数据流再一次性编码。
-3. 模型在调试阶段连续五次读取同一个未经修改的 mapreduce.go 文件，这种无意义的重复读取说明模型对代码结构缺乏系统性把握，属于推理低效的典型信号。
-4. 模型在完成异步 Shuffle 代码后未做任何自检验证就声称"Reduce 任务在有数据到达时即可开始处理"，但实际 reduce goroutine 完全是空的。这是实现与声称不一致的幻觉完成。
+1. 模型收到提示词第一步就建了 10 项子任务，此时还没读任何代码或需求文档。随后在阅读代码过程中又把计划推倒重建为 5 项，说明初始计划是盲目的。按规范应先分析再规划。
+2. 模型第一次写 mapreduce.go 时把 Reduce 任务输出设计为单个 interface{}，测试失败后改成按分区返回 []KeyValue，整个测试文件也重写了一遍，然后又补了 panic 恢复再次改生产代码。核心数据模型经历了"写错→重写→再补"三轮大重构，正确做法是先设计完整数据流再编码。
+3. 模型在调试阶段连续五次读取同一个没改过的 mapreduce.go，无意义的重复读取说明对代码结构缺乏系统性把握，推理效率低。
+4. 模型完成异步 Shuffle 代码后没做任何自检就声称"Reduce 任务在有数据到达时即可开始处理"，但实际 reduce goroutine 完全是空的。这就是典型幻觉，实现跟声称不一致。

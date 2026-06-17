@@ -1,90 +1,11 @@
 产物不满意：
-1. graceful.go 的 BeginRequest 方法中 for {} 循环是死代码，循环体内所有分支均以 return 结束，不存在 continue 退出逻辑，循环体实际只会执行一次。rollback 逻辑中 newCount == atomic.LoadInt64(&m.activeRequests) 的真假两个分支执行完全相同的 atomic.AddInt64(&m.activeRequests, -1) 操作，说明模型从未认真设计过这个乐观自旋 + 回滚模式，只是机械搬运了一套不完整的双检锁模板而未理解其语义。根因是模型没有先梳理并发安全方案再编码，正确做法是用 sync/atomic 的 CAS 实现无锁递增或直接用互斥锁保护整个 BeginRequest 方法。
-2. graceful.go 的 phaseExecuteCallbacks 方法中对回调排序使用的是 Priority 字段降序后反序遍历，而提示词要求的是"按注册的反序"即 reverse of registration order 依次执行。Priority 字段是模型自己新增的概念，并非提示词要求的功能，导致 callbacks 执行顺序由 Priority 值控制而非注册先后决定。当各模块按依赖关系依次注册回调时（先注册底层资源释放再注册上层资源释放），按 Priority 排序会打乱这一隐含依赖序，可能导致上层依赖的底层资源已被提前释放而引发空指针引用或资源泄漏。根因是模型擅自扩展了提示词未要求的功能而偏离了原始需求，应在 CleanupCallback 中记录注册序号或使用链表维护插入顺序，关闭时单纯反序slice遍历。
-3. graceful.go 的 phaseStopAccepting 方法在设置 accepting=false 后继续使用 StopAcceptingTimeout 轮询等待活跃请求归零，而 phaseWaitRequests 方法又用 RequestWaitTimeout 再等待一轮。这导致停止接收阶段和等待进行中请求阶段职责重叠，两次等待实际上把 StopAcceptingTimeout 变成了一个隐式的预等待缓冲，消费者无法清晰理解两阶段的分工边界。当 StopAcceptingTimeout 设置为较大值时整个关闭流程的耗时将不可预测地拉长。根因是模型没有严格划分各阶段的职责范围，正确做法是 phaseStopAccepting 仅负责翻转 accepting 标志后立即结束进入下一阶段，等待工作统一由 phaseWaitRequests 完成。
-4. graceful.go 的 Shutdown 方法内部 shutdownOnce.Do 闭包中定义了一个 firstErr 变量，在闭包中试图通过二次状态检查来设置 firstErr，但外层 Shutdown 入口已用 RLock 检查了 state == StateRunning，当外层检查通过后 shutdownOnce.Do 只会被执行一次，闭包内部的二次状态检查永远不可能触发。这导致 firstErr 永远是 nil，Shutdown 被首次调用时也永远返回 nil，二次状态检查成为无法到达的无效代码分支。根因是模型对 sync.Once 的语义理解不完整，认为闭包可以被多个 goroutine 各自执行一次内部逻辑，应移除冗余的内部状态检查直接假定闭包内状态正确执行关闭流程。
-5. docs/graceful.md 文档在 3.1 节 ShutdownState 状态定义表头处截断，全文仅 72 行，3.2 节 ShutdownPhase 定义、第 4 节阶段执行顺序与超时说明、第 5 节使用示例等关键章节全部缺失。模型在思考过程中声称"包含 10 个章节...包含 4 个使用示例"与实际文件内容严重不符，提示词第 8 条明确要求文档包含核心结构体职责、各关闭阶段的执行顺序与超时控制以及使用示例，这三项需求均未满足。根因是模型在写入文档时内容被平台截断或写入操作未完整完成，但模型仅检查了文件路径存在就宣称完成而未验证文件内容的完整性。
+1. BeginRequest 里 for {} 循环是死代码，循环体内所有分支都以 return 结束根本没有 continue，实际只会执行一次。rollback 逻辑中 newCount 是否等于 activeRequests 的两种分支执行的代码完全一样，说明模型从没认真设计过乐观自旋+回滚模式，只是机械搬运了一套不完整的双检锁模板。正确做法是用 CAS 实现无锁递增或直接用互斥锁。
+2. phaseExecuteCallbacks 对回调排序用的是 Priority 字段降序然后反序遍历，而提示词要求的是"按注册的反序"。Priority 是模型自己造的概念，导致回调执行顺序由 Priority 值决定而非注册先后。当各模块按依赖关系依次注册时（先注册底层资源释放再注册上层），按 Priority 排序会打乱隐含的依赖顺序，底层资源在上层之前被释放可能引发空指针引用。应该在 CleanupCallback 记录注册序号或维护插入顺序。
+3. phaseStopAccepting 在设置 accepting=false 后继续用 StopAcceptingTimeout 轮询等待活跃请求归零，而 phaseWaitRequests 又用 RequestWaitTimeout 再等一轮。两个阶段职责重叠，两次等待实际上把 StopAcceptingTimeout 变成了隐式的预等待缓冲，消费者看不清楚两阶段的分工边界。正确做法是 phaseStopAccepting 只负责翻转标志立即进入下一阶段，等待统一由 phaseWaitRequests 完成。
+4. Shutdown 里 shutdownOnce.Do 闭包中定义 firstErr 变量并通过二次状态检查来设置，但外层入口已用 RLock 检查了 state == StateRunning，当外层检查通过后 shutdownOnce.Do 只执行一次闭包内部的二次检查永远走不到。导致 firstErr 永远是 nil 无法返回真正的关闭错误。根因是对 sync.Once 语义理解不完整，应移除冗余状态检查直接执行关闭流程。
+5. docs/graceful.md 文档在 3.1 节表头处截断全文仅 72 行，状态定义、阶段顺序说明、超时说明、使用示例等关键章节全部缺失。模型在思考中声称"包含 10 个章节 4 个使用示例"跟实际文件严重不符。根因是写入文档时内容被截断或写入未完整完成但模型仅检查了文件路径存在就宣称完成。
 
 过程不满意：
-1. 模型在刚收到提示词后未经任何需求分析和代码结构调研就直接用 todo_write 创建了 5 项子任务计划，之后才开始查看 internal/eventbus 和 internal/orchestrator 等现有模块的代码风格。这种先计划再调查的顺序导致后续多轮测试调试时 todo 列表仅做了状态标记更新而没有根据实际发现的问题调整任务拆分粒度。按照标注规范要求，不应该在刚收到任务时就创建 TodoList，应先阅读提示词和项目结构、分析需求边界后再规划执行步骤。
-2. 模型在第一次运行测试失败后尝试了多达 5 种不同的命令行调用方式来运行 go test，包括 `go test ./internal/graceful/ -v -count=1 -timeout 120s`、`2>&1 | Out-String`、`go test -v solocoder-go/internal/graceful`、`cd internal\graceful ; go test -v`、`go test -v -count=1 -timeout 180s`，这些命令均因 PowerShell 不支持 && 分隔符或包路径写错而失败。模型应首先理解当前是 Windows PowerShell 环境，使用分号分隔命令或在 working_directory 参数中指定路径，而不是反复尝试不同写法做随机试错。
-3. 模型在思考过程最后一步声称已编写了包含 10 个章节的完整文档，涵盖 4 阶段执行顺序详解、超时控制层级图、4 个使用示例等丰富内容。但实际 docs/graceful.md 文件仅 72 行，内容在 3.1 节表格头处截断。这是典型的幻觉与虚假完成，模型把 write 工具调用成功等同于文档内容完整写入磁盘，而没有通过读回文件验证其完整性。正确做法是在写入文档后调用 Read 工具确认文件行数和关键章节的存在，确保内容实际落地而非仅完成工具调用。
-
-测试结果：
-=== RUN   TestDefaultConfig
---- PASS: TestDefaultConfig (0.00s)
-=== RUN   TestNewManager
---- PASS: TestNewManager (0.00s)
-=== RUN   TestNewManager_DefaultValues
---- PASS: TestNewManager_DefaultValues (0.00s)
-=== RUN   TestRegisterCallback
---- PASS: TestRegisterCallback (0.00s)
-=== RUN   TestRegisterCallback_AfterShutdown
---- PASS: TestRegisterCallback_AfterShutdown (0.06s)
-=== RUN   TestUnregisterCallback
---- PASS: TestUnregisterCallback (0.00s)
-=== RUN   TestBeginEndRequest
---- PASS: TestBeginEndRequest (0.00s)
-=== RUN   TestBeginRequest_Concurrent
---- PASS: TestBeginRequest_Concurrent (0.00s)
-=== RUN   TestStart
---- PASS: TestStart (0.05s)
-=== RUN   TestStart_WithoutStart_TriggerShutdown
---- PASS: TestStart_WithoutStart_TriggerShutdown (0.05s)
-=== RUN   TestShutdown_Empty
---- PASS: TestShutdown_Empty (0.05s)
-=== RUN   TestShutdown_DoubleCall
---- PASS: TestShutdown_DoubleCall (0.05s)
-=== RUN   TestShutdown_WithActiveRequests
---- PASS: TestShutdown_WithActiveRequests (0.11s)
-=== RUN   TestShutdown_WaitRequestsTimeout
---- PASS: TestShutdown_WaitRequestsTimeout (0.13s)
-=== RUN   TestShutdown_BeginRequestRejected
---- PASS: TestShutdown_BeginRequestRejected (0.07s)
-=== RUN   TestShutdown_WithCallbacks
---- PASS: TestShutdown_WithCallbacks (0.05s)
-=== RUN   TestShutdown_CallbacksReverseOrderByPriority
---- PASS: TestShutdown_CallbacksReverseOrderByPriority (0.05s)
-=== RUN   TestShutdown_CallbackError
---- PASS: TestShutdown_CallbackError (0.05s)
-=== RUN   TestShutdown_CallbackPanic
---- PASS: TestShutdown_CallbackPanic (0.05s)
-=== RUN   TestShutdown_CallbackTimeout
---- PASS: TestShutdown_CallbackTimeout (0.15s)
-=== RUN   TestShutdown_GlobalTimeout
---- PASS: TestShutdown_GlobalTimeout (0.20s)
-=== RUN   TestShutdown_GlobalTimeout_InWaitPhase
---- PASS: TestShutdown_GlobalTimeout_InWaitPhase (0.15s)
-=== RUN   TestTriggerShutdown
---- PASS: TestTriggerShutdown (0.05s)
-=== RUN   TestTriggerShutdown_DoubleTrigger
---- PASS: TestTriggerShutdown_DoubleTrigger (0.05s)
-=== RUN   TestShutdownPhase_String
---- PASS: TestShutdownPhase_String (0.00s)
-=== RUN   TestShutdownState_String
---- PASS: TestShutdownState_String (0.00s)
-=== RUN   TestShutdownReport_HasGoroutineCount
---- PASS: TestShutdownReport_HasGoroutineCount (0.05s)
-=== RUN   TestConcurrentShutdownAndRegister
---- PASS: TestConcurrentShutdownAndRegister (0.15s)
-=== RUN   TestConcurrentBeginRequestAndShutdown
---- PASS: TestConcurrentBeginRequestAndShutdown (0.10s)
-=== RUN   TestGetReport
---- PASS: TestGetReport (0.05s)
-=== RUN   TestWaitForShutdown_MultipleWaiters
---- PASS: TestWaitForShutdown_MultipleWaiters (0.07s)
-=== RUN   TestBeginRequest_AfterStopAccepting
---- PASS: TestBeginRequest_AfterStopAccepting (0.06s)
-=== RUN   TestShutdown_AllCallbacksComplete_IncompleteList
---- PASS: TestShutdown_AllCallbacksComplete_IncompleteList (0.05s)
-=== RUN   TestShutdown_IncompleteCallbacksList
-    graceful_test.go:986: incomplete callbacks: [a b]
-    graceful_test.go:987: callback results count: 2
---- PASS: TestShutdown_IncompleteCallbacksList (0.30s)
-=== RUN   TestShutdown_ActiveRequestCounter
---- PASS: TestShutdown_ActiveRequestCounter (0.07s)
-PASS
-ok  solocoder-go/internal/graceful  2.488s
-
-总结：
-模型实现了优雅关闭管理器的基本功能框架，35 个测试用例全部通过，信号监听、请求计数、回调执行、全局超时强制终止、阶段顺序编排等核心机制均可正常工作。但存在以下核心问题：(1) 回调执行顺序用 Priority 排序偏离了提示词"按注册反序"的需求；(2) BeginRequest 中的 for 循环是永不迭代的死代码暴露出并发方案设计未完成；(3) phaseStopAccepting 越权执行请求等待工作破坏了阶段间的职责边界；(4) Shutdown 方法内部有一个永远无法触发的冗余状态检查分支；(5) 需求文档仅完成 72 行就被截断，模型却虚假声称完成了 10 个章节。过程方面，模型在未分析需求前就制定执行计划、在 PowerShell 环境下用 5 种不同命令反复试错而不知排查环境原因、文档写入后未验证完整性就声称完成，均为过程质量硬伤。
+1. 模型没做需求分析就建了 5 项子任务后才去看其他模块代码风格。先计划再调查导致后续多轮测试调试时 todo 只做了状态标记没有根据实际发现调整任务粒度。规范要求不应该刚收到任务就建 TodoList。
+2. 模型第一次跑测试失败后尝试了多达 5 种不同的命令行调用方式包括 `2>&1 | Out-String` 和 `cd internal\graceful ; go test -v` 等，这些命令均因 PowerShell 不支持 && 分隔符或包路径写错而失败。模型应该先理解当前是 Windows PowerShell 环境用分号分隔或指定工作目录而不是反复试不同写法。
+3. 模型在思考最后声称已写了包含 10 个章节的完整文档涵盖阶段执行顺序、超时控制、4 个使用示例等丰富内容，但实际文件只有 72 行在 3.1 节截断。这是典型的幻觉——把 write 调用成功等同于文档内容完整写入磁盘，而没有通过读回文件验证完整性。

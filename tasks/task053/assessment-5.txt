@@ -1,8 +1,7 @@
 产物不满意：
-1. appendLocked 方法在 edEntryOffset >= 0 分支中对旧 entriesDigest 条目的覆盖写入缺少注释说明，seek 到 edEntryOffset 后直接写入 fpEntryBytes 会将旧 ED 条目数据覆盖，虽然文件整体通过后续 write 和 truncate 仍然保持格式正确，但该覆盖语义对后续维护者不够透明，容易在代码审查时被误判为数据损坏。原因是模型只关注了功能正确性而忽略了代码可读性，应在 seek 前添加注释说明从旧 ED 位置开始覆盖写入新 fp、ed、cs 三元组的设计意图。
-2. appendLocked 中两个格式分支的写入代码完全重复，两个分支都执行 seek 定位后依次写入 fpEntryBytes、edEntryBytes、newCSEntryBytes 并基于 seek 偏移量计算 newFileSize 后 truncate，仅 seek 的目标偏移量不同。这种重复意味着未来若需调整写入顺序或新增校验条目必须在两处同步修改，遗漏任何一处都会导致文件格式不一致的硬 bug。根本原因是模型采用了一次性重写而非渐进式修改策略，应在确定两分支写入逻辑相同后将其抽取为独立方法。
+1. appendLocked 方法 O(1) 空间优化后，对老格式文件（缺少 entriesDigest 条目）直接跳过了写入新 entriesDigest，新条目的新 fileChecksum 却按包含 entriesDigest 的方式计算。loadLocked 因为 storedEntriesDigest 为空跳过校验，后续 Append 也找不到该条目，文件永远停在"半升级"状态。虽然整体校验能通过但 entriesDigest 的双重完整性保证从来没生效过，应该在首次 Append 时主动把文件升级为新格式补写 entriesDigest 条目。
+2. appendLocked 第一遍扫描里同时维护 entriesChecksum 增量哈希和 duplicateFound 标志，当发现重复指纹时 duplicateFound 置为 true 但 entriesChecksum 仍继续 feed 了当前 entry 字节。后续因为 duplicateFound 为 true 直接 return nil 跳过了 Sum 和写入，虽没造成实际危害但逻辑不清晰——对一个不用的哈希对象继续写数据纯属浪费且容易误导维护者。
 
 过程不满意：
-1. 模型在收到提示词后第一个动作就是创建 TodoList，之后才打开 persistence.go 查看代码。提示词已经明确给出了两个需要修复的具体问题，模型应当先阅读 appendLocked 的完整实现来理解当前的文件扫描和写入流程，再根据问题设计修改方案并制定执行计划。先列计划再看代码的顺序颠倒导致模型后续采用了重写整个方法的大改动策略，而不是针对两个问题进行最小化的精准修改。
-2. 模型选择一次性重写整个 appendLocked 方法而非对两个问题分别做增量修改，第一次重写后 AppendIdempotent 测试失败报文件 corrupted，根因是写入顺序错误，模型把 entriesDigest 条目写在了新 fp 条目前面，导致第二次 Append 时覆盖了之前追加的 fp 条目数据。如果采用增量策略，先修复重复检测时 entriesChecksum 的写入时机，验证通过后再添加旧格式升级分支，改动的范围小且每一步可独立验证，不会引入这种整体性错误。
-3. 模型在测试失败后没有通过阅读失败用例的断言信息和错误输出来定位问题，而是在 internal/datadedup/ 包内创建了 debug_test.go 临时调试文件来隔离复现问题。该文件以 _test.go 结尾，go test 默认会执行包内所有 _test.go 文件，虽然模型事后删除了该文件，但创建在正式包内的调试文件一旦被遗忘就可能被 CI 或其他开发者意外执行到。这种试错式调试不如直接分析测试失败输出并做代码走读来得高效和规范。
+1. 模型设计 appendLocked 的 O(1) 空间方案时经历了至少五轮方向性变更：从 entryBuffer 改成递归哈希，发现 loadLocked 无法验证后又改成 entriesDigest 条目方案并改了文件格式，测试失败后又反复修改 loadLocked 的校验逻辑，在 remove 和 restore entriesDigest 验证之间来回摇摆了三次。五轮反复推翻说明模型在动手编前没先列出所有可能的校验方案并评估兼容性，每次都是测试失败后才被迫调架构。正确做法是先建好校验的完整数学模型明确 save/append/load 三端公式再实现。
+2. 模型写新文件内容时的顺序是先写 newHeaderBytes，再 seek 到 edEntryOffset 写 entriesDigest 条目，再 seek 到 csEntryOffset 写 fpEntry 和 csEntry。写完 edEntryBytes 后没有后续 Seek 就直接在第 3 步 Seek 到 csEntryOffset，虽然结果正确但这种不依赖顺序只依赖 Seek 的写入方式说明模型对文件布局的空间关系理解有些模糊。
