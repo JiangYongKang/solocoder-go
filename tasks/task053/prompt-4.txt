@@ -1,0 +1,5 @@
+你实现的数据去重引擎模块在第三轮修复后仍存在残留问题，需要继续修复：
+1. persistence.go 的 appendLocked 方法在追加条目时虽消除了第二遍磁盘重读，但改用 entryBuffer 字节切片收集所有已有条目的完整原始字节来重建校验和，其内存占用量随索引条目数线性增长。当索引包含上万条目时追加操作的内存开销可达数 MB。需要改为在第一遍扫描时保存 SHA256 校验和的中间状态，第二遍只需在恢复的哈希状态上继续哈希新的 header 和新条目，实现 O(1) 空间成本。
+2. chunker.go 新增的 calcTargetMask 函数签名中包含 windowSize 参数，但函数体内从未使用该参数，目标遮罩计算仅依赖于 minChunkSize。需要移除函数签名中未使用的 windowSize 参数，避免给阅读者传递该参数会影响 CDC 边界检测的错误信号。
+3. persistence.go 的 Append 方法已在 appendLocked 中增加了重复指纹检测逻辑，但测试文件中没有任何测试用例覆盖对同一指纹重复调用 Append 的幂等性行为。需要为 Append 方法补充幂等场景的单元测试，验证同一指纹被重复追加时不会在文件中产生重复条目且 Header.Count 与条目数保持一致。
+4. 修复后运行 go test ./internal/datadedup/ -v，需要让所有测试通过。

@@ -323,7 +323,7 @@ func (ha *HealthAggregator) aggregateResults(
 		}
 
 	default:
-		status = StatusHealthy
+		status = StatusUnhealthy
 	}
 
 	return AggregatedHealth{

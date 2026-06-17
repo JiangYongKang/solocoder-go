@@ -1,0 +1,4 @@
+你实现的滑动窗口聚合器模块在第三轮修复后仍存在残留问题，需要继续修复：
+1. windowagg_test.go 中的 TestTimeWindow 和 TestTimeWindowAllItemsEvicted 两个测试虽然把 baseTime 从固定时间戳恢复为 time.Now()，但这两个测试中所有驱逐行为仍然完全由 AddValue 内部调用 evictLocked 完成，Result() 调用紧跟在 AddValue 之后没有任何 time.Sleep 等待真实时间流逝。这意味着 evictLocked(time.Now()) 与旧版 evictLocked(lastItem.timestamp) 在这两个测试中计算结果完全等价，无论新旧代码都能通过，无法为 Result() 的修复提供任何回归保护。需要在这两个旧测试中增加 time.Sleep 后再调用 Result() 的验证步骤，确保它们也验证到长时间无写入后 Result() 能基于真实时间流逝正确驱逐过期数据。
+2. 新增的 TestTimeWindowResultEvictsExpiredData 测试仅使用翻转窗口配置（Size 等于 Slide），只覆盖了窗口内全部数据同时过期的场景。当窗口为滑动窗口（Slide 小于 Size）时，真实时间流逝后应仅驱逐部分数据而保留仍在窗口内的数据。需要新增滑动窗口场景的测试用例，写入多个不同时间戳的数据后 sleep 使部分数据过期其余仍在窗口内，验证 Result() 返回的是窗口内剩余数据的正确聚合值。
+3. 修复后运行 go test ./internal/windowagg/ -v，需要让所有测试通过。

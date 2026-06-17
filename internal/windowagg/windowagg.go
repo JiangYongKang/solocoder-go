@@ -308,14 +308,13 @@ type windowItem struct {
 }
 
 type SlidingWindow struct {
-	mu            sync.RWMutex
-	name          string
-	config        WindowConfig
-	aggregator    Aggregator
-	items         *list.List
-	currentStart  int64
-	seqCounter    int64
-	baseTimestamp int64
+	mu           sync.RWMutex
+	name         string
+	config       WindowConfig
+	aggregator   Aggregator
+	items        *list.List
+	currentStart int64
+	seqCounter   int64
 }
 
 func NewSlidingWindow(name string, cfg WindowConfig) (*SlidingWindow, error) {
@@ -358,9 +357,6 @@ func (w *SlidingWindow) AddValue(value float64, timestamp time.Time) {
 	defer w.mu.Unlock()
 
 	w.seqCounter++
-	if w.items.Len() == 0 {
-		w.baseTimestamp = timestamp.UnixNano()
-	}
 	item := &windowItem{
 		value:     value,
 		timestamp: timestamp,
@@ -379,9 +375,6 @@ func (w *SlidingWindow) AddValueWithSeq(value float64, timestamp time.Time, seq 
 
 	if seq > w.seqCounter {
 		w.seqCounter = seq
-	}
-	if w.items.Len() == 0 {
-		w.baseTimestamp = timestamp.UnixNano()
 	}
 	item := &windowItem{
 		value:     value,
@@ -419,20 +412,12 @@ func (w *SlidingWindow) evictLocked(currentTime time.Time) {
 		slideDuration := time.Duration(w.config.Slide) * time.Millisecond
 		sizeDuration := time.Duration(w.config.Size) * time.Millisecond
 
-		currentOffset := currentTime.UnixNano() - w.baseTimestamp
+		currentUnixNano := currentTime.UnixNano()
 		slideNano := slideDuration.Nanoseconds()
 		sizeNano := sizeDuration.Nanoseconds()
 
-		var windowStartOffset int64
-		if currentOffset <= 0 {
-			windowStartOffset = 0
-		} else {
-			windowStartOffset = ((currentOffset - 1) / slideNano) * slideNano + slideNano - sizeNano + 1
-			if windowStartOffset < 0 {
-				windowStartOffset = 0
-			}
-		}
-		windowStartTime := time.Unix(0, w.baseTimestamp+windowStartOffset)
+		windowStartNano := ((currentUnixNano - 1) / slideNano) * slideNano + slideNano - sizeNano + 1
+		windowStartTime := time.Unix(0, windowStartNano)
 
 		var next *list.Element
 		for e := w.items.Front(); e != nil; e = next {
@@ -471,7 +456,6 @@ func (w *SlidingWindow) Reset() {
 	w.aggregator.Reset()
 	w.currentStart = 0
 	w.seqCounter = 0
-	w.baseTimestamp = 0
 }
 
 type WindowManager struct {

@@ -1,0 +1,4 @@
+你实现的可插拔序列化框架在第三轮修复后仍存在残留问题，需要继续修复：
+1. protobuf.go 的 getPBFieldInfo 函数在遍历标签逗号分隔部分时，将最后一个非 protobuf 前缀的部分作为字段名，而 JSON 和 MessagePack 序列化器取标签第一个逗号分隔部分 parts[0] 作为字段名。当标签格式为 `serialize:"name,extra,protobuf:5"` 时，Protobuf 序列化器取 "extra" 为字段名，JSON 序列化器取 "name" 为字段名，同一标签在同一结构体上出现了两个不同的字段名。需要让三种序列化器对同一标签的字段名解析结果保持一致，都应取第一个逗号分隔部分作为字段名。
+2. protobuf.go 中 getPBFieldInfo 函数无标签字段的字段号回退规则为 field.Index[0]+1，Marshal 中调用 encodeField 传入 info.fieldNum+1 再次偏移，Unmarshal 中 fieldMap 构建也使用 info.fieldNum+1。需要检查并确保 +1 偏移链在编码端 encodeField 和解码端 fieldMap 构建两端逻辑一致，同时在代码注释中说明字段号偏移规则，避免后续维护者混淆 default+1 与 wire+1 两层偏移的关系。
+3. 修复后运行 go test ./internal/serialize/ -v，需要让所有测试通过。

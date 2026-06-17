@@ -477,16 +477,14 @@ func TestTimeWindow(t *testing.T) {
 		WindowType:     WindowTypeTime,
 		AggregatorType: AggregatorSum,
 		Size:           100,
-		Slide:          50,
+		Slide:          100,
 	})
 	if err != nil {
 		t.Fatalf("NewSlidingWindow failed: %v", err)
 	}
 
-	baseTime := time.Now()
-
-	w.AddValue(1.0, baseTime)
-	w.AddValue(2.0, baseTime.Add(30*time.Millisecond))
+	w.AddValue(1.0, time.Now())
+	w.AddValue(2.0, time.Now())
 	result, err := w.Result()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -498,10 +496,23 @@ func TestTimeWindow(t *testing.T) {
 		t.Errorf("expected count 2, got %d", w.Count())
 	}
 
-	w.AddValue(3.0, baseTime.Add(60*time.Millisecond))
-	w.AddValue(4.0, baseTime.Add(150*time.Millisecond))
-	if w.Count() != 2 {
-		t.Errorf("expected count 2 after time eviction, got %d", w.Count())
+	w.AddValue(3.0, time.Now())
+	w.AddValue(4.0, time.Now())
+	if w.Count() != 4 {
+		t.Errorf("expected count 4, got %d", w.Count())
+	}
+
+	time.Sleep(120 * time.Millisecond)
+
+	result, err = w.Result()
+	if err != nil {
+		t.Fatalf("unexpected error after sleep: %v", err)
+	}
+	if result != 0.0 {
+		t.Errorf("expected sum 0.0 after real time expiry, got %f", result)
+	}
+	if w.Count() != 0 {
+		t.Errorf("expected count 0 after real time expiry, got %d", w.Count())
 	}
 }
 
@@ -516,12 +527,12 @@ func TestTimeWindowAllItemsEvicted(t *testing.T) {
 		t.Fatalf("NewSlidingWindow failed: %v", err)
 	}
 
-	baseTime := time.Now()
+	w.AddValue(1.0, time.Now())
+	w.AddValue(2.0, time.Now())
 
-	w.AddValue(1.0, baseTime)
-	w.AddValue(2.0, baseTime.Add(10*time.Millisecond))
+	time.Sleep(60 * time.Millisecond)
 
-	w.AddValue(3.0, baseTime.Add(200*time.Millisecond))
+	w.AddValue(3.0, time.Now())
 	result, err := w.Result()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -531,6 +542,19 @@ func TestTimeWindowAllItemsEvicted(t *testing.T) {
 	}
 	if w.Count() != 1 {
 		t.Errorf("expected count 1, got %d", w.Count())
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	result, err = w.Result()
+	if err != nil {
+		t.Fatalf("unexpected error after sleep: %v", err)
+	}
+	if result != 0.0 {
+		t.Errorf("expected sum 0.0 after real time expiry, got %f", result)
+	}
+	if w.Count() != 0 {
+		t.Errorf("expected count 0 after real time expiry, got %d", w.Count())
 	}
 }
 
@@ -571,6 +595,60 @@ func TestTimeWindowResultEvictsExpiredData(t *testing.T) {
 	}
 	if w.Count() != 0 {
 		t.Errorf("expected count 0 after expiry, got %d", w.Count())
+	}
+}
+
+func TestTimeWindowSlidingPartialExpiry(t *testing.T) {
+	w, err := NewSlidingWindow("test", WindowConfig{
+		WindowType:     WindowTypeTime,
+		AggregatorType: AggregatorSum,
+		Size:           200,
+		Slide:          50,
+	})
+	if err != nil {
+		t.Fatalf("NewSlidingWindow failed: %v", err)
+	}
+
+	w.AddValue(1.0, time.Now())
+	w.AddValue(2.0, time.Now())
+
+	result, err := w.Result()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != 3.0 {
+		t.Errorf("expected sum 3.0 after first batch, got %f", result)
+	}
+	if w.Count() != 2 {
+		t.Errorf("expected count 2 after first batch, got %d", w.Count())
+	}
+
+	time.Sleep(80 * time.Millisecond)
+
+	w.AddValue(10.0, time.Now())
+
+	result, err = w.Result()
+	if err != nil {
+		t.Fatalf("unexpected error after second batch: %v", err)
+	}
+	if result != 13.0 {
+		t.Errorf("expected sum 13.0 after second batch (all data in window), got %f", result)
+	}
+	if w.Count() != 3 {
+		t.Errorf("expected count 3 after second batch, got %d", w.Count())
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	result, err = w.Result()
+	if err != nil {
+		t.Fatalf("unexpected error after sleep: %v", err)
+	}
+	if result != 10.0 {
+		t.Errorf("expected sum 10.0 after partial expiry (only 10.0 remains), got %f", result)
+	}
+	if w.Count() != 1 {
+		t.Errorf("expected count 1 after partial expiry, got %d", w.Count())
 	}
 }
 

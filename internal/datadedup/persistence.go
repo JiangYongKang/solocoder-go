@@ -2,6 +2,7 @@ package datadedup
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -12,11 +13,12 @@ import (
 )
 
 const (
-	magicNumber   uint32 = 0x44445550
-	version       uint16 = 1
-	entryTypeFP   byte   = 1
-	entryTypeCS   byte   = 2
-	headerSize           = 16
+	magicNumber           uint32 = 0x44445550
+	version               uint16 = 1
+	entryTypeFP           byte   = 1
+	entryTypeCS           byte   = 2
+	entryTypeEntriesDigest byte  = 3
+	headerSize                   = 16
 )
 
 type persistIndex struct {
@@ -67,9 +69,6 @@ func (p *persistIndex) saveLocked(index FingerprintIndex, path string) error {
 
 	writer := bufio.NewWriter(f)
 
-	checksum := sha256.New()
-	mw := io.MultiWriter(writer, checksum)
-
 	header := persistHeader{
 		Magic:    magicNumber,
 		Version:  version,
@@ -83,10 +82,11 @@ func (p *persistIndex) saveLocked(index FingerprintIndex, path string) error {
 	binary.BigEndian.PutUint16(headerBytes[6:8], header.Reserved)
 	binary.BigEndian.PutUint64(headerBytes[8:16], header.Count)
 
-	if _, err := mw.Write(headerBytes); err != nil {
+	if _, err := writer.Write(headerBytes); err != nil {
 		return err
 	}
 
+	entriesChecksum := sha256.New()
 	for fp := range index {
 		entry := persistEntry{
 			Type:      entryTypeFP,
@@ -95,16 +95,34 @@ func (p *persistIndex) saveLocked(index FingerprintIndex, path string) error {
 		}
 
 		entryBytes := encodeEntry(entry)
-		if _, err := mw.Write(entryBytes); err != nil {
+		if _, err := entriesChecksum.Write(entryBytes); err != nil {
+			return err
+		}
+		if _, err := writer.Write(entryBytes); err != nil {
 			return err
 		}
 	}
 
-	cs := hex.EncodeToString(checksum.Sum(nil))
+	entriesDigest := entriesChecksum.Sum(nil)
+
+	edEntry := persistEntry{
+		Type:      entryTypeEntriesDigest,
+		FP:        Fingerprint(entriesDigest),
+		Timestamp: 0,
+	}
+	edEntryBytes := encodeEntry(edEntry)
+	if _, err := writer.Write(edEntryBytes); err != nil {
+		return err
+	}
+
+	fileChecksum := sha256.New()
+	fileChecksum.Write(headerBytes)
+	fileChecksum.Write(entriesDigest)
+	fileCS := hex.EncodeToString(fileChecksum.Sum(nil))
 
 	csEntry := persistEntry{
 		Type:      entryTypeCS,
-		FP:        Fingerprint(cs),
+		FP:        Fingerprint(fileCS),
 		Timestamp: 0,
 	}
 
@@ -169,9 +187,11 @@ func (p *persistIndex) loadLocked(path string) (FingerprintIndex, error) {
 		return nil, ErrPersistCorrupted
 	}
 
+	headerBytes := data[0:headerSize]
+
 	offset := headerSize
-	checksum := sha256.New()
-	checksum.Write(data[0:offset])
+	entriesChecksum := sha256.New()
+	var storedEntriesDigest Fingerprint
 
 	index := make(FingerprintIndex, header.Count)
 	var lastChecksum string
@@ -206,8 +226,14 @@ func (p *persistIndex) loadLocked(path string) (FingerprintIndex, error) {
 			break
 		}
 
+		if entryType == entryTypeEntriesDigest {
+			storedEntriesDigest = Fingerprint(fpBytes)
+			offset += entryLen
+			continue
+		}
+
 		if entryType == entryTypeFP {
-			checksum.Write(data[offset : offset+entryLen])
+			entriesChecksum.Write(data[offset : offset+entryLen])
 			index[Fingerprint(fpBytes)] = true
 			fpCount++
 		}
@@ -223,7 +249,19 @@ func (p *persistIndex) loadLocked(path string) (FingerprintIndex, error) {
 		return nil, ErrPersistCorrupted
 	}
 
-	calculated := hex.EncodeToString(checksum.Sum(nil))
+	entriesDigest := entriesChecksum.Sum(nil)
+
+	if storedEntriesDigest != "" {
+		if !bytes.Equal(entriesDigest, []byte(storedEntriesDigest)) {
+			return nil, ErrChecksumMismatch
+		}
+	}
+
+	fileChecksum := sha256.New()
+	fileChecksum.Write(headerBytes)
+	fileChecksum.Write(entriesDigest)
+	calculated := hex.EncodeToString(fileChecksum.Sum(nil))
+
 	if calculated != lastChecksum {
 		return nil, ErrChecksumMismatch
 	}
@@ -271,21 +309,18 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 		return ErrPersistCorrupted
 	}
 
-	checksum := sha256.New()
-	checksum.Write(headerBytes)
+	entriesChecksum := sha256.New()
 
 	var csEntryOffset int64 = -1
-	var lastChecksum string
+	var edEntryOffset int64 = -1
 	var fpCount uint64
-	var entryBuffer []byte
+	duplicateFound := false
 
 	for {
 		curOffset, _ := f.Seek(0, io.SeekCurrent)
 		if curOffset >= fileInfo.Size() {
 			break
 		}
-
-		entryStart := curOffset
 
 		entryHeader := make([]byte, 5)
 		if _, err := io.ReadFull(f, entryHeader); err != nil {
@@ -311,30 +346,26 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 		fpBytes := rest[:int(fpLen)]
 
 		if entryType == entryTypeCS {
-			lastChecksum = string(fpBytes)
 			csEntryOffset = curOffset
 			break
 		}
 
+		if entryType == entryTypeEntriesDigest {
+			edEntryOffset = curOffset
+			continue
+		}
+
 		if entryType == entryTypeFP {
 			fpCount++
-			checksum.Write(entryHeader)
-			checksum.Write(rest)
-
-			entryEnd, _ := f.Seek(0, io.SeekCurrent)
-			entryLen := int(entryEnd - entryStart)
-			fullEntry := make([]byte, entryLen)
-			copy(fullEntry[0:5], entryHeader)
-			copy(fullEntry[5:], rest)
-			entryBuffer = append(entryBuffer, fullEntry...)
-
+			entriesChecksum.Write(entryHeader)
+			entriesChecksum.Write(rest)
 			if Fingerprint(fpBytes) == fp {
-				return nil
+				duplicateFound = true
 			}
 		}
 	}
 
-	if csEntryOffset < 0 || lastChecksum == "" {
+	if csEntryOffset < 0 {
 		return ErrPersistCorrupted
 	}
 
@@ -342,13 +373,26 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 		return ErrPersistCorrupted
 	}
 
+	if duplicateFound {
+		return nil
+	}
+
 	fpEntry := persistEntry{
 		Type:      entryTypeFP,
 		FP:        fp,
 		Timestamp: 0,
 	}
-
 	fpEntryBytes := encodeEntry(fpEntry)
+
+	entriesChecksum.Write(fpEntryBytes)
+	newEntriesDigest := entriesChecksum.Sum(nil)
+
+	edEntry := persistEntry{
+		Type:      entryTypeEntriesDigest,
+		FP:        Fingerprint(newEntriesDigest),
+		Timestamp: 0,
+	}
+	edEntryBytes := encodeEntry(edEntry)
 
 	newCount := count + 1
 	newHeaderBytes := make([]byte, headerSize)
@@ -357,36 +401,40 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 	binary.BigEndian.PutUint16(newHeaderBytes[6:8], 0)
 	binary.BigEndian.PutUint64(newHeaderBytes[8:16], newCount)
 
-	newChecksum := sha256.New()
-	newChecksum.Write(newHeaderBytes)
-	newChecksum.Write(entryBuffer)
-	newChecksum.Write(fpEntryBytes)
-	newCS := hex.EncodeToString(newChecksum.Sum(nil))
+	fileChecksum := sha256.New()
+	fileChecksum.Write(newHeaderBytes)
+	fileChecksum.Write(newEntriesDigest)
+	newCS := hex.EncodeToString(fileChecksum.Sum(nil))
 
 	newCSEntry := persistEntry{
 		Type:      entryTypeCS,
 		FP:        Fingerprint(newCS),
 		Timestamp: 0,
 	}
-
 	newCSEntryBytes := encodeEntry(newCSEntry)
 
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-
 	if _, err := f.Write(newHeaderBytes); err != nil {
 		return err
+	}
+
+	if edEntryOffset >= 0 {
+		if _, err := f.Seek(edEntryOffset, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := f.Write(edEntryBytes); err != nil {
+			return err
+		}
 	}
 
 	if _, err := f.Seek(csEntryOffset, io.SeekStart); err != nil {
 		return err
 	}
-
 	if _, err := f.Write(fpEntryBytes); err != nil {
 		return err
 	}
-
 	if _, err := f.Write(newCSEntryBytes); err != nil {
 		return err
 	}

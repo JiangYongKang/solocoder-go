@@ -1,0 +1,4 @@
+你实现的舱壁隔离模块在第三轮修复后仍存在残留问题，需要继续修复：
+1. bulkhead.go 新增的 SemaphoreFullError 错误类型虽解决了 Acquire 超时报错误包含队列字段的问题，但其 Error 方法打印的错误信息前缀固定为 "semaphore full"，而 err 中的 ActiveCount 字段实际取值是 workerActive 和 semHolders 两个计数器的总和。当 Acquire 因 worker 正在执行任务而导致总并发上限耗尽时，semHolders 可能只有少量几个，错误信息却以 "semaphore full" 开头，将 worker 占槽导致的拒收误报为信号量耗尽。需要修改错误信息的表述，使用中立的语义区分"总并发槽位耗尽"与"信号量持有者耗尽"两种场景，避免调用方对真正限制资源产生误判。
+2. bulkhead_test.go 中的 TestResize_Concurrency_ShrinkWithActiveTasks 和 TestCanSubmit_QueueFullWithIdleWorkers 等测试用例在第三轮修复中将原先对 ActiveCount 的断言替换为对 WorkerActiveCount 的断言。WorkerActiveCount 仅反映 worker 执行中的任务数，不再涵盖信号量持有者 semHolders 数量，导致这些测试丧失了对 semHolders 残留计数的验证能力。例如收缩并发数后原断言 ActiveCount=0 能确认没有任何活跃资源占用，改为 WorkerActiveCount=0 后即使 semHolders 未正确归零也不会被检测到。需要恢复以 ActiveCount 为对象的断言以维持原有验证强度。
+3. 修复后运行 go test ./internal/bulkhead/ -v，需要让所有测试通过。

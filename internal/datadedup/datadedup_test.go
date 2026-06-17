@@ -1006,6 +1006,69 @@ func TestPersistence(t *testing.T) {
 			t.Errorf("expected ErrPersistFileNotExist, got %v", err)
 		}
 	})
+
+	t.Run("AppendIdempotent", func(t *testing.T) {
+		idempotentPath := filepath.Join(tmpDir, "idempotent.idx")
+		p := NewPersistIndex()
+
+		index := FingerprintIndex{
+			"fp_alpha": true,
+			"fp_beta":  true,
+		}
+		err := p.Save(index, idempotentPath)
+		if err != nil {
+			t.Fatalf("Save failed: %v", err)
+		}
+
+		err = p.Append("fp_gamma", idempotentPath)
+		if err != nil {
+			t.Fatalf("first Append failed: %v", err)
+		}
+
+		err = p.Append("fp_gamma", idempotentPath)
+		if err != nil {
+			t.Fatalf("duplicate Append returned error: %v", err)
+		}
+
+		err = p.Append("fp_gamma", idempotentPath)
+		if err != nil {
+			t.Fatalf("third duplicate Append returned error: %v", err)
+		}
+
+		loaded, err := p.Load(idempotentPath)
+		if err != nil {
+			t.Fatalf("Load after idempotent appends failed: %v", err)
+		}
+
+		if len(loaded) != 3 {
+			t.Errorf("expected 3 entries after idempotent appends, got %d", len(loaded))
+		}
+
+		if !loaded["fp_alpha"] || !loaded["fp_beta"] || !loaded["fp_gamma"] {
+			t.Error("missing expected entries after idempotent appends")
+		}
+
+		valid, err := p.Verify(idempotentPath)
+		if err != nil {
+			t.Fatalf("Verify failed: %v", err)
+		}
+		if !valid {
+			t.Error("expected valid file after idempotent appends")
+		}
+
+		err = p.Append("fp_delta", idempotentPath)
+		if err != nil {
+			t.Fatalf("Append new fp after idempotent appends failed: %v", err)
+		}
+
+		loaded2, err := p.Load(idempotentPath)
+		if err != nil {
+			t.Fatalf("Load after new append failed: %v", err)
+		}
+		if len(loaded2) != 4 {
+			t.Errorf("expected 4 entries after new append, got %d", len(loaded2))
+		}
+	})
 }
 
 func TestDedupEngine(t *testing.T) {

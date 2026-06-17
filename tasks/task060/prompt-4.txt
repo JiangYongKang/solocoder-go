@@ -1,0 +1,4 @@
+你实现的降级策略链模块在第三轮修复后仍存在残留问题，需要继续修复：
+1. fallback.go 的 matchTriggerCondition 方法中虽然删除了 TriggerConditionErrorRate 分支的死代码，但未按提示词要求在代码中添加注释说明错误率检查的处理位置。当前代码无任何注释指出 ErrorRate 触发条件由 shouldSkipByErrorRate 在 Execute 循环中负责判断，后续维护者看到 TriggerConditionErrorRate 常量存在却无对应 case 处理会误以为该功能缺失。
+2. fallback_test.go 中 TestCountRecentSuccessesWithAndWithoutWindow 测试函数的名称暗示覆盖有窗口和无窗口两种模式，但实际仅验证 PassiveSuccessWindow 为 0 的无窗口路径，有窗口模式下 countRecentSuccesses 的时间过滤行为完全未测试。此外末尾的被动恢复检查使用 t.Logf 输出日志而非断言，使得该检查仅记录不验证，一旦 countRecentSuccesses 方法回归也无法被测试发现。
+3. 修复后运行 go test ./internal/fallback/ -v，需要让所有测试通过。

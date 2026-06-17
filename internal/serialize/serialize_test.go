@@ -1130,15 +1130,15 @@ func TestProtoBufEdgeCases(t *testing.T) {
 	opts := DefaultOptions()
 
 	type EdgeStruct struct {
-		BoolVal   bool    `serialize:"bool,protobuf:1"`
-		IntVal    int     `serialize:"int,protobuf:2"`
-		Int32Val  int32   `serialize:"int32,protobuf:3"`
-		Int64Val  int64   `serialize:"int64,protobuf:4"`
-		UintVal   uint    `serialize:"uint,protobuf:5"`
-		Uint32Val uint32  `serialize:"uint32,protobuf:6"`
-		Uint64Val uint64  `serialize:"uint64,protobuf:7"`
-		Float32   float32 `serialize:"float32,protobuf:8"`
-		Float64   float64 `serialize:"float64,protobuf:9"`
+		BoolVal   bool    `serialize:"bool,protobuf:2"`
+		IntVal    int     `serialize:"int,protobuf:3"`
+		Int32Val  int32   `serialize:"int32,protobuf:4"`
+		Int64Val  int64   `serialize:"int64,protobuf:5"`
+		UintVal   uint    `serialize:"uint,protobuf:6"`
+		Uint32Val uint32  `serialize:"uint32,protobuf:7"`
+		Uint64Val uint64  `serialize:"uint64,protobuf:8"`
+		Float32   float32 `serialize:"float32,protobuf:9"`
+		Float64   float64 `serialize:"float64,protobuf:10"`
 	}
 
 	original := EdgeStruct{

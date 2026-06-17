@@ -1,0 +1,5 @@
+产物不满意：
+1. bulkhead.go 的 SemaphoreFullError 经过修改后 Error 方法输出格式为 `concurrency limit reached: active=5/5 (workers=3, semaphoreHolders=2)`，但 ActiveCount 字段的定义是 `workerActive + semHolders` 两个计数器的总和。当 workerActive 为 2 且 semHolders 为 0 时，ActiveCount 等于 2，错误信息显示 `active=2/5 (workers=2, semaphoreHolders=0)`。调用方看到 active 等于 workers 而 semaphoreHolders 为 0，能正确判断出是 worker 占槽导致拒收。但 SemaphoreFullError 结构体仍保留了 SemHolders 字段名与 ActiveCount 字段共存，这两个字段在语义上存在重叠：ActiveCount 已经包含 SemHolders，SemHolders 是 ActiveCount 的子集。调用方可能误用 ActiveCount - SemHolders 来计算 WorkerActive 而非直接使用新增的 WorkerActive 字段，存在冗余字段引发误用的风险。建议在结构体注释中说明各字段的来源关系。
+过程不满意：
+1. 模型在收到提示词后立即创建了 3 项 TodoList 并标为 in_progress，随后才开始查看 bulkhead.go 文件内容。这种在不了解代码现状前就预先规划任务的做法不符合标注规范要求的"应先分析问题再规划"，尽管本轮任务只有两个明确问题且 TodoList 粒度基本合理，但流程上仍应在阅读并理解代码后再制定执行计划。模型全程仅查看了 bulkhead.go 一次就完成了所有修改，其余操作均针对测试文件，代码理解效率尚可但规划时机有优化空间。
+2. 模型在修改 TestCanSubmit_QueueFullWithIdleWorkers 测试时第一次搜索替换因字符串在两处匹配而失败，模型随后增加了更多上下文重新尝试并成功。但模型在失败的搜索替换后没有先确认当前文件中该断言的实际位置和内容，而是直接凭记忆添加了额外上下文行，这存在替换目标不精确的风险。好在第二次替换成功了，正确的做法应是先读取目标区域确认精确的上下文再构造替换字符串。

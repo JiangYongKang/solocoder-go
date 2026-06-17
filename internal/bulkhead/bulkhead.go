@@ -38,13 +38,14 @@ type SemaphoreFullError struct {
 	Name           string
 	ActiveCount    int
 	MaxConcurrency int
+	WorkerActive   int
 	SemHolders     int
 }
 
 func (e *SemaphoreFullError) Error() string {
 	return fmt.Sprintf(
-		"bulkhead '%s' semaphore full: active=%d/%d, semaphoreHolders=%d",
-		e.Name, e.ActiveCount, e.MaxConcurrency, e.SemHolders,
+		"bulkhead '%s' concurrency limit reached: active=%d/%d (workers=%d, semaphoreHolders=%d)",
+		e.Name, e.ActiveCount, e.MaxConcurrency, e.WorkerActive, e.SemHolders,
 	)
 }
 
@@ -269,6 +270,7 @@ func (b *Bulkhead) Acquire(timeout time.Duration) error {
 			Name:           b.name,
 			ActiveCount:    b.activeCount(),
 			MaxConcurrency: b.maxConcurrency,
+			WorkerActive:   b.workerActive,
 			SemHolders:     b.semHolders,
 		}
 	}
@@ -290,6 +292,7 @@ func (b *Bulkhead) Acquire(timeout time.Duration) error {
 				Name:           b.name,
 				ActiveCount:    b.activeCount(),
 				MaxConcurrency: b.maxConcurrency,
+				WorkerActive:   b.workerActive,
 				SemHolders:     b.semHolders,
 			}
 		}

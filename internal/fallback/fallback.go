@@ -305,6 +305,10 @@ func (c *Chain) matchTriggerCondition(err error, cond *TriggerCondition) bool {
 		return false
 	}
 
+	// NOTE: TriggerConditionErrorRate 类型不在此处处理。
+	// 错误率触发条件需要基于策略的历史统计数据进行判断，
+	// 由 shouldSkipByErrorRate 方法在 Execute 循环的策略执行前进行检查。
+
 	switch cond.Type {
 	case TriggerConditionErrorType:
 		for _, targetErr := range cond.ErrorTypes {

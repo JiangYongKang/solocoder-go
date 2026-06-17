@@ -1,0 +1,6 @@
+产物不满意：
+1. windowagg.go 的 evictLocked 方法在移除 baseTimestamp 后使用绝对时间戳计算窗口起始边界，公式为 `windowStartNano = ((currentUnixNano - 1) / slideNano) * slideNano + slideNano - sizeNano + 1`。当 currentUnixNano 恰好为 slideNano 的整数倍时，减去 1 后向下对齐到上一个窗口，导致当前应该属于的窗口被向前偏移了一个 slide。这个问题在时间点恰为 Slide 边界时会导致窗口起始时间计算错误一个 slide 周期，虽然在实际使用中精确命中的概率很低但在长时间运行的系统中必然会偶尔触发，表现为窗口内数据点的归属边界出现一个 slide 的抖动。应改用向上取整的对齐公式避免减去 1 导致的下溢问题。
+2. TestTimeWindow 测试中写入数据的顺序是 AddValue 两次后立即 Result() 验证，然后 AddValue 两次后直接断言 Count 为 4，最后 sleep 再 Result() 验证归零。但中间两次 AddValue 使用 time.Now() 获取的时间戳可能在两次调用之间没有实质性的时间差，使得两个数据点的时间戳完全相同。如果这两次 AddValue 恰好落在 Slide 边界导致第一个数据点被驱逐，Count 可能不是 4 而是 2 或 3，测试存在微弱的竞态脆弱性。应在两次 AddValue 之间加入极短的 Sleep 或使用精确可控的 timestamp 参数来消除时间对齐的不确定性。
+过程不满意：
+1. 模型在第一次尝试增加 sleep 测试时直接在旧的 baseTimestamp 机制上运行，测试失败后不是先分析 evictLocked 中 baseTimestamp 与 time.Now() 冲突的根因，而是反复修改测试中的时间参数和 Sleep 时长试图让测试通过。连续两次编辑测试文件后才意识到需要修改 evictLocked 中时间计算逻辑，随后才开始修改生产代码。这两轮对着测试参数的试错属于典型的未先分析根因就盲目调整，正确做法是在首次测试失败时立即阅读 evictLocked 的实现代码并分析 baseTimestamp 与 time.Now() 的不兼容性，直接定位到需要移除 baseTimestamp 的生产代码变更。
+2. 模型新增的 TestTimeWindowSlidingPartialExpiry 测试使用了 200ms 窗口加 50ms 滑动步长，在三阶段写入和 Sleep 间的总等待时间约 230ms。测试在 80ms sleep 后期望三个数据点全部在窗口内 sum 为 13，但这个期望依赖精确的时序假设：如果机器负载高导致 80ms sleep 实际经过 100ms 以上，第一批数据可能已部分过期。测试中没有对时间敏感区间使用宽松范围断言或增加重试机制，使得这个测试在慢速 CI 环境下有概率误报失败。应在时间相关的断言中引入容差范围或使用 `>=` 比较而非精确相等。

@@ -154,7 +154,7 @@ func NewContentBasedChunker(minSize, maxSize int, boundary byte, hashAlgo HashAl
 
 	windowSize := calcRollingWindowSize(minSize)
 	rh := newRollingHash(windowSize)
-	targetMask := calcTargetMask(minSize, windowSize)
+	targetMask := calcTargetMask(minSize)
 
 	return &contentBasedChunker{
 		minChunkSize: minSize,
@@ -176,7 +176,7 @@ func NewContentBasedChunkerWithProvider(minSize, maxSize int, boundary byte, hp 
 
 	windowSize := calcRollingWindowSize(minSize)
 	rh := newRollingHash(windowSize)
-	targetMask := calcTargetMask(minSize, windowSize)
+	targetMask := calcTargetMask(minSize)
 
 	return &contentBasedChunker{
 		minChunkSize: minSize,
@@ -203,7 +203,7 @@ func calcRollingWindowSize(minChunkSize int) int {
 	return windowSize
 }
 
-func calcTargetMask(minChunkSize int, windowSize int) uint64 {
+func calcTargetMask(minChunkSize int) uint64 {
 	targetBits := rollingHashDefaultTargetBits
 	if minChunkSize < 256 {
 		targetBits = 8

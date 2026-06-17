@@ -1,0 +1,3 @@
+你实现的健康检查聚合器模块在第三轮修复后仍存在残留问题，需要继续修复：
+1. healthagg.go 中 NewHealthAggregator 函数虽然新增了 Strategy 枚举值校验，在构造函数入口拦截了无效策略值，但 aggregateResults 方法的 switch 语句 default 分支仍然直接返回 StatusHealthy 而未做任何兜底处理。尽管当前构造函数已能拦截无效策略，若后续新增策略常量后忘记同步更新构造函数校验列表，aggregateResults 的 default 分支会再次静默返回 StatusHealthy 导致调用方无法感知内部错误。需要将 aggregateResults 的 default 分支改为返回 StatusUnhealthy，与构造函数校验形成双重防护确保任何异常策略值都能被暴露。
+2. 修复后运行 go test ./internal/healthagg/ -v，需要让所有测试通过。
