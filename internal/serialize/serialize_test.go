@@ -697,66 +697,234 @@ func TestMsgPackEdgeCases(t *testing.T) {
 	s := NewMsgPackSerializer()
 	opts := DefaultOptions()
 
-	tests := []struct {
-		name  string
-		value interface{}
-	}{
-		{"bool true", true},
-		{"bool false", false},
-		{"small int", 42},
-		{"negative int", -42},
-		{"large int", int64(1234567890)},
-		{"large negative int", int64(-1234567890)},
-		{"float32", float32(3.14)},
-		{"float64", float64(3.1415926535)},
-		{"empty string", ""},
-		{"long string", strings.Repeat("x", 1000)},
-		{"byte slice", []byte("binary data")},
-		{"nil bytes", ([]byte)(nil)},
-	}
+	t.Run("bool true", func(t *testing.T) {
+		type BoolContainer struct {
+			Value bool `serialize:"value"`
+		}
+		orig := BoolContainer{Value: true}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res BoolContainer
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if res.Value != orig.Value {
+			t.Errorf("Bool mismatch: got %v, want %v", res.Value, orig.Value)
+		}
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			type Container struct {
-				Value interface{} `serialize:"value"`
-			}
-		})
-	}
+	t.Run("bool false", func(t *testing.T) {
+		type BoolContainer struct {
+			Value bool `serialize:"value"`
+		}
+		orig := BoolContainer{Value: false}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res BoolContainer
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if res.Value != orig.Value {
+			t.Errorf("Bool mismatch: got %v, want %v", res.Value, orig.Value)
+		}
+	})
 
-	type IntContainer struct {
-		Value int `serialize:"value"`
-	}
+	t.Run("small int", func(t *testing.T) {
+		type IntContainer struct {
+			Value int `serialize:"value"`
+		}
+		orig := IntContainer{Value: 42}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res IntContainer
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if res.Value != orig.Value {
+			t.Errorf("Int mismatch: got %d, want %d", res.Value, orig.Value)
+		}
+	})
 
-	intOrig := IntContainer{Value: 123}
-	data, err := s.Marshal(&intOrig, opts)
-	if err != nil {
-		t.Fatalf("Marshal int failed: %v", err)
-	}
-	var intRes IntContainer
-	err = s.Unmarshal(data, &intRes, opts)
-	if err != nil {
-		t.Fatalf("Unmarshal int failed: %v", err)
-	}
-	if intRes.Value != intOrig.Value {
-		t.Errorf("Int mismatch: got %d, want %d", intRes.Value, intOrig.Value)
-	}
+	t.Run("negative int", func(t *testing.T) {
+		type IntContainer struct {
+			Value int `serialize:"value"`
+		}
+		orig := IntContainer{Value: -42}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res IntContainer
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if res.Value != orig.Value {
+			t.Errorf("Int mismatch: got %d, want %d", res.Value, orig.Value)
+		}
+	})
 
-	type StringContainer struct {
-		Value string `serialize:"value"`
-	}
-	strOrig := StringContainer{Value: "Hello"}
-	data, err = s.Marshal(&strOrig, opts)
-	if err != nil {
-		t.Fatalf("Marshal string failed: %v", err)
-	}
-	var strRes StringContainer
-	err = s.Unmarshal(data, &strRes, opts)
-	if err != nil {
-		t.Fatalf("Unmarshal string failed: %v", err)
-	}
-	if strRes.Value != strOrig.Value {
-		t.Errorf("String mismatch: got %s, want %s", strRes.Value, strOrig.Value)
-	}
+	t.Run("large int", func(t *testing.T) {
+		type Int64Container struct {
+			Value int64 `serialize:"value"`
+		}
+		orig := Int64Container{Value: 1234567890}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res Int64Container
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if res.Value != orig.Value {
+			t.Errorf("Int64 mismatch: got %d, want %d", res.Value, orig.Value)
+		}
+	})
+
+	t.Run("large negative int", func(t *testing.T) {
+		type Int64Container struct {
+			Value int64 `serialize:"value"`
+		}
+		orig := Int64Container{Value: -1234567890}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res Int64Container
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if res.Value != orig.Value {
+			t.Errorf("Int64 mismatch: got %d, want %d", res.Value, orig.Value)
+		}
+	})
+
+	t.Run("float32", func(t *testing.T) {
+		type Float32Container struct {
+			Value float32 `serialize:"value"`
+		}
+		orig := Float32Container{Value: float32(3.14)}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res Float32Container
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if res.Value != orig.Value {
+			t.Errorf("Float32 mismatch: got %v, want %v", res.Value, orig.Value)
+		}
+	})
+
+	t.Run("float64", func(t *testing.T) {
+		type Float64Container struct {
+			Value float64 `serialize:"value"`
+		}
+		orig := Float64Container{Value: 3.1415926535}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res Float64Container
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if res.Value != orig.Value {
+			t.Errorf("Float64 mismatch: got %v, want %v", res.Value, orig.Value)
+		}
+	})
+
+	t.Run("empty string", func(t *testing.T) {
+		type StringContainer struct {
+			Value string `serialize:"value"`
+		}
+		orig := StringContainer{Value: ""}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res StringContainer
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if res.Value != orig.Value {
+			t.Errorf("String mismatch: got %q, want %q", res.Value, orig.Value)
+		}
+	})
+
+	t.Run("long string", func(t *testing.T) {
+		type StringContainer struct {
+			Value string `serialize:"value"`
+		}
+		longStr := strings.Repeat("x", 1000)
+		orig := StringContainer{Value: longStr}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res StringContainer
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if res.Value != orig.Value {
+			t.Errorf("Long string mismatch: length got %d, want %d", len(res.Value), len(orig.Value))
+		}
+	})
+
+	t.Run("byte slice", func(t *testing.T) {
+		type BytesContainer struct {
+			Value []byte `serialize:"value"`
+		}
+		orig := BytesContainer{Value: []byte("binary data")}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res BytesContainer
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if !bytes.Equal(res.Value, orig.Value) {
+			t.Errorf("Byte slice mismatch: got %v, want %v", res.Value, orig.Value)
+		}
+	})
+
+	t.Run("nil bytes", func(t *testing.T) {
+		type BytesContainer struct {
+			Value []byte `serialize:"value"`
+		}
+		orig := BytesContainer{Value: nil}
+		data, err := s.Marshal(&orig, opts)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var res BytesContainer
+		err = s.Unmarshal(data, &res, opts)
+		if err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if len(res.Value) != 0 {
+			t.Errorf("Nil bytes mismatch: got length %d, want 0", len(res.Value))
+		}
+	})
 }
 
 func TestMsgPackInvalidData(t *testing.T) {

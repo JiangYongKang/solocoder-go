@@ -1,0 +1,4 @@
+你实现的数据去重引擎模块存在一些问题，需要修复：
+1. persistence.go 的 Append 方法在文件已存在时先读取整个索引到内存再修改后全量写回磁盘，这与"增量写入避免每次全量刷新整个索引"的要求直接矛盾，当索引包含大量指纹时每次 Append 都触发全量 I/O，需要改为真正的尾部追加写入方式。
+2. chunker.go 的 contentBasedChunker 结构体中定义了 hasher、windowSize、targetBits 三个字段但 Chunk 方法从未使用它们，实际只实现了基于分隔符的分块而非真正的 Content-Defined Chunking 算法，需要补全滚动哈希窗口分界点计算的 CDC 算法实现或者移除这些死代码字段。
+3. 修复后运行 go test ./internal/datadedup/ -v，需要让所有测试通过。

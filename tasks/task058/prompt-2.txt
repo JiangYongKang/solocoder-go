@@ -1,0 +1,5 @@
+你实现的健康检查聚合器模块存在一些问题，需要修复：
+1. healthagg.go 的 Check 方法会用注册时设置的探针名称覆盖探针函数返回的 ProbeResult 中的 Name 字段，导致调用方在探针函数内部设置的 Name 信息被静默丢弃，需要改为尊重探针函数返回的 Name 或在 ProbeResult 中去掉 Name 字段避免歧义。
+2. healthagg.go 的 maybeTriggerAlert 方法对所有状态变化都触发告警回调，但提示词要求的告警范围是限定在不健康状态相关的场景，需要增加对 PreviousStatus 或 CurrentStatus 涉及 StatusUnhealthy 的过滤条件。
+3. healthagg.go 的 NewHealthAggregator 函数声明了 error 返回值但从未返回非 nil 错误，当 MajorityRatio 等配置参数不合法时静默回退到默认值，调用方无法感知配置错误，需要在配置校验失败时返回明确错误。
+4. 修复后运行 go test ./internal/healthagg/ -v，需要让所有测试通过。

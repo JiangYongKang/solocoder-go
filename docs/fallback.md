@@ -394,4 +394,75 @@ fmt.Printf("恢复次数: %d\n", metrics.RecoveryCount)
 // 获取策略统计
 if strategy, ok := chain.GetStrategy("main"); ok {
     success, failures, consecFail := strategy.Stats()
-    fmt.Printf("主策略: 成功=%d, 失败=%d, 连续
+    fmt.Printf("主策略: 成功=%d, 失败=%d, 连续失败=%d\n",
+        success, failures, consecFail)
+}
+
+// 计算错误率
+errorRate, _ := chain.CalculateErrorRate("main", 5*time.Minute)
+fmt.Printf("主策略5分钟错误率: %.2f%%\n", errorRate*100)
+```
+
+### 4.7 强制切换
+
+```go
+// 强制切换到指定策略
+err := chain.ForceSwitchToStrategy("cache")
+if err != nil {
+    fmt.Printf("切换失败: %v\n", err)
+}
+
+// 强制切回主策略
+err = chain.ForceSwitchToMain()
+if err != nil {
+    fmt.Printf("切回失败: %v\n", err)
+}
+```
+
+## 5. 错误处理
+
+### 5.1 AggregateError
+
+当所有降级策略都失败时，返回 `AggregateError`，包含所有策略的错误信息：
+
+```go
+result, err := chain.Execute(ctx)
+if err != nil {
+    var aggErr *fallback.AggregateError
+    if errors.As(err, &aggErr) {
+        for i, e := range aggErr.Errors {
+            fmt.Printf("策略 %d 错误: %v\n", i+1, e)
+        }
+    }
+}
+```
+
+### 5.2 预定义错误
+
+| 错误 | 说明 |
+|------|------|
+| `ErrNoStrategies` | 没有注册任何策略 |
+| `ErrStrategyAlreadyExists` | 策略ID已存在 |
+| `ErrStrategyNotFound` | 策略不存在 |
+| `ErrNilHandler` | 处理函数为nil |
+| `ErrInvalidPriority` | 无效的优先级 |
+| `ErrChainNotRunning` | 降级链未启动 |
+| `ErrChainAlreadyRunning` | 降级链已启动 |
+| `ErrInvalidConfig` | 无效配置 |
+| `ErrAllStrategiesFailed` | 所有策略都失败 |
+| `ErrExecutionTimeout` | 执行超时 |
+
+## 6. 并发安全
+
+该模块完全支持并发访问，所有共享状态都通过 `sync.RWMutex` 进行保护。可以在多个 goroutine 中同时调用 `Execute()` 方法。
+
+## 7. 最佳实践
+
+1. **合理设置优先级**：优先级数字越小越先执行，主策略通常设置为 0
+2. **配置适当的超时**：对于可能阻塞的操作，务必设置超时触发条件
+3. **选择合适的恢复模式**：
+   - 主动探测：适合可以接受额外探测流量的场景
+   - 被动检测：适合对额外流量敏感的场景
+4. **设置预热期**：在切回主策略前，通过预热期验证稳定性
+5. **监控指标**：定期检查 `ChainMetrics` 和策略统计，及时发现问题
+6. **合理的降级层级**：建议设置 2-3 层降级，避免层级过多导致复杂度上升

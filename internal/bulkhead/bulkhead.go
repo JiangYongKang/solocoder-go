@@ -14,6 +14,7 @@ var (
 	ErrInvalidConcurrency = errors.New("bulkhead: max concurrency must be greater than 0")
 	ErrInvalidQueueSize   = errors.New("bulkhead: max queue size must be greater than or equal to 0")
 	ErrInvalidName        = errors.New("bulkhead: name must not be empty")
+	ErrNotAcquired        = errors.New("bulkhead: no semaphore slot acquired")
 )
 
 type Task func()
@@ -45,15 +46,16 @@ type Bulkhead struct {
 	maxQueueSize   int
 	waitTimeout    time.Duration
 
-	mu             sync.Mutex
-	cond           *sync.Cond
-	taskQueue      []Task
-	active         int
-	idleWorkers    int
-	closed         bool
-	workerCnt      int
-	shrinkCnt      int
-	wg             sync.WaitGroup
+	mu          sync.Mutex
+	cond        *sync.Cond
+	taskQueue   []Task
+	active      int
+	idleWorkers int
+	semHolders  int
+	closed      bool
+	workerCnt   int
+	shrinkCnt   int
+	wg          sync.WaitGroup
 }
 
 func NewBulkhead(name string, cfg Config) (*Bulkhead, error) {
@@ -98,14 +100,14 @@ func (b *Bulkhead) worker() {
 	defer b.mu.Unlock()
 
 	for {
-		for len(b.taskQueue) == 0 && !b.closed && b.shrinkCnt == 0 {
+		for (len(b.taskQueue) == 0 || b.active >= b.maxConcurrency) && !b.closed && b.shrinkCnt == 0 {
 			b.idleWorkers++
 			b.cond.Broadcast()
 			b.cond.Wait()
 			b.idleWorkers--
 		}
 
-		if len(b.taskQueue) == 0 {
+		if len(b.taskQueue) == 0 || b.active >= b.maxConcurrency {
 			if b.closed {
 				b.workerCnt--
 				return
@@ -118,7 +120,7 @@ func (b *Bulkhead) worker() {
 		}
 
 		var task Task
-		if len(b.taskQueue) > 0 {
+		if len(b.taskQueue) > 0 && b.active < b.maxConcurrency {
 			task = b.taskQueue[0]
 			b.taskQueue = b.taskQueue[1:]
 			b.active++
@@ -140,13 +142,10 @@ func (b *Bulkhead) worker() {
 }
 
 func (b *Bulkhead) canSubmit() bool {
-	if len(b.taskQueue) < b.maxQueueSize {
-		return true
+	if b.maxQueueSize == 0 {
+		return b.idleWorkers > 0 && b.active < b.maxConcurrency
 	}
-	if b.idleWorkers > 0 {
-		return true
-	}
-	return false
+	return len(b.taskQueue) < b.maxQueueSize
 }
 
 func (b *Bulkhead) Submit(task Task) error {
@@ -233,6 +232,81 @@ func (b *Bulkhead) TrySubmit(task Task) (bool, error) {
 	return true, nil
 }
 
+func (b *Bulkhead) Acquire(timeout time.Duration) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return ErrBulkheadClosed
+	}
+
+	if b.active < b.maxConcurrency {
+		b.active++
+		b.semHolders++
+		b.cond.Broadcast()
+		return nil
+	}
+
+	if timeout <= 0 {
+		return &FullError{
+			Name:           b.name,
+			ActiveCount:    b.active,
+			MaxConcurrency: b.maxConcurrency,
+			QueueLength:    len(b.taskQueue),
+			MaxQueueSize:   b.maxQueueSize,
+		}
+	}
+
+	deadline := time.Now().Add(timeout)
+	timer := time.AfterFunc(timeout, func() {
+		b.mu.Lock()
+		b.cond.Broadcast()
+		b.mu.Unlock()
+	})
+	defer timer.Stop()
+
+	for b.active >= b.maxConcurrency {
+		if b.closed {
+			return ErrBulkheadClosed
+		}
+		if time.Now().After(deadline) {
+			return &FullError{
+				Name:           b.name,
+				ActiveCount:    b.active,
+				MaxConcurrency: b.maxConcurrency,
+				QueueLength:    len(b.taskQueue),
+				MaxQueueSize:   b.maxQueueSize,
+			}
+		}
+		b.cond.Wait()
+	}
+
+	b.active++
+	b.semHolders++
+	b.cond.Broadcast()
+	return nil
+}
+
+func (b *Bulkhead) Release() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.semHolders <= 0 {
+		return ErrNotAcquired
+	}
+
+	b.semHolders--
+	b.active--
+	b.cond.Broadcast()
+	return nil
+}
+
+func (b *Bulkhead) SemaphoreCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.semHolders
+}
+
 func (b *Bulkhead) ActiveCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -301,6 +375,7 @@ func (b *Bulkhead) resizeConcurrency(newMax int) {
 	}
 
 	b.maxConcurrency = newMax
+	b.cond.Broadcast()
 }
 
 func (b *Bulkhead) resizeQueue(newSize int) {

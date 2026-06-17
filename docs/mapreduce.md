@@ -7,7 +7,9 @@ MapReduce 是一个分布式计算框架模块，提供 Map 和 Reduce 两阶段
 ### 主要特性
 
 - **Map/Reduce 任务分发**：输入数据按分片分配给 Map 任务并行处理，Map 输出的中间键值对按 Key 分组后分发给对应的 Reduce 任务
-- **中间数据 Shuffle**：支持同步（ShuffleSync）和异步（ShuffleAsync）两种 Shuffle 模式，Reduce 任务在收到对应分区的全部中间数据后开始执行
+- **中间数据 Shuffle**：支持同步（ShuffleSync）和异步（ShuffleAsync）两种 Shuffle 模式
+  - `ShuffleSync`：等待所有 Map 任务完成后，统一执行分区路由，再启动所有 Reduce 任务
+  - `ShuffleAsync`：Map 任务完成后立即将中间数据路由到对应 Reduce 分区，Reduce 任务在数据到达时即开始增量分组，全部 Map 完成后立即执行 Reduce 计算（Reduce 的分组工作与 Map 计算并行进行）
 - **任务失败重试**：Map 或 Reduce 任务执行失败时自动重试，重试次数可配置，重试时重新执行完整计算逻辑而非从失败点续算
 - **结果合并**：所有 Reduce 任务完成后合并各分区输出，支持简单拼接或自定义合并函数
 
@@ -299,6 +301,25 @@ Panic 被捕获后视为普通错误，遵循重试策略处理。
 - `Cancel()` 方法主动取消正在执行的作业
 - 任务在执行前检查 `ctx.Done()`，如果已取消则立即返回
 
+### 4.5 异步 Shuffle 模式详解
+
+在 `ShuffleAsync` 模式下，Map 和 Reduce 阶段的执行存在时间重叠，提高整体处理效率：
+
+1. **Reduce goroutine 提前启动**：在 Shuffle 阶段开始时即为每个 Reduce 分区启动 goroutine，等待数据到达
+2. **增量分组**：每当一个 Map 任务完成并将中间数据写入某个分区时，该分区对应的 Reduce goroutine 被唤醒并执行增量分组，将新到达的 KeyValue 按 Key 组织到本地分组表中。此分组工作与剩余 Map 任务的执行并行进行
+3. **Map 完成触发 Reduce 计算**：当所有 Map 任务完成时，各 Reduce goroutine 已完成大部分分组工作，立即对本地已分组的数据调用 `ReduceFunc` 执行聚合计算
+4. **统一等待与错误收集**：主协程通过 `WaitGroup` 等待所有 Reduce goroutine 完成，并收集错误
+
+与 `ShuffleSync`（所有 Map 完成后才开始分区 + Reduce 启动 + 分组）相比，`ShuffleAsync` 将分组工作与 Map 计算并行化，总耗时更短。
+
+### 4.6 完成通知通道
+
+`Done()` 方法返回一个只读 `<-chan struct{}`，当 `Run()` 方法即将返回时（无论成功、失败或取消），该通道会被关闭：
+
+- 可通过 `select { case <-mr.Done(): ... }` 非阻塞监听作业完成
+- 通道关闭后可立即调用 `Result()` 获取最终结果
+- 适用于需要同时监听多个事件源（如多个 MapReduce 作业、定时器、其他通道）的场景
+
 ## 5. API 使用示例
 
 ### 5.1 基本 WordCount
@@ -451,6 +472,39 @@ if err != nil {
 }
 ```
 
+### 5.7 通过 Done() 通道接收完成通知
+
+```go
+mr, _ := mapreduce.NewMapReduce(mapreduce.Config{
+    MapFunc:     myMapFunc,
+    ReduceFunc:  myReduceFunc,
+    NumReduce:   2,
+    ShuffleMode: mapreduce.ShuffleAsync,
+})
+mr.SetInput(input)
+
+done := mr.Done()
+
+go func() {
+    <-done
+    fmt.Println("作业完成（无论成功或失败）")
+    result, err := mr.Result()
+    if err != nil {
+        fmt.Printf("作业失败: %v\n", err)
+    } else {
+        fmt.Printf("作业结果: %v\n", result)
+    }
+}()
+
+_, err := mr.Run(context.Background())
+if err != nil {
+    // Run 会阻塞直到完成，Done() 通道也会被关闭
+    log.Fatal(err)
+}
+```
+
+`Done()` 返回只读通道，在 `Run()` 方法返回前（作业成功、失败、取消或超时）关闭。调用方可以通过监听该通道实现非阻塞等待。
+
 ## 6. 错误处理
 
 | 错误 | 场景 |
@@ -479,3 +533,4 @@ MapReduce 所有公共方法均为**并发安全**：
 - **执行**：`Run(ctx)` 启动作业，阻塞直到完成或失败
 - **查询**：`Status()`、`Result()`、`Errors()`、`CompletedMapCount()`、`CompletedReduceCount()` 查询作业状态
 - **取消**：`Cancel()` 主动取消正在执行的作业
+- **完成通知**：`Done()` 返回只读通道，作业完成（成功/失败/取消）时通道被关闭，调用方可以非阻塞地监听

@@ -184,12 +184,22 @@ func (r *Retryer) nextInterval(attempt int) time.Duration {
 		interval = r.cfg.MaxInterval
 	}
 
+	isCapped := interval >= r.cfg.MaxInterval
+
 	if r.cfg.JitterFactor > 0 {
 		jitterRange := float64(interval) * r.cfg.JitterFactor
-		jitter := r.randSrc.Float64()*jitterRange*2 - jitterRange
+		var jitter float64
+		if isCapped {
+			jitter = -r.randSrc.Float64() * jitterRange
+		} else {
+			jitter = r.randSrc.Float64()*jitterRange*2 - jitterRange
+		}
 		interval = time.Duration(float64(interval) + jitter)
 		if interval < 0 {
 			interval = 0
+		}
+		if interval > r.cfg.MaxInterval {
+			interval = r.cfg.MaxInterval
 		}
 	}
 

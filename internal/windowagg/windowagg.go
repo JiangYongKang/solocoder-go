@@ -308,13 +308,14 @@ type windowItem struct {
 }
 
 type SlidingWindow struct {
-	mu           sync.RWMutex
-	name         string
-	config       WindowConfig
-	aggregator   Aggregator
-	items        *list.List
-	currentStart int64
-	seqCounter   int64
+	mu            sync.RWMutex
+	name          string
+	config        WindowConfig
+	aggregator    Aggregator
+	items         *list.List
+	currentStart  int64
+	seqCounter    int64
+	baseTimestamp int64
 }
 
 func NewSlidingWindow(name string, cfg WindowConfig) (*SlidingWindow, error) {
@@ -357,6 +358,9 @@ func (w *SlidingWindow) AddValue(value float64, timestamp time.Time) {
 	defer w.mu.Unlock()
 
 	w.seqCounter++
+	if w.items.Len() == 0 {
+		w.baseTimestamp = timestamp.UnixNano()
+	}
 	item := &windowItem{
 		value:     value,
 		timestamp: timestamp,
@@ -375,6 +379,9 @@ func (w *SlidingWindow) AddValueWithSeq(value float64, timestamp time.Time, seq 
 
 	if seq > w.seqCounter {
 		w.seqCounter = seq
+	}
+	if w.items.Len() == 0 {
+		w.baseTimestamp = timestamp.UnixNano()
 	}
 	item := &windowItem{
 		value:     value,
@@ -399,42 +406,65 @@ func (w *SlidingWindow) evictLocked(currentTime time.Time) {
 			windowStart = 1
 		}
 
-		for w.items.Len() > 0 {
-			front := w.items.Front()
-			item := front.Value.(*windowItem)
+		var next *list.Element
+		for e := w.items.Front(); e != nil; e = next {
+			next = e.Next()
+			item := e.Value.(*windowItem)
 			if item.seq < windowStart {
 				w.aggregator.Remove(item.value)
-				w.items.Remove(front)
-			} else {
-				break
+				w.items.Remove(e)
 			}
 		}
 	} else {
-		sizeMs := w.config.Size
-		cutoff := currentTime.Add(-time.Duration(sizeMs) * time.Millisecond)
+		slideDuration := time.Duration(w.config.Slide) * time.Millisecond
+		sizeDuration := time.Duration(w.config.Size) * time.Millisecond
 
-		for w.items.Len() > 0 {
-			front := w.items.Front()
-			item := front.Value.(*windowItem)
-			if item.timestamp.Before(cutoff) {
+		currentOffset := currentTime.UnixNano() - w.baseTimestamp
+		slideNano := slideDuration.Nanoseconds()
+		sizeNano := sizeDuration.Nanoseconds()
+
+		var windowStartOffset int64
+		if currentOffset <= 0 {
+			windowStartOffset = 0
+		} else {
+			windowStartOffset = ((currentOffset - 1) / slideNano) * slideNano + slideNano - sizeNano + 1
+			if windowStartOffset < 0 {
+				windowStartOffset = 0
+			}
+		}
+		windowStartTime := time.Unix(0, w.baseTimestamp+windowStartOffset)
+
+		var next *list.Element
+		for e := w.items.Front(); e != nil; e = next {
+			next = e.Next()
+			item := e.Value.(*windowItem)
+			if item.timestamp.Before(windowStartTime) {
 				w.aggregator.Remove(item.value)
-				w.items.Remove(front)
-			} else {
-				break
+				w.items.Remove(e)
 			}
 		}
 	}
 }
 
 func (w *SlidingWindow) Result() (float64, error) {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.config.WindowType == WindowTypeTime && w.items.Len() > 0 {
+		back := w.items.Back()
+		lastItem := back.Value.(*windowItem)
+		w.evictLocked(lastItem.timestamp)
+	}
 	return w.aggregator.Result()
 }
 
 func (w *SlidingWindow) Count() int {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.config.WindowType == WindowTypeTime && w.items.Len() > 0 {
+		back := w.items.Back()
+		lastItem := back.Value.(*windowItem)
+		w.evictLocked(lastItem.timestamp)
+	}
 	return w.items.Len()
 }
 
@@ -445,6 +475,7 @@ func (w *SlidingWindow) Reset() {
 	w.aggregator.Reset()
 	w.currentStart = 0
 	w.seqCounter = 0
+	w.baseTimestamp = 0
 }
 
 type WindowManager struct {

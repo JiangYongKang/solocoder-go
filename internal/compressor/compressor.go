@@ -1,6 +1,7 @@
 package compressor
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"math"
@@ -234,12 +235,20 @@ func AnalyzeData(data []byte) *DataCharacteristics {
 	}
 	printableRatio := float64(printableCount) / float64(size)
 
+	patternScore := analyzePatterns(data)
+
+	compressibility := 1.0 - (entropy / 8.0)
+
+	totalRepeatScore := (repeatRatio*0.4 + patternScore*0.4 + compressibility*0.2)
+
 	var dataType DataType
 	if entropy > 7.5 {
 		dataType = DataTypeRandom
 	} else if printableRatio > 0.85 {
 		dataType = DataTypeText
-	} else if repeatRatio > 0.3 {
+	} else if totalRepeatScore > 0.25 {
+		dataType = DataTypeStructured
+	} else if printableRatio > 0.5 && entropy < 6.5 {
 		dataType = DataTypeStructured
 	} else {
 		dataType = DataTypeBinary
@@ -248,23 +257,256 @@ func AnalyzeData(data []byte) *DataCharacteristics {
 	return &DataCharacteristics{
 		Size:        size,
 		Entropy:     entropy,
-		RepeatRatio: repeatRatio,
+		RepeatRatio: totalRepeatScore,
 		DataType:    dataType,
 	}
 }
 
-func (m *Manager) NewStreamCompressor(w io.Writer) (io.WriteCloser, error) {
-	compressor, err := m.NewCompressor()
-	if err != nil {
-		return nil, err
+func analyzePatterns(data []byte) float64 {
+	size := len(data)
+	if size < 8 {
+		return 0
 	}
-	return compressor.NewCompressedWriter(w)
+
+	score := 0.0
+	patternCount := 0
+
+	for patternLen := 2; patternLen <= min(16, size/4); patternLen++ {
+		patterns := make(map[string]int)
+		maxOccurrences := 0
+
+		for i := 0; i <= size-patternLen; i += patternLen {
+			pattern := string(data[i : i+patternLen])
+			patterns[pattern]++
+			if patterns[pattern] > maxOccurrences {
+				maxOccurrences = patterns[pattern]
+			}
+		}
+
+		if maxOccurrences >= 2 {
+			patternCount++
+			uniquePatterns := len(patterns)
+			expectedUnique := float64(size) / float64(patternLen)
+			patternDensity := 1.0 - (float64(uniquePatterns) / expectedUnique)
+			if patternDensity > score {
+				score = patternDensity
+			}
+		}
+	}
+
+	if patternCount > 0 {
+		score = math.Min(1.0, score+float64(patternCount)*0.2)
+	}
+
+	runScore := 0.0
+	for i := 0; i < size; {
+		j := i + 1
+		for j < size && data[j] == data[i] {
+			j++
+		}
+		runLen := j - i
+		if runLen >= 3 {
+			runScore += float64(runLen) * 0.1
+		}
+		i = j
+	}
+	runScore = math.Min(1.0, runScore/float64(size))
+
+	score = math.Max(score, runScore)
+
+	return score
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (m *Manager) NewStreamCompressor(w io.Writer) (io.WriteCloser, error) {
+	if w == nil {
+		return nil, ErrNilWriter
+	}
+
+	if m.config.Mode == ModeManual {
+		compressor, err := m.NewCompressor()
+		if err != nil {
+			return nil, err
+		}
+		return compressor.NewCompressedWriter(w)
+	}
+
+	return &adaptiveStreamWriter{
+		manager: m,
+		writer:  w,
+		buf:     make([]byte, 0, 4096),
+		maxBuf:  4096,
+	}, nil
 }
 
 func (m *Manager) NewStreamDecompressor(r io.Reader) (io.ReadCloser, error) {
-	decompressor, err := m.NewDecompressor()
-	if err != nil {
-		return nil, err
+	if r == nil {
+		return nil, ErrNilReader
 	}
-	return decompressor.NewDecompressedReader(r)
+
+	if m.config.Mode == ModeManual {
+		decompressor, err := m.NewDecompressor()
+		if err != nil {
+			return nil, err
+		}
+		return decompressor.NewDecompressedReader(r)
+	}
+
+	return &adaptiveStreamReader{
+		manager: m,
+		reader:  r,
+	}, nil
+}
+
+type adaptiveStreamWriter struct {
+	manager    *Manager
+	writer     io.Writer
+	actual     io.WriteCloser
+	buf        []byte
+	maxBuf     int
+	compressed bool
+	closed     bool
+}
+
+func (a *adaptiveStreamWriter) Write(p []byte) (int, error) {
+	if a.closed {
+		return 0, fmt.Errorf("stream writer is closed")
+	}
+
+	if a.compressed {
+		return a.actual.Write(p)
+	}
+
+	remaining := a.maxBuf - len(a.buf)
+	if len(p) <= remaining {
+		a.buf = append(a.buf, p...)
+		return len(p), nil
+	}
+
+	if remaining > 0 {
+		a.buf = append(a.buf, p[:remaining]...)
+	}
+
+	if err := a.initCompressor(); err != nil {
+		return 0, err
+	}
+
+	if remaining < len(p) {
+		n, err := a.actual.Write(p[remaining:])
+		if err != nil {
+			return remaining + n, err
+		}
+	}
+
+	return len(p), nil
+}
+
+func (a *adaptiveStreamWriter) initCompressor() error {
+	compressor, err := a.manager.autoSelectCompressor(a.buf)
+	if err != nil {
+		return err
+	}
+
+	actual, err := compressor.NewCompressedWriter(a.writer)
+	if err != nil {
+		return err
+	}
+
+	a.actual = actual
+	a.compressed = true
+
+	if len(a.buf) > 0 {
+		if _, err := a.actual.Write(a.buf); err != nil {
+			a.actual.Close()
+			return err
+		}
+		a.buf = nil
+	}
+
+	return nil
+}
+
+func (a *adaptiveStreamWriter) Close() error {
+	if a.closed {
+		return nil
+	}
+	a.closed = true
+
+	if !a.compressed {
+		if err := a.initCompressor(); err != nil {
+			return err
+		}
+	}
+
+	return a.actual.Close()
+}
+
+type adaptiveStreamReader struct {
+	manager *Manager
+	reader  io.Reader
+	actual  io.ReadCloser
+	buf     []byte
+}
+
+func (a *adaptiveStreamReader) Read(p []byte) (int, error) {
+	if a.actual != nil {
+		return a.actual.Read(p)
+	}
+
+	if a.buf == nil {
+		preview := make([]byte, 4096)
+		n, err := io.ReadFull(a.reader, preview)
+		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+			return 0, err
+		}
+		a.buf = preview[:n]
+
+		if n == 0 {
+			return 0, io.EOF
+		}
+
+		algorithms := []Algorithm{AlgorithmGzip, AlgorithmSnappy, AlgorithmLZ4}
+		for _, alg := range algorithms {
+			testBuf := make([]byte, len(a.buf))
+			copy(testBuf, a.buf)
+
+			decompressor, err := NewDecompressor(alg)
+			if err != nil {
+				continue
+			}
+
+			testReader, err := decompressor.NewDecompressedReader(bytes.NewReader(testBuf))
+			if err != nil {
+				continue
+			}
+			_, err = io.ReadAll(testReader)
+			testReader.Close()
+
+			if err == nil {
+				actualDecompressor, _ := NewDecompressor(alg)
+				a.actual, _ = actualDecompressor.NewDecompressedReader(
+					io.MultiReader(bytes.NewReader(a.buf), a.reader),
+				)
+				a.buf = nil
+				return a.actual.Read(p)
+			}
+		}
+
+		return 0, ErrCorruptedData
+	}
+
+	return 0, nil
+}
+
+func (a *adaptiveStreamReader) Close() error {
+	if a.actual != nil {
+		return a.actual.Close()
+	}
+	return nil
 }

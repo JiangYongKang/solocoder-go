@@ -37,24 +37,32 @@ func TestDefaultAggregatorConfig(t *testing.T) {
 
 func TestNewHealthAggregatorWithInvalidRatio(t *testing.T) {
 	tests := []struct {
-		name  string
-		ratio float64
+		name        string
+		ratio       float64
+		expectError bool
 	}{
-		{"negative", -1.0},
-		{"zero", 0.0},
-		{"greater than one", 1.5},
+		{"negative", -1.0, true},
+		{"zero_not_set", 0.0, false},
+		{"greater than one", 1.5, true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := AggregatorConfig{Strategy: StrategyWeightedMajority, MajorityRatio: tt.ratio}
 			ha, err := NewHealthAggregator(cfg)
+			if tt.expectError {
+				if err != ErrInvalidConfig {
+					t.Errorf("expected ErrInvalidConfig, got %v", err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if ha.majorityRatio != 0.5 {
 				t.Errorf("expected majority ratio to default to 0.5, got %f", ha.majorityRatio)
 			}
+			ha.Stop()
 		})
 	}
 }
@@ -840,18 +848,24 @@ func TestAlertDegradedToUnhealthy(t *testing.T) {
 
 	ha.Check()
 
+	mu.Lock()
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events for healthy->degraded (no unhealthy involved), got %d", len(events))
+	}
+	mu.Unlock()
+
 	criticalFailing = true
 	ha.Check()
 
 	mu.Lock()
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events, got %d", len(events))
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event for degraded->unhealthy, got %d", len(events))
 	}
-	if events[0].CurrentStatus != StatusDegraded {
-		t.Errorf("first event: expected degraded, got %v", events[0].CurrentStatus)
+	if events[0].PreviousStatus != StatusDegraded {
+		t.Errorf("expected previous status degraded, got %v", events[0].PreviousStatus)
 	}
-	if events[1].CurrentStatus != StatusUnhealthy {
-		t.Errorf("second event: expected unhealthy, got %v", events[1].CurrentStatus)
+	if events[0].CurrentStatus != StatusUnhealthy {
+		t.Errorf("expected current status unhealthy, got %v", events[0].CurrentStatus)
 	}
 	mu.Unlock()
 }
@@ -982,7 +996,7 @@ func TestCheckProbeResults(t *testing.T) {
 		t.Fatalf("expected 2 probe results, got %d", len(result.ProbeResults))
 	}
 
-	resultMap := make(map[string]ProbeResult)
+	resultMap := make(map[string]ProbeCheckResult)
 	for _, r := range result.ProbeResults {
 		resultMap[r.Name] = r
 	}
@@ -1296,4 +1310,128 @@ func TestAggregatorRestart(t *testing.T) {
 	if result.Status != StatusHealthy {
 		t.Errorf("expected StatusHealthy after restart with healthy probe, got %v", result.Status)
 	}
+}
+
+func TestAlertNotTriggeredForHealthyToDegraded(t *testing.T) {
+	ha, _ := NewHealthAggregator(DefaultAggregatorConfig())
+	defer ha.Stop()
+
+	var eventCount int32
+
+	ha.SubscribeAlert(func(event StatusChangeEvent) {
+		atomic.AddInt32(&eventCount, 1)
+	})
+
+	ha.RegisterProbe(ProbeConfig{
+		Name:     "db",
+		Critical: true,
+		Probe:    func() ProbeResult { return ProbeResult{Healthy: true} },
+	})
+	ha.RegisterProbe(ProbeConfig{
+		Name:     "monitoring",
+		Critical: false,
+		Probe:    func() ProbeResult { return ProbeResult{Healthy: false} },
+	})
+
+	ha.Check()
+
+	if atomic.LoadInt32(&eventCount) != 0 {
+		t.Errorf("expected 0 alerts for healthy->degraded (no unhealthy involved), got %d", atomic.LoadInt32(&eventCount))
+	}
+}
+
+func TestAlertNotTriggeredForDegradedToHealthy(t *testing.T) {
+	ha, _ := NewHealthAggregator(DefaultAggregatorConfig())
+	defer ha.Stop()
+
+	var events []StatusChangeEvent
+	var mu sync.Mutex
+
+	ha.SubscribeAlert(func(event StatusChangeEvent) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	})
+
+	ncFailing := true
+	ha.RegisterProbe(ProbeConfig{
+		Name:     "db",
+		Critical: true,
+		Probe:    func() ProbeResult { return ProbeResult{Healthy: true} },
+	})
+	ha.RegisterProbe(ProbeConfig{
+		Name:     "monitoring",
+		Critical: false,
+		Probe: func() ProbeResult {
+			if ncFailing {
+				return ProbeResult{Healthy: false}
+			}
+			return ProbeResult{Healthy: true}
+		},
+	})
+
+	ha.Check()
+
+	mu.Lock()
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events for healthy->degraded, got %d", len(events))
+	}
+	mu.Unlock()
+
+	ncFailing = false
+	ha.Check()
+
+	mu.Lock()
+	if len(events) != 0 {
+		t.Errorf("expected 0 alerts for degraded->healthy (no unhealthy involved), got %d", len(events))
+	}
+	mu.Unlock()
+}
+
+func TestAlertTriggeredForUnhealthyToDegraded(t *testing.T) {
+	ha, _ := NewHealthAggregator(DefaultAggregatorConfig())
+	defer ha.Stop()
+
+	var events []StatusChangeEvent
+	var mu sync.Mutex
+
+	ha.SubscribeAlert(func(event StatusChangeEvent) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	})
+
+	criticalFailing := true
+	ha.RegisterProbe(ProbeConfig{
+		Name:     "db",
+		Critical: true,
+		Probe: func() ProbeResult {
+			if criticalFailing {
+				return ProbeResult{Healthy: false}
+			}
+			return ProbeResult{Healthy: true}
+		},
+	})
+	ha.RegisterProbe(ProbeConfig{
+		Name:     "monitoring",
+		Critical: false,
+		Probe:    func() ProbeResult { return ProbeResult{Healthy: false} },
+	})
+
+	ha.Check()
+
+	criticalFailing = false
+	ha.Check()
+
+	mu.Lock()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].CurrentStatus != StatusUnhealthy {
+		t.Errorf("first event: expected unhealthy, got %v", events[0].CurrentStatus)
+	}
+	if events[1].PreviousStatus != StatusUnhealthy || events[1].CurrentStatus != StatusDegraded {
+		t.Errorf("second event: expected unhealthy->degraded, got %v->%v", events[1].PreviousStatus, events[1].CurrentStatus)
+	}
+	mu.Unlock()
 }

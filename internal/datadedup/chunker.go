@@ -1,9 +1,14 @@
 package datadedup
 
 import (
-	"hash"
-	"hash/fnv"
 	"sync"
+)
+
+const (
+	rollingHashBase    uint64 = 257
+	rollingHashMod     uint64 = 1000000007
+	rollingHashDefaultWindowSize = 48
+	rollingHashDefaultTargetBits = 13
 )
 
 type fixedSizeChunker struct {
@@ -77,14 +82,64 @@ func (c *fixedSizeChunker) Strategy() ChunkStrategy {
 	return ChunkStrategyFixedSize
 }
 
+type rollingHash struct {
+	window     []byte
+	windowSize int
+	head       int
+	count      int
+	hash       uint64
+	power      uint64
+}
+
+func newRollingHash(windowSize int) *rollingHash {
+	power := uint64(1)
+	for i := 0; i < windowSize-1; i++ {
+		power = (power * rollingHashBase) % rollingHashMod
+	}
+
+	return &rollingHash{
+		window:     make([]byte, windowSize),
+		windowSize: windowSize,
+		power:      power,
+	}
+}
+
+func (rh *rollingHash) appendByte(b byte) {
+	if rh.count < rh.windowSize {
+		rh.window[rh.count] = b
+		rh.hash = (rh.hash*rollingHashBase + uint64(b)) % rollingHashMod
+		rh.count++
+		return
+	}
+
+	outgoing := rh.window[rh.head]
+	rh.hash = (rh.hash + rollingHashMod - (uint64(outgoing)*rh.power)%rollingHashMod) % rollingHashMod
+	rh.hash = (rh.hash*rollingHashBase + uint64(b)) % rollingHashMod
+	rh.window[rh.head] = b
+	rh.head = (rh.head + 1) % rh.windowSize
+}
+
+func (rh *rollingHash) reset() {
+	rh.head = 0
+	rh.count = 0
+	rh.hash = 0
+}
+
+func (rh *rollingHash) full() bool {
+	return rh.count >= rh.windowSize
+}
+
+func (rh *rollingHash) value() uint64 {
+	return rh.hash
+}
+
 type contentBasedChunker struct {
 	minChunkSize int
 	maxChunkSize int
 	boundary     byte
 	hashProvider HashProvider
-	hasher       hash.Hash64
-	windowSize   int
-	targetBits   uint8
+	rh           *rollingHash
+	targetMask   uint64
 }
 
 func NewContentBasedChunker(minSize, maxSize int, boundary byte, hashAlgo HashAlgorithm) (Chunker, error) {
@@ -97,14 +152,16 @@ func NewContentBasedChunker(minSize, maxSize int, boundary byte, hashAlgo HashAl
 		return nil, err
 	}
 
+	rh := newRollingHash(rollingHashDefaultWindowSize)
+	targetMask := uint64((1 << rollingHashDefaultTargetBits) - 1)
+
 	return &contentBasedChunker{
 		minChunkSize: minSize,
 		maxChunkSize: maxSize,
 		boundary:     boundary,
 		hashProvider: hp,
-		hasher:       fnv.New64(),
-		windowSize:   48,
-		targetBits:   13,
+		rh:           rh,
+		targetMask:   targetMask,
 	}, nil
 }
 
@@ -116,14 +173,16 @@ func NewContentBasedChunkerWithProvider(minSize, maxSize int, boundary byte, hp 
 		return nil, ErrNilHashProvider
 	}
 
+	rh := newRollingHash(rollingHashDefaultWindowSize)
+	targetMask := uint64((1 << rollingHashDefaultTargetBits) - 1)
+
 	return &contentBasedChunker{
 		minChunkSize: minSize,
 		maxChunkSize: maxSize,
 		boundary:     boundary,
 		hashProvider: hp,
-		hasher:       fnv.New64(),
-		windowSize:   48,
-		targetBits:   13,
+		rh:           rh,
+		targetMask:   targetMask,
 	}, nil
 }
 
@@ -133,25 +192,57 @@ func (c *contentBasedChunker) Chunk(data []byte) ([]Chunk, error) {
 	}
 
 	var chunks []Chunk
-	var offset int64
 	dataLen := int64(len(data))
+	var start int64
 
-	for offset < dataLen {
-		start := offset
-		var end int64
+	for start < dataLen {
+		c.rh.reset()
 
-		if dataLen-start <= int64(c.minChunkSize) {
-			end = dataLen
-		} else if dataLen-start <= int64(c.maxChunkSize) {
-			end = c.findBoundary(data, start, dataLen)
-			if end == start {
-				end = dataLen
+		remaining := dataLen - start
+		if remaining <= int64(c.minChunkSize) {
+			chunkData := data[start:dataLen]
+			fp, err := c.hashProvider.Hash(chunkData)
+			if err != nil {
+				return nil, err
 			}
-		} else {
-			end = c.findBoundary(data, start, start+int64(c.maxChunkSize))
-			if end == start {
-				end = start + int64(c.maxChunkSize)
+			chunks = append(chunks, Chunk{
+				Data:        chunkData,
+				Offset:      start,
+				Fingerprint: fp,
+			})
+			break
+		}
+
+		maxEnd := start + int64(c.maxChunkSize)
+		if maxEnd > dataLen {
+			maxEnd = dataLen
+		}
+
+		minEnd := start + int64(c.minChunkSize)
+
+		var end int64 = maxEnd
+		foundBoundary := false
+
+		for i := start; i < maxEnd; i++ {
+			c.rh.appendByte(data[i])
+
+			if i >= minEnd-1 {
+				if data[i] == c.boundary {
+					end = i + 1
+					foundBoundary = true
+					break
+				}
+
+				if c.rh.full() && (c.rh.value()&c.targetMask) == 0 {
+					end = i + 1
+					foundBoundary = true
+					break
+				}
 			}
+		}
+
+		if !foundBoundary {
+			end = maxEnd
 		}
 
 		chunkData := data[start:end]
@@ -166,25 +257,10 @@ func (c *contentBasedChunker) Chunk(data []byte) ([]Chunk, error) {
 			Fingerprint: fp,
 		})
 
-		offset = end
+		start = end
 	}
 
 	return chunks, nil
-}
-
-func (c *contentBasedChunker) findBoundary(data []byte, start, limit int64) int64 {
-	minEnd := start + int64(c.minChunkSize)
-	if minEnd > limit {
-		minEnd = limit
-	}
-
-	for i := minEnd; i < limit; i++ {
-		if data[i] == c.boundary {
-			return i + 1
-		}
-	}
-
-	return limit
 }
 
 func (c *contentBasedChunker) Strategy() ChunkStrategy {

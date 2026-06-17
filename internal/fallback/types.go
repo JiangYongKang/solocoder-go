@@ -68,8 +68,13 @@ type Strategy struct {
 	SuccessCount    uint64
 	FailureCount    uint64
 	ConsecutiveFail uint64
+	SuccessWindow   []successEntry
 	ErrorWindow     []errorEntry
 	mu              sync.RWMutex
+}
+
+type successEntry struct {
+	Time time.Time
 }
 
 type errorEntry struct {

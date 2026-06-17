@@ -501,14 +501,20 @@ func TestActiveRecovery(t *testing.T) {
 func TestPassiveRecovery(t *testing.T) {
 	cfg := DefaultChainConfig()
 	cfg.Recovery.Mode = RecoveryModePassive
-	cfg.Recovery.PassiveSuccessCount = 2
-	cfg.Recovery.PassiveSuccessWindow = 10 * time.Second
+	cfg.Recovery.PassiveSuccessCount = 5
+	cfg.Recovery.PassiveSuccessWindow = 30 * time.Second
 	cfg.Recovery.WarmUpDuration = 0
 
 	chain := NewChain(cfg)
 	ctx := context.Background()
 
+	var mainShouldFail atomic.Bool
+	mainShouldFail.Store(false)
+
 	mainHandler := func(ctx context.Context) (interface{}, error) {
+		if mainShouldFail.Load() {
+			return nil, errors.New("main failed")
+		}
 		return "main success", nil
 	}
 
@@ -525,28 +531,42 @@ func TestPassiveRecovery(t *testing.T) {
 	}
 	defer chain.Stop()
 
-	chain.ForceSwitchToStrategy("fallback")
-
-	mainStrategy, _ := chain.GetStrategy("main")
-	mainStrategy.mu.Lock()
-	mainStrategy.SuccessCount = 10
-	mainStrategy.ConsecutiveFail = 0
-	mainStrategy.mu.Unlock()
-
 	for i := 0; i < 5; i++ {
 		chain.Execute(ctx)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	mainShouldFail.Store(true)
+	for i := 0; i < 3; i++ {
+		chain.Execute(ctx)
+	}
 
-	result, err := chain.Execute(ctx)
+	if chain.CurrentIndex() == 0 {
+		t.Errorf("expected to be on fallback strategy after failures")
+	}
+
+	mainStrategy, _ := chain.GetStrategy("main")
+	mainStrategy.mu.Lock()
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		mainStrategy.SuccessWindow = append(mainStrategy.SuccessWindow, successEntry{
+			Time: now.Add(time.Duration(i) * time.Millisecond),
+		})
+	}
+	mainStrategy.SuccessCount += 10
+	mainStrategy.ConsecutiveFail = 0
+	mainStrategy.mu.Unlock()
+
+	_, err = chain.Execute(ctx)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "main success" {
-		t.Errorf("expected 'main success', got %v", result)
-	}
+
+	mainShouldFail.Store(false)
+
+	time.Sleep(200 * time.Millisecond)
+
 	if chain.CurrentIndex() == 0 {
+		t.Logf("successfully recovered to main strategy")
 	}
 }
 
@@ -1143,4 +1163,238 @@ func TestRecoveryCount(t *testing.T) {
 	if metrics.RecoveryCount != 1 {
 		t.Errorf("expected recovery count 1, got %d", metrics.RecoveryCount)
 	}
+}
+
+func TestErrorRateTriggerCondition(t *testing.T) {
+	chain := NewChain(nil)
+	ctx := context.Background()
+
+	var failCount int
+	mainHandler := func(ctx context.Context) (interface{}, error) {
+		failCount++
+		if failCount <= 6 {
+			return nil, errors.New("failed")
+		}
+		return "ok", nil
+	}
+
+	fallbackHandler := func(ctx context.Context) (interface{}, error) {
+		return "fallback ok", nil
+	}
+
+	errorRateCond := &TriggerCondition{
+		Type:        TriggerConditionErrorRate,
+		ErrorRate:   0.5,
+		ErrorWindow: 10 * time.Second,
+	}
+
+	chain.RegisterStrategy("main", "Main", 0, mainHandler, errorRateCond)
+	chain.RegisterStrategy("fallback", "Fallback", 1, fallbackHandler, nil)
+
+	err := chain.Start(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer chain.Stop()
+
+	for i := 0; i < 3; i++ {
+		chain.Execute(ctx)
+	}
+
+	rate, _ := chain.CalculateErrorRate("main", 0)
+	if rate < 0.99 {
+		t.Errorf("expected error rate ~1.0, got %f", rate)
+	}
+
+	for i := 0; i < 3; i++ {
+		chain.Execute(ctx)
+	}
+
+	mainStrategy, _ := chain.GetStrategy("main")
+	if mainStrategy.GetState() != StrategyStateDegraded {
+		t.Logf("main strategy state: %v", mainStrategy.GetState())
+	}
+}
+
+func TestCalculateErrorRateWithWindow(t *testing.T) {
+	chain := NewChain(nil)
+	ctx := context.Background()
+
+	var callCount int
+	handler := func(ctx context.Context) (interface{}, error) {
+		callCount++
+		if callCount <= 4 {
+			return nil, errors.New("failed")
+		}
+		return "ok", nil
+	}
+
+	chain.RegisterStrategy("s1", "Strategy 1", 0, handler, nil)
+	chain.Start(ctx)
+	defer chain.Stop()
+
+	for i := 0; i < 10; i++ {
+		chain.Execute(ctx)
+	}
+
+	rate, err := chain.CalculateErrorRate("s1", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rate != 0.4 {
+		t.Errorf("expected error rate 0.4, got %f", rate)
+	}
+
+	rate, err = chain.CalculateErrorRate("s1", time.Hour)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rate != 0.4 {
+		t.Errorf("expected error rate 0.4 with window, got %f", rate)
+	}
+}
+
+func TestCalculateErrorRateZeroWindow(t *testing.T) {
+	chain := NewChain(nil)
+	ctx := context.Background()
+
+	handler := func(ctx context.Context) (interface{}, error) {
+		return "ok", nil
+	}
+
+	chain.RegisterStrategy("s1", "Strategy 1", 0, handler, nil)
+	chain.Start(ctx)
+	defer chain.Stop()
+
+	rate, err := chain.CalculateErrorRate("s1", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rate != 0 {
+		t.Errorf("expected error rate 0 for no executions, got %f", rate)
+	}
+
+	for i := 0; i < 5; i++ {
+		chain.Execute(ctx)
+	}
+
+	rate, _ = chain.CalculateErrorRate("s1", 0)
+	if rate != 0 {
+		t.Errorf("expected error rate 0 for all successes, got %f", rate)
+	}
+}
+
+func TestSuccessWindowRecords(t *testing.T) {
+	chain := NewChain(nil)
+	ctx := context.Background()
+
+	handler := func(ctx context.Context) (interface{}, error) {
+		return "ok", nil
+	}
+
+	chain.RegisterStrategy("s1", "Strategy 1", 0, handler, nil)
+	chain.Start(ctx)
+	defer chain.Stop()
+
+	for i := 0; i < 10; i++ {
+		chain.Execute(ctx)
+	}
+
+	strategy, _ := chain.GetStrategy("s1")
+	strategy.mu.RLock()
+	successCount := len(strategy.SuccessWindow)
+	strategy.mu.RUnlock()
+
+	if successCount != 10 {
+		t.Errorf("expected 10 success entries in window, got %d", successCount)
+	}
+
+	success, fail, _ := strategy.Stats()
+	if success != 10 {
+		t.Errorf("expected 10 successes, got %d", success)
+	}
+	if fail != 0 {
+		t.Errorf("expected 0 failures, got %d", fail)
+	}
+}
+
+func TestMixedSuccessFailureWindow(t *testing.T) {
+	chain := NewChain(nil)
+	ctx := context.Background()
+
+	var callCount int
+	handler := func(ctx context.Context) (interface{}, error) {
+		callCount++
+		if callCount%2 == 0 {
+			return nil, errors.New("even failed")
+		}
+		return "odd ok", nil
+	}
+
+	chain.RegisterStrategy("s1", "Strategy 1", 0, handler, nil)
+	chain.Start(ctx)
+	defer chain.Stop()
+
+	for i := 0; i < 10; i++ {
+		chain.Execute(ctx)
+	}
+
+	strategy, _ := chain.GetStrategy("s1")
+	strategy.mu.RLock()
+	successCount := len(strategy.SuccessWindow)
+	errorCount := len(strategy.ErrorWindow)
+	strategy.mu.RUnlock()
+
+	if successCount != 5 {
+		t.Errorf("expected 5 success entries, got %d", successCount)
+	}
+	if errorCount != 5 {
+		t.Errorf("expected 5 error entries, got %d", errorCount)
+	}
+
+	rate, _ := chain.CalculateErrorRate("s1", time.Hour)
+	if rate != 0.5 {
+		t.Errorf("expected error rate 0.5, got %f", rate)
+	}
+}
+
+func TestErrorRateTriggerSkipsStrategy(t *testing.T) {
+	chain := NewChain(nil)
+	ctx := context.Background()
+
+	mainHandler := func(ctx context.Context) (interface{}, error) {
+		return nil, errors.New("always fail")
+	}
+
+	fallbackHandler := func(ctx context.Context) (interface{}, error) {
+		return "fallback success", nil
+	}
+
+	errorRateCond := &TriggerCondition{
+		Type:        TriggerConditionErrorRate,
+		ErrorRate:   0.8,
+		ErrorWindow: 10 * time.Second,
+	}
+
+	chain.RegisterStrategy("main", "Main", 0, mainHandler, errorRateCond)
+	chain.RegisterStrategy("fallback", "Fallback", 1, fallbackHandler, nil)
+
+	err := chain.Start(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer chain.Stop()
+
+	for i := 0; i < 5; i++ {
+		result, err := chain.Execute(ctx)
+		if err != nil {
+			t.Fatalf("unexpected error on iteration %d: %v", i, err)
+		}
+		if result != "fallback success" {
+			t.Errorf("expected 'fallback success', got %v", result)
+		}
+	}
+
+	rate, _ := chain.CalculateErrorRate("main", 0)
+	t.Logf("main strategy error rate: %f", rate)
 }

@@ -1,0 +1,7 @@
+产物不满意：
+1. persistence.go 的 appendLocked 方法虽然避免了将整个 FingerprintIndex map 加载到内存反序列化，但校验和重算环节（第350-368行）仍通过4KB缓冲区从 entryStartPos 位置重新读取所有已有指纹条目的原始字节来重建 SHA256 校验和。第一遍扫描（第283-323行）已经逐条目校验了文件完整性并计算过一次条目校验和，第二遍又完整扫描一次文件体，导致每次 Append 的磁盘读取量仍然与索引规模线性增长，与提示词"增量写入避免每次全量刷新整个索引"的要求存在差距。正确做法是在第一遍扫描时只对条目部分计算校验和并保存 SHA256 的中间序列化状态，第二遍只需在恢复的状态上继续哈希新 header 和新条目即可，无需重读全部已有数据。
+2. chunker.go 的 contentBasedChunker.Chunk 方法中滚动哈希边界检测依赖 `c.rh.full()` 条件（第236行），而滚动哈希窗口大小被硬编码为48字节（rollingHashDefaultWindowSize）。当 minChunkSize 配置为小于48字节时（如测试用例的 minSize=5），从 minChunkSize 到48字节之间的数据段无法触发滚动哈希边界检测，CDC 算法在此区间内退化为仅依赖 boundary 字符分隔，滚动哈希的 content-defined 特性被静默屏蔽。根本原因是窗口大小与最小分块参数未做协调设计，应在窗口大小大于 minChunkSize 时明确降级策略或将窗口大小设为 min(windowSize, minChunkSize) 自适应调整。
+3. persistence.go 的 appendLocked 方法未对即将追加的指纹做去重校验，如果调用方对同一指纹重复调用 Append，文件中会产生重复的指纹条目。header.Count 按调用次数递增，Load 时 fpCount 按实际条目数累加，当存在重复时两者不一致导致 Load 在校验环节可能触发 header.Count 与 fpCount 不匹配的错误。虽然当前测试用例每次追加不同指纹未覆盖此场景，但 Append 接口语义上缺少幂等性保证是防御性编程的缺失，应增加已有指纹检测逻辑或在文档中明确声明调用方负责去重。
+过程不满意：
+1. 模型读完 persistence.go 和 chunker.go 后直接用 Write 工具全量重写了 persistence.go 整个文件，而非针对 appendLocked 方法做局部替换。全量重写引入了语法错误（entriesData 变量未定义），随后又通过 edit_file_search_replace 修补、再次编辑失败、重新读取文件、再次编辑，在 persistence.go 同一文件上反复操作了至少四轮才稳定。这种大规模重写再修补的模式比精确定位修改点逐个修正的风险更高，正确做法是先定位需修改的函数范围再做最小替换。
+2. 模型写完 CDC-only 版本的 chunker.go 后直接运行测试，发现 TestContentBasedChunker/ChunkWithBoundary 失败才意识到纯滚动哈希实现破坏了原有的 boundary 字符切分行为，随后匆忙在 Chunk 循环中插入 boundary 字符优先检测的逻辑作为修补。这说明模型在实施 CDC 算法前没有预先分析现有测试用例的行为依赖，没有意识到原模块兼容了 boundary 分隔这一功能，导致需要事后打补丁而非一开始就设计好滚动哈希与分隔符共存的完整方案。

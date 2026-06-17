@@ -42,6 +42,11 @@ const (
 )
 
 type ProbeResult struct {
+	Healthy bool
+	Details string
+}
+
+type ProbeCheckResult struct {
 	Name    string
 	Healthy bool
 	Details string
@@ -67,7 +72,7 @@ type AlertCallback func(event StatusChangeEvent)
 
 type AggregatedHealth struct {
 	Status       HealthStatus
-	ProbeResults []ProbeResult
+	ProbeResults []ProbeCheckResult
 	FailedProbes []string
 	HealthyCount int
 	TotalCount   int
@@ -84,6 +89,12 @@ type HealthAggregator struct {
 	running        bool
 }
 
+type probeOutcome struct {
+	name   string
+	result ProbeResult
+	config *ProbeConfig
+}
+
 type AggregatorConfig struct {
 	Strategy      AggregationStrategy
 	MajorityRatio float64
@@ -97,7 +108,10 @@ func DefaultAggregatorConfig() AggregatorConfig {
 }
 
 func NewHealthAggregator(cfg AggregatorConfig) (*HealthAggregator, error) {
-	if cfg.MajorityRatio <= 0 || cfg.MajorityRatio > 1 {
+	if cfg.MajorityRatio < 0 || cfg.MajorityRatio > 1 {
+		return nil, ErrInvalidConfig
+	}
+	if cfg.MajorityRatio == 0 {
 		cfg.MajorityRatio = 0.5
 	}
 
@@ -211,14 +225,13 @@ func (ha *HealthAggregator) Check() AggregatedHealth {
 	majorityRatio := ha.majorityRatio
 	ha.mu.RUnlock()
 
-	results := make([]ProbeResult, 0, len(probeConfigs))
+	outcomes := make([]probeOutcome, 0, len(probeConfigs))
 	for _, pc := range probeConfigs {
-		result := pc.Probe()
-		result.Name = pc.Name
-		results = append(results, result)
+		r := pc.Probe()
+		outcomes = append(outcomes, probeOutcome{name: pc.Name, result: r, config: pc})
 	}
 
-	aggregated := ha.aggregateResults(results, probeConfigs, strategy, majorityRatio)
+	aggregated := ha.aggregateResults(outcomes, strategy, majorityRatio)
 
 	ha.maybeTriggerAlert(aggregated)
 
@@ -226,16 +239,10 @@ func (ha *HealthAggregator) Check() AggregatedHealth {
 }
 
 func (ha *HealthAggregator) aggregateResults(
-	results []ProbeResult,
-	configs []*ProbeConfig,
+	outcomes []probeOutcome,
 	strategy AggregationStrategy,
 	majorityRatio float64,
 ) AggregatedHealth {
-	configMap := make(map[string]*ProbeConfig)
-	for _, cfg := range configs {
-		configMap[cfg.Name] = cfg
-	}
-
 	healthyCount := 0
 	criticalFailed := false
 	var failedProbes []string
@@ -245,21 +252,28 @@ func (ha *HealthAggregator) aggregateResults(
 	criticalTotalWeight := 0
 	criticalHealthyWeight := 0
 
-	for _, result := range results {
-		cfg := configMap[result.Name]
-		weight := cfg.Weight
+	var checkResults []ProbeCheckResult
+
+	for _, o := range outcomes {
+		weight := o.config.Weight
 		totalWeight += weight
 
-		if result.Healthy {
+		checkResults = append(checkResults, ProbeCheckResult{
+			Name:    o.name,
+			Healthy: o.result.Healthy,
+			Details: o.result.Details,
+		})
+
+		if o.result.Healthy {
 			healthyCount++
 			healthyWeight += weight
-			if cfg.Critical {
+			if o.config.Critical {
 				criticalTotalWeight += weight
 				criticalHealthyWeight += weight
 			}
 		} else {
-			failedProbes = append(failedProbes, result.Name)
-			if cfg.Critical {
+			failedProbes = append(failedProbes, o.name)
+			if o.config.Critical {
 				criticalFailed = true
 				criticalTotalWeight += weight
 			}
@@ -308,10 +322,10 @@ func (ha *HealthAggregator) aggregateResults(
 
 	return AggregatedHealth{
 		Status:       status,
-		ProbeResults: results,
+		ProbeResults: checkResults,
 		FailedProbes: failedProbes,
 		HealthyCount: healthyCount,
-		TotalCount:   len(results),
+		TotalCount:   len(outcomes),
 	}
 }
 
@@ -325,6 +339,11 @@ func (ha *HealthAggregator) maybeTriggerAlert(aggregated AggregatedHealth) {
 	}
 
 	ha.lastStatus = aggregated.Status
+
+	if prevStatus != StatusUnhealthy && aggregated.Status != StatusUnhealthy {
+		ha.mu.Unlock()
+		return
+	}
 
 	callbacks := make([]AlertCallback, 0, len(ha.alertCallbacks))
 	for _, cb := range ha.alertCallbacks {

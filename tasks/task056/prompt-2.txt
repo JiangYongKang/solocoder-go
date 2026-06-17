@@ -1,0 +1,4 @@
+你实现的指数退避重试器模块存在一些问题，需要修复：
+1. retry.go 的 nextInterval 方法中抖动计算放在间隔封顶至 MaxInterval 之后叠加，当基础间隔已达到 MaxInterval 时正向抖动偏移会使实际等待时间超出 MaxInterval，与"达到最大间隔后不再增加"的要求矛盾，需要对抖动叠加后的结果做二次封顶或在间隔已封顶时将抖动限制为仅负向偏移。
+2. retry_test.go 的 TestDo_WithAllOptions 中 RetryableFunc 固定返回 nil 导致重试流程从不触发，回调函数从未被实际调用而断言用空白标识符丢弃了验证变量，测试形同虚设，需要让操作先失败再成功以触发重试流程并正确断言回调执行。
+3. 修复后运行 go test ./internal/retry/ -v，需要让所有测试通过。

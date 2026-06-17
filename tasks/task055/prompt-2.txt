@@ -1,0 +1,4 @@
+你实现的 MapReduce 分布式计算框架模块存在一些问题，需要修复：
+1. mapreduce.go 的 shuffleAsync 方法中为每个 Reduce 分区启动的 reduce goroutine 内部完全是空循环，从未调用实际的 Reduce 计算函数，导致异步模式和同步模式在实际行为上完全相同，需要将 Reduce 计算逻辑填入这些 goroutine 中使异步模式下 Reduce 可以在 Map 尚未全部完成时就开始处理已到达的数据。
+2. mapreduce.go 的 MapReduce 结构体中定义了 onComplete 通道但在整个模块中从未对其执行 close 或 select 监听，导致调用方无法通过通道接收完成通知，需要在所有任务完成后关闭该通道并导出给调用方使用。
+3. 修复后运行 go test ./internal/mapreduce/ -v，需要让所有测试通过。

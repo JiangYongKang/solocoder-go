@@ -1,0 +1,7 @@
+产物不满意：
+1. 在 fallback.go 的 matchTriggerCondition 方法中 TriggerConditionErrorRate 分支仍直接 return false，该死代码未被清理。模型选择在 Execute 循环首部新增 shouldSkipByErrorRate 方法独立实现错误率检查，而未按提示词第一条要求修复 matchTriggerCondition 内部的错误率匹配逻辑。虽然 shouldSkipByErrorRate 让错误率触发跳过功能可用，但 matchTriggerCondition 中保留的无条件 false 返回会让后续维护者误判该功能缺失，构成代码腐化隐患。应删除 matchTriggerCondition 中 TriggerConditionErrorRate 分支并添加注释说明错误率检查已移至 shouldSkipByErrorRate 中独立处理。
+2. 错误率计算逻辑在两个方法中重复实现：calculateStrategyErrorRate 用于 shouldSkipByErrorRate 内部决策，CalculateErrorRate 作为公开方法对外暴露。两者都包含窗口模式和非窗口模式的分支，窗口内遍历 SuccessWindow 和 ErrorWindow 计数的代码完全一致。calculateStrategyErrorRate 通过 getStrategyWindow 间接获取窗口时长，在策略无显式配置时回退到 recoveryCfg.PassiveSuccessWindow，而 CalculateErrorRate 由调用方显式传入窗口参数，两个方法对窗口缺省值的处理语义不一致，增加了理解成本。应统一错误率计算逻辑，消除重复代码。
+3. countRecentSuccesses 方法在 window 小于等于零时回退使用 strategy.SuccessCount 全局累计值作为近期成功数，但当 PassiveSuccessWindow 被配置为零或未配置时此分支将绕过时间窗口语义直接使用全量历史数据，与提示词要求的“用独立的时间窗口存储成功事件”矛盾。应在无窗口配置时也返回基于 SuccessWindow 内数据的合理数量而非直接暴露全局计数器。
+过程不满意：
+1. 模型在收到提示词后立即用 todo_write 创建了 6 项子任务计划，之后才通过 view_files 开始阅读 fallback.go 和 types.go 的源代码。初始计划与实际代码结构脱节，随后又用 todo_write 将计划从 6 项调整为 5 项。这违反了标注规范中“不应在刚收到任务时直接创建 TodoList，应先分析问题再规划”的要求。正确做法是先阅读相关源文件理解三个缺陷的代码位置及其关联关系，再制定有针对性的修复方案。
+2. 提示词第一条明确指出 matchTriggerCondition 方法的 TriggerConditionErrorRate 分支需要补全逻辑，但模型选择在 Execute 循环中新增 shouldSkipByErrorRate 方法绕开该问题。模型在思考过程中从未解释为何放弃直接修复 matchTriggerCondition 而采用绕行方案，也未评估这种双轨触发检查机制对架构的影响。这反映模型对提示词指令的处理偏向于功能实现而非精准修复，抓住了“让错误率触发可工作”的需求目标但忽视了“在 matchTriggerCondition 中修复”的具体代码定位指引。应优先尝试在指定方法内完成修复，若语义确实不适合再明确说明理由后采用替代方案。

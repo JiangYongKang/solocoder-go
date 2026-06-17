@@ -1,0 +1,5 @@
+你实现的压缩编解码器模块存在一些问题，需要修复：
+1. snappy.go 中 Compress 方法使用 snappy.Encode 生成原始块格式，而 NewCompressedWriter 使用 snappy.NewBufferedWriter 生成帧格式，两种格式互不兼容，当调用方先用 Compress 压缩再用流式解压时会导致解压失败，需要统一为同一种数据格式。
+2. compressor.go 的 NewStreamCompressor 方法从未调用 selectCompressor 进行自适应选择，用户在自动模式下调用流式压缩时不会分析数据特征而直接使用配置中的默认算法，需要让流式压缩接口也根据模式判断是否走自适应选择分支。
+3. compressor.go 的 AnalyzeData 函数仅基于相邻字节重复率判断数据类型，有明显子串模式但无相邻重复的结构化数据被错误归类为二进制数据，需要改进数据分类逻辑使其能识别更多的数据模式特征。
+4. 修复后运行 go test ./internal/compressor/ -v，需要让所有测试通过。

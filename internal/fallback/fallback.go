@@ -40,13 +40,14 @@ func (c *Chain) RegisterStrategy(id, name string, priority int, handler HandlerF
 	}
 
 	strategy := &Strategy{
-		ID:          id,
-		Name:        name,
-		Priority:    priority,
-		Handler:     handler,
-		TriggerCond: triggerCond,
-		State:       StrategyStateActive,
-		ErrorWindow: make([]errorEntry, 0),
+		ID:            id,
+		Name:          name,
+		Priority:      priority,
+		Handler:       handler,
+		TriggerCond:   triggerCond,
+		State:         StrategyStateActive,
+		SuccessWindow: make([]successEntry, 0),
+		ErrorWindow:   make([]errorEntry, 0),
 	}
 
 	c.strategies = append(c.strategies, strategy)
@@ -129,6 +130,10 @@ func (c *Chain) Execute(ctx context.Context) (interface{}, error) {
 
 		if i > startIndex {
 			c.updateFallbackCount()
+		}
+
+		if c.shouldSkipByErrorRate(strategy) {
+			continue
 		}
 
 		if shouldSkip, skipIndex := c.checkTriggerConditions(ctx, strategy, errs, i, strategies); shouldSkip {
@@ -242,6 +247,52 @@ func (c *Chain) checkTriggerConditions(ctx context.Context, strategy *Strategy, 
 	return false, 0
 }
 
+func (c *Chain) shouldSkipByErrorRate(strategy *Strategy) bool {
+	if strategy.TriggerCond == nil || strategy.TriggerCond.Type != TriggerConditionErrorRate {
+		return false
+	}
+
+	rate := c.calculateStrategyErrorRate(strategy)
+	return rate >= strategy.TriggerCond.ErrorRate
+}
+
+func (c *Chain) calculateStrategyErrorRate(strategy *Strategy) float64 {
+	strategy.mu.RLock()
+	defer strategy.mu.RUnlock()
+
+	window := c.getStrategyWindow(strategy)
+	if window <= 0 {
+		total := strategy.SuccessCount + strategy.FailureCount
+		if total == 0 {
+			return 0
+		}
+		return float64(strategy.FailureCount) / float64(total)
+	}
+
+	cutoff := time.Now().Add(-window)
+	successes := 0
+	failures := 0
+
+	for _, entry := range strategy.SuccessWindow {
+		if entry.Time.After(cutoff) {
+			successes++
+		}
+	}
+
+	for _, entry := range strategy.ErrorWindow {
+		if entry.Time.After(cutoff) {
+			failures++
+		}
+	}
+
+	total := successes + failures
+	if total == 0 {
+		return 0
+	}
+
+	return float64(failures) / float64(total)
+}
+
 func (c *Chain) matchTriggerCondition(err error, cond *TriggerCondition) bool {
 	if cond == nil {
 		return false
@@ -302,16 +353,21 @@ func (c *Chain) updateStrategyStats(strategy *Strategy, result executionResult) 
 	strategy.mu.Lock()
 	defer strategy.mu.Unlock()
 
-	strategy.LastUsedAt = time.Now()
+	now := time.Now()
+	strategy.LastUsedAt = now
 
 	if result.Err == nil {
 		strategy.SuccessCount++
 		strategy.ConsecutiveFail = 0
+		strategy.SuccessWindow = append(strategy.SuccessWindow, successEntry{
+			Time: now,
+		})
+		c.cleanupSuccessWindow(strategy)
 	} else {
 		strategy.FailureCount++
 		strategy.ConsecutiveFail++
 		strategy.ErrorWindow = append(strategy.ErrorWindow, errorEntry{
-			Time: time.Now(),
+			Time: now,
 			Err:  result.Err,
 		})
 		c.cleanupErrorWindow(strategy)
@@ -319,14 +375,15 @@ func (c *Chain) updateStrategyStats(strategy *Strategy, result executionResult) 
 }
 
 func (c *Chain) cleanupErrorWindow(strategy *Strategy) {
-	if strategy.TriggerCond == nil || strategy.TriggerCond.ErrorWindow <= 0 {
-		if len(strategy.ErrorWindow) > 100 {
-			strategy.ErrorWindow = strategy.ErrorWindow[len(strategy.ErrorWindow)-100:]
+	window := c.getStrategyWindow(strategy)
+	if window <= 0 {
+		if len(strategy.ErrorWindow) > 1000 {
+			strategy.ErrorWindow = strategy.ErrorWindow[len(strategy.ErrorWindow)-1000:]
 		}
 		return
 	}
 
-	cutoff := time.Now().Add(-strategy.TriggerCond.ErrorWindow)
+	cutoff := time.Now().Add(-window)
 	i := 0
 	for ; i < len(strategy.ErrorWindow); i++ {
 		if strategy.ErrorWindow[i].Time.After(cutoff) {
@@ -334,6 +391,35 @@ func (c *Chain) cleanupErrorWindow(strategy *Strategy) {
 		}
 	}
 	strategy.ErrorWindow = strategy.ErrorWindow[i:]
+}
+
+func (c *Chain) cleanupSuccessWindow(strategy *Strategy) {
+	window := c.getStrategyWindow(strategy)
+	if window <= 0 {
+		if len(strategy.SuccessWindow) > 1000 {
+			strategy.SuccessWindow = strategy.SuccessWindow[len(strategy.SuccessWindow)-1000:]
+		}
+		return
+	}
+
+	cutoff := time.Now().Add(-window)
+	i := 0
+	for ; i < len(strategy.SuccessWindow); i++ {
+		if strategy.SuccessWindow[i].Time.After(cutoff) {
+			break
+		}
+	}
+	strategy.SuccessWindow = strategy.SuccessWindow[i:]
+}
+
+func (c *Chain) getStrategyWindow(strategy *Strategy) time.Duration {
+	if strategy.TriggerCond != nil && strategy.TriggerCond.ErrorWindow > 0 {
+		return strategy.TriggerCond.ErrorWindow
+	}
+	if c.recoveryCfg.PassiveSuccessWindow > 0 {
+		return c.recoveryCfg.PassiveSuccessWindow
+	}
+	return 0
 }
 
 func (c *Chain) markStrategyDegraded(strategy *Strategy) {
@@ -422,13 +508,13 @@ func (c *Chain) countRecentSuccesses(strategy *Strategy) int {
 
 	cutoff := time.Now().Add(-window)
 	count := 0
-	for _, entry := range strategy.ErrorWindow {
+	for _, entry := range strategy.SuccessWindow {
 		if entry.Time.After(cutoff) {
 			count++
 		}
 	}
 
-	return int(strategy.SuccessCount) - count
+	return count
 }
 
 func (c *Chain) getMainStrategy() *Strategy {
@@ -734,6 +820,12 @@ func (c *Chain) CalculateErrorRate(strategyID string, window time.Duration) (flo
 	cutoff := time.Now().Add(-window)
 	successes := 0
 	failures := 0
+
+	for _, entry := range strategy.SuccessWindow {
+		if entry.Time.After(cutoff) {
+			successes++
+		}
+	}
 
 	for _, entry := range strategy.ErrorWindow {
 		if entry.Time.After(cutoff) {

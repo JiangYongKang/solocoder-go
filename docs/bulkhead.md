@@ -11,14 +11,16 @@
 | 编号 | 功能名称 | 描述 |
 |------|----------|------|
 | F1 | 独立协程池分配 | 为不同服务或资源组分配独立的协程池，每个池有独立的并发上限和队列容量，舱室之间互不影响 |
-| F2 | 信号量限流 | 通过固定数量的 worker 协程控制并发执行数量，达到上限后新任务可排队等待或被拒绝 |
-| F3 | 等待超时机制 | 支持配置任务等待超时时间，超时后返回资源耗尽错误，避免无限阻塞 |
-| F4 | 快速失败 | 当协程池和等待队列均满且不等待时，新任务立即返回携带诊断信息的 FullError |
-| F5 | 动态扩缩容 | 运行时动态调整并发数和队列容量，扩容立即可用，缩容不影响已提交任务执行 |
-| F6 | 渐进式缩容 | 缩容时空闲协程逐步回收，不强制杀死正在执行的协程，保证任务完整性 |
-| F7 | 多隔离舱管理 | 通过 Registry 统一管理多个命名隔离舱，支持创建、查询、删除操作 |
-| F8 | 状态查询 | 提供当前并发数、等待队列长度、最大并发数、最大队列容量等查询接口 |
-| F9 | 优雅关闭 | 关闭隔离舱时等待所有已提交任务执行完毕后再退出，确保任务不丢失 |
+| F2 | 信号量限流 | 通过信号量机制控制每个隔离舱的并发执行数量，达到上限后新任务可排队等待或被拒绝 |
+| F3 | 信号量接口 | 提供独立的 `Acquire(timeout)` 和 `Release()` 方法，调用方可在自己的 goroutine 中获取/释放并发槽位 |
+| F4 | 共享并发配额 | worker 池模式和信号量模式共享同一个并发上限，总并发数不超过 `maxConcurrency` |
+| F5 | 等待超时机制 | 支持配置任务等待超时时间，超时后返回资源耗尽错误，避免无限阻塞 |
+| F6 | 快速失败 | 当协程池和等待队列均满且不等待时，新任务立即返回携带诊断信息的 FullError |
+| F7 | 动态扩缩容 | 运行时动态调整并发数和队列容量，扩容立即可用，缩容不影响已提交任务执行 |
+| F8 | 渐进式缩容 | 缩容时空闲协程逐步回收，不强制杀死正在执行的协程，保证任务完整性 |
+| F9 | 多隔离舱管理 | 通过 Registry 统一管理多个命名隔离舱，支持创建、查询、删除操作 |
+| F10 | 状态查询 | 提供当前并发数、等待队列长度、信号量持有数、最大并发数、最大队列容量等查询接口 |
+| F11 | 优雅关闭 | 关闭隔离舱时等待所有已提交任务执行完毕后再退出，确保任务不丢失 |
 
 ## 3. 核心结构体与职责
 
@@ -417,15 +419,163 @@ go func() {
 }()
 ```
 
-## 8. 线程安全与设计要点
+### 7.6 信号量使用（Acquire/Release）
 
-### 8.1 同步原语选择
+#### 7.6.1 基础使用：在调用方 goroutine 中执行受保护代码
+
+```go
+cfg := bulkhead.Config{
+    MaxConcurrency: 5,
+    MaxQueueSize:   10,
+}
+
+b, err := bulkhead.NewBulkhead("db-operations", cfg)
+if err != nil {
+    panic(err)
+}
+defer b.Close()
+
+// 获取信号量槽位，最多等待 3 秒
+err = b.Acquire(3 * time.Second)
+if err != nil {
+    if fe, ok := err.(*bulkhead.FullError); ok {
+        fmt.Printf("Database bulkhead full: active=%d/%d\n",
+            fe.ActiveCount, fe.MaxConcurrency)
+    }
+    return
+}
+defer func() {
+    if err := b.Release(); err != nil {
+        fmt.Printf("Release failed: %v\n", err)
+    }
+}()
+
+// 执行受保护的数据库操作（在当前 goroutine 中）
+rows, err := db.Query("SELECT * FROM users WHERE id = ?", userID)
+if err != nil {
+    return
+}
+defer rows.Close()
+
+// 处理查询结果...
+```
+
+#### 7.6.2 非阻塞模式获取信号量
+
+```go
+// timeout=0 表示不等待，立即返回
+err = b.Acquire(0)
+if err != nil {
+    if fe, ok := err.(*bulkhead.FullError); ok {
+        // 资源不足，执行降级逻辑
+        fmt.Println("Database is busy, using cache instead")
+        return cachedResult
+    }
+    return err
+}
+defer b.Release()
+
+// 执行数据库操作...
+```
+
+#### 7.6.3 信号量与 Worker 池混合使用
+
+```go
+cfg := bulkhead.Config{
+    MaxConcurrency: 10,
+    MaxQueueSize:   20,
+}
+
+b, _ := bulkhead.NewBulkhead("mixed-usage", cfg)
+defer b.Close()
+
+// Worker 池模式：提交异步任务
+for i := 0; i < 5; i++ {
+    go func(id int) {
+        err := b.Submit(func() {
+            fmt.Printf("Async task %d executed by worker\n", id)
+        })
+        if err != nil {
+            log.Printf("Submit task %d failed: %v", id, err)
+        }
+    }(i)
+}
+
+// 直接调用模式：在当前 goroutine 中执行
+err := b.Acquire(1 * time.Second)
+if err == nil {
+    fmt.Println("Acquired semaphore, executing protected code")
+    // 执行需要并发控制的代码...
+    b.Release()
+}
+
+// 查询状态
+fmt.Printf("Active: %d (workers + semaphore), Semaphore holders: %d, Queue: %d\n",
+    b.ActiveCount(), b.SemaphoreCount(), b.QueueLength())
+```
+
+#### 7.6.4 并发 HTTP 请求限流
+
+```go
+http.HandleFunc("/api/orders", func(w http.ResponseWriter, r *http.Request) {
+    // 获取信号量，最多等待 500ms
+    err := b.Acquire(500 * time.Millisecond)
+    if err != nil {
+        w.Header().Set("Retry-After", "10")
+        http.Error(w, "Service busy", http.StatusServiceUnavailable)
+        return
+    }
+    defer b.Release()
+
+    // 处理订单创建请求（在当前 HTTP handler goroutine 中）
+    orderID, err := createOrder(r.Body)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.WriteHeader(http.StatusCreated)
+    fmt.Fprintf(w, `{"order_id": "%s"}`, orderID)
+})
+```
+
+## 8. 核心 API 说明
+
+### 8.1 Acquire(timeout time.Duration) error
+
+获取一个并发槽位（信号量）。
+
+**参数：**
+- `timeout`：等待超时时间。0 表示不等待，立即返回结果。
+
+**返回值：**
+- `nil`：成功获取槽位
+- `*FullError`：资源耗尽或等待超时，携带诊断信息
+- `ErrBulkheadClosed`：隔离舱已关闭
+
+### 8.2 Release() error
+
+释放通过 `Acquire()` 获取的并发槽位。
+
+**返回值：**
+- `nil`：成功释放
+- `ErrNotAcquired`：没有通过 `Acquire()` 持有槽位时调用
+
+### 8.3 SemaphoreCount() int
+
+查询当前通过 `Acquire()` 持有的信号量槽位数。
+
+**返回值：** 当前持有的信号量槽位数
+
+## 9. 线程安全与设计要点
+
+### 9.1 同步原语选择
 
 - **互斥锁 (sync.Mutex)**：保护所有内部状态的并发访问
 - **条件变量 (sync.Cond)**：实现 Submit 与 worker 之间的等待/唤醒机制，避免忙等待
 - **等待组 (sync.WaitGroup)**：跟踪 worker 协程生命周期，实现优雅关闭
 
-### 8.2 关键设计决策
+### 9.2 关键设计决策
 
 1. **切片队列替代 Channel**：使用 `[]Task` + `sync.Cond` 替代 channel 实现任务队列，支持动态调整队列容量，同时保证并发安全。
 
@@ -437,7 +587,9 @@ go func() {
 
 5. **优雅关闭**：Close() 设置 `closed=true` 并唤醒所有等待者，worker 处理完队列中所有任务后才退出，保证已提交任务不丢失。
 
-## 9. 文件结构
+6. **信号量与 Worker 池共享配额**：`active` 计数器统一管理 worker 执行的任务和外部调用方持有的信号量，两种模式共享同一个并发上限。
+
+## 10. 文件结构
 
 ```
 internal/bulkhead/

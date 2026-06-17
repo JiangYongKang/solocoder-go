@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -77,10 +76,10 @@ func (s ShutdownState) String() string {
 type CleanupFunc func(ctx context.Context) error
 
 type CleanupCallback struct {
-	Name     string
-	Func     CleanupFunc
-	Timeout  time.Duration
-	Priority int
+	Name    string
+	Func    CleanupFunc
+	Timeout time.Duration
+	order   int
 }
 
 type CallbackResult struct {
@@ -126,22 +125,23 @@ type Manager struct {
 
 	cfg Config
 
-	mu             sync.RWMutex
-	state          ShutdownState
-	phase          ShutdownPhase
-	accepting      bool
+	mu                  sync.RWMutex
+	state               ShutdownState
+	phase               ShutdownPhase
+	accepting           bool
+	callbacks           map[string]*CleanupCallback
+	callbackOrder       []string
+	nextCallbackOrder   int
 
-	callbacks map[string]*CleanupCallback
-
-	signalCh    chan os.Signal
-	stopSignalCh chan struct{}
+	signalCh       chan os.Signal
+	stopSignalCh   chan struct{}
 
 	shutdownCh    chan struct{}
 	shutdownOnce  sync.Once
 	completedCh   chan struct{}
 
-	report   *ShutdownReport
-	reportMu sync.Mutex
+	report          *ShutdownReport
+	reportMu        sync.Mutex
 
 	manualTriggerCh chan struct{}
 }
@@ -169,6 +169,8 @@ func NewManager(cfg Config) *Manager {
 		phase:           PhaseInit,
 		accepting:       true,
 		callbacks:       make(map[string]*CleanupCallback),
+		callbackOrder:   make([]string, 0),
+		nextCallbackOrder: 0,
 		shutdownCh:      make(chan struct{}),
 		completedCh:     make(chan struct{}),
 		manualTriggerCh: make(chan struct{}, 1),
@@ -207,7 +209,7 @@ func (m *Manager) signalListener() {
 	}
 }
 
-func (m *Manager) RegisterCallback(name string, fn CleanupFunc, timeout time.Duration, priority int) error {
+func (m *Manager) RegisterCallback(name string, fn CleanupFunc, timeout time.Duration) error {
 	if fn == nil {
 		return ErrNilCallback
 	}
@@ -231,11 +233,13 @@ func (m *Manager) RegisterCallback(name string, fn CleanupFunc, timeout time.Dur
 	}
 
 	m.callbacks[name] = &CleanupCallback{
-		Name:     name,
-		Func:     fn,
-		Timeout:  timeout,
-		Priority: priority,
+		Name:    name,
+		Func:    fn,
+		Timeout: timeout,
+		order:   m.nextCallbackOrder,
 	}
+	m.nextCallbackOrder++
+	m.callbackOrder = append(m.callbackOrder, name)
 
 	return nil
 }
@@ -249,37 +253,25 @@ func (m *Manager) UnregisterCallback(name string) error {
 	}
 
 	delete(m.callbacks, name)
+	for i, n := range m.callbackOrder {
+		if n == name {
+			m.callbackOrder = append(m.callbackOrder[:i], m.callbackOrder[i+1:]...)
+			break
+		}
+	}
 	return nil
 }
 
 func (m *Manager) BeginRequest() error {
-	for {
-		m.mu.RLock()
-		accepting := m.accepting
-		state := m.state
-		m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-		if !accepting || state != StateRunning {
-			return ErrManagerAlreadyShuttingDown
-		}
-
-		newCount := atomic.AddInt64(&m.activeRequests, 1)
-		m.mu.RLock()
-		stillAccepting := m.accepting
-		stillRunning := m.state == StateRunning
-		m.mu.RUnlock()
-
-		if stillAccepting && stillRunning {
-			return nil
-		}
-
-		if newCount == atomic.LoadInt64(&m.activeRequests) {
-			atomic.AddInt64(&m.activeRequests, -1)
-		} else {
-			atomic.AddInt64(&m.activeRequests, -1)
-		}
+	if !m.accepting || m.state != StateRunning {
 		return ErrManagerAlreadyShuttingDown
 	}
+
+	atomic.AddInt64(&m.activeRequests, 1)
+	return nil
 }
 
 func (m *Manager) EndRequest() {
@@ -317,15 +309,8 @@ func (m *Manager) Shutdown() error {
 		return ErrManagerAlreadyShuttingDown
 	}
 
-	var firstErr error
-
 	m.shutdownOnce.Do(func() {
 		m.mu.Lock()
-		if m.state != StateRunning {
-			m.mu.Unlock()
-			firstErr = ErrManagerAlreadyShuttingDown
-			return
-		}
 		m.state = StateShuttingDown
 		m.mu.Unlock()
 
@@ -346,7 +331,7 @@ func (m *Manager) Shutdown() error {
 		close(m.completedCh)
 	})
 
-	return firstErr
+	return nil
 }
 
 func (m *Manager) TriggerShutdown() error {
@@ -524,29 +509,21 @@ func (m *Manager) phaseWaitRequests(ctx context.Context) error {
 
 func (m *Manager) phaseExecuteCallbacks(ctx context.Context) ([]*CallbackResult, []string, error) {
 	m.mu.RLock()
-	cbs := make([]*CleanupCallback, 0, len(m.callbacks))
-	for _, cb := range m.callbacks {
-		cbs = append(cbs, cb)
-	}
+	order := make([]string, len(m.callbackOrder))
+	copy(order, m.callbackOrder)
+	cbMap := m.callbacks
 	m.mu.RUnlock()
 
-	sort.SliceStable(cbs, func(i, j int) bool {
-		if cbs[i].Priority != cbs[j].Priority {
-			return cbs[i].Priority > cbs[j].Priority
-		}
-		return cbs[i].Name < cbs[j].Name
-	})
-
-	results := make([]*CallbackResult, 0, len(cbs))
+	results := make([]*CallbackResult, 0, len(order))
 	incomplete := make([]string, 0)
 	var firstErr error
 
-	for i := len(cbs) - 1; i >= 0; i-- {
+	for i := len(order) - 1; i >= 0; i-- {
 		if ctx.Err() != nil {
 			for j := i; j >= 0; j-- {
-				incomplete = append(incomplete, cbs[j].Name)
+				incomplete = append(incomplete, order[j])
 				results = append(results, &CallbackResult{
-					Name:     cbs[j].Name,
+					Name:     order[j],
 					Success:  false,
 					TimedOut: true,
 					Error:    ctx.Err(),
@@ -556,7 +533,10 @@ func (m *Manager) phaseExecuteCallbacks(ctx context.Context) ([]*CallbackResult,
 			break
 		}
 
-		cb := cbs[i]
+		cb, exists := cbMap[order[i]]
+		if !exists {
+			continue
+		}
 		result := m.executeSingleCallback(ctx, cb)
 		results = append(results, result)
 

@@ -1,0 +1,5 @@
+你实现的优雅关闭管理器模块存在一些问题，需要修复：
+1. graceful.go 的 BeginRequest 方法中存在一个永不迭代的 for {} 死代码循环，循环体内所有分支均以 return 结束，rollback 的两个分支执行完全相同的 atomic.AddInt64 操作，说明并发控制方案设计不完整，需要用 CAS 或互斥锁实现正确的请求计数递增逻辑。
+2. graceful.go 的 phaseExecuteCallbacks 方法使用 Priority 字段排序回调执行顺序，而提示词要求的是"按注册的反序"即注册先后顺序的逆序执行回调，Priority 是模型自己新增的概念偏离了原始需求，需要改为按注册序的逆序执行。
+3. graceful.go 的 Shutdown 方法内部 shutdownOnce.Do 闭包中有一个二次状态检查分支用于设置 firstErr，但外层入口已做状态检查且 shutdownOnce.Do 只执行一次，闭包内部的二次检查永远不可能触发成为无效死代码，需要移除多余的内部状态检查。
+4. 修复后运行 go test ./internal/graceful/ -v，需要让所有测试通过。

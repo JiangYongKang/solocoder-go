@@ -1,0 +1,5 @@
+你实现的降级策略链模块存在一些问题，需要修复：
+1. fallback.go 的 matchTriggerCondition 方法中 TriggerConditionErrorRate 分支直接返回 false，当策略配置了错误率阈值触发条件时该条件永远不会被满足，提示词要求的"降级触发条件包括错误率超过阈值"功能完全未实现，需要补全错误率阈值匹配逻辑。
+2. fallback.go 的 countRecentSuccesses 方法采用"总成功数减去近期错误数"计算近期成功数，但总成功数是历史累计值而非时间窗口内的值，与窗口内错误数相减的结果毫无语义，需要改为用独立的时间窗口存储成功事件或用双计数器追踪窗口内成功次数。
+3. fallback.go 的 CalculateErrorRate 方法在窗口模式下 successes 变量始终为 0 从未被递增，只要 ErrorWindow 中有任何记录就返回错误率 1.0，需要修复为正确统计窗口内的成功和失败事件数来计算真实错误率。
+4. 修复后运行 go test ./internal/fallback/ -v，需要让所有测试通过。

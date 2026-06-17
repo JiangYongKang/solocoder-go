@@ -79,22 +79,22 @@ func TestNewManager_DefaultValues(t *testing.T) {
 func TestRegisterCallback(t *testing.T) {
 	m := NewManager(DefaultConfig())
 
-	err := m.RegisterCallback("test", func(ctx context.Context) error { return nil }, 5*time.Second, 10)
+	err := m.RegisterCallback("test", func(ctx context.Context) error { return nil }, 5*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error registering callback: %v", err)
 	}
 
-	err = m.RegisterCallback("test", func(ctx context.Context) error { return nil }, 5*time.Second, 10)
+	err = m.RegisterCallback("test", func(ctx context.Context) error { return nil }, 5*time.Second)
 	if err != ErrCallbackAlreadyRegistered {
 		t.Errorf("expected ErrCallbackAlreadyRegistered, got %v", err)
 	}
 
-	err = m.RegisterCallback("", func(ctx context.Context) error { return nil }, 5*time.Second, 10)
+	err = m.RegisterCallback("", func(ctx context.Context) error { return nil }, 5*time.Second)
 	if err == nil {
 		t.Error("expected error for empty callback name")
 	}
 
-	err = m.RegisterCallback("nil-fn", nil, 5*time.Second, 10)
+	err = m.RegisterCallback("nil-fn", nil, 5*time.Second)
 	if err != ErrNilCallback {
 		t.Errorf("expected ErrNilCallback, got %v", err)
 	}
@@ -114,7 +114,7 @@ func TestRegisterCallback_AfterShutdown(t *testing.T) {
 	}()
 
 	time.Sleep(30 * time.Millisecond)
-	err := m.RegisterCallback("too-late", func(ctx context.Context) error { return nil }, 0, 0)
+	err := m.RegisterCallback("too-late", func(ctx context.Context) error { return nil }, 0)
 	if err != ErrManagerAlreadyShuttingDown {
 		t.Errorf("expected ErrManagerAlreadyShuttingDown, got %v", err)
 	}
@@ -125,7 +125,7 @@ func TestRegisterCallback_AfterShutdown(t *testing.T) {
 func TestUnregisterCallback(t *testing.T) {
 	m := NewManager(DefaultConfig())
 
-	m.RegisterCallback("cb1", func(ctx context.Context) error { return nil }, 0, 0)
+	m.RegisterCallback("cb1", func(ctx context.Context) error { return nil }, 0)
 
 	err := m.UnregisterCallback("cb1")
 	if err != nil {
@@ -376,21 +376,21 @@ func TestShutdown_WithCallbacks(t *testing.T) {
 		executed = append(executed, "cb1")
 		mu.Unlock()
 		return nil
-	}, 0, 10)
+	}, 0)
 
 	m.RegisterCallback("cb2", func(ctx context.Context) error {
 		mu.Lock()
 		executed = append(executed, "cb2")
 		mu.Unlock()
 		return nil
-	}, 0, 20)
+	}, 0)
 
 	m.RegisterCallback("cb3", func(ctx context.Context) error {
 		mu.Lock()
 		executed = append(executed, "cb3")
 		mu.Unlock()
 		return nil
-	}, 0, 5)
+	}, 0)
 
 	go m.Shutdown()
 	report := m.WaitForShutdown()
@@ -419,37 +419,37 @@ func TestShutdown_WithCallbacks(t *testing.T) {
 	}
 }
 
-func TestShutdown_CallbacksReverseOrderByPriority(t *testing.T) {
+func TestShutdown_CallbacksReverseRegistrationOrder(t *testing.T) {
 	m := NewManager(Config{
-		RequestWaitTimeout:  50 * time.Millisecond,
-		GlobalTimeout:       2 * time.Second,
+		RequestWaitTimeout:     50 * time.Millisecond,
+		GlobalTimeout:          2 * time.Second,
 		DefaultCallbackTimeout: 200 * time.Millisecond,
-		StopAcceptingTimeout: 20 * time.Millisecond,
+		StopAcceptingTimeout:   20 * time.Millisecond,
 	})
 
 	var mu sync.Mutex
 	executed := make([]string, 0)
 
-	m.RegisterCallback("high", func(ctx context.Context) error {
+	m.RegisterCallback("first", func(ctx context.Context) error {
 		mu.Lock()
-		executed = append(executed, "high")
+		executed = append(executed, "first")
 		mu.Unlock()
 		return nil
-	}, 0, 100)
+	}, 0)
 
-	m.RegisterCallback("low", func(ctx context.Context) error {
+	m.RegisterCallback("second", func(ctx context.Context) error {
 		mu.Lock()
-		executed = append(executed, "low")
+		executed = append(executed, "second")
 		mu.Unlock()
 		return nil
-	}, 0, 10)
+	}, 0)
 
-	m.RegisterCallback("mid", func(ctx context.Context) error {
+	m.RegisterCallback("third", func(ctx context.Context) error {
 		mu.Lock()
-		executed = append(executed, "mid")
+		executed = append(executed, "third")
 		mu.Unlock()
 		return nil
-	}, 0, 50)
+	}, 0)
 
 	go m.Shutdown()
 	report := m.WaitForShutdown()
@@ -465,14 +465,14 @@ func TestShutdown_CallbacksReverseOrderByPriority(t *testing.T) {
 		t.Fatalf("expected 3 callbacks, got %v", executed)
 	}
 
-	if executed[0] != "low" {
-		t.Errorf("expected 'low' first, got %v", executed)
+	if executed[0] != "third" {
+		t.Errorf("expected 'third' first (reverse registration order), got %v", executed)
 	}
-	if executed[1] != "mid" {
-		t.Errorf("expected 'mid' second, got %v", executed)
+	if executed[1] != "second" {
+		t.Errorf("expected 'second' second (reverse registration order), got %v", executed)
 	}
-	if executed[2] != "high" {
-		t.Errorf("expected 'high' last, got %v", executed)
+	if executed[2] != "first" {
+		t.Errorf("expected 'first' last (reverse registration order), got %v", executed)
 	}
 }
 
@@ -486,11 +486,11 @@ func TestShutdown_CallbackError(t *testing.T) {
 
 	m.RegisterCallback("fails", func(ctx context.Context) error {
 		return errors.New("callback failed")
-	}, 0, 10)
+	}, 0)
 
 	m.RegisterCallback("ok", func(ctx context.Context) error {
 		return nil
-	}, 0, 20)
+	}, 0)
 
 	go m.Shutdown()
 	report := m.WaitForShutdown()
@@ -532,7 +532,7 @@ func TestShutdown_CallbackPanic(t *testing.T) {
 
 	m.RegisterCallback("panics", func(ctx context.Context) error {
 		panic("oh no!")
-	}, 0, 10)
+	}, 0)
 
 	go m.Shutdown()
 	report := m.WaitForShutdown()
@@ -564,11 +564,11 @@ func TestShutdown_CallbackTimeout(t *testing.T) {
 	m.RegisterCallback("slow", func(ctx context.Context) error {
 		time.Sleep(5 * time.Second)
 		return nil
-	}, 100*time.Millisecond, 10)
+	}, 100*time.Millisecond)
 
 	m.RegisterCallback("fast", func(ctx context.Context) error {
 		return nil
-	}, 0, 20)
+	}, 0)
 
 	start := time.Now()
 	go m.Shutdown()
@@ -607,12 +607,12 @@ func TestShutdown_GlobalTimeout(t *testing.T) {
 	m.RegisterCallback("very-slow-1", func(ctx context.Context) error {
 		time.Sleep(10 * time.Second)
 		return nil
-	}, 0, 10)
+	}, 0)
 
 	m.RegisterCallback("very-slow-2", func(ctx context.Context) error {
 		time.Sleep(10 * time.Second)
 		return nil
-	}, 0, 20)
+	}, 0)
 
 	start := time.Now()
 	go m.Shutdown()
@@ -783,7 +783,7 @@ func TestConcurrentShutdownAndRegister(t *testing.T) {
 			name := fmt.Sprintf("cb-%d", i)
 			_ = m.RegisterCallback(name, func(ctx context.Context) error {
 				return nil
-			}, 0, i)
+			}, 0)
 			time.Sleep(1 * time.Millisecond)
 		}
 	}()
@@ -947,8 +947,8 @@ func TestShutdown_AllCallbacksComplete_IncompleteList(t *testing.T) {
 		StopAcceptingTimeout: 20 * time.Millisecond,
 	})
 
-	m.RegisterCallback("ok-1", func(ctx context.Context) error { return nil }, 0, 10)
-	m.RegisterCallback("ok-2", func(ctx context.Context) error { return nil }, 0, 20)
+	m.RegisterCallback("ok-1", func(ctx context.Context) error { return nil }, 0)
+	m.RegisterCallback("ok-2", func(ctx context.Context) error { return nil }, 0)
 
 	go m.Shutdown()
 	report := m.WaitForShutdown()
@@ -969,12 +969,12 @@ func TestShutdown_IncompleteCallbacksList(t *testing.T) {
 	m.RegisterCallback("a", func(ctx context.Context) error {
 		time.Sleep(10 * time.Second)
 		return nil
-	}, 0, 10)
+	}, 0)
 
 	m.RegisterCallback("b", func(ctx context.Context) error {
 		time.Sleep(10 * time.Second)
 		return nil
-	}, 0, 20)
+	}, 0)
 
 	go m.Shutdown()
 	report := m.WaitForShutdown()

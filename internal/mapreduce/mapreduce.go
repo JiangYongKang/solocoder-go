@@ -188,6 +188,7 @@ func (mr *MapReduce) Run(ctx context.Context) (interface{}, error) {
 			mr.status = TaskStatusCompleted
 		}
 		mr.statusMu.Unlock()
+		close(mr.onComplete)
 	}()
 
 	mapResultsCh := make(chan mapTaskResult, len(mr.input))
@@ -200,14 +201,13 @@ func (mr *MapReduce) Run(ctx context.Context) (interface{}, error) {
 		if err := mr.shuffleSync(mapResultsCh); err != nil {
 			return nil, err
 		}
+		if err := mr.runReduceTasks(); err != nil {
+			return nil, err
+		}
 	case ShuffleAsync:
 		if err := mr.shuffleAsync(mapResultsCh); err != nil {
 			return nil, err
 		}
-	}
-
-	if err := mr.runReduceTasks(); err != nil {
-		return nil, err
 	}
 
 	return mr.mergeResults()
@@ -309,32 +309,103 @@ func (mr *MapReduce) shuffleSync(mapResultsCh <-chan mapTaskResult) error {
 
 func (mr *MapReduce) shuffleAsync(mapResultsCh <-chan mapTaskResult) error {
 	totalMapTasks := len(mr.input)
-	received := 0
-	failedCount := 0
+	var received int64
+	var mapFailed int64
 
 	reduceReadyChs := make([]chan struct{}, mr.cfg.NumReduce)
 	for i := 0; i < mr.cfg.NumReduce; i++ {
-		reduceReadyChs[i] = make(chan struct{}, 1)
+		reduceReadyChs[i] = make(chan struct{}, mr.cfg.NumReduce)
 	}
 
 	allMapDone := make(chan struct{})
+	reduceErrCh := make(chan error, mr.cfg.NumReduce)
+
+	var reduceWg sync.WaitGroup
+	for r := 0; r < mr.cfg.NumReduce; r++ {
+		reduceID := r
+		reduceWg.Add(1)
+		mr.wg.Add(1)
+		go func() {
+			defer reduceWg.Done()
+			defer mr.wg.Done()
+
+			processedMapTasks := make(map[int]bool)
+			localGrouped := make(map[string][]interface{})
+
+			for {
+				select {
+				case <-mr.ctx.Done():
+					reduceErrCh <- mr.ctx.Err()
+					return
+
+				case <-reduceReadyChs[reduceID]:
+					mr.mapResultsMu[reduceID].Lock()
+					for mapID, kvs := range mr.mapResults[reduceID] {
+						if processedMapTasks[mapID] {
+							continue
+						}
+						processedMapTasks[mapID] = true
+						for _, kv := range kvs {
+							localGrouped[kv.Key] = append(localGrouped[kv.Key], kv.Value)
+						}
+					}
+					mr.mapResultsMu[reduceID].Unlock()
+
+					select {
+					case <-allMapDone:
+						mr.finalizeAndRunReduce(reduceID, localGrouped, processedMapTasks, reduceErrCh)
+						return
+					default:
+					}
+
+				case <-allMapDone:
+					mr.mapResultsMu[reduceID].Lock()
+					for mapID, kvs := range mr.mapResults[reduceID] {
+						if processedMapTasks[mapID] {
+							continue
+						}
+						processedMapTasks[mapID] = true
+						for _, kv := range kvs {
+							localGrouped[kv.Key] = append(localGrouped[kv.Key], kv.Value)
+						}
+					}
+					mr.mapResultsMu[reduceID].Unlock()
+
+					mr.finalizeAndRunReduce(reduceID, localGrouped, processedMapTasks, reduceErrCh)
+					return
+				}
+			}
+		}()
+	}
+
 	go func() {
-		for received < totalMapTasks {
+		for atomic.LoadInt64(&received) < int64(totalMapTasks) {
 			select {
 			case <-mr.ctx.Done():
 				return
 			case result := <-mapResultsCh:
-				received++
+				atomic.AddInt64(&received, 1)
 				if result.err != nil {
-					failedCount++
+					atomic.AddInt64(&mapFailed, 1)
 					continue
 				}
 				mr.partitionIntermediate(result.kvs, result.taskID)
 				atomic.AddInt64(&mr.completedMapCount, 1)
 
-				for r := 0; r < mr.cfg.NumReduce; r++ {
+				affectedPartitions := make(map[int]bool)
+				for _, kv := range result.kvs {
+					p := mr.cfg.PartitionFunc(kv.Key, mr.cfg.NumReduce)
+					if p < 0 {
+						p = 0
+					}
+					if p >= mr.cfg.NumReduce {
+						p = mr.cfg.NumReduce - 1
+					}
+					affectedPartitions[p] = true
+				}
+				for p := range affectedPartitions {
 					select {
-					case reduceReadyChs[r] <- struct{}{}:
+					case reduceReadyChs[p] <- struct{}{}:
 					default:
 					}
 				}
@@ -343,35 +414,88 @@ func (mr *MapReduce) shuffleAsync(mapResultsCh <-chan mapTaskResult) error {
 		close(allMapDone)
 	}()
 
-	reduceWg := &mr.wg
-	for r := 0; r < mr.cfg.NumReduce; r++ {
-		reduceID := r
-		reduceWg.Add(1)
-		go func() {
-			defer reduceWg.Done()
-			for {
-				select {
-				case <-mr.ctx.Done():
-					return
-				case <-allMapDone:
-					return
-				case <-reduceReadyChs[reduceID]:
-				}
-			}
-		}()
-	}
-
-	<-allMapDone
-
+	reduceWg.Wait()
 	for r := 0; r < mr.cfg.NumReduce; r++ {
 		close(reduceReadyChs[r])
 	}
+	close(reduceErrCh)
 
-	if failedCount > 0 {
-		return fmt.Errorf("mapreduce: %d map task(s) failed", failedCount)
+	if atomic.LoadInt64(&mapFailed) > 0 {
+		return fmt.Errorf("mapreduce: %d map task(s) failed", atomic.LoadInt64(&mapFailed))
+	}
+
+	var reduceErrs []error
+	for err := range reduceErrCh {
+		if err != nil {
+			reduceErrs = append(reduceErrs, err)
+		}
+	}
+	if len(reduceErrs) > 0 {
+		return fmt.Errorf("mapreduce: %d reduce task(s) failed: %v", len(reduceErrs), reduceErrs[0])
 	}
 
 	return nil
+}
+
+func (mr *MapReduce) finalizeAndRunReduce(
+	reduceID int,
+	localGrouped map[string][]interface{},
+	_ map[int]bool,
+	errCh chan<- error,
+) {
+	if len(localGrouped) == 0 {
+		mr.reduceResults[reduceID] = nil
+		atomic.AddInt64(&mr.completedReduceCount, 1)
+		return
+	}
+
+	keys := make([]string, 0, len(localGrouped))
+	for key := range localGrouped {
+		keys = append(keys, key)
+	}
+
+	for attempt := 0; attempt <= mr.cfg.MaxRetries; attempt++ {
+		select {
+		case <-mr.ctx.Done():
+			mr.reduceErrs[reduceID] = mr.ctx.Err()
+			errCh <- mr.ctx.Err()
+			return
+		default:
+		}
+
+		var partitionResults []KeyValue
+		var allErr error
+		for _, key := range keys {
+			values := localGrouped[key]
+			result, err := mr.safeExecuteReduce(key, values)
+			if err != nil {
+				allErr = err
+				break
+			}
+			partitionResults = append(partitionResults, KeyValue{Key: key, Value: result})
+		}
+
+		if allErr == nil {
+			mr.reduceResults[reduceID] = partitionResults
+			atomic.AddInt64(&mr.completedReduceCount, 1)
+			return
+		}
+
+		if attempt < mr.cfg.MaxRetries {
+			partitionResults = nil
+			continue
+		}
+
+		mr.errCh <- &TaskError{
+			TaskType: "reduce",
+			TaskID:   reduceID,
+			Attempt:  attempt + 1,
+			Err:      allErr,
+		}
+		mr.reduceErrs[reduceID] = fmt.Errorf("reduce task %d failed after %d attempts: %w", reduceID, attempt+1, allErr)
+		errCh <- mr.reduceErrs[reduceID]
+		return
+	}
 }
 
 func (mr *MapReduce) partitionIntermediate(kvs []KeyValue, mapTaskID int) {
@@ -576,4 +700,8 @@ func (mr *MapReduce) Wait(ctx context.Context) (interface{}, error) {
 	case <-done:
 		return result, err
 	}
+}
+
+func (mr *MapReduce) Done() <-chan struct{} {
+	return mr.onComplete
 }

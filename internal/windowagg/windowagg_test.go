@@ -483,7 +483,7 @@ func TestTimeWindow(t *testing.T) {
 		t.Fatalf("NewSlidingWindow failed: %v", err)
 	}
 
-	baseTime := time.Now()
+	baseTime := time.Unix(1700000000, 0)
 
 	w.AddValue(1.0, baseTime)
 	w.AddValue(2.0, baseTime.Add(30*time.Millisecond))
@@ -516,7 +516,7 @@ func TestTimeWindowAllItemsEvicted(t *testing.T) {
 		t.Fatalf("NewSlidingWindow failed: %v", err)
 	}
 
-	baseTime := time.Now()
+	baseTime := time.Unix(1700000000, 0)
 
 	w.AddValue(1.0, baseTime)
 	w.AddValue(2.0, baseTime.Add(10*time.Millisecond))

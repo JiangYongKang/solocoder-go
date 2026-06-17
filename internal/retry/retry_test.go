@@ -730,35 +730,49 @@ func TestRetryer_Do_ResetStateBetweenCalls(t *testing.T) {
 }
 
 func TestDo_WithAllOptions(t *testing.T) {
-	var beforeCalled, afterCalled bool
-	var isRetryableCalled bool
+	var beforeCalls, afterCalls int
+	var isRetryableCalls int
 
+	var fnCalls int
 	err := Do(context.Background(),
 		func(ctx context.Context) error {
+			fnCalls++
+			if fnCalls <= 2 {
+				return fmt.Errorf("temporary error %d", fnCalls)
+			}
 			return nil
 		},
-		WithInitialInterval(50*time.Millisecond),
-		WithMaxInterval(500*time.Millisecond),
+		WithInitialInterval(10*time.Millisecond),
+		WithMaxInterval(100*time.Millisecond),
 		WithMaxRetries(5),
 		WithJitterFactor(0.15),
 		WithIsRetryable(func(err error) bool {
-			isRetryableCalled = true
+			isRetryableCalls++
 			return true
 		}),
 		WithOnRetryBefore(func(attempt int, err error) {
-			beforeCalled = true
+			beforeCalls++
 		}),
 		WithOnRetryAfter(func(attempt int, err error) {
-			afterCalled = true
+			afterCalls++
 		}),
 	)
 
 	if err != nil {
 		t.Errorf("expected nil error, got %v", err)
 	}
-	_ = isRetryableCalled
-	_ = beforeCalled
-	_ = afterCalled
+	if fnCalls != 3 {
+		t.Errorf("expected 3 fn calls (2 failures + 1 success), got %d", fnCalls)
+	}
+	if isRetryableCalls != 2 {
+		t.Errorf("expected 2 IsRetryable calls, got %d", isRetryableCalls)
+	}
+	if beforeCalls != 2 {
+		t.Errorf("expected 2 OnRetryBefore calls, got %d", beforeCalls)
+	}
+	if afterCalls != 2 {
+		t.Errorf("expected 2 OnRetryAfter calls, got %d", afterCalls)
+	}
 }
 
 func TestRetryer_Do_TimingExponentialBackoff(t *testing.T) {

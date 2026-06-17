@@ -32,8 +32,17 @@ func (s *snappyCompressor) Compress(data []byte) ([]byte, error) {
 		return nil, ErrEmptyData
 	}
 
-	compressed := snappy.Encode(nil, data)
-	return compressed, nil
+	var buf bytes.Buffer
+	writer := snappy.NewBufferedWriter(&buf)
+	if _, err := writer.Write(data); err != nil {
+		writer.Close()
+		return nil, fmt.Errorf("snappy write error: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("snappy close error: %w", err)
+	}
+
+	return buf.Bytes(), nil
 }
 
 func (s *snappyCompressor) NewCompressedWriter(w io.Writer) (io.WriteCloser, error) {
@@ -69,12 +78,13 @@ func (s *snappyDecompressor) Decompress(data []byte) ([]byte, error) {
 		return nil, ErrEmptyData
 	}
 
-	decoded, err := snappy.Decode(nil, data)
-	if err != nil {
+	reader := snappy.NewReader(bytes.NewReader(data))
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, reader); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorruptedData, err)
 	}
 
-	return decoded, nil
+	return buf.Bytes(), nil
 }
 
 func (s *snappyDecompressor) NewDecompressedReader(r io.Reader) (io.ReadCloser, error) {
@@ -99,34 +109,4 @@ func (s *snappyReaderCloser) Read(p []byte) (int, error) {
 
 func (s *snappyReaderCloser) Close() error {
 	return nil
-}
-
-type snappyBufferedWriter struct {
-	buf    bytes.Buffer
-	writer io.Writer
-	closed bool
-}
-
-func newSnappyBufferedWriter(w io.Writer) *snappyBufferedWriter {
-	return &snappyBufferedWriter{
-		writer: w,
-	}
-}
-
-func (s *snappyBufferedWriter) Write(p []byte) (int, error) {
-	if s.closed {
-		return 0, fmt.Errorf("snappy writer is closed")
-	}
-	return s.buf.Write(p)
-}
-
-func (s *snappyBufferedWriter) Close() error {
-	if s.closed {
-		return nil
-	}
-	s.closed = true
-
-	compressed := snappy.Encode(nil, s.buf.Bytes())
-	_, err := s.writer.Write(compressed)
-	return err
 }

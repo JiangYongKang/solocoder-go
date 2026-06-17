@@ -16,6 +16,7 @@ const (
 	version       uint16 = 1
 	entryTypeFP   byte   = 1
 	entryTypeCS   byte   = 2
+	headerSize           = 16
 )
 
 type persistIndex struct {
@@ -76,7 +77,7 @@ func (p *persistIndex) saveLocked(index FingerprintIndex, path string) error {
 		Count:    uint64(len(index)),
 	}
 
-	headerBytes := make([]byte, binary.Size(header))
+	headerBytes := make([]byte, headerSize)
 	binary.BigEndian.PutUint32(headerBytes[0:4], header.Magic)
 	binary.BigEndian.PutUint16(headerBytes[4:6], header.Version)
 	binary.BigEndian.PutUint16(headerBytes[6:8], header.Reserved)
@@ -149,7 +150,7 @@ func (p *persistIndex) loadLocked(path string) (FingerprintIndex, error) {
 		return nil, err
 	}
 
-	if len(data) < binary.Size(persistHeader{}) {
+	if len(data) < headerSize {
 		return nil, ErrPersistCorrupted
 	}
 
@@ -168,7 +169,7 @@ func (p *persistIndex) loadLocked(path string) (FingerprintIndex, error) {
 		return nil, ErrPersistCorrupted
 	}
 
-	offset := binary.Size(header)
+	offset := headerSize
 	checksum := sha256.New()
 	checksum.Write(data[0:offset])
 
@@ -238,14 +239,176 @@ func (p *persistIndex) Append(fp Fingerprint, path string) error {
 		return p.saveLocked(FingerprintIndex{fp: true}, path)
 	}
 
-	index, err := p.loadLocked(path)
+	return p.appendLocked(fp, path)
+}
+
+func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fileInfo, err := f.Stat()
 	if err != nil {
 		return err
 	}
 
-	index[fp] = true
+	if fileInfo.Size() < int64(headerSize) {
+		return ErrPersistCorrupted
+	}
 
-	return p.saveLocked(index, path)
+	headerBytes := make([]byte, headerSize)
+	if _, err := io.ReadFull(f, headerBytes); err != nil {
+		return err
+	}
+
+	magic := binary.BigEndian.Uint32(headerBytes[0:4])
+	ver := binary.BigEndian.Uint16(headerBytes[4:6])
+	count := binary.BigEndian.Uint64(headerBytes[8:16])
+
+	if magic != magicNumber || ver != version {
+		return ErrPersistCorrupted
+	}
+
+	entryStartPos, _ := f.Seek(0, io.SeekCurrent)
+
+	checksum := sha256.New()
+	checksum.Write(headerBytes)
+
+	var csEntryOffset int64 = -1
+	var lastChecksum string
+	var fpCount uint64
+
+	for {
+		curOffset, _ := f.Seek(0, io.SeekCurrent)
+		if curOffset >= fileInfo.Size() {
+			break
+		}
+
+		entryHeader := make([]byte, 5)
+		if _, err := io.ReadFull(f, entryHeader); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return ErrPersistCorrupted
+		}
+
+		entryType := entryHeader[0]
+		fpLen := binary.BigEndian.Uint32(entryHeader[1:5])
+
+		if fpLen > 1024 {
+			return ErrPersistCorrupted
+		}
+
+		restLen := int(fpLen) + 8
+		rest := make([]byte, restLen)
+		if _, err := io.ReadFull(f, rest); err != nil {
+			return ErrPersistCorrupted
+		}
+
+		fpBytes := rest[:int(fpLen)]
+
+		if entryType == entryTypeCS {
+			lastChecksum = string(fpBytes)
+			csEntryOffset = curOffset
+			break
+		}
+
+		if entryType == entryTypeFP {
+			fpCount++
+			checksum.Write(entryHeader)
+			checksum.Write(rest)
+		}
+	}
+
+	if csEntryOffset < 0 || lastChecksum == "" {
+		return ErrPersistCorrupted
+	}
+
+	if fpCount != count {
+		return ErrPersistCorrupted
+	}
+
+	fpEntry := persistEntry{
+		Type:      entryTypeFP,
+		FP:        fp,
+		Timestamp: 0,
+	}
+
+	fpEntryBytes := encodeEntry(fpEntry)
+
+	newCount := count + 1
+	newHeaderBytes := make([]byte, headerSize)
+	binary.BigEndian.PutUint32(newHeaderBytes[0:4], magicNumber)
+	binary.BigEndian.PutUint16(newHeaderBytes[4:6], version)
+	binary.BigEndian.PutUint16(newHeaderBytes[6:8], 0)
+	binary.BigEndian.PutUint64(newHeaderBytes[8:16], newCount)
+
+	entryBytesStartPos, _ := f.Seek(entryStartPos, io.SeekStart)
+
+	newChecksum := sha256.New()
+	newChecksum.Write(newHeaderBytes)
+	buf := make([]byte, 4096)
+	remaining := csEntryOffset - entryStartPos
+	for remaining > 0 {
+		toRead := int64(len(buf))
+		if remaining < toRead {
+			toRead = remaining
+		}
+		n, err := f.Read(buf[:toRead])
+		if err != nil && err != io.EOF {
+			return ErrPersistCorrupted
+		}
+		if n == 0 {
+			break
+		}
+		newChecksum.Write(buf[:n])
+		remaining -= int64(n)
+	}
+	newChecksum.Write(fpEntryBytes)
+	newCS := hex.EncodeToString(newChecksum.Sum(nil))
+
+	newCSEntry := persistEntry{
+		Type:      entryTypeCS,
+		FP:        Fingerprint(newCS),
+		Timestamp: 0,
+	}
+
+	newCSEntryBytes := encodeEntry(newCSEntry)
+
+	_ = entryBytesStartPos
+
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	if _, err := f.Write(newHeaderBytes); err != nil {
+		return err
+	}
+
+	if _, err := f.Seek(csEntryOffset, io.SeekStart); err != nil {
+		return err
+	}
+
+	if _, err := f.Write(fpEntryBytes); err != nil {
+		return err
+	}
+
+	if _, err := f.Write(newCSEntryBytes); err != nil {
+		return err
+	}
+
+	newFileSize := csEntryOffset + int64(len(fpEntryBytes)) + int64(len(newCSEntryBytes))
+	if err := f.Truncate(newFileSize); err != nil {
+		return err
+	}
+
+	if err := f.Sync(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (p *persistIndex) Verify(path string) (bool, error) {

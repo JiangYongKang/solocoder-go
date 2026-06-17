@@ -651,7 +651,7 @@ func (d *mpDecoder) decodeBytes(rv reflect.Value, l int) error {
 
 	if rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
 		if d.opts.ZeroCopy {
-			rv.SetBytes(zeroCopyBytes(string(b)))
+			rv.SetBytes(b)
 		} else {
 			cp := make([]byte, l)
 			copy(cp, b)

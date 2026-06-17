@@ -1392,3 +1392,208 @@ func TestRun_TaskErrorString(t *testing.T) {
 		t.Errorf("error string should contain inner error: %s", s)
 	}
 }
+
+func TestRun_DoneChannel_ClosesAfterRun(t *testing.T) {
+	mr, _ := NewMapReduce(Config{
+		MapFunc:    wordCountMap,
+		ReduceFunc: wordCountReduce,
+		NumReduce:  2,
+	})
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: "hello world"},
+	})
+
+	done := mr.Done()
+
+	select {
+	case <-done:
+		t.Error("Done channel should not be closed before Run()")
+	default:
+	}
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+	}()
+
+	result, err := mr.Run(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Done channel should be closed after Run() completes")
+	}
+
+	_ = result
+}
+
+func TestRun_DoneChannel_ClosesAfterError(t *testing.T) {
+	mr, _ := NewMapReduce(Config{
+		MapFunc:    alwaysFailMap,
+		ReduceFunc: wordCountReduce,
+		NumReduce:  1,
+		MaxRetries: 0,
+	})
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: "hello"},
+	})
+
+	done := mr.Done()
+
+	_, _ = mr.Run(context.Background())
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Done channel should be closed after Run() returns error")
+	}
+}
+
+func TestRun_DoneChannel_ClosesAfterCancel(t *testing.T) {
+	mr, _ := NewMapReduce(Config{
+		MapFunc: func(_ context.Context, key string, value interface{}) ([]KeyValue, error) {
+			time.Sleep(2 * time.Second)
+			return []KeyValue{{Key: key, Value: value}}, nil
+		},
+		ReduceFunc: wordCountReduce,
+		NumReduce:  1,
+		MaxRetries: 0,
+	})
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: 1},
+	})
+
+	done := mr.Done()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		mr.Cancel()
+	}()
+
+	_, _ = mr.Run(context.Background())
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Done channel should be closed after cancel")
+	}
+}
+
+func TestRun_DoneChannel_AsyncShuffle(t *testing.T) {
+	mr, _ := NewMapReduce(Config{
+		MapFunc:     wordCountMap,
+		ReduceFunc:  wordCountReduce,
+		NumReduce:   2,
+		ShuffleMode: ShuffleAsync,
+	})
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: "hello world hello"},
+		{Key: "doc2", Value: "world go world"},
+	})
+
+	done := mr.Done()
+
+	result, err := mr.Run(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Done channel should be closed after async shuffle Run() completes")
+	}
+
+	wc := collectWordCounts(result)
+	if wc["hello"] != 2 {
+		t.Errorf("expected hello=2, got %d", wc["hello"])
+	}
+}
+
+func TestRun_DoneChannel_NotClosedBeforeRun(t *testing.T) {
+	mr, _ := NewMapReduce(Config{
+		MapFunc:    wordCountMap,
+		ReduceFunc: wordCountReduce,
+		NumReduce:  1,
+	})
+
+	done := mr.Done()
+
+	select {
+	case <-done:
+		t.Error("Done channel should not be closed before Run() is called")
+	default:
+	}
+}
+
+func TestRun_AsyncShuffle_ProcessesDataIncrementally(t *testing.T) {
+	var mu sync.Mutex
+	var mapCompleteTimes []time.Time
+	var reduceStartTimes []time.Time
+
+	slowMapFunc := func(_ context.Context, key string, value interface{}) ([]KeyValue, error) {
+		delay := value.(time.Duration)
+		time.Sleep(delay)
+		mu.Lock()
+		mapCompleteTimes = append(mapCompleteTimes, time.Now())
+		mu.Unlock()
+		return wordCountMap(context.Background(), key, "hello world")
+	}
+
+	reducedStarted := int32(0)
+	trackingReduceFunc := func(_ context.Context, key string, values []interface{}) (interface{}, error) {
+		start := atomic.AddInt32(&reducedStarted, 1)
+		if start == 1 {
+			mu.Lock()
+			reduceStartTimes = append(reduceStartTimes, time.Now())
+			mu.Unlock()
+		}
+		return wordCountReduce(context.Background(), key, values)
+	}
+
+	mr, _ := NewMapReduce(Config{
+		MapFunc:     slowMapFunc,
+		ReduceFunc:  trackingReduceFunc,
+		NumReduce:   2,
+		ShuffleMode: ShuffleAsync,
+		MaxRetries:  0,
+	})
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: 80 * time.Millisecond},
+		{Key: "doc2", Value: 80 * time.Millisecond},
+		{Key: "doc3", Value: 200 * time.Millisecond},
+	})
+
+	start := time.Now()
+	result, err := mr.Run(context.Background())
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wc := collectWordCounts(result)
+	if wc["hello"] != 3 {
+		t.Errorf("expected hello=3, got %d", wc["hello"])
+	}
+	if wc["world"] != 3 {
+		t.Errorf("expected world=3, got %d", wc["world"])
+	}
+
+	t.Logf("Total elapsed: %v", elapsed)
+	mu.Lock()
+	for i, mt := range mapCompleteTimes {
+		t.Logf("Map %d completed at: %v", i, mt.Sub(start))
+	}
+	for i, rt := range reduceStartTimes {
+		t.Logf("Reduce %d started at: %v", i, rt.Sub(start))
+	}
+	mu.Unlock()
+}

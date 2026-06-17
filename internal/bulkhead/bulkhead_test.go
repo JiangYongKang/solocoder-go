@@ -452,7 +452,19 @@ func TestResize_Concurrency_ShrinkWithActiveTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer b.Close()
+
+	cleanupDone := make(chan struct{})
+	defer func() {
+		go func() {
+			b.Close()
+			close(cleanupDone)
+		}()
+		select {
+		case <-cleanupDone:
+		case <-time.After(time.Second):
+			t.Error("Close timed out during cleanup")
+		}
+	}()
 
 	started := make(chan struct{}, 3)
 	block := make(chan struct{})
@@ -572,7 +584,19 @@ func TestResize_Queue_Shrink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer b.Close()
+
+	cleanupDone := make(chan struct{})
+	defer func() {
+		go func() {
+			b.Close()
+			close(cleanupDone)
+		}()
+		select {
+		case <-cleanupDone:
+		case <-time.After(time.Second):
+			t.Error("Close timed out during cleanup")
+		}
+	}()
 
 	started := make(chan struct{})
 	block := make(chan struct{})
@@ -988,4 +1012,628 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestAcquire_Success(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 2,
+		MaxQueueSize:   5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	if b.ActiveCount() != 1 {
+		t.Errorf("expected ActiveCount=1, got %d", b.ActiveCount())
+	}
+	if b.SemaphoreCount() != 1 {
+		t.Errorf("expected SemaphoreCount=1, got %d", b.SemaphoreCount())
+	}
+
+	err = b.Release()
+	if err != nil {
+		t.Fatalf("Release failed: %v", err)
+	}
+
+	if b.ActiveCount() != 0 {
+		t.Errorf("expected ActiveCount=0 after release, got %d", b.ActiveCount())
+	}
+	if b.SemaphoreCount() != 0 {
+		t.Errorf("expected SemaphoreCount=0 after release, got %d", b.SemaphoreCount())
+	}
+}
+
+func TestAcquire_NoWait_Full(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 1,
+		MaxQueueSize:   5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("first Acquire failed: %v", err)
+	}
+	defer b.Release()
+
+	err = b.Acquire(0)
+	if err == nil {
+		t.Fatal("expected Acquire to fail when full, but succeeded")
+	}
+
+	fe, ok := err.(*FullError)
+	if !ok {
+		t.Fatalf("expected FullError, got %T", err)
+	}
+	if fe.ActiveCount != 1 {
+		t.Errorf("expected ActiveCount=1 in FullError, got %d", fe.ActiveCount)
+	}
+	if fe.MaxConcurrency != 1 {
+		t.Errorf("expected MaxConcurrency=1 in FullError, got %d", fe.MaxConcurrency)
+	}
+}
+
+func TestAcquire_WaitTimeout(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 1,
+		MaxQueueSize:   5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("first Acquire failed: %v", err)
+	}
+	defer b.Release()
+
+	start := time.Now()
+	err = b.Acquire(100 * time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected Acquire to timeout, but succeeded")
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("expected to wait at least 100ms, waited %v", elapsed)
+	}
+
+	_, ok := err.(*FullError)
+	if !ok {
+		t.Fatalf("expected FullError on timeout, got %T", err)
+	}
+}
+
+func TestAcquire_WaitSuccess(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 1,
+		MaxQueueSize:   5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("first Acquire failed: %v", err)
+	}
+
+	var acquireErr error
+	done := make(chan struct{})
+	go func() {
+		acquireErr = b.Acquire(500 * time.Millisecond)
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	err = b.Release()
+	if err != nil {
+		t.Fatalf("Release failed: %v", err)
+	}
+
+	select {
+	case <-done:
+		if acquireErr != nil {
+			t.Errorf("expected Acquire to succeed after release, got %v", acquireErr)
+		}
+		if b.SemaphoreCount() != 1 {
+			t.Errorf("expected SemaphoreCount=1, got %d", b.SemaphoreCount())
+		}
+		b.Release()
+	case <-time.After(time.Second):
+		t.Fatal("Acquire should have succeeded after release")
+	}
+}
+
+func TestRelease_WithoutAcquire(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 2,
+		MaxQueueSize:   5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	err = b.Release()
+	if err != ErrNotAcquired {
+		t.Errorf("expected ErrNotAcquired, got %v", err)
+	}
+}
+
+func TestAcquire_ClosedBulkhead(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 2,
+		MaxQueueSize:   5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	b.Close()
+
+	err = b.Acquire(0)
+	if err != ErrBulkheadClosed {
+		t.Errorf("expected ErrBulkheadClosed, got %v", err)
+	}
+}
+
+func TestSemaphore_WithWorkerPool(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 3,
+		MaxQueueSize:   10,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cleanupDone := make(chan struct{})
+	defer func() {
+		go func() {
+			b.Close()
+			close(cleanupDone)
+		}()
+		select {
+		case <-cleanupDone:
+		case <-time.After(time.Second):
+			t.Error("Close timed out during cleanup")
+		}
+	}()
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	defer b.Release()
+
+	if b.ActiveCount() != 1 {
+		t.Errorf("expected ActiveCount=1, got %d", b.ActiveCount())
+	}
+
+	started := make(chan struct{})
+	block := make(chan struct{})
+
+	err = b.Submit(func() {
+		close(started)
+		<-block
+	})
+	if err != nil {
+		t.Fatalf("Submit failed: %v", err)
+	}
+
+	<-started
+
+	if b.ActiveCount() != 2 {
+		t.Errorf("expected ActiveCount=2 (1 semaphore + 1 worker), got %d", b.ActiveCount())
+	}
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("second Acquire failed: %v", err)
+	}
+	defer b.Release()
+
+	if b.ActiveCount() != 3 {
+		t.Errorf("expected ActiveCount=3 (2 semaphore + 1 worker), got %d", b.ActiveCount())
+	}
+
+	err = b.Acquire(0)
+	if err == nil {
+		t.Fatal("expected Acquire to fail when full (3 slots used)")
+		b.Release()
+	}
+
+	close(block)
+}
+
+func TestSemaphoreCount(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 5,
+		MaxQueueSize:   10,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	if b.SemaphoreCount() != 0 {
+		t.Errorf("expected SemaphoreCount=0, got %d", b.SemaphoreCount())
+	}
+
+	for i := 0; i < 3; i++ {
+		err = b.Acquire(0)
+		if err != nil {
+			t.Fatalf("Acquire %d failed: %v", i, err)
+		}
+	}
+
+	if b.SemaphoreCount() != 3 {
+		t.Errorf("expected SemaphoreCount=3, got %d", b.SemaphoreCount())
+	}
+
+	for i := 0; i < 3; i++ {
+		err = b.Release()
+		if err != nil {
+			t.Fatalf("Release %d failed: %v", i, err)
+		}
+	}
+
+	if b.SemaphoreCount() != 0 {
+		t.Errorf("expected SemaphoreCount=0 after all releases, got %d", b.SemaphoreCount())
+	}
+}
+
+func TestAcquire_Concurrent(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 3,
+		MaxQueueSize:   10,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	var wg sync.WaitGroup
+	var counter int64
+	active := make(chan int, 100)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := b.Acquire(100 * time.Millisecond)
+			if err != nil {
+				return
+			}
+			defer b.Release()
+
+			cnt := b.ActiveCount()
+			active <- cnt
+			if cnt > 3 {
+				atomic.AddInt64(&counter, 1)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}()
+	}
+
+	wg.Wait()
+	close(active)
+
+	if atomic.LoadInt64(&counter) > 0 {
+		t.Errorf("ActiveCount exceeded maxConcurrency %d times", atomic.LoadInt64(&counter))
+	}
+}
+
+func TestCanSubmit_QueueFullWithIdleWorkers(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 3,
+		MaxQueueSize:   2,
+		WaitTimeout:    0,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cleanupDone := make(chan struct{})
+	defer func() {
+		go func() {
+			b.Close()
+			close(cleanupDone)
+		}()
+		select {
+		case <-cleanupDone:
+		case <-time.After(time.Second):
+			t.Error("Close timed out during cleanup")
+		}
+	}()
+
+	started := make(chan struct{})
+	block := make(chan struct{})
+
+	err = b.Submit(func() {
+		close(started)
+		<-block
+	})
+	if err != nil {
+		t.Fatalf("first submit failed: %v", err)
+	}
+
+	<-started
+
+	for i := 0; i < 2; i++ {
+		err = b.Submit(func() {})
+		if err != nil {
+			t.Fatalf("queue submit %d failed: %v", i, err)
+		}
+	}
+
+	if b.QueueLength() != 2 {
+		t.Fatalf("expected QueueLength=2, got %d", b.QueueLength())
+	}
+	if b.WorkerCount() != 3 {
+		t.Fatalf("expected WorkerCount=3, got %d", b.WorkerCount())
+	}
+
+	if b.ActiveCount() != 1 {
+		t.Errorf("expected ActiveCount=1, got %d", b.ActiveCount())
+	}
+
+	err = b.Submit(func() {})
+	if err == nil {
+		t.Fatal("expected Submit to fail when queue is full, even with idle workers")
+	}
+
+	fe, ok := err.(*FullError)
+	if !ok {
+		t.Fatalf("expected FullError, got %T", err)
+	}
+	if fe.QueueLength != 2 {
+		t.Errorf("expected QueueLength=2 in FullError, got %d", fe.QueueLength)
+	}
+	if fe.MaxQueueSize != 2 {
+		t.Errorf("expected MaxQueueSize=2 in FullError, got %d", fe.MaxQueueSize)
+	}
+
+	close(block)
+}
+
+func TestResizeQueue_Shrink_RejectsNewTasks(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 1,
+		MaxQueueSize:   5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cleanupDone := make(chan struct{})
+	defer func() {
+		go func() {
+			b.Close()
+			close(cleanupDone)
+		}()
+		select {
+		case <-cleanupDone:
+		case <-time.After(time.Second):
+			t.Error("Close timed out during cleanup")
+		}
+	}()
+
+	started := make(chan struct{})
+	block := make(chan struct{})
+
+	err = b.Submit(func() {
+		close(started)
+		<-block
+	})
+	if err != nil {
+		t.Fatalf("first submit failed: %v", err)
+	}
+
+	<-started
+
+	for i := 0; i < 5; i++ {
+		err = b.Submit(func() {})
+		if err != nil {
+			t.Fatalf("queue submit %d failed: %v", i, err)
+		}
+	}
+
+	if b.QueueLength() != 5 {
+		t.Fatalf("expected QueueLength=5, got %d", b.QueueLength())
+	}
+
+	err = b.Resize(1, 2)
+	if err != nil {
+		t.Fatalf("unexpected error on Resize: %v", err)
+	}
+
+	if b.QueueLength() != 5 {
+		t.Errorf("expected QueueLength=5 (submitted tasks preserved), got %d", b.QueueLength())
+	}
+
+	err = b.Submit(func() {})
+	if err == nil {
+		t.Fatal("expected Submit to fail after queue shrink (current length 5 > new max 2)")
+	}
+
+	fe, ok := err.(*FullError)
+	if !ok {
+		t.Fatalf("expected FullError, got %T", err)
+	}
+	if fe.QueueLength != 5 {
+		t.Errorf("expected QueueLength=5 in FullError, got %d", fe.QueueLength)
+	}
+	if fe.MaxQueueSize != 2 {
+		t.Errorf("expected MaxQueueSize=2 in FullError, got %d", fe.MaxQueueSize)
+	}
+
+	close(block)
+}
+
+func TestSemaphore_ExecuteProtectedCode(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 2,
+		MaxQueueSize:   5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	var concurrentCount int32
+	var maxConcurrent int32
+	var wg sync.WaitGroup
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			err := b.Acquire(500 * time.Millisecond)
+			if err != nil {
+				t.Logf("goroutine %d: Acquire failed: %v", id, err)
+				return
+			}
+			defer b.Release()
+
+			cnt := atomic.AddInt32(&concurrentCount, 1)
+			for {
+				current := atomic.LoadInt32(&maxConcurrent)
+				if cnt <= current {
+					break
+				}
+				if atomic.CompareAndSwapInt32(&maxConcurrent, current, cnt) {
+					break
+				}
+			}
+
+			time.Sleep(20 * time.Millisecond)
+
+			atomic.AddInt32(&concurrentCount, -1)
+		}(i)
+	}
+
+	wg.Wait()
+
+	if atomic.LoadInt32(&maxConcurrent) > 2 {
+		t.Errorf("max concurrent execution exceeded limit: got %d, expected <= 2",
+			atomic.LoadInt32(&maxConcurrent))
+	}
+	t.Logf("max concurrent execution: %d", atomic.LoadInt32(&maxConcurrent))
+}
+
+func TestSubmit_QueueFull_SemaphoreSlotsAvailable(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 3,
+		MaxQueueSize:   1,
+		WaitTimeout:    0,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	started := make(chan struct{})
+	block := make(chan struct{})
+	cleanupDone := make(chan struct{})
+
+	go func() {
+		err = b.Submit(func() {
+			close(started)
+			<-block
+		})
+		if err != nil {
+			t.Errorf("first submit failed: %v", err)
+		}
+	}()
+
+	<-started
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("expected first Acquire to succeed (1 active < 3), got: %v", err)
+	}
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("expected second Acquire to succeed (2 active < 3), got: %v", err)
+	}
+
+	if b.ActiveCount() != 3 {
+		t.Errorf("expected ActiveCount=3 (1 worker + 2 semaphore), got %d", b.ActiveCount())
+	}
+
+	if b.QueueLength() != 0 {
+		t.Errorf("expected QueueLength=0, got %d", b.QueueLength())
+	}
+
+	err = b.Submit(func() {})
+	if err != nil {
+		t.Fatalf("expected Submit to succeed (queue len=0 < max=1), got: %v", err)
+	}
+
+	if b.QueueLength() != 1 {
+		t.Fatalf("expected QueueLength=1 (task queued, no semaphore slots for worker), got %d", b.QueueLength())
+	}
+
+	err = b.Submit(func() {})
+	if err == nil {
+		t.Fatal("expected Submit to fail: queue is full (len=1, max=1)")
+	}
+
+	fe, ok := err.(*FullError)
+	if !ok {
+		t.Fatalf("expected FullError, got %T", err)
+	}
+	if fe.QueueLength != 1 {
+		t.Errorf("expected QueueLength=1 in FullError, got %d", fe.QueueLength)
+	}
+	if fe.MaxQueueSize != 1 {
+		t.Errorf("expected MaxQueueSize=1 in FullError, got %d", fe.MaxQueueSize)
+	}
+
+	err = b.Release()
+	if err != nil {
+		t.Errorf("Release failed: %v", err)
+	}
+
+	if b.QueueLength() != 1 {
+		t.Errorf("expected QueueLength=1 after one release (worker needs to wake up), got %d", b.QueueLength())
+	}
+
+	time.Sleep(20 * time.Millisecond)
+
+	if b.QueueLength() != 0 {
+		t.Errorf("expected QueueLength=0 after worker processes queued task, got %d", b.QueueLength())
+	}
+
+	err = b.Release()
+	if err != nil {
+		t.Errorf("second Release failed: %v", err)
+	}
+
+	close(block)
+
+	go func() {
+		b.Close()
+		close(cleanupDone)
+	}()
+
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Error("Close timed out")
+	}
 }

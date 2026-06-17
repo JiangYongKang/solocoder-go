@@ -47,14 +47,25 @@ func getPBFieldInfo(field reflect.StructField) (*pbFieldInfo, bool) {
 
 	info := &pbFieldInfo{name: field.Name, index: field.Index[0]}
 
-	if strings.HasPrefix(tag, "protobuf:") {
-		numStr := strings.TrimPrefix(tag, "protobuf:")
-		info.fieldNum = 0
-		fmt.Sscanf(numStr, "%d", &info.fieldNum)
+	if tag != "" {
+		parts := strings.Split(tag, ",")
+		if parts[0] != "" {
+			info.name = parts[0]
+		}
+		for i := 1; i < len(parts); i++ {
+			part := strings.TrimSpace(parts[i])
+			if strings.HasPrefix(part, "protobuf:") {
+				numStr := strings.TrimPrefix(part, "protobuf:")
+				var num int
+				if n, err := fmt.Sscanf(numStr, "%d", &num); err == nil && n == 1 && num > 0 {
+					info.fieldNum = num
+				}
+			}
+		}
 	}
 
 	if info.fieldNum == 0 {
-		info.fieldNum = field.Index[0] + 1
+		info.fieldNum = field.Index[0] + 2
 	}
 
 	info.wireType = getWireType(field.Type)
@@ -535,7 +546,7 @@ func (d *pbDecoder) setLengthDelimValue(rv reflect.Value, data []byte) error {
 	case reflect.Slice:
 		if rv.Type().Elem().Kind() == reflect.Uint8 {
 			if d.opts.ZeroCopy {
-				rv.SetBytes(zeroCopyBytes(string(data)))
+				rv.SetBytes(data)
 			} else {
 				cp := make([]byte, len(data))
 				copy(cp, data)
