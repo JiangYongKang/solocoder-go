@@ -34,6 +34,23 @@ func (e *FullError) Error() string {
 	)
 }
 
+// SemaphoreFullError 表示调用 Acquire 时总并发槽位已耗尽（包括 worker 正在执行的任务
+// 和通过 Acquire 持有的信号量），或等待超时仍未获得槽位。
+//
+// 字段间的包含关系：
+//   ActiveCount = WorkerActive + SemHolders
+//   ActiveCount <= MaxConcurrency（耗尽时两者相等）
+//
+// 字段含义与计算来源：
+//   - Name:            隔离舱名称
+//   - MaxConcurrency:  隔离舱配置的最大并发上限（来自 Bulkhead.maxConcurrency）
+//   - ActiveCount:     当前总活跃数，是 WorkerActive 和 SemHolders 的总和
+//                      （来自 Bulkhead.workerActive + Bulkhead.semHolders）
+//   - WorkerActive:    当前 worker 正在执行的任务数（来自 Bulkhead.workerActive）
+//   - SemHolders:      当前通过 Acquire 持有的信号量槽位数（来自 Bulkhead.semHolders）
+//
+// 调用方应直接读取 WorkerActive 与 SemHolders 字段判断资源占用情况，
+// 不应通过 ActiveCount - SemHolders 反推 WorkerActive。
 type SemaphoreFullError struct {
 	Name           string
 	ActiveCount    int

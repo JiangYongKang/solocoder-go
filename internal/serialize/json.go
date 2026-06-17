@@ -48,13 +48,7 @@ func (s *JSONSerializer) Marshal(v interface{}, opts Options) ([]byte, error) {
 				if tag == "-" {
 					continue
 				}
-				name := field.Name
-				if tag != "" {
-					parts := strings.Split(tag, ",")
-					if parts[0] != "" {
-						name = parts[0]
-					}
-				}
+				name := getFieldName(field)
 				versioned[name] = rv.Field(i).Interface()
 			}
 			return json.Marshal(versioned)
@@ -124,13 +118,7 @@ func (s *JSONSerializer) Unmarshal(data []byte, v interface{}, opts Options) err
 			if tag == "-" {
 				continue
 			}
-			name := field.Name
-			if tag != "" {
-				parts := strings.Split(tag, ",")
-				if parts[0] != "" {
-					name = parts[0]
-				}
-			}
+			name := getFieldName(field)
 			fieldMap[name] = field
 			fieldMap[strings.ToLower(name)] = field
 		}

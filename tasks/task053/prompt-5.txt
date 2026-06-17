@@ -1,0 +1,4 @@
+你实现的数据去重引擎模块仍存在残留问题，需要继续修复：
+1. persistence.go 的 appendLocked 方法在 O(1) 空间优化后新增了 entriesDigest 条目作为文件完整性双重校验。但当追加目标是由旧版本 saveLocked 保存的文件（文件中不含 entryTypeEntriesDigest 条目，即 edEntryOffset 为 -1）时，appendLocked 会跳过 entriesDigest 条目的写入，导致文件格式未升级。此后对该文件的再追加操作每次都会因找不到 entriesDigest 条目而继续跳过，文件始终处于半升级状态，entriesDigest 双重校验从未真正生效，追加链路中完全退化为仅 fileChecksum 单层校验。需要在首次 Append 时自动将旧格式文件升级，补写 entriesDigest 条目。
+2. persistence.go 的 appendLocked 方法在第一遍扫描中维护 entriesChecksum 增量哈希的同时检查重复指纹，当检测到重复时将 duplicateFound 置为 true，但此时 entriesChecksum 已经写入当前 entry 的字节数据。后续 duplicateFound 为 true 时直接 return nil 跳过所有写入，entriesChecksum 中残留的无用数据未被使用且容易被维护者误以为该哈希状态会被用于后续计算。需要在检测到重复指纹时跳过对该 entry 的 entriesChecksum 写入，或在确认重复后立即返回避免无意义的哈希计算。
+3. 修复后运行 go test ./internal/datadedup/ -v，需要让所有测试通过。

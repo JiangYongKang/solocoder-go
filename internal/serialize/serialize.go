@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -213,6 +214,32 @@ func UnmarshalWith(name string, data []byte, v interface{}, opts Options) error 
 		return err
 	}
 	return s.Unmarshal(data, v, opts)
+}
+
+// getFieldName extracts the serialized field name from a struct field's "serialize" tag,
+// following consistent rules across all serializer implementations.
+//
+// Tag format (comma-separated):
+//
+//	`serialize:"fieldname"`               => field name "fieldname"
+//	`serialize:"fieldname,protobuf:3"`    => field name "fieldname"
+//	`serialize:",protobuf:3"`             => field name uses default (field.Name)
+//	`serialize:"protobuf:3"`              => field name uses default (field.Name)
+//	`serialize:""`                        => field name uses default (field.Name)
+//
+// A leading "protobuf:" prefix on parts[0] is treated as a field number declaration,
+// NOT as a field name, to keep behavior consistent across JSON/MessagePack/Protobuf.
+func getFieldName(field reflect.StructField) string {
+	name := field.Name
+	tag := field.Tag.Get("serialize")
+	if tag == "" {
+		return name
+	}
+	parts := strings.Split(tag, ",")
+	if parts[0] != "" && !strings.HasPrefix(parts[0], "protobuf:") {
+		name = parts[0]
+	}
+	return name
 }
 
 func setFieldValue(field reflect.Value, value interface{}) error {

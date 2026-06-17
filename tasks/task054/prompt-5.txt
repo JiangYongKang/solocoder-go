@@ -1,0 +1,5 @@
+你实现的滑动窗口聚合器模块仍存在残留问题，需要继续修复：
+1. windowagg.go 的 evictLocked 方法中窗口起始边界使用公式 `((currentUnixNano - 1) / slideNano) * slideNano + slideNano - sizeNano + 1` 计算。当 currentUnixNano 恰好等于 slideNano 的整数倍时，减去 1 后整数除法会向下取整对齐到前一个 slide 边界，窗口起始时间被向前偏移了一个 slide 周期，导致该时间点附近的数据点窗口归属出现边界抖动。需要修正对齐公式使其在边界处也能正确定位到当前窗口。
+2. TestTimeWindow 测试中向窗口写入第三和第四个数据点时使用的是两次紧邻的 time.Now() 调用，可能产生完全相同的时间戳。如果这两个数据点的时间戳恰好落在 Slide 边界上，evictLocked 可能将较早点驱逐使得 Count 不是预期的 4 而是更少，测试存在微弱的竞态脆弱性。需要消除测试中对 time.Now() 精确时序的依赖。
+3. TestTimeWindowSlidingPartialExpiry 测试在 sleep 80ms 后断言所有三个数据点仍在窗口内且 sum 精确等于 13，但系统负载波动可能导致实际 sleep 时长超过预期，使第一批数据部分过期从而结果偏离期望值。需要在时间相关断言中引入容差机制。
+4. 修复后运行 go test ./internal/windowagg/ -v，需要让所有测试通过。

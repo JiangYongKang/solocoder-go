@@ -1,0 +1,4 @@
+你实现的可插拔序列化框架仍存在残留问题，需要继续修复：
+1. protobuf.go 的 getPBFieldInfo 函数在处理标签第一个逗号分隔部分时做了特殊判断：当 parts[0] 以 `protobuf:` 开头时直接将其解析为字段号并跳过字段名设置。这导致 Protobuf 序列化器对 `serialize:"protobuf:5"` 格式的标签不设置字段名，而 JSON 和 MessagePack 序列化器取 parts[0] 作为字段名时会得到 "protobuf:5" 这个非预期值，三种序列化器的行为均不正确且不一致。需要让三种序列化器对字段名的提取采用完全相同的逻辑，保持语义一致性。
+2. protobuf.go 中编码端在 opts.Version > 0 时将版本号写入 wire 字段 1，解码端在 `fieldNum == 1 && opts.Version > 0` 时从字段 1 读取版本号。但当 opts.Version=0 解码一条由旧配置（Version > 0）编码的消息时，字段 1 的版本号值会被 setFieldValue 视作数据字段写入目标结构体，而结构体可能根本没有映射到字段 1 的成员，导致版本号数据污染用户结构体。需要增加编码格式层面的标识来区分是否包含版本号字段，而非仅依赖 opts 参数做判断。
+3. 修复后运行 go test ./internal/serialize/ -v，需要让所有测试通过。

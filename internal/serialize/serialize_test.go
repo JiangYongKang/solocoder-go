@@ -1199,9 +1199,9 @@ func TestProtoBufZeroValues(t *testing.T) {
 	opts.Version = 0
 
 	type ZeroStruct struct {
-		ID     int    `serialize:"id,protobuf:1"`
-		Name   string `serialize:"name,protobuf:2"`
-		Active bool   `serialize:"active,protobuf:3"`
+		ID     int    `serialize:"id,protobuf:2"`
+		Name   string `serialize:"name,protobuf:3"`
+		Active bool   `serialize:"active,protobuf:4"`
 	}
 
 	original := ZeroStruct{ID: 0, Name: "", Active: false}

@@ -1399,10 +1399,21 @@ func TestErrorRateTriggerSkipsStrategy(t *testing.T) {
 	t.Logf("main strategy error rate: %f", rate)
 }
 
+func waitForCondition(timeout time.Duration, condition func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return condition()
+}
+
 func TestCountRecentSuccessesWithAndWithoutWindow(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("without_window", func(t *testing.T) {
+	t.Run("without_window_uses_execute_path", func(t *testing.T) {
 		cfg := DefaultChainConfig()
 		cfg.Recovery.Mode = RecoveryModePassive
 		cfg.Recovery.PassiveSuccessCount = 10
@@ -1429,7 +1440,13 @@ func TestCountRecentSuccessesWithAndWithoutWindow(t *testing.T) {
 		defer chain.Stop()
 
 		for i := 0; i < 15; i++ {
-			chain.Execute(ctx)
+			result, execErr := chain.Execute(ctx)
+			if execErr != nil {
+				t.Fatalf("unexpected execution error on iteration %d: %v", i, execErr)
+			}
+			if result != "main success" {
+				t.Fatalf("expected 'main success' on iteration %d, got %v", i, result)
+			}
 		}
 
 		mainStrategy, _ := chain.GetStrategy("main")
@@ -1441,17 +1458,17 @@ func TestCountRecentSuccessesWithAndWithoutWindow(t *testing.T) {
 		recentCount := chain.countRecentSuccesses(mainStrategy)
 
 		if windowLen != 15 {
-			t.Errorf("expected 15 entries in SuccessWindow, got %d", windowLen)
+			t.Errorf("expected 15 entries in SuccessWindow via Execute path, got %d", windowLen)
 		}
 		if totalSuccess != 15 {
-			t.Errorf("expected 15 total successes, got %d", totalSuccess)
+			t.Errorf("expected 15 total successes via Execute path, got %d", totalSuccess)
 		}
 		if recentCount != 15 {
 			t.Errorf("expected 15 recent successes (window=0 returns window len), got %d", recentCount)
 		}
 	})
 
-	t.Run("with_window_filtering", func(t *testing.T) {
+	t.Run("window_filtering_unit_test", func(t *testing.T) {
 		cfg := DefaultChainConfig()
 		cfg.Recovery.Mode = RecoveryModePassive
 		cfg.Recovery.PassiveSuccessCount = 5
@@ -1502,11 +1519,11 @@ func TestCountRecentSuccessesWithAndWithoutWindow(t *testing.T) {
 		}
 	})
 
-	t.Run("with_window_above_threshold_triggers_recovery", func(t *testing.T) {
+	t.Run("with_window_execute_path_above_threshold_triggers_recovery", func(t *testing.T) {
 		cfg := DefaultChainConfig()
 		cfg.Recovery.Mode = RecoveryModePassive
 		cfg.Recovery.PassiveSuccessCount = 3
-		cfg.Recovery.PassiveSuccessWindow = 10 * time.Second
+		cfg.Recovery.PassiveSuccessWindow = 30 * time.Second
 		cfg.Recovery.WarmUpDuration = 0
 
 		chain := NewChain(cfg)
@@ -1528,17 +1545,27 @@ func TestCountRecentSuccessesWithAndWithoutWindow(t *testing.T) {
 		}
 		defer chain.Stop()
 
-		mainStrategy, _ := chain.GetStrategy("main")
+		for i := 0; i < 8; i++ {
+			result, execErr := chain.Execute(ctx)
+			if execErr != nil {
+				t.Fatalf("unexpected execution error on iteration %d: %v", i, execErr)
+			}
+			if result != "main success" {
+				t.Fatalf("expected 'main success' on iteration %d, got %v", i, result)
+			}
+		}
 
-		now := time.Now()
-		for i := 0; i < 5; i++ {
-			mainStrategy.mu.Lock()
-			mainStrategy.SuccessWindow = append(mainStrategy.SuccessWindow, successEntry{
-				Time: now.Add(-time.Duration(i) * time.Second),
-			})
-			mainStrategy.SuccessCount++
-			mainStrategy.ConsecutiveFail = 0
-			mainStrategy.mu.Unlock()
+		mainStrategy, _ := chain.GetStrategy("main")
+		mainStrategy.mu.RLock()
+		consecFail := mainStrategy.ConsecutiveFail
+		windowLen := len(mainStrategy.SuccessWindow)
+		mainStrategy.mu.RUnlock()
+
+		if consecFail != 0 {
+			t.Fatalf("expected ConsecutiveFail=0 after successes, got %d", consecFail)
+		}
+		if windowLen != 8 {
+			t.Fatalf("expected 8 entries in SuccessWindow via Execute, got %d", windowLen)
 		}
 
 		chain.ForceSwitchToStrategy("fallback")
@@ -1552,21 +1579,21 @@ func TestCountRecentSuccessesWithAndWithoutWindow(t *testing.T) {
 			t.Fatalf("unexpected execution error: %v", execErr)
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		recovered := waitForCondition(5*time.Second, func() bool {
+			return chain.CurrentIndex() == 0 && chain.State() == ChainStateHealthy
+		})
 
-		if chain.CurrentIndex() != 0 {
-			t.Errorf("expected to switch back to main strategy (index 0), got index %d", chain.CurrentIndex())
-		}
-		if chain.State() != ChainStateHealthy {
-			t.Errorf("expected chain state HEALTHY, got %v", chain.State())
+		if !recovered {
+			t.Errorf("expected to switch back to main strategy (index 0, state HEALTHY) within timeout, got index=%d state=%v",
+				chain.CurrentIndex(), chain.State())
 		}
 	})
 
-	t.Run("with_window_below_threshold_no_recovery", func(t *testing.T) {
+	t.Run("with_window_execute_path_below_threshold_no_recovery", func(t *testing.T) {
 		cfg := DefaultChainConfig()
 		cfg.Recovery.Mode = RecoveryModePassive
-		cfg.Recovery.PassiveSuccessCount = 10
-		cfg.Recovery.PassiveSuccessWindow = 5 * time.Second
+		cfg.Recovery.PassiveSuccessCount = 20
+		cfg.Recovery.PassiveSuccessWindow = 30 * time.Second
 		cfg.Recovery.WarmUpDuration = 0
 
 		chain := NewChain(cfg)
@@ -1588,17 +1615,22 @@ func TestCountRecentSuccessesWithAndWithoutWindow(t *testing.T) {
 		}
 		defer chain.Stop()
 
-		mainStrategy, _ := chain.GetStrategy("main")
+		for i := 0; i < 5; i++ {
+			result, execErr := chain.Execute(ctx)
+			if execErr != nil {
+				t.Fatalf("unexpected execution error on iteration %d: %v", i, execErr)
+			}
+			if result != "main success" {
+				t.Fatalf("expected 'main success' on iteration %d, got %v", i, result)
+			}
+		}
 
-		now := time.Now()
-		for i := 0; i < 3; i++ {
-			mainStrategy.mu.Lock()
-			mainStrategy.SuccessWindow = append(mainStrategy.SuccessWindow, successEntry{
-				Time: now.Add(-time.Duration(i) * time.Second),
-			})
-			mainStrategy.SuccessCount++
-			mainStrategy.ConsecutiveFail = 0
-			mainStrategy.mu.Unlock()
+		mainStrategy, _ := chain.GetStrategy("main")
+		mainStrategy.mu.RLock()
+		windowLen := len(mainStrategy.SuccessWindow)
+		mainStrategy.mu.RUnlock()
+		if windowLen != 5 {
+			t.Fatalf("expected 5 entries in SuccessWindow via Execute, got %d", windowLen)
 		}
 
 		chain.ForceSwitchToStrategy("fallback")
@@ -1610,8 +1642,17 @@ func TestCountRecentSuccessesWithAndWithoutWindow(t *testing.T) {
 		if result != "fallback" {
 			t.Errorf("expected to stay on fallback when below threshold, got %v", result)
 		}
+
+		noRecovery := waitForCondition(200*time.Millisecond, func() bool {
+			return chain.CurrentIndex() != 1
+		})
+
+		if noRecovery {
+			t.Errorf("expected to stay on fallback strategy (index 1) when below threshold, but switched to index %d",
+				chain.CurrentIndex())
+		}
 		if chain.CurrentIndex() != 1 {
-			t.Errorf("expected to stay on fallback strategy (index 1), got index %d", chain.CurrentIndex())
+			t.Errorf("expected fallback strategy index=1, got %d", chain.CurrentIndex())
 		}
 	})
 }

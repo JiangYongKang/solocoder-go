@@ -314,7 +314,6 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 	var csEntryOffset int64 = -1
 	var edEntryOffset int64 = -1
 	var fpCount uint64
-	duplicateFound := false
 
 	for {
 		curOffset, _ := f.Seek(0, io.SeekCurrent)
@@ -357,11 +356,11 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 
 		if entryType == entryTypeFP {
 			fpCount++
+			if Fingerprint(fpBytes) == fp {
+				return nil
+			}
 			entriesChecksum.Write(entryHeader)
 			entriesChecksum.Write(rest)
-			if Fingerprint(fpBytes) == fp {
-				duplicateFound = true
-			}
 		}
 	}
 
@@ -371,10 +370,6 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 
 	if fpCount != count {
 		return ErrPersistCorrupted
-	}
-
-	if duplicateFound {
-		return nil
 	}
 
 	fpEntry := persistEntry{
@@ -424,24 +419,36 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 		if _, err := f.Seek(edEntryOffset, io.SeekStart); err != nil {
 			return err
 		}
+		if _, err := f.Write(fpEntryBytes); err != nil {
+			return err
+		}
 		if _, err := f.Write(edEntryBytes); err != nil {
 			return err
 		}
-	}
-
-	if _, err := f.Seek(csEntryOffset, io.SeekStart); err != nil {
-		return err
-	}
-	if _, err := f.Write(fpEntryBytes); err != nil {
-		return err
-	}
-	if _, err := f.Write(newCSEntryBytes); err != nil {
-		return err
-	}
-
-	newFileSize := csEntryOffset + int64(len(fpEntryBytes)) + int64(len(newCSEntryBytes))
-	if err := f.Truncate(newFileSize); err != nil {
-		return err
+		if _, err := f.Write(newCSEntryBytes); err != nil {
+			return err
+		}
+		newFileSize := edEntryOffset + int64(len(fpEntryBytes)) + int64(len(edEntryBytes)) + int64(len(newCSEntryBytes))
+		if err := f.Truncate(newFileSize); err != nil {
+			return err
+		}
+	} else {
+		if _, err := f.Seek(csEntryOffset, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := f.Write(fpEntryBytes); err != nil {
+			return err
+		}
+		if _, err := f.Write(edEntryBytes); err != nil {
+			return err
+		}
+		if _, err := f.Write(newCSEntryBytes); err != nil {
+			return err
+		}
+		newFileSize := csEntryOffset + int64(len(fpEntryBytes)) + int64(len(edEntryBytes)) + int64(len(newCSEntryBytes))
+		if err := f.Truncate(newFileSize); err != nil {
+			return err
+		}
 	}
 
 	if err := f.Sync(); err != nil {

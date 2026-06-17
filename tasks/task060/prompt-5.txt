@@ -1,0 +1,4 @@
+你实现的降级策略链模块仍存在残留问题，需要继续修复：
+1. fallback_test.go 新增的 with_window_filtering 子测试通过直接调用 mainStrategy.mu.Lock() 锁定内部状态后手动向 SuccessWindow 中插入 entry 来注入历史数据，完全绕过了 Execute 正常调用路径。这种白盒构造方式仅对 countRecentSuccesses 函数的内部时间过滤逻辑做单元验证，当 Execute 路径中 SuccessWindow 的写入时机或内容格式发生变更时，该测试仍然通过但真实的端到端被动恢复行为可能已被破坏。需要改为通过 Execute 的正常调用路径写入带有特定时间戳的成功记录来覆盖时间窗口过滤场景。
+2. with_window_above_threshold_triggers_recovery 子测试中使用 `time.Sleep(100 * time.Millisecond)` 等待异步 goroutine 中的被动恢复逻辑完成，再断言 CurrentIndex 和 State 的恢复结果。但这个固定时延与异步恢复操作之间没有任何同步机制，当系统负载较高导致 goroutine 调度延迟超过等待时间时，断言会在恢复实际完成之前执行从而导致误报失败。需要将固定时延等待改为基于信号同步的检测方式。
+3. 修复后运行 go test ./internal/fallback/ -v，需要让所有测试通过。

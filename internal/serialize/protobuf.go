@@ -38,14 +38,19 @@ type pbFieldInfo struct {
 
 // Protobuf wire field number assignment rules:
 //
-//   - Wire field number 1 is reserved for the __version__ field (encoded when opts.Version > 0).
-//   - When a struct tag explicitly declares a protobuf number (e.g. serialize:"name,protobuf:3"),
-//     that number is used as-is on the wire. Users should avoid using field number 1
-//     when versioning is enabled.
+//   - Wire field number 1 is PERMANENTLY RESERVED for the __version__ field.
+//     This is true regardless of whether opts.Version > 0 during encoding.
+//     During decoding, wire field 1 is always treated as version metadata
+//     and is NEVER mapped to a user struct field, preventing version data
+//     from contaminating user structures when opts.Version=0 decodes an
+//     encoded message that contained a version.
+//   - When a struct tag explicitly declares a protobuf number (e.g.
+//     serialize:"name,protobuf:3"), that number is used as-is on the wire.
+//     Users MUST NOT declare protobuf:1 for their own fields.
 //   - When no protobuf number is declared, the default is field.Index[0] + 2,
-//     skipping field 1 (reserved for version) so that the first struct field maps to wire field 2.
-//   - Marshal encodes using info.fieldNum directly; Unmarshal builds fieldMap keyed by
-//     info.fieldNum directly. No additional offset is applied in encode/decode paths.
+//     skipping the reserved field 1 so the first struct field maps to wire field 2.
+//   - Marshal encodes using info.fieldNum directly; Unmarshal builds fieldMap
+//     keyed by info.fieldNum directly. No additional offset is applied.
 func getPBFieldInfo(field reflect.StructField) (*pbFieldInfo, bool) {
 	if !field.IsExported() {
 		return nil, false
@@ -55,27 +60,19 @@ func getPBFieldInfo(field reflect.StructField) (*pbFieldInfo, bool) {
 		return nil, false
 	}
 
-	info := &pbFieldInfo{name: field.Name, index: field.Index[0]}
+	info := &pbFieldInfo{name: getFieldName(field), index: field.Index[0]}
 
 	if tag != "" {
 		parts := strings.Split(tag, ",")
-		if parts[0] != "" {
-			if strings.HasPrefix(parts[0], "protobuf:") {
-				numStr := strings.TrimPrefix(parts[0], "protobuf:")
-				var num int
-				if n, err := fmt.Sscanf(numStr, "%d", &num); err == nil && n == 1 && num > 0 {
-					info.fieldNum = num
-				}
-			} else {
-				info.name = parts[0]
-			}
-		}
-		for i := 1; i < len(parts); i++ {
+		for i := 0; i < len(parts); i++ {
 			part := strings.TrimSpace(parts[i])
 			if strings.HasPrefix(part, "protobuf:") {
 				numStr := strings.TrimPrefix(part, "protobuf:")
 				var num int
 				if n, err := fmt.Sscanf(numStr, "%d", &num); err == nil && n == 1 && num > 0 {
+					if num == 1 {
+						num = 2
+					}
 					info.fieldNum = num
 				}
 			}
@@ -375,7 +372,7 @@ func (s *ProtoBufSerializer) Unmarshal(data []byte, v interface{}, opts Options)
 		fieldNum := int(tag >> 3)
 		wireType := int(tag & 0x7)
 
-		if fieldNum == 1 && opts.Version > 0 {
+		if fieldNum == 1 {
 			version, err := dec.readVarint()
 			if err != nil {
 				return err

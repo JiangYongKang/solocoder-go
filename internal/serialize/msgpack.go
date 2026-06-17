@@ -102,13 +102,7 @@ func (s *MsgPackSerializer) Marshal(v interface{}, opts Options) ([]byte, error)
 			if tag == "-" {
 				continue
 			}
-			name := field.Name
-			if tag != "" {
-				parts := strings.Split(tag, ",")
-				if parts[0] != "" {
-					name = parts[0]
-				}
-			}
+			name := getFieldName(field)
 			buf = appendString(buf, name)
 			buf, err = appendValue(buf, rv.Field(i))
 			if err != nil {
@@ -364,13 +358,7 @@ func appendStruct(buf []byte, rv reflect.Value) ([]byte, error) {
 		if tag == "-" {
 			continue
 		}
-		name := field.Name
-		if tag != "" {
-			parts := strings.Split(tag, ",")
-			if parts[0] != "" {
-				name = parts[0]
-			}
-		}
+		name := getFieldName(field)
 		buf = appendString(buf, name)
 		var err error
 		buf, err = appendValue(buf, rv.Field(i))
@@ -706,13 +694,7 @@ func (d *mpDecoder) decodeMap(rv reflect.Value, l int) error {
 			if tag == "-" {
 				continue
 			}
-			name := field.Name
-			if tag != "" {
-				parts := strings.Split(tag, ",")
-				if parts[0] != "" {
-					name = parts[0]
-				}
-			}
+			name := getFieldName(field)
 			fieldMap[name] = field
 			fieldMap[strings.ToLower(name)] = field
 		}

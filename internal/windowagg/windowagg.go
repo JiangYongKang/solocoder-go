@@ -416,7 +416,11 @@ func (w *SlidingWindow) evictLocked(currentTime time.Time) {
 		slideNano := slideDuration.Nanoseconds()
 		sizeNano := sizeDuration.Nanoseconds()
 
-		windowStartNano := ((currentUnixNano - 1) / slideNano) * slideNano + slideNano - sizeNano + 1
+		rightBoundary := (currentUnixNano / slideNano) * slideNano + slideNano
+		windowStartNano := rightBoundary - sizeNano
+		if windowStartNano < 0 {
+			windowStartNano = 0
+		}
 		windowStartTime := time.Unix(0, windowStartNano)
 
 		var next *list.Element
