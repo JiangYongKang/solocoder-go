@@ -261,6 +261,10 @@ func (c *Chain) calculateStrategyErrorRate(strategy *Strategy) float64 {
 	defer strategy.mu.RUnlock()
 
 	window := c.getStrategyWindow(strategy)
+	return c.calculateErrorRateLocked(strategy, window)
+}
+
+func (c *Chain) calculateErrorRateLocked(strategy *Strategy, window time.Duration) float64 {
 	if window <= 0 {
 		total := strategy.SuccessCount + strategy.FailureCount
 		if total == 0 {
@@ -270,9 +274,17 @@ func (c *Chain) calculateStrategyErrorRate(strategy *Strategy) float64 {
 	}
 
 	cutoff := time.Now().Add(-window)
-	successes := 0
-	failures := 0
+	successes, failures := c.countEventsInWindowLocked(strategy, cutoff)
 
+	total := successes + failures
+	if total == 0 {
+		return 0
+	}
+
+	return float64(failures) / float64(total)
+}
+
+func (c *Chain) countEventsInWindowLocked(strategy *Strategy, cutoff time.Time) (successes, failures int) {
 	for _, entry := range strategy.SuccessWindow {
 		if entry.Time.After(cutoff) {
 			successes++
@@ -285,12 +297,7 @@ func (c *Chain) calculateStrategyErrorRate(strategy *Strategy) float64 {
 		}
 	}
 
-	total := successes + failures
-	if total == 0 {
-		return 0
-	}
-
-	return float64(failures) / float64(total)
+	return successes, failures
 }
 
 func (c *Chain) matchTriggerCondition(err error, cond *TriggerCondition) bool {
@@ -305,8 +312,6 @@ func (c *Chain) matchTriggerCondition(err error, cond *TriggerCondition) bool {
 				return true
 			}
 		}
-	case TriggerConditionErrorRate:
-		return false
 	case TriggerConditionTimeout:
 		if errIsType(err, ErrExecutionTimeout) {
 			return true
@@ -503,7 +508,7 @@ func (c *Chain) countRecentSuccesses(strategy *Strategy) int {
 
 	window := c.recoveryCfg.PassiveSuccessWindow
 	if window <= 0 {
-		return int(strategy.SuccessCount)
+		return len(strategy.SuccessWindow)
 	}
 
 	cutoff := time.Now().Add(-window)
@@ -809,36 +814,7 @@ func (c *Chain) CalculateErrorRate(strategyID string, window time.Duration) (flo
 	strategy.mu.RLock()
 	defer strategy.mu.RUnlock()
 
-	if window <= 0 {
-		total := strategy.SuccessCount + strategy.FailureCount
-		if total == 0 {
-			return 0, nil
-		}
-		return float64(strategy.FailureCount) / float64(total), nil
-	}
-
-	cutoff := time.Now().Add(-window)
-	successes := 0
-	failures := 0
-
-	for _, entry := range strategy.SuccessWindow {
-		if entry.Time.After(cutoff) {
-			successes++
-		}
-	}
-
-	for _, entry := range strategy.ErrorWindow {
-		if entry.Time.After(cutoff) {
-			failures++
-		}
-	}
-
-	total := successes + failures
-	if total == 0 {
-		return 0, nil
-	}
-
-	return float64(failures) / float64(total), nil
+	return c.calculateErrorRateLocked(strategy, window), nil
 }
 
 var _ sync.Locker = (*sync.Mutex)(nil)

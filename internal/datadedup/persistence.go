@@ -271,20 +271,21 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 		return ErrPersistCorrupted
 	}
 
-	entryStartPos, _ := f.Seek(0, io.SeekCurrent)
-
 	checksum := sha256.New()
 	checksum.Write(headerBytes)
 
 	var csEntryOffset int64 = -1
 	var lastChecksum string
 	var fpCount uint64
+	var entryBuffer []byte
 
 	for {
 		curOffset, _ := f.Seek(0, io.SeekCurrent)
 		if curOffset >= fileInfo.Size() {
 			break
 		}
+
+		entryStart := curOffset
 
 		entryHeader := make([]byte, 5)
 		if _, err := io.ReadFull(f, entryHeader); err != nil {
@@ -319,6 +320,17 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 			fpCount++
 			checksum.Write(entryHeader)
 			checksum.Write(rest)
+
+			entryEnd, _ := f.Seek(0, io.SeekCurrent)
+			entryLen := int(entryEnd - entryStart)
+			fullEntry := make([]byte, entryLen)
+			copy(fullEntry[0:5], entryHeader)
+			copy(fullEntry[5:], rest)
+			entryBuffer = append(entryBuffer, fullEntry...)
+
+			if Fingerprint(fpBytes) == fp {
+				return nil
+			}
 		}
 	}
 
@@ -345,27 +357,9 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 	binary.BigEndian.PutUint16(newHeaderBytes[6:8], 0)
 	binary.BigEndian.PutUint64(newHeaderBytes[8:16], newCount)
 
-	entryBytesStartPos, _ := f.Seek(entryStartPos, io.SeekStart)
-
 	newChecksum := sha256.New()
 	newChecksum.Write(newHeaderBytes)
-	buf := make([]byte, 4096)
-	remaining := csEntryOffset - entryStartPos
-	for remaining > 0 {
-		toRead := int64(len(buf))
-		if remaining < toRead {
-			toRead = remaining
-		}
-		n, err := f.Read(buf[:toRead])
-		if err != nil && err != io.EOF {
-			return ErrPersistCorrupted
-		}
-		if n == 0 {
-			break
-		}
-		newChecksum.Write(buf[:n])
-		remaining -= int64(n)
-	}
+	newChecksum.Write(entryBuffer)
 	newChecksum.Write(fpEntryBytes)
 	newCS := hex.EncodeToString(newChecksum.Sum(nil))
 
@@ -376,8 +370,6 @@ func (p *persistIndex) appendLocked(fp Fingerprint, path string) error {
 	}
 
 	newCSEntryBytes := encodeEntry(newCSEntry)
-
-	_ = entryBytesStartPos
 
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err

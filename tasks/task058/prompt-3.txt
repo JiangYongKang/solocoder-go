@@ -1,0 +1,3 @@
+你实现的健康检查聚合器模块在第二轮修复后仍存在残留问题，需要继续修复：
+1. healthagg.go 的 NewHealthAggregator 函数新增了 MajorityRatio 数值范围校验，但未同步校验 AggregatorConfig 的 Strategy 字段。当调用方传入 AggregationStrategy(99) 这类无效枚举值时 aggregateResults 的 default 分支直接返回 StatusHealthy 而无任何错误反馈，调用方无法感知配置了无效策略。需要将 Strategy 枚举值也纳入配置校验范围，对未知策略值返回明确错误。
+2. 修复后运行 go test ./internal/healthagg/ -v，需要让所有测试通过。

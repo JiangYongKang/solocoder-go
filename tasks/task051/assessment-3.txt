@@ -1,0 +1,7 @@
+﻿产物不满意：
+1. getPBFieldInfo 标签解析遍历逗号分隔部分后将最后一个非 protobuf 前缀的部分作为字段名，而 JSON/MessagePack 取 parts[0] 为字段名，同套标签解析行为不一致。`serialize:"name,extra,protobuf:5"` 下 Protobuf 取 "extra" 而 JSON 取 "name"。根因是模型重写了解析策略而非最小修正，应保持 parts[0] 优先，仅 parts[0] 以 protobuf 前缀开头时退回默认字段名。
+2. getPBFieldInfo 中回退字段号从 field.Index[0]+2 恢复为 field.Index[0]+1 满足了提示词要求，但模型未检查 Marshal 和 Unmarshal 中统一对字段号执行的 +1 偏移。两者叠加后无标签字段 wire 编号为 field.Index[0]+2，版本独占编号 1，`protobuf:N` 字段 wire 编号为 N+1。模型未在注释中说明偏移关系，也未验证还原后的语义是否全局一致。
+
+过程不满意：
+1. 模型收到提示词后未做分析就直接用 todo_write 创建了 3 项子任务计划，然后才通过 view_files 阅读 protobuf.go 和测试文件。虽然任务简单且子任务粒度合理，但先计划后分析的行为违反了先分析需求文档和代码骨架再制定执行计划的正确流程，复杂任务中易导致计划与代码脱节而需反复调整架构。
+2. 模型用 search_by_regex 搜索了 fieldNum|fieldMap|field\.Index 模式，但搜索后未追踪 Marshal 中 encodeField(info.fieldNum+1) 和 Unmarshal 中 fieldMap[info.fieldNum+1] 与 getPBFieldInfo 返回值的偏移叠加关系。模型直接修改代码后运行测试通过即声称完成，缺少对 +1/+2 偏移链的架构分析，无法确认字段号规则在编解码全链路中的一致性。

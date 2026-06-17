@@ -1,0 +1,4 @@
+你实现的优雅关闭管理器模块在第二轮修复后仍存在残留问题，需要继续修复：
+1. graceful.go 中 CleanupCallback 结构体的 order 字段和 Manager 的 nextCallbackOrder 变量是无效死代码，只有赋值从不被任何方法读取，phaseExecuteCallbacks 通过 callbackOrder 切片管理顺序从未访问 order 字段。需要移除这些未使用的冗余字段和变量以保持代码整洁。
+2. graceful.go 的 BeginRequest 修复后使用 sync.RWMutex 的独占写锁保护请求计数递增，但全局写锁会阻塞所有并发的 IsAccepting 和 State 等读操作。提示词允许用 CAS 或互斥锁实现正确的请求计数递增，当前选择了粒度最粗的方案导致高并发下读写互相阻塞。需要改用 CAS 循环或独立的 sync.Mutex 仅保护请求计数，让读路径不受写锁阻塞。
+3. 修复后运行 go test ./internal/graceful/ -v，需要让所有测试通过。

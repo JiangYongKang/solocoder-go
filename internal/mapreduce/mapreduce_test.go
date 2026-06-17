@@ -1597,3 +1597,382 @@ func TestRun_AsyncShuffle_ProcessesDataIncrementally(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+func TestRun_StatusIsFailedOnError(t *testing.T) {
+	mr, _ := NewMapReduce(Config{
+		MapFunc:    alwaysFailMap,
+		ReduceFunc: wordCountReduce,
+		NumReduce:  1,
+		MaxRetries: 0,
+	})
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: "hello"},
+	})
+
+	_, runErr := mr.Run(context.Background())
+	if runErr == nil {
+		t.Fatal("expected error from run")
+	}
+
+	if mr.Status() != TaskStatusFailed {
+		t.Errorf("expected TaskStatusFailed after error, got %d", mr.Status())
+	}
+}
+
+func TestRun_StatusIsCompletedOnSuccess(t *testing.T) {
+	mr, _ := NewMapReduce(Config{
+		MapFunc:    wordCountMap,
+		ReduceFunc: wordCountReduce,
+		NumReduce:  1,
+	})
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: "hello world"},
+	})
+
+	_, runErr := mr.Run(context.Background())
+	if runErr != nil {
+		t.Fatalf("unexpected error: %v", runErr)
+	}
+
+	if mr.Status() != TaskStatusCompleted {
+		t.Errorf("expected TaskStatusCompleted on success, got %d", mr.Status())
+	}
+}
+
+func TestRun_StatusIsFailedOnReduceError(t *testing.T) {
+	mr, _ := NewMapReduce(Config{
+		MapFunc:    wordCountMap,
+		ReduceFunc: alwaysFailReduce,
+		NumReduce:  1,
+		MaxRetries: 0,
+	})
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: "hello"},
+	})
+
+	_, runErr := mr.Run(context.Background())
+	if runErr == nil {
+		t.Fatal("expected reduce error")
+	}
+
+	if mr.Status() != TaskStatusFailed {
+		t.Errorf("expected TaskStatusFailed after reduce error, got %d", mr.Status())
+	}
+}
+
+func TestRun_RepeatedRuns_NoPanic(t *testing.T) {
+	mr, _ := NewMapReduce(Config{
+		MapFunc:    wordCountMap,
+		ReduceFunc: wordCountReduce,
+		NumReduce:  2,
+	})
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: "hello world"},
+	})
+
+	result1, err := mr.Run(context.Background())
+	if err != nil {
+		t.Fatalf("first run failed: %v", err)
+	}
+	wc1 := collectWordCounts(result1)
+	if wc1["hello"] != 1 || wc1["world"] != 1 {
+		t.Errorf("first run wrong counts: %v", wc1)
+	}
+
+	<-mr.Done()
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: "foo bar foo"},
+		{Key: "doc2", Value: "bar baz"},
+	})
+
+	result2, err := mr.Run(context.Background())
+	if err != nil {
+		t.Fatalf("second run failed: %v", err)
+	}
+	wc2 := collectWordCounts(result2)
+	if wc2["foo"] != 2 || wc2["bar"] != 2 || wc2["baz"] != 1 {
+		t.Errorf("second run wrong counts: %v", wc2)
+	}
+
+	<-mr.Done()
+}
+
+func TestRun_RepeatedRuns_WithErrorInBetween(t *testing.T) {
+	mr, _ := NewMapReduce(Config{
+		MapFunc:    wordCountMap,
+		ReduceFunc: wordCountReduce,
+		NumReduce:  1,
+		MaxRetries: 0,
+	})
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: "hello"},
+	})
+	_, err := mr.Run(context.Background())
+	if err != nil {
+		t.Fatalf("first run failed: %v", err)
+	}
+	if mr.Status() != TaskStatusCompleted {
+		t.Errorf("first run: expected Completed, got %d", mr.Status())
+	}
+
+	mr.cfg.MaxRetries = 0
+	mr2, _ := NewMapReduce(Config{
+		MapFunc:    alwaysFailMap,
+		ReduceFunc: wordCountReduce,
+		NumReduce:  1,
+		MaxRetries: 0,
+	})
+	mr2.SetInput([]KeyValue{
+		{Key: "doc1", Value: "test"},
+	})
+	_, err = mr2.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error on second instance run")
+	}
+	if mr2.Status() != TaskStatusFailed {
+		t.Errorf("second instance: expected Failed, got %d", mr2.Status())
+	}
+
+	mr.SetInput([]KeyValue{
+		{Key: "doc1", Value: "world"},
+	})
+	result, err := mr.Run(context.Background())
+	if err != nil {
+		t.Fatalf("third run (first instance) failed: %v", err)
+	}
+	if mr.Status() != TaskStatusCompleted {
+		t.Errorf("third run: expected Completed, got %d", mr.Status())
+	}
+	wc := collectWordCounts(result)
+	if wc["world"] != 1 {
+		t.Errorf("third run wrong counts: %v", wc)
+	}
+}
+
+func TestRun_AsyncShuffle_ReduceStartsBeforeAllMapsComplete(t *testing.T) {
+	var reduceStartedMu sync.Mutex
+	var firstReduceStart time.Time
+	firstReduceStartSet := false
+
+	var mapReportTimes [4]time.Time
+	var mapReportMu sync.Mutex
+
+	p0Key := ""
+	p1Key := ""
+	for i := 0; i < 1000; i++ {
+		k := fmt.Sprintf("fastkey_p0_%d", i)
+		if HashPartition(k, 2) == 0 && p0Key == "" {
+			p0Key = k
+		}
+		k2 := fmt.Sprintf("slowkey_p1_%d", i)
+		if HashPartition(k2, 2) == 1 && p1Key == "" {
+			p1Key = k2
+		}
+		if p0Key != "" && p1Key != "" {
+			break
+		}
+	}
+
+	if p0Key == "" || p1Key == "" {
+		t.Skip("could not find suitable keys for partition test")
+		return
+	}
+
+	mapFunc := func(_ context.Context, key string, value interface{}) ([]KeyValue, error) {
+		docIdx := value.(int)
+
+		var result []KeyValue
+		if docIdx == 3 {
+			time.Sleep(250 * time.Millisecond)
+			result = []KeyValue{
+				{Key: p1Key, Value: 1},
+			}
+		} else {
+			time.Sleep(30 * time.Millisecond)
+			result = []KeyValue{
+				{Key: p0Key, Value: 1},
+			}
+		}
+
+		mapReportMu.Lock()
+		mapReportTimes[docIdx] = time.Now()
+		mapReportMu.Unlock()
+		return result, nil
+	}
+
+	reduceStartRecorded := int32(0)
+	reduceFunc := func(_ context.Context, key string, values []interface{}) (interface{}, error) {
+		if HashPartition(key, 2) == 0 && atomic.CompareAndSwapInt32(&reduceStartRecorded, 0, 1) {
+			reduceStartedMu.Lock()
+			firstReduceStart = time.Now()
+			firstReduceStartSet = true
+			reduceStartedMu.Unlock()
+		}
+		return wordCountReduce(context.Background(), key, values)
+	}
+
+	mr, _ := NewMapReduce(Config{
+		MapFunc:     mapFunc,
+		ReduceFunc:  reduceFunc,
+		NumReduce:   2,
+		ShuffleMode: ShuffleAsync,
+		MaxRetries:  0,
+	})
+
+	input := []KeyValue{
+		{Key: "doc0", Value: 0},
+		{Key: "doc1", Value: 1},
+		{Key: "doc2", Value: 2},
+		{Key: "doc3", Value: 3},
+	}
+	mr.SetInput(input)
+
+	start := time.Now()
+	_, err := mr.Run(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	reduceStartedMu.Lock()
+	startSet := firstReduceStartSet
+	reduceStart := firstReduceStart
+	reduceStartedMu.Unlock()
+
+	if !startSet {
+		t.Fatal("Partition 0 Reduce start time was never recorded")
+	}
+
+	reduceStartOffset := reduceStart.Sub(start)
+
+	mapReportMu.Lock()
+	lastReportTime := mapReportTimes[0]
+	for i := 1; i < 4; i++ {
+		if mapReportTimes[i].After(lastReportTime) {
+			lastReportTime = mapReportTimes[i]
+		}
+	}
+	mapReportMu.Unlock()
+	lastReportOffset := lastReportTime.Sub(start)
+
+	reduceAfterReport := reduceStart.Sub(lastReportTime)
+
+	t.Logf("Last map reported at: %v", lastReportOffset)
+	t.Logf("Partition 0 reduce started at: %v", reduceStartOffset)
+	t.Logf("Reduce started %v after last map report", reduceAfterReport)
+
+	if reduceAfterReport > 50*time.Millisecond {
+		t.Errorf("Reduce started %v after last map report, should start immediately (< 50ms)", reduceAfterReport)
+	}
+}
+
+func TestRun_AsyncShuffle_ReduceStartsImmediatelyAfterLastMapReport(t *testing.T) {
+	var reduceStartedMu sync.Mutex
+	reduceStartTimesByPartition := make(map[int]time.Time)
+
+	p0Key := ""
+	p1Key := ""
+	for i := 0; i < 1000; i++ {
+		k := fmt.Sprintf("findkey_p0_%d", i)
+		if HashPartition(k, 2) == 0 && p0Key == "" {
+			p0Key = k
+		}
+		k2 := fmt.Sprintf("findkey_p1_%d", i)
+		if HashPartition(k2, 2) == 1 && p1Key == "" {
+			p1Key = k2
+		}
+		if p0Key != "" && p1Key != "" {
+			break
+		}
+	}
+	if p0Key == "" || p1Key == "" {
+		t.Skip("could not find keys for both partitions")
+		return
+	}
+
+	var mapReportMu sync.Mutex
+	mapReportTimes := make([]time.Time, 4)
+
+	mapFunc := func(_ context.Context, key string, value interface{}) ([]KeyValue, error) {
+		docIdx := value.(int)
+		var result []KeyValue
+		if docIdx < 3 {
+			time.Sleep(30 * time.Millisecond)
+			result = []KeyValue{{Key: p0Key, Value: docIdx}}
+		} else {
+			time.Sleep(150 * time.Millisecond)
+			result = []KeyValue{{Key: p1Key, Value: docIdx}}
+		}
+		mapReportMu.Lock()
+		mapReportTimes[docIdx] = time.Now()
+		mapReportMu.Unlock()
+		return result, nil
+	}
+
+	reduceFunc := func(_ context.Context, key string, values []interface{}) (interface{}, error) {
+		partition := HashPartition(key, 2)
+		reduceStartedMu.Lock()
+		if _, ok := reduceStartTimesByPartition[partition]; !ok {
+			reduceStartTimesByPartition[partition] = time.Now()
+		}
+		reduceStartedMu.Unlock()
+		return wordCountReduce(context.Background(), key, values)
+	}
+
+	mr, _ := NewMapReduce(Config{
+		MapFunc:     mapFunc,
+		ReduceFunc:  reduceFunc,
+		NumReduce:   2,
+		ShuffleMode: ShuffleAsync,
+		MaxRetries:  0,
+	})
+
+	input := []KeyValue{
+		{Key: "doc0", Value: 0},
+		{Key: "doc1", Value: 1},
+		{Key: "doc2", Value: 2},
+		{Key: "doc3", Value: 3},
+	}
+	mr.SetInput(input)
+
+	start := time.Now()
+	result, err := mr.Run(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	_ = result
+
+	reduceStartedMu.Lock()
+	p0Start, p0ok := reduceStartTimesByPartition[0]
+	p1Start, p1ok := reduceStartTimesByPartition[1]
+	reduceStartedMu.Unlock()
+
+	if !p0ok {
+		t.Fatal("partition 0 reduce start not recorded")
+	}
+	if !p1ok {
+		t.Fatal("partition 1 reduce start not recorded")
+	}
+
+	mapReportMu.Lock()
+	doc3ReportTime := mapReportTimes[3].Sub(start)
+	mapReportMu.Unlock()
+
+	p0Offset := p0Start.Sub(start)
+	p1Offset := p1Start.Sub(start)
+
+	t.Logf("doc3 map reported at: %v", doc3ReportTime)
+	t.Logf("Partition 0 reduce start: %v (after doc3 by %v)", p0Offset, p0Start.Sub(mapReportTimes[3]))
+	t.Logf("Partition 1 reduce start: %v (after doc3 by %v)", p1Offset, p1Start.Sub(mapReportTimes[3]))
+
+	p0AfterDoc3 := p0Start.Sub(mapReportTimes[3])
+	if p0AfterDoc3 > 50*time.Millisecond {
+		t.Errorf("Partition 0 reduce started %v after doc3 reported, should start immediately (< 50ms)", p0AfterDoc3)
+	}
+}

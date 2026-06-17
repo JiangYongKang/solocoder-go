@@ -176,16 +176,28 @@ func (mr *MapReduce) Run(ctx context.Context) (interface{}, error) {
 		mr.statusMu.Unlock()
 		return nil, ErrNoInputData
 	}
+	if mr.status == TaskStatusCompleted || mr.status == TaskStatusFailed {
+		mr.resetState()
+	}
 	mr.status = TaskStatusRunning
 	mr.statusMu.Unlock()
 
 	mr.ctx, mr.cancel = context.WithCancel(ctx)
 	defer mr.cancel()
 
+	var (
+		result interface{}
+		runErr error
+	)
+
 	defer func() {
 		mr.statusMu.Lock()
 		if mr.status == TaskStatusRunning {
-			mr.status = TaskStatusCompleted
+			if runErr != nil {
+				mr.status = TaskStatusFailed
+			} else {
+				mr.status = TaskStatusCompleted
+			}
 		}
 		mr.statusMu.Unlock()
 		close(mr.onComplete)
@@ -193,24 +205,45 @@ func (mr *MapReduce) Run(ctx context.Context) (interface{}, error) {
 
 	mapResultsCh := make(chan mapTaskResult, len(mr.input))
 	if err := mr.runMapTasks(mapResultsCh); err != nil {
+		runErr = err
 		return nil, err
 	}
 
 	switch mr.cfg.ShuffleMode {
 	case ShuffleSync:
 		if err := mr.shuffleSync(mapResultsCh); err != nil {
+			runErr = err
 			return nil, err
 		}
 		if err := mr.runReduceTasks(); err != nil {
+			runErr = err
 			return nil, err
 		}
 	case ShuffleAsync:
 		if err := mr.shuffleAsync(mapResultsCh); err != nil {
+			runErr = err
 			return nil, err
 		}
 	}
 
-	return mr.mergeResults()
+	result, runErr = mr.mergeResults()
+	return result, runErr
+}
+
+func (mr *MapReduce) resetState() {
+	mr.mapResults = make([]map[int][]KeyValue, mr.cfg.NumReduce)
+	for i := 0; i < mr.cfg.NumReduce; i++ {
+		mr.mapResults[i] = make(map[int][]KeyValue)
+	}
+	mr.reduceResults = make([]interface{}, mr.cfg.NumReduce)
+	mr.reduceErrs = make([]error, mr.cfg.NumReduce)
+	atomic.StoreInt64(&mr.completedMapCount, 0)
+	atomic.StoreInt64(&mr.completedReduceCount, 0)
+	mr.result = nil
+	mr.resultErr = nil
+	mr.resultOnce = sync.Once{}
+	mr.onComplete = make(chan struct{})
+	mr.errCh = make(chan *TaskError, mr.cfg.NumReduce+mr.cfg.NumReduce)
 }
 
 func (mr *MapReduce) runMapTasks(resultsCh chan<- mapTaskResult) error {
@@ -312,12 +345,11 @@ func (mr *MapReduce) shuffleAsync(mapResultsCh <-chan mapTaskResult) error {
 	var received int64
 	var mapFailed int64
 
-	reduceReadyChs := make([]chan struct{}, mr.cfg.NumReduce)
+	mapReportedChs := make([]chan mapReport, mr.cfg.NumReduce)
 	for i := 0; i < mr.cfg.NumReduce; i++ {
-		reduceReadyChs[i] = make(chan struct{}, mr.cfg.NumReduce)
+		mapReportedChs[i] = make(chan mapReport, totalMapTasks)
 	}
 
-	allMapDone := make(chan struct{})
 	reduceErrCh := make(chan error, mr.cfg.NumReduce)
 
 	var reduceWg sync.WaitGroup
@@ -329,66 +361,61 @@ func (mr *MapReduce) shuffleAsync(mapResultsCh <-chan mapTaskResult) error {
 			defer reduceWg.Done()
 			defer mr.wg.Done()
 
-			processedMapTasks := make(map[int]bool)
+			reportedCount := 0
 			localGrouped := make(map[string][]interface{})
 
-			for {
+			for reportedCount < totalMapTasks {
 				select {
 				case <-mr.ctx.Done():
 					reduceErrCh <- mr.ctx.Err()
 					return
 
-				case <-reduceReadyChs[reduceID]:
-					mr.mapResultsMu[reduceID].Lock()
-					for mapID, kvs := range mr.mapResults[reduceID] {
-						if processedMapTasks[mapID] {
-							continue
+				case report := <-mapReportedChs[reduceID]:
+					reportedCount++
+					if report.err == nil {
+						mr.mapResultsMu[reduceID].Lock()
+						if kvs, ok := mr.mapResults[reduceID][report.mapID]; ok {
+							for _, kv := range kvs {
+								localGrouped[kv.Key] = append(localGrouped[kv.Key], kv.Value)
+							}
 						}
-						processedMapTasks[mapID] = true
-						for _, kv := range kvs {
-							localGrouped[kv.Key] = append(localGrouped[kv.Key], kv.Value)
-						}
+						mr.mapResultsMu[reduceID].Unlock()
 					}
-					mr.mapResultsMu[reduceID].Unlock()
-
-					select {
-					case <-allMapDone:
-						mr.finalizeAndRunReduce(reduceID, localGrouped, processedMapTasks, reduceErrCh)
-						return
-					default:
-					}
-
-				case <-allMapDone:
-					mr.mapResultsMu[reduceID].Lock()
-					for mapID, kvs := range mr.mapResults[reduceID] {
-						if processedMapTasks[mapID] {
-							continue
-						}
-						processedMapTasks[mapID] = true
-						for _, kv := range kvs {
-							localGrouped[kv.Key] = append(localGrouped[kv.Key], kv.Value)
-						}
-					}
-					mr.mapResultsMu[reduceID].Unlock()
-
-					mr.finalizeAndRunReduce(reduceID, localGrouped, processedMapTasks, reduceErrCh)
-					return
 				}
 			}
+
+			if atomic.LoadInt64(&mapFailed) > 0 {
+				return
+			}
+
+			mr.finalizeAndRunReduce(reduceID, localGrouped, nil, reduceErrCh)
 		}()
 	}
 
+	var consumerErr error
+	consumerDone := make(chan struct{})
+
 	go func() {
+		defer close(consumerDone)
 		for atomic.LoadInt64(&received) < int64(totalMapTasks) {
 			select {
 			case <-mr.ctx.Done():
+				consumerErr = mr.ctx.Err()
 				return
 			case result := <-mapResultsCh:
 				atomic.AddInt64(&received, 1)
 				if result.err != nil {
 					atomic.AddInt64(&mapFailed, 1)
+					for r := 0; r < mr.cfg.NumReduce; r++ {
+						select {
+						case mapReportedChs[r] <- mapReport{mapID: result.taskID, err: result.err}:
+						case <-mr.ctx.Done():
+							return
+						}
+					}
 					continue
 				}
+
 				mr.partitionIntermediate(result.kvs, result.taskID)
 				atomic.AddInt64(&mr.completedMapCount, 1)
 
@@ -403,22 +430,33 @@ func (mr *MapReduce) shuffleAsync(mapResultsCh <-chan mapTaskResult) error {
 					}
 					affectedPartitions[p] = true
 				}
-				for p := range affectedPartitions {
+
+				for r := 0; r < mr.cfg.NumReduce; r++ {
+					report := mapReport{mapID: result.taskID}
+					if affectedPartitions[r] {
+						report.hasData = true
+					}
 					select {
-					case reduceReadyChs[p] <- struct{}{}:
-					default:
+					case mapReportedChs[r] <- report:
+					case <-mr.ctx.Done():
+						return
 					}
 				}
 			}
 		}
-		close(allMapDone)
 	}()
+
+	<-consumerDone
 
 	reduceWg.Wait()
 	for r := 0; r < mr.cfg.NumReduce; r++ {
-		close(reduceReadyChs[r])
+		close(mapReportedChs[r])
 	}
 	close(reduceErrCh)
+
+	if consumerErr != nil {
+		return consumerErr
+	}
 
 	if atomic.LoadInt64(&mapFailed) > 0 {
 		return fmt.Errorf("mapreduce: %d map task(s) failed", atomic.LoadInt64(&mapFailed))
@@ -435,6 +473,12 @@ func (mr *MapReduce) shuffleAsync(mapResultsCh <-chan mapTaskResult) error {
 	}
 
 	return nil
+}
+
+type mapReport struct {
+	mapID   int
+	hasData bool
+	err     error
 }
 
 func (mr *MapReduce) finalizeAndRunReduce(

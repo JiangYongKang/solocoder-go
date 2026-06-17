@@ -1,0 +1,4 @@
+你实现的舱壁隔离模块在第二轮修复后仍存在残留问题，需要继续修复：
+1. bulkhead.go 的 Acquire 方法在超时后返回 FullError 错误，错误信息中包含了 QueueLength 和 MaxQueueSize 等与并发槽位耗尽无关的队列字段。当信号量槽位全部被占满时，Acquire 超时返回的错误信息会打印 `queue=0/5` 将并发上限问题误报为队列容量问题。需要让 Acquire 超时时返回不含队列字段的错误类型，或者增设字段明确区分槽位耗尽与队列耗尽两种场景。
+2. bulkhead.go 的 worker 循环将信号量持有者计入 active 计数器，当外部调用方通过 Acquire 占满所有并发槽位后，已通过 Submit 提交到队列的任务无法被空闲 worker 取出执行，worker 池处于名义上有空闲协程但无法工作的冻结状态。需要将 worker 执行和信号量使用做资源隔离，设置独立计数或分离并发上限以保障队列任务的执行公平性。
+3. 修复后运行 go test ./internal/bulkhead/ -v，需要让所有测试通过。

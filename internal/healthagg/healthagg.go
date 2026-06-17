@@ -108,6 +108,12 @@ func DefaultAggregatorConfig() AggregatorConfig {
 }
 
 func NewHealthAggregator(cfg AggregatorConfig) (*HealthAggregator, error) {
+	switch cfg.Strategy {
+	case StrategyAllHealthy, StrategyWeightedMajority:
+	default:
+		return nil, ErrInvalidConfig
+	}
+
 	if cfg.MajorityRatio < 0 || cfg.MajorityRatio > 1 {
 		return nil, ErrInvalidConfig
 	}

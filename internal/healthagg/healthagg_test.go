@@ -67,6 +67,60 @@ func TestNewHealthAggregatorWithInvalidRatio(t *testing.T) {
 	}
 }
 
+func TestNewHealthAggregatorWithInvalidStrategy(t *testing.T) {
+	tests := []struct {
+		name     string
+		strategy AggregationStrategy
+	}{
+		{"small_garbage", AggregationStrategy(-1)},
+		{"large_garbage", AggregationStrategy(99)},
+		{"zero_outside_const", AggregationStrategy(10)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := AggregatorConfig{
+				Strategy:      tt.strategy,
+				MajorityRatio: 0.5,
+			}
+			ha, err := NewHealthAggregator(cfg)
+			if err != ErrInvalidConfig {
+				t.Errorf("expected ErrInvalidConfig for strategy %d, got %v", tt.strategy, err)
+			}
+			if ha != nil {
+				t.Errorf("expected nil aggregator for invalid strategy %d", tt.strategy)
+			}
+		})
+	}
+}
+
+func TestNewHealthAggregatorValidStrategies(t *testing.T) {
+	tests := []struct {
+		name     string
+		strategy AggregationStrategy
+	}{
+		{"all_healthy", StrategyAllHealthy},
+		{"weighted_majority", StrategyWeightedMajority},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := AggregatorConfig{Strategy: tt.strategy, MajorityRatio: 0.5}
+			ha, err := NewHealthAggregator(cfg)
+			if err != nil {
+				t.Fatalf("unexpected error for strategy %d: %v", tt.strategy, err)
+			}
+			if ha == nil {
+				t.Fatal("expected non-nil aggregator for valid strategy")
+			}
+			if ha.strategy != tt.strategy {
+				t.Errorf("expected strategy %d, got %d", tt.strategy, ha.strategy)
+			}
+			ha.Stop()
+		})
+	}
+}
+
 func TestRegisterProbe(t *testing.T) {
 	ha, _ := NewHealthAggregator(DefaultAggregatorConfig())
 	defer ha.Stop()

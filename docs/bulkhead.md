@@ -13,7 +13,7 @@
 | F1 | 独立协程池分配 | 为不同服务或资源组分配独立的协程池，每个池有独立的并发上限和队列容量，舱室之间互不影响 |
 | F2 | 信号量限流 | 通过信号量机制控制每个隔离舱的并发执行数量，达到上限后新任务可排队等待或被拒绝 |
 | F3 | 信号量接口 | 提供独立的 `Acquire(timeout)` 和 `Release()` 方法，调用方可在自己的 goroutine 中获取/释放并发槽位 |
-| F4 | 共享并发配额 | worker 池模式和信号量模式共享同一个并发上限，总并发数不超过 `maxConcurrency` |
+| F4 | 资源隔离 | worker 执行和信号量使用资源隔离，worker 不受信号量占用影响，保障队列任务执行公平性 |
 | F5 | 等待超时机制 | 支持配置任务等待超时时间，超时后返回资源耗尽错误，避免无限阻塞 |
 | F6 | 快速失败 | 当协程池和等待队列均满且不等待时，新任务立即返回携带诊断信息的 FullError |
 | F7 | 动态扩缩容 | 运行时动态调整并发数和队列容量，扩容立即可用，缩容不影响已提交任务执行 |
@@ -51,7 +51,8 @@ type Bulkhead struct {
     mu             sync.Mutex    // 互斥锁，保护内部状态
     cond           *sync.Cond    // 条件变量，用于任务提交与 worker 的同步
     taskQueue      []Task        // 任务队列（切片实现，支持动态调整容量）
-    active         int           // 当前正在执行的任务数
+    workerActive   int           // 当前 worker 正在执行的任务数
+    semHolders     int           // 当前信号量持有者数
     idleWorkers    int           // 当前空闲的 worker 数
     closed         bool          // 是否已关闭
     workerCnt      int           // 当前 worker 总数
@@ -63,16 +64,16 @@ type Bulkhead struct {
 **主要职责：**
 - 管理 worker 协程池的生命周期
 - 维护任务队列，协调任务提交与执行
-- 实现并发控制与限流逻辑
+- 实现并发控制与限流逻辑（worker 和信号量资源隔离）
 - 支持动态调整资源配额
 - 提供状态查询与优雅关闭能力
 
-### 3.3 FullError - 资源耗尽错误
+### 3.3 FullError - 队列资源耗尽错误
 
 ```go
 type FullError struct {
     Name           string // 隔离舱名称
-    ActiveCount    int    // 当前并发数
+    ActiveCount    int    // 当前并发数（workerActive + semHolders）
     MaxConcurrency int    // 最大并发数
     QueueLength    int    // 当前队列长度
     MaxQueueSize   int    // 最大队列容量
@@ -80,8 +81,24 @@ type FullError struct {
 ```
 
 **主要职责：**
-- 携带丰富的诊断信息，便于问题排查
+- Submit/TrySubmit 队列满时返回，携带队列相关的诊断信息
 - 实现 `error` 接口，格式化输出当前资源使用状态
+
+### 3.3.1 SemaphoreFullError - 信号量槽位耗尽错误
+
+```go
+type SemaphoreFullError struct {
+    Name           string // 隔离舱名称
+    ActiveCount    int    // 当前并发数（workerActive + semHolders）
+    MaxConcurrency int    // 最大并发数
+    SemHolders     int    // 当前信号量持有者数
+}
+```
+
+**主要职责：**
+- Acquire 槽位耗尽或超时时返回，仅包含信号量相关字段，不包含队列信息
+- 明确区分"信号量槽位耗尽"与"队列容量耗尽"两种场景
+- 实现 `error` 接口，格式化输出 `semaphore full: active=X/Y, semaphoreHolders=Z`
 
 ### 3.4 Task - 任务类型
 
@@ -109,12 +126,13 @@ type Registry struct {
 
 | 错误变量 | 含义 | 触发场景 |
 |----------|------|----------|
-| `ErrBulkheadClosed` | 隔离舱已关闭 | 已关闭的隔离舱上调用 Submit/TrySubmit/Resize |
+| `ErrBulkheadClosed` | 隔离舱已关闭 | 已关闭的隔离舱上调用 Submit/TrySubmit/Acquire/Resize |
 | `ErrBulkheadFull` | 隔离舱已满 | 资源耗尽且不等待时返回（实际返回 `*FullError`） |
 | `ErrBulkheadTimeout` | 等待超时 | 任务等待超时时返回（实际返回 `*FullError`） |
 | `ErrInvalidConcurrency` | 并发数无效 | MaxConcurrency <= 0 |
 | `ErrInvalidQueueSize` | 队列大小无效 | MaxQueueSize < 0 |
 | `ErrInvalidName` | 名称无效 | 名称为空字符串 |
+| `ErrNotAcquired` | 未持有信号量槽位 | 未通过 Acquire 持有槽位时调用 Release |
 
 ## 4. 舱壁隔离与信号量限流的协作方式
 
@@ -151,11 +169,16 @@ type Registry struct {
 
 1. **舱壁隔离（空间维度）**：通过 Registry 将系统划分为多个独立的 Bulkhead，每个 Bulkhead 拥有独立的资源配额（协程池 + 队列）。一个 Bulkhead 的任务积压或故障不会影响其他 Bulkhead 的正常运行。
 
-2. **信号量限流（时间维度）**：在单个 Bulkhead 内部，通过固定数量的 worker 协程实现并发控制（信号量模式）。同时执行的任务数不超过 `MaxConcurrency`，超出的任务进入队列等待。
+2. **信号量限流（时间维度）**：在单个 Bulkhead 内部，通过信号量机制控制并发执行数量。信号量是底层的并发控制原语，支持两种使用模式：
+   - **Worker 池模式**：通过 `Submit()` 提交任务，由内部 worker 协程执行
+   - **直接调用模式**：通过 `Acquire()` / `Release()` 在调用方自己的 goroutine 中执行受保护代码
+   
+   两种模式的并发受 `maxConcurrency` 限制，但 worker 执行和信号量使用是资源隔离的：worker 只受 `workerActive < workerCnt` 约束，信号量受 `workerActive + semHolders < maxConcurrency` 约束。信号量占满所有槽位不会阻塞 worker 执行队列任务。
 
 两者的协作关系：
 - **舱壁隔离**是"粗粒度"的资源划分，解决"故障蔓延"问题
 - **信号量限流**是"细粒度"的并发控制，解决"单个舱室内过载"问题
+- 信号量是核心控制机制，worker 池模式是其上层封装
 - 两者结合形成纵深防御体系，既防止故障跨舱扩散，又防止单个舱室自身过载
 
 ### 4.3 任务提交流程
@@ -170,8 +193,10 @@ Submit(task)
     ├─ 检查 closed → 返回 ErrBulkheadClosed
     │
     ├─ 检查是否可提交（canSubmit）
-    │     ├─ 队列未满（len(queue) < maxQueueSize）→ 可以
-    │     └─ 有空闲 worker（idleWorkers > 0）→ 可以
+    │     ├─ maxQueueSize == 0 ?
+    │     │   ├─ 是：idleWorkers > 0 && workerActive < workerCnt → 可以
+    │     │   └─ 否：len(taskQueue) < maxQueueSize → 可以
+    │     └─ 否则：不可以（队列满时一律拒绝，即使有空闲 worker）
     │
     ├─ 可提交：
     │     ├─ task 追加到队列尾部
@@ -207,26 +232,26 @@ worker()
     │
     ├─ [外层循环]
     │     │
-    │     ├─ [内层循环：队列为空 && 未关闭 && 不需要缩容]
+    │     ├─ [内层循环：队列为空 || workerActive >= workerCnt，且未关闭且不需要缩容]
     │     │     ├─ idleWorkers++
-    │     │     ├─ cond.Broadcast() （通知等待中的 Submit）
+    │     │     ├─ cond.Broadcast() （通知等待中的 Submit/Acquire）
     │     │     └─ cond.Wait() 等待任务
     │     │     └─ idleWorkers--
     │     │
-    │     ├─ 队列为空？
+    │     ├─ 队列为空 或 workerActive >= workerCnt？
     │     │     ├─ closed == true → workerCnt--，return
     │     │     └─ shrinkCnt > 0 → shrinkCnt--，workerCnt--，return
     │     │
     │     ├─ 从队列头部取出任务
-    │     ├─ active++
+    │     ├─ workerActive++
     │     ├─ cond.Broadcast() （通知等待队列空间的 Submit）
     │     ├─ mu.Unlock()
     │     │
     │     ├─ 执行任务函数
     │     │
     │     └─ mu.Lock()
-    │           ├─ active--
-    │           └─ cond.Broadcast() （通知等待空闲 worker 的 Submit）
+    │           ├─ workerActive--
+    │           └─ cond.Broadcast() （通知等待空闲 worker 的 Submit/Acquire）
     │
     └─ 回到外层循环
 ```
@@ -438,9 +463,9 @@ defer b.Close()
 // 获取信号量槽位，最多等待 3 秒
 err = b.Acquire(3 * time.Second)
 if err != nil {
-    if fe, ok := err.(*bulkhead.FullError); ok {
-        fmt.Printf("Database bulkhead full: active=%d/%d\n",
-            fe.ActiveCount, fe.MaxConcurrency)
+    if se, ok := err.(*bulkhead.SemaphoreFullError); ok {
+        fmt.Printf("Database semaphore full: active=%d/%d, holders=%d\n",
+            se.ActiveCount, se.MaxConcurrency, se.SemHolders)
     }
     return
 }
@@ -466,8 +491,8 @@ defer rows.Close()
 // timeout=0 表示不等待，立即返回
 err = b.Acquire(0)
 if err != nil {
-    if fe, ok := err.(*bulkhead.FullError); ok {
-        // 资源不足，执行降级逻辑
+    if se, ok := err.(*bulkhead.SemaphoreFullError); ok {
+        // 信号量槽位耗尽，执行降级逻辑
         fmt.Println("Database is busy, using cache instead")
         return cachedResult
     }
@@ -550,7 +575,7 @@ http.HandleFunc("/api/orders", func(w http.ResponseWriter, r *http.Request) {
 
 **返回值：**
 - `nil`：成功获取槽位
-- `*FullError`：资源耗尽或等待超时，携带诊断信息
+- `*SemaphoreFullError`：信号量槽位耗尽或等待超时，仅包含信号量相关字段（不包含队列信息）
 - `ErrBulkheadClosed`：隔离舱已关闭
 
 ### 8.2 Release() error
@@ -566,6 +591,12 @@ http.HandleFunc("/api/orders", func(w http.ResponseWriter, r *http.Request) {
 查询当前通过 `Acquire()` 持有的信号量槽位数。
 
 **返回值：** 当前持有的信号量槽位数
+
+### 8.4 WorkerActiveCount() int
+
+查询当前 worker 正在执行的任务数。
+
+**返回值：** 当前 worker 活跃数（不受信号量占用影响）
 
 ## 9. 线程安全与设计要点
 
@@ -587,7 +618,9 @@ http.HandleFunc("/api/orders", func(w http.ResponseWriter, r *http.Request) {
 
 5. **优雅关闭**：Close() 设置 `closed=true` 并唤醒所有等待者，worker 处理完队列中所有任务后才退出，保证已提交任务不丢失。
 
-6. **信号量与 Worker 池共享配额**：`active` 计数器统一管理 worker 执行的任务和外部调用方持有的信号量，两种模式共享同一个并发上限。
+6. **Worker 与信号量资源隔离**：`workerActive` 和 `semHolders` 是独立的计数器。worker 取任务只受 `workerActive < workerCnt` 约束，不受信号量占用影响。`Acquire` 受 `workerActive + semHolders < maxConcurrency` 约束。这确保了即使信号量占满所有槽位，worker 仍可执行队列任务，保障公平性。
+
+7. **错误类型区分**：`FullError`（队列满）包含 `QueueLength` 和 `MaxQueueSize` 字段，`SemaphoreFullError`（信号量槽位耗尽）只包含 `SemHolders` 字段，明确区分两种耗尽场景，避免误报。
 
 ## 10. 文件结构
 

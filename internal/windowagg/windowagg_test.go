@@ -483,7 +483,7 @@ func TestTimeWindow(t *testing.T) {
 		t.Fatalf("NewSlidingWindow failed: %v", err)
 	}
 
-	baseTime := time.Unix(1700000000, 0)
+	baseTime := time.Now()
 
 	w.AddValue(1.0, baseTime)
 	w.AddValue(2.0, baseTime.Add(30*time.Millisecond))
@@ -516,7 +516,7 @@ func TestTimeWindowAllItemsEvicted(t *testing.T) {
 		t.Fatalf("NewSlidingWindow failed: %v", err)
 	}
 
-	baseTime := time.Unix(1700000000, 0)
+	baseTime := time.Now()
 
 	w.AddValue(1.0, baseTime)
 	w.AddValue(2.0, baseTime.Add(10*time.Millisecond))
@@ -531,6 +531,46 @@ func TestTimeWindowAllItemsEvicted(t *testing.T) {
 	}
 	if w.Count() != 1 {
 		t.Errorf("expected count 1, got %d", w.Count())
+	}
+}
+
+func TestTimeWindowResultEvictsExpiredData(t *testing.T) {
+	w, err := NewSlidingWindow("test", WindowConfig{
+		WindowType:     WindowTypeTime,
+		AggregatorType: AggregatorSum,
+		Size:           50,
+		Slide:          50,
+	})
+	if err != nil {
+		t.Fatalf("NewSlidingWindow failed: %v", err)
+	}
+
+	now := time.Now()
+	w.AddValue(10.0, now)
+	w.AddValue(20.0, now)
+
+	result, err := w.Result()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != 30.0 {
+		t.Errorf("expected sum 30.0 before expiry, got %f", result)
+	}
+	if w.Count() != 2 {
+		t.Errorf("expected count 2 before expiry, got %d", w.Count())
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	result, err = w.Result()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != 0.0 {
+		t.Errorf("expected sum 0.0 after expiry, got %f", result)
+	}
+	if w.Count() != 0 {
+		t.Errorf("expected count 0 after expiry, got %d", w.Count())
 	}
 }
 

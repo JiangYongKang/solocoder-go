@@ -1,0 +1,6 @@
+你实现的压缩编解码器模块在第二轮修复后仍存在残留问题，需要继续修复：
+1. compressor.go 的 adaptiveStreamWriter.Write 方法中无论底层 actual.Write 实际写入多少字节，函数末尾始终返回 len(p)，这违反了 io.Writer 接口约定。当底层压缩 writer 部分写入时调用方会误认为全部数据写入完成，需要让 Write 返回底层 actual.Write 的真实写入字节数。
+2. compressor.go 的 adaptiveStreamReader.Read 方法在自动检测压缩算法失败后直接将错误吞没，后续 Read 调用返回空读结果等价于 EOF。需要让解压失败的错误持久化并在后续 Read 调用中持续返回，而非转换为正常的文件结束信号。
+3. compressor.go 的 analyzePatterns 函数内模式扫描使用非重叠窗口遍历，导致跨窗口边界的重复子串无法被检测。需要用滑动窗口逐字节推进而非跳过整个模式长度，确保不严格对齐的重复模式也能被正确识别。
+4. 新增的 adaptiveStreamWriter 和 adaptiveStreamReader 代码路径在测试文件中没有任何覆盖，需要为自动模式下的流式压缩和解压路径补充单元测试。
+5. 修复后运行 go test ./internal/compressor/ -v，需要让所有测试通过。

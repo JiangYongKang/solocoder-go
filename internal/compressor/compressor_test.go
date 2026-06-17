@@ -849,4 +849,456 @@ func TestAllCompressionLevels(t *testing.T) {
 	}
 }
 
+func TestAutoModeStreamCompression(t *testing.T) {
+	testData := []byte(strings.Repeat("Hello, World! This is auto mode stream test. ", 200))
+
+	cfg := Config{
+		Algorithm:      AlgorithmGzip,
+		Level:          LevelDefault,
+		Mode:           ModeAuto,
+		AutoSpeedRatio: 0.7,
+	}
+
+	mgr, err := NewManager(cfg)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+
+	var compressedBuf bytes.Buffer
+	writer, err := mgr.NewStreamCompressor(&compressedBuf)
+	if err != nil {
+		t.Fatalf("NewStreamCompressor failed: %v", err)
+	}
+
+	chunkSize := 512
+	for i := 0; i < len(testData); i += chunkSize {
+		end := i + chunkSize
+		if end > len(testData) {
+			end = len(testData)
+		}
+		n, err := writer.Write(testData[i:end])
+		if err != nil {
+			t.Fatalf("Write failed at offset %d: %v", i, err)
+		}
+		if n != end-i {
+			t.Errorf("Write returned %d, expected %d", n, end-i)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	compressedSize := compressedBuf.Len()
+	if compressedSize == 0 {
+		t.Error("compressed buffer is empty")
+	}
+
+	t.Logf("Compressed %d bytes to %d bytes", len(testData), compressedSize)
+
+	reader, err := mgr.NewStreamDecompressor(bytes.NewReader(compressedBuf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewStreamDecompressor failed: %v", err)
+	}
+	defer reader.Close()
+
+	var decompressedBuf bytes.Buffer
+	_, err = io.Copy(&decompressedBuf, reader)
+	if err != nil {
+		t.Fatalf("Copy failed: %v", err)
+	}
+
+	if !bytes.Equal(testData, decompressedBuf.Bytes()) {
+		t.Error("auto mode stream roundtrip failed: data mismatch")
+	}
+}
+
+func TestAutoModeStreamCompression_SmallData(t *testing.T) {
+	testData := []byte("Small data that fits in buffer.")
+
+	cfg := Config{
+		Algorithm:      AlgorithmGzip,
+		Level:          LevelDefault,
+		Mode:           ModeAuto,
+		AutoSpeedRatio: 0.5,
+	}
+
+	mgr, _ := NewManager(cfg)
+
+	var compressedBuf bytes.Buffer
+	writer, err := mgr.NewStreamCompressor(&compressedBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := writer.Write(testData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(testData) {
+		t.Errorf("Write returned %d, expected %d", n, len(testData))
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	compressedSize := compressedBuf.Len()
+	if compressedSize == 0 {
+		t.Error("compressed buffer is empty")
+	}
+
+	reader, err := mgr.NewStreamDecompressor(bytes.NewReader(compressedBuf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	result, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(testData, result) {
+		t.Error("small data roundtrip failed")
+	}
+}
+
+func TestAutoModeStreamCompression_LargeChunk(t *testing.T) {
+	testData := []byte(strings.Repeat("Large chunk test data that exceeds buffer size. ", 100))
+
+	cfg := Config{
+		Algorithm:      AlgorithmSnappy,
+		Level:          LevelDefault,
+		Mode:           ModeAuto,
+		AutoSpeedRatio: 0.9,
+	}
+
+	mgr, _ := NewManager(cfg)
+
+	var compressedBuf bytes.Buffer
+	writer, err := mgr.NewStreamCompressor(&compressedBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := writer.Write(testData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(testData) {
+		t.Errorf("Write returned %d, expected %d", n, len(testData))
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := mgr.NewStreamDecompressor(&compressedBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	result, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(testData, result) {
+		t.Error("large chunk roundtrip failed")
+	}
+}
+
+func TestAutoModeStreamDecompressor_ErrorPersistence(t *testing.T) {
+	corruptedData := []byte("this is not valid compressed data at all")
+
+	cfg := Config{
+		Algorithm: AlgorithmGzip,
+		Level:     LevelDefault,
+		Mode:      ModeAuto,
+	}
+
+	mgr, _ := NewManager(cfg)
+
+	reader, err := mgr.NewStreamDecompressor(bytes.NewReader(corruptedData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	buf := make([]byte, 100)
+	n, err := reader.Read(buf)
+	if err == nil {
+		t.Error("expected error for corrupted data, got nil")
+	}
+	if n != 0 {
+		t.Errorf("expected 0 bytes read, got %d", n)
+	}
+
+	n2, err2 := reader.Read(buf)
+	if err2 == nil {
+		t.Error("expected persistent error on second Read, got nil")
+	}
+	if err2 != err {
+		t.Errorf("expected same error, got %v (first was %v)", err2, err)
+	}
+	if n2 != 0 {
+		t.Errorf("expected 0 bytes on second read, got %d", n2)
+	}
+}
+
+func TestAutoModeStreamDecompressor_EmptyData(t *testing.T) {
+	cfg := Config{
+		Algorithm: AlgorithmGzip,
+		Level:     LevelDefault,
+		Mode:      ModeAuto,
+	}
+
+	mgr, _ := NewManager(cfg)
+
+	reader, err := mgr.NewStreamDecompressor(bytes.NewReader([]byte{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	buf := make([]byte, 100)
+	n, err := reader.Read(buf)
+	if err != io.EOF {
+		t.Errorf("expected EOF, got %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 bytes, got %d", n)
+	}
+
+	n2, err2 := reader.Read(buf)
+	if err2 != io.EOF {
+		t.Errorf("expected persistent EOF, got %v", err2)
+	}
+	if n2 != 0 {
+		t.Errorf("expected 0 bytes, got %d", n2)
+	}
+}
+
+func TestAutoModeStreamCompression_MultipleWrites(t *testing.T) {
+	parts := [][]byte{
+		[]byte("First part of the data. "),
+		[]byte("Second part with more content. "),
+		[]byte("Third part to test multiple writes. "),
+		[]byte("Fourth part that will exceed the buffer threshold."),
+	}
+
+	fullData := bytes.Join(parts, nil)
+
+	cfg := Config{
+		Algorithm:      AlgorithmLZ4,
+		Level:          LevelDefault,
+		Mode:           ModeAuto,
+		AutoSpeedRatio: 0.6,
+	}
+
+	mgr, _ := NewManager(cfg)
+
+	var compressedBuf bytes.Buffer
+	writer, err := mgr.NewStreamCompressor(&compressedBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, part := range parts {
+		n, err := writer.Write(part)
+		if err != nil {
+			t.Fatalf("Write part %d failed: %v", i, err)
+		}
+		if n != len(part) {
+			t.Errorf("Part %d: write returned %d, expected %d", i, n, len(part))
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := mgr.NewStreamDecompressor(&compressedBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	result, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(fullData, result) {
+		t.Error("multiple writes roundtrip failed")
+	}
+}
+
+func TestAnalyzePatterns_SlidingWindow(t *testing.T) {
+	data := []byte("ABCDABCDABCD")
+
+	characteristics := AnalyzeData(data)
+
+	if characteristics.DataType != DataTypeStructured && characteristics.DataType != DataTypeText {
+		t.Logf("Data type: %s, RepeatRatio: %.4f, Entropy: %.4f",
+			characteristics.DataType, characteristics.RepeatRatio, characteristics.Entropy)
+	}
+
+	if characteristics.RepeatRatio < 0.2 {
+		t.Errorf("Expected high repeat ratio for repeating pattern, got %.4f", characteristics.RepeatRatio)
+	}
+
+	t.Logf("Pattern analysis - Size: %d, DataType: %s, RepeatRatio: %.4f",
+		characteristics.Size, characteristics.DataType, characteristics.RepeatRatio)
+}
+
+func TestAnalyzePatterns_NonAlignedRepeats(t *testing.T) {
+	data := []byte("XABCABCABCY")
+
+	characteristics := AnalyzeData(data)
+
+	t.Logf("Non-aligned pattern - DataType: %s, RepeatRatio: %.4f, Entropy: %.4f",
+		characteristics.DataType, characteristics.RepeatRatio, characteristics.Entropy)
+
+	if characteristics.RepeatRatio < 0.15 {
+		t.Errorf("Expected sliding window to detect non-aligned repeats, got ratio %.4f", characteristics.RepeatRatio)
+	}
+}
+
+func TestAnalyzePatterns_NoPattern(t *testing.T) {
+	randomData := make([]byte, 100)
+	rand.Read(randomData)
+
+	characteristics := AnalyzeData(randomData)
+
+	t.Logf("Random data - DataType: %s, RepeatRatio: %.4f, Entropy: %.4f",
+		characteristics.DataType, characteristics.RepeatRatio, characteristics.Entropy)
+
+	if characteristics.RepeatRatio > 0.3 {
+		t.Errorf("Expected low repeat ratio for random data, got %.4f", characteristics.RepeatRatio)
+	}
+}
+
+func TestAdaptiveStreamWriter_WriteAfterClose(t *testing.T) {
+	cfg := Config{
+		Algorithm: AlgorithmGzip,
+		Level:     LevelDefault,
+		Mode:      ModeAuto,
+	}
+
+	mgr, _ := NewManager(cfg)
+
+	var buf bytes.Buffer
+	writer, _ := mgr.NewStreamCompressor(&buf)
+
+	writer.Close()
+
+	_, err := writer.Write([]byte("test"))
+	if err == nil {
+		t.Error("expected error writing to closed writer, got nil")
+	}
+}
+
+func TestAdaptiveStreamWriter_NilWriter(t *testing.T) {
+	cfg := Config{
+		Algorithm: AlgorithmGzip,
+		Level:     LevelDefault,
+		Mode:      ModeAuto,
+	}
+
+	mgr, _ := NewManager(cfg)
+
+	_, err := mgr.NewStreamCompressor(nil)
+	if err != ErrNilWriter {
+		t.Errorf("expected ErrNilWriter, got %v", err)
+	}
+}
+
+func TestAdaptiveStreamReader_NilReader(t *testing.T) {
+	cfg := Config{
+		Algorithm: AlgorithmGzip,
+		Level:     LevelDefault,
+		Mode:      ModeAuto,
+	}
+
+	mgr, _ := NewManager(cfg)
+
+	_, err := mgr.NewStreamDecompressor(nil)
+	if err != ErrNilReader {
+		t.Errorf("expected ErrNilReader, got %v", err)
+	}
+}
+
+func TestAutoModeStreamCompression_AlgorithmSelection(t *testing.T) {
+	tests := []struct {
+		name       string
+		data       []byte
+		speedRatio float64
+	}{
+		{
+			name:       "text data speed priority",
+			data:       []byte(strings.Repeat("Hello World! This is text data. ", 100)),
+			speedRatio: 0.9,
+		},
+		{
+			name:       "text data compression priority",
+			data:       []byte(strings.Repeat("Hello World! This is text data. ", 100)),
+			speedRatio: 0.1,
+		},
+		{
+			name:       "structured binary data",
+			data:       bytes.Repeat([]byte{0x01, 0x02, 0x03, 0x04}, 200),
+			speedRatio: 0.5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Algorithm:      AlgorithmGzip,
+				Level:          LevelDefault,
+				Mode:           ModeAuto,
+				AutoSpeedRatio: tt.speedRatio,
+			}
+
+			mgr, _ := NewManager(cfg)
+
+			var compressedBuf bytes.Buffer
+			writer, err := mgr.NewStreamCompressor(&compressedBuf)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = writer.Write(tt.data)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			compressedSize := compressedBuf.Len()
+			t.Logf("Compressed %d bytes to %d bytes", len(tt.data), compressedSize)
+
+			reader, err := mgr.NewStreamDecompressor(bytes.NewReader(compressedBuf.Bytes()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+
+			result, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !bytes.Equal(tt.data, result) {
+				t.Error("algorithm selection roundtrip failed")
+			}
+		})
+	}
+}
+
 

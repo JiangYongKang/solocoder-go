@@ -79,7 +79,6 @@ type CleanupCallback struct {
 	Name    string
 	Func    CleanupFunc
 	Timeout time.Duration
-	order   int
 }
 
 type CallbackResult struct {
@@ -125,13 +124,12 @@ type Manager struct {
 
 	cfg Config
 
-	mu                  sync.RWMutex
-	state               ShutdownState
-	phase               ShutdownPhase
-	accepting           bool
-	callbacks           map[string]*CleanupCallback
-	callbackOrder       []string
-	nextCallbackOrder   int
+	mu            sync.RWMutex
+	state         ShutdownState
+	phase         ShutdownPhase
+	accepting     bool
+	callbacks     map[string]*CleanupCallback
+	callbackOrder []string
 
 	signalCh       chan os.Signal
 	stopSignalCh   chan struct{}
@@ -170,7 +168,6 @@ func NewManager(cfg Config) *Manager {
 		accepting:       true,
 		callbacks:       make(map[string]*CleanupCallback),
 		callbackOrder:   make([]string, 0),
-		nextCallbackOrder: 0,
 		shutdownCh:      make(chan struct{}),
 		completedCh:     make(chan struct{}),
 		manualTriggerCh: make(chan struct{}, 1),
@@ -236,9 +233,7 @@ func (m *Manager) RegisterCallback(name string, fn CleanupFunc, timeout time.Dur
 		Name:    name,
 		Func:    fn,
 		Timeout: timeout,
-		order:   m.nextCallbackOrder,
 	}
-	m.nextCallbackOrder++
 	m.callbackOrder = append(m.callbackOrder, name)
 
 	return nil
@@ -263,15 +258,31 @@ func (m *Manager) UnregisterCallback(name string) error {
 }
 
 func (m *Manager) BeginRequest() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	for {
+		m.mu.RLock()
+		accepting := m.accepting
+		state := m.state
+		m.mu.RUnlock()
 
-	if !m.accepting || m.state != StateRunning {
-		return ErrManagerAlreadyShuttingDown
+		if !accepting || state != StateRunning {
+			return ErrManagerAlreadyShuttingDown
+		}
+
+		cur := atomic.LoadInt64(&m.activeRequests)
+		if atomic.CompareAndSwapInt64(&m.activeRequests, cur, cur+1) {
+			m.mu.RLock()
+			stillAccepting := m.accepting
+			stillRunning := m.state == StateRunning
+			m.mu.RUnlock()
+
+			if stillAccepting && stillRunning {
+				return nil
+			}
+
+			atomic.AddInt64(&m.activeRequests, -1)
+			return ErrManagerAlreadyShuttingDown
+		}
 	}
-
-	atomic.AddInt64(&m.activeRequests, 1)
-	return nil
 }
 
 func (m *Manager) EndRequest() {

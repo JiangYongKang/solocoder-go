@@ -1,0 +1,5 @@
+你实现的 MapReduce 分布式计算框架模块在第二轮修复后仍存在残留问题，需要继续修复：
+1. mapreduce.go 的 Run 方法中 defer 闭包在任务以错误返回时将状态无条件设置为 Completed，当所有 Map 任务重试耗尽后 shuffleSync 返回错误，但 defer 将状态错误标记为 Completed 而非 Failed。需要在 defer 中根据 Run 的返回值区分成功与失败路径来设置正确的最终状态。
+2. 第二轮修复后 onComplete 通道在 Run 正常结束后被 close，如果调用方随后再次调用 SetInput 和 Run，第二次 Run 的 defer 会尝试对已关闭的通道再次 close 触发 panic。需要确保每次 Run 启动前 onComplete 通道重新初始化，或者增加对已完成实例重复调用的防护。
+3. shuffleAsync 中的 Reduce 计算仅在 allMapDone 关闭后才执行，实际 Reduce 计算启动时间与最慢 Map 完成时间完全一致，异步模式下 Reduce 并未在 Map 尚未全部完成时就开始处理已到达的数据。需要改为当某个 Reduce 分区收到其所需的所有 Map 结果后立即对该分区执行计算，而非等待全局 Map 阶段全部完成。
+4. 修复后运行 go test ./internal/mapreduce/ -v，需要让所有测试通过。

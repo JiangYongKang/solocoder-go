@@ -496,8 +496,8 @@ func TestResize_Concurrency_ShrinkWithActiveTasks(t *testing.T) {
 		t.Errorf("expected MaxConcurrency=1, got %d", b.MaxConcurrency())
 	}
 
-	if b.ActiveCount() != 3 {
-		t.Errorf("expected ActiveCount still 3 (tasks still running), got %d", b.ActiveCount())
+	if b.WorkerActiveCount() != 3 {
+		t.Errorf("expected WorkerActiveCount still 3 (tasks still running), got %d", b.WorkerActiveCount())
 	}
 
 	if b.WorkerCount() != 3 {
@@ -508,8 +508,8 @@ func TestResize_Concurrency_ShrinkWithActiveTasks(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	if b.ActiveCount() != 0 {
-		t.Errorf("expected ActiveCount=0 after tasks complete, got %d", b.ActiveCount())
+	if b.WorkerActiveCount() != 0 {
+		t.Errorf("expected WorkerActiveCount=0 after tasks complete, got %d", b.WorkerActiveCount())
 	}
 	if b.WorkerCount() != 1 {
 		t.Errorf("expected WorkerCount=1 after tasks complete and shrink, got %d", b.WorkerCount())
@@ -881,6 +881,29 @@ func TestFullError_ErrorString(t *testing.T) {
 	}
 }
 
+func TestSemaphoreFullError_ErrorString(t *testing.T) {
+	err := &SemaphoreFullError{
+		Name:           "test-svc",
+		ActiveCount:    5,
+		MaxConcurrency: 5,
+		SemHolders:     3,
+	}
+
+	msg := err.Error()
+	if msg == "" {
+		t.Error("expected non-empty error message")
+	}
+	if !contains(msg, "test-svc") {
+		t.Errorf("error message should contain name, got: %s", msg)
+	}
+	if !contains(msg, "semaphoreHolders=3") {
+		t.Errorf("error message should contain SemHolders, got: %s", msg)
+	}
+	if contains(msg, "queue=") {
+		t.Errorf("SemaphoreFullError should not contain queue info, got: %s", msg)
+	}
+}
+
 func TestZeroQueueSize(t *testing.T) {
 	b, err := NewBulkhead("test", Config{
 		MaxConcurrency: 1,
@@ -1070,15 +1093,18 @@ func TestAcquire_NoWait_Full(t *testing.T) {
 		t.Fatal("expected Acquire to fail when full, but succeeded")
 	}
 
-	fe, ok := err.(*FullError)
+	se, ok := err.(*SemaphoreFullError)
 	if !ok {
-		t.Fatalf("expected FullError, got %T", err)
+		t.Fatalf("expected SemaphoreFullError, got %T", err)
 	}
-	if fe.ActiveCount != 1 {
-		t.Errorf("expected ActiveCount=1 in FullError, got %d", fe.ActiveCount)
+	if se.ActiveCount != 1 {
+		t.Errorf("expected ActiveCount=1 in SemaphoreFullError, got %d", se.ActiveCount)
 	}
-	if fe.MaxConcurrency != 1 {
-		t.Errorf("expected MaxConcurrency=1 in FullError, got %d", fe.MaxConcurrency)
+	if se.MaxConcurrency != 1 {
+		t.Errorf("expected MaxConcurrency=1 in SemaphoreFullError, got %d", se.MaxConcurrency)
+	}
+	if se.SemHolders != 1 {
+		t.Errorf("expected SemHolders=1 in SemaphoreFullError, got %d", se.SemHolders)
 	}
 }
 
@@ -1109,9 +1135,9 @@ func TestAcquire_WaitTimeout(t *testing.T) {
 		t.Errorf("expected to wait at least 100ms, waited %v", elapsed)
 	}
 
-	_, ok := err.(*FullError)
+	_, ok := err.(*SemaphoreFullError)
 	if !ok {
-		t.Fatalf("expected FullError on timeout, got %T", err)
+		t.Fatalf("expected SemaphoreFullError on timeout, got %T", err)
 	}
 }
 
@@ -1235,6 +1261,9 @@ func TestSemaphore_WithWorkerPool(t *testing.T) {
 
 	<-started
 
+	if b.WorkerActiveCount() != 1 {
+		t.Errorf("expected WorkerActiveCount=1, got %d", b.WorkerActiveCount())
+	}
 	if b.ActiveCount() != 2 {
 		t.Errorf("expected ActiveCount=2 (1 semaphore + 1 worker), got %d", b.ActiveCount())
 	}
@@ -1386,8 +1415,8 @@ func TestCanSubmit_QueueFullWithIdleWorkers(t *testing.T) {
 		t.Fatalf("expected WorkerCount=3, got %d", b.WorkerCount())
 	}
 
-	if b.ActiveCount() != 1 {
-		t.Errorf("expected ActiveCount=1, got %d", b.ActiveCount())
+	if b.WorkerActiveCount() != 1 {
+		t.Errorf("expected WorkerActiveCount=1, got %d", b.WorkerActiveCount())
 	}
 
 	err = b.Submit(func() {})
@@ -1447,7 +1476,7 @@ func TestResizeQueue_Shrink_RejectsNewTasks(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		err = b.Submit(func() {})
 		if err != nil {
-			t.Fatalf("queue submit %d failed: %v", i, err)
+			t.Fatalf("queued submit %d failed: %v", i, err)
 		}
 	}
 
@@ -1585,7 +1614,7 @@ func TestSubmit_QueueFull_SemaphoreSlotsAvailable(t *testing.T) {
 	}
 
 	if b.QueueLength() != 1 {
-		t.Fatalf("expected QueueLength=1 (task queued, no semaphore slots for worker), got %d", b.QueueLength())
+		t.Fatalf("expected QueueLength=1 (task queued, no worker available yet), got %d", b.QueueLength())
 	}
 
 	err = b.Submit(func() {})
@@ -1609,11 +1638,7 @@ func TestSubmit_QueueFull_SemaphoreSlotsAvailable(t *testing.T) {
 		t.Errorf("Release failed: %v", err)
 	}
 
-	if b.QueueLength() != 1 {
-		t.Errorf("expected QueueLength=1 after one release (worker needs to wake up), got %d", b.QueueLength())
-	}
-
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	if b.QueueLength() != 0 {
 		t.Errorf("expected QueueLength=0 after worker processes queued task, got %d", b.QueueLength())
@@ -1635,5 +1660,214 @@ func TestSubmit_QueueFull_SemaphoreSlotsAvailable(t *testing.T) {
 	case <-cleanupDone:
 	case <-time.After(time.Second):
 		t.Error("Close timed out")
+	}
+}
+
+func TestAcquire_DoesNotBlockWorkers(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 2,
+		MaxQueueSize:   10,
+		WaitTimeout:    0,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("first Acquire failed: %v", err)
+	}
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("second Acquire failed: %v", err)
+	}
+
+	if b.SemaphoreCount() != 2 {
+		t.Fatalf("expected SemaphoreCount=2, got %d", b.SemaphoreCount())
+	}
+	if b.ActiveCount() != 2 {
+		t.Fatalf("expected ActiveCount=2, got %d", b.ActiveCount())
+	}
+
+	done := make(chan struct{})
+	err = b.Submit(func() {
+		close(done)
+	})
+	if err != nil {
+		t.Fatalf("Submit failed even though workers are available: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("task should have been executed by worker, semaphore should not block workers")
+	}
+
+	b.Release()
+	b.Release()
+}
+
+func TestSemaphoreFullError_NoQueueFields(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 2,
+		MaxQueueSize:   10,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("first Acquire failed: %v", err)
+	}
+	defer b.Release()
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("second Acquire failed: %v", err)
+	}
+	defer b.Release()
+
+	err = b.Acquire(0)
+	if err == nil {
+		t.Fatal("expected Acquire to fail when all slots taken")
+	}
+
+	se, ok := err.(*SemaphoreFullError)
+	if !ok {
+		t.Fatalf("expected SemaphoreFullError, got %T", err)
+	}
+
+	msg := se.Error()
+	if contains(msg, "queue=") {
+		t.Errorf("SemaphoreFullError should not contain queue info, got: %s", msg)
+	}
+	if !contains(msg, "semaphoreHolders=") {
+		t.Errorf("SemaphoreFullError should contain semaphoreHolders, got: %s", msg)
+	}
+	if se.ActiveCount != 2 {
+		t.Errorf("expected ActiveCount=2, got %d", se.ActiveCount)
+	}
+	if se.MaxConcurrency != 2 {
+		t.Errorf("expected MaxConcurrency=2, got %d", se.MaxConcurrency)
+	}
+	if se.SemHolders != 2 {
+		t.Errorf("expected SemHolders=2, got %d", se.SemHolders)
+	}
+}
+
+func TestWorkerActiveCount(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 3,
+		MaxQueueSize:   10,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer b.Close()
+
+	if b.WorkerActiveCount() != 0 {
+		t.Errorf("expected WorkerActiveCount=0, got %d", b.WorkerActiveCount())
+	}
+
+	started := make(chan struct{}, 2)
+	block := make(chan struct{})
+
+	for i := 0; i < 2; i++ {
+		err = b.Submit(func() {
+			started <- struct{}{}
+			<-block
+		})
+		if err != nil {
+			t.Fatalf("submit %d failed: %v", i, err)
+		}
+	}
+
+	for i := 0; i < 2; i++ {
+		<-started
+	}
+
+	if b.WorkerActiveCount() != 2 {
+		t.Errorf("expected WorkerActiveCount=2, got %d", b.WorkerActiveCount())
+	}
+
+	err = b.Acquire(0)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	if b.WorkerActiveCount() != 2 {
+		t.Errorf("expected WorkerActiveCount still 2 (Acquire should not affect workerActive), got %d", b.WorkerActiveCount())
+	}
+	if b.ActiveCount() != 3 {
+		t.Errorf("expected ActiveCount=3 (2 worker + 1 semaphore), got %d", b.ActiveCount())
+	}
+
+	b.Release()
+	close(block)
+
+	time.Sleep(50 * time.Millisecond)
+
+	if b.WorkerActiveCount() != 0 {
+		t.Errorf("expected WorkerActiveCount=0 after tasks done, got %d", b.WorkerActiveCount())
+	}
+}
+
+func TestSemaphore_OccupyAllSlots_WorkersStillProcess(t *testing.T) {
+	b, err := NewBulkhead("test", Config{
+		MaxConcurrency: 3,
+		MaxQueueSize:   10,
+		WaitTimeout:    0,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cleanupDone := make(chan struct{})
+	defer func() {
+		go func() {
+			b.Close()
+			close(cleanupDone)
+		}()
+		select {
+		case <-cleanupDone:
+		case <-time.After(2 * time.Second):
+			t.Error("Close timed out during cleanup")
+		}
+	}()
+
+	for i := 0; i < 3; i++ {
+		err = b.Acquire(0)
+		if err != nil {
+			t.Fatalf("Acquire %d failed: %v", i, err)
+		}
+	}
+
+	if b.SemaphoreCount() != 3 {
+		t.Fatalf("expected SemaphoreCount=3, got %d", b.SemaphoreCount())
+	}
+	if b.ActiveCount() != 3 {
+		t.Fatalf("expected ActiveCount=3, got %d", b.ActiveCount())
+	}
+
+	taskDone := make(chan struct{})
+	err = b.Submit(func() {
+		close(taskDone)
+	})
+	if err != nil {
+		t.Fatalf("Submit failed: %v", err)
+	}
+
+	select {
+	case <-taskDone:
+	case <-time.After(time.Second):
+		t.Fatal("worker should still process queued tasks even when semaphore occupies all concurrency slots")
+	}
+
+	for i := 0; i < 3; i++ {
+		b.Release()
 	}
 }

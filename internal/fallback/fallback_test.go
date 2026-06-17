@@ -1398,3 +1398,277 @@ func TestErrorRateTriggerSkipsStrategy(t *testing.T) {
 	rate, _ := chain.CalculateErrorRate("main", 0)
 	t.Logf("main strategy error rate: %f", rate)
 }
+
+func TestCountRecentSuccessesWithAndWithoutWindow(t *testing.T) {
+	cfg := DefaultChainConfig()
+	cfg.Recovery.Mode = RecoveryModePassive
+	cfg.Recovery.PassiveSuccessCount = 10
+	cfg.Recovery.PassiveSuccessWindow = 0
+	cfg.Recovery.WarmUpDuration = 0
+
+	chain := NewChain(cfg)
+	ctx := context.Background()
+
+	mainHandler := func(ctx context.Context) (interface{}, error) {
+		return "main success", nil
+	}
+
+	fallbackHandler := func(ctx context.Context) (interface{}, error) {
+		return "fallback", nil
+	}
+
+	chain.RegisterStrategy("main", "Main", 0, mainHandler, nil)
+	chain.RegisterStrategy("fallback", "Fallback", 1, fallbackHandler, nil)
+
+	err := chain.Start(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer chain.Stop()
+
+	for i := 0; i < 15; i++ {
+		chain.Execute(ctx)
+	}
+
+	mainStrategy, _ := chain.GetStrategy("main")
+	mainStrategy.mu.RLock()
+	windowLen := len(mainStrategy.SuccessWindow)
+	totalSuccess := mainStrategy.SuccessCount
+	mainStrategy.mu.RUnlock()
+
+	if windowLen != 15 {
+		t.Errorf("expected 15 entries in SuccessWindow, got %d", windowLen)
+	}
+	if totalSuccess != 15 {
+		t.Errorf("expected 15 total successes, got %d", totalSuccess)
+	}
+
+	chain.ForceSwitchToStrategy("fallback")
+
+	result, err := chain.Execute(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "main success" {
+		t.Logf("passive recovery triggered with window=0, result: %v", result)
+	}
+}
+
+func TestUnifiedErrorRateCalculation(t *testing.T) {
+	chain := NewChain(nil)
+	ctx := context.Background()
+
+	var callCount int
+	handler := func(ctx context.Context) (interface{}, error) {
+		callCount++
+		if callCount <= 3 {
+			return nil, errors.New("failed")
+		}
+		return "ok", nil
+	}
+
+	chain.RegisterStrategy("s1", "Strategy 1", 0, handler, nil)
+	chain.Start(ctx)
+	defer chain.Stop()
+
+	for i := 0; i < 10; i++ {
+		chain.Execute(ctx)
+	}
+
+	rate1, err := chain.CalculateErrorRate("s1", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	rate2, err := chain.CalculateErrorRate("s1", time.Hour)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if rate1 != rate2 {
+		t.Errorf("expected consistent error rates, got window=0: %f, window=1h: %f", rate1, rate2)
+	}
+	if rate1 != 0.3 {
+		t.Errorf("expected error rate 0.3, got %f", rate1)
+	}
+
+	strategy, _ := chain.GetStrategy("s1")
+	strategy.mu.Lock()
+	oldWindow := strategy.SuccessWindow
+	oldErrorWindow := strategy.ErrorWindow
+	strategy.SuccessWindow = []successEntry{}
+	strategy.ErrorWindow = []errorEntry{}
+	strategy.mu.Unlock()
+
+	rate4, err := chain.CalculateErrorRate("s1", time.Hour)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rate4 != 0 {
+		t.Errorf("expected 0 error rate after clearing windows, got %f", rate4)
+	}
+
+	strategy.mu.Lock()
+	strategy.SuccessWindow = oldWindow
+	strategy.ErrorWindow = oldErrorWindow
+	strategy.mu.Unlock()
+
+	rate5, err := chain.CalculateErrorRate("s1", time.Hour)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rate5 != rate1 {
+		t.Errorf("expected consistent error rate after restoring windows, got %f, expected %f", rate5, rate1)
+	}
+}
+
+func TestMatchTriggerConditionCoverage(t *testing.T) {
+	chain := NewChain(nil)
+
+	baseErr := errors.New("base error")
+	wrappedErr := fmt.Errorf("wrapped: %w", baseErr)
+	timeoutErr := fmt.Errorf("%w: test timed out", ErrExecutionTimeout)
+
+	testCases := []struct {
+		name     string
+		err      error
+		cond     *TriggerCondition
+		expected bool
+	}{
+		{
+			name:     "nil condition",
+			err:      baseErr,
+			cond:     nil,
+			expected: false,
+		},
+		{
+			name: "error type match",
+			err:  baseErr,
+			cond: &TriggerCondition{
+				Type:       TriggerConditionErrorType,
+				ErrorTypes: []error{baseErr},
+			},
+			expected: true,
+		},
+		{
+			name: "error type mismatch",
+			err:  baseErr,
+			cond: &TriggerCondition{
+				Type:       TriggerConditionErrorType,
+				ErrorTypes: []error{errors.New("other")},
+			},
+			expected: false,
+		},
+		{
+			name: "wrapped error type match",
+			err:  wrappedErr,
+			cond: &TriggerCondition{
+				Type:       TriggerConditionErrorType,
+				ErrorTypes: []error{baseErr},
+			},
+			expected: true,
+		},
+		{
+			name: "timeout match",
+			err:  timeoutErr,
+			cond: &TriggerCondition{
+				Type: TriggerConditionTimeout,
+			},
+			expected: true,
+		},
+		{
+			name: "timeout mismatch",
+			err:  baseErr,
+			cond: &TriggerCondition{
+				Type: TriggerConditionTimeout,
+			},
+			expected: false,
+		},
+		{
+			name: "custom match",
+			err:  baseErr,
+			cond: &TriggerCondition{
+				Type: TriggerConditionCustom,
+				CustomCheck: func(err error) bool {
+					return err.Error() == "base error"
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "custom mismatch",
+			err:  baseErr,
+			cond: &TriggerCondition{
+				Type: TriggerConditionCustom,
+				CustomCheck: func(err error) bool {
+					return false
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "custom nil check",
+			err:  baseErr,
+			cond: &TriggerCondition{
+				Type:        TriggerConditionCustom,
+				CustomCheck: nil,
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := chain.matchTriggerCondition(tc.err, tc.cond)
+			if result != tc.expected {
+				t.Errorf("expected %v, got %v", tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestCountEventsInWindow(t *testing.T) {
+	chain := NewChain(nil)
+	ctx := context.Background()
+
+	var callCount int
+	handler := func(ctx context.Context) (interface{}, error) {
+		callCount++
+		if callCount%3 == 0 {
+			return nil, errors.New("fail")
+		}
+		return "ok", nil
+	}
+
+	chain.RegisterStrategy("s1", "Strategy 1", 0, handler, nil)
+	chain.Start(ctx)
+	defer chain.Stop()
+
+	for i := 0; i < 12; i++ {
+		chain.Execute(ctx)
+	}
+
+	strategy, _ := chain.GetStrategy("s1")
+
+	strategy.mu.RLock()
+	successes, failures := chain.countEventsInWindowLocked(strategy, time.Now().Add(-time.Hour))
+	strategy.mu.RUnlock()
+
+	if successes != 8 {
+		t.Errorf("expected 8 successes in window, got %d", successes)
+	}
+	if failures != 4 {
+		t.Errorf("expected 4 failures in window, got %d", failures)
+	}
+
+	total := successes + failures
+	if total != 12 {
+		t.Errorf("expected 12 total events, got %d", total)
+	}
+
+	expectedRate := float64(failures) / float64(total)
+	rate, _ := chain.CalculateErrorRate("s1", time.Hour)
+	if rate != expectedRate {
+		t.Errorf("expected rate %f, got %f", expectedRate, rate)
+	}
+}

@@ -49,23 +49,25 @@ func getPBFieldInfo(field reflect.StructField) (*pbFieldInfo, bool) {
 
 	if tag != "" {
 		parts := strings.Split(tag, ",")
-		if parts[0] != "" {
-			info.name = parts[0]
-		}
-		for i := 1; i < len(parts); i++ {
-			part := strings.TrimSpace(parts[i])
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
 			if strings.HasPrefix(part, "protobuf:") {
 				numStr := strings.TrimPrefix(part, "protobuf:")
 				var num int
 				if n, err := fmt.Sscanf(numStr, "%d", &num); err == nil && n == 1 && num > 0 {
 					info.fieldNum = num
 				}
+			} else {
+				info.name = part
 			}
 		}
 	}
 
 	if info.fieldNum == 0 {
-		info.fieldNum = field.Index[0] + 2
+		info.fieldNum = field.Index[0] + 1
 	}
 
 	info.wireType = getWireType(field.Type)

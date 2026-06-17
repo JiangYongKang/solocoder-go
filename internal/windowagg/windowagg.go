@@ -449,10 +449,8 @@ func (w *SlidingWindow) evictLocked(currentTime time.Time) {
 func (w *SlidingWindow) Result() (float64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.config.WindowType == WindowTypeTime && w.items.Len() > 0 {
-		back := w.items.Back()
-		lastItem := back.Value.(*windowItem)
-		w.evictLocked(lastItem.timestamp)
+	if w.config.WindowType == WindowTypeTime {
+		w.evictLocked(time.Now())
 	}
 	return w.aggregator.Result()
 }
@@ -460,10 +458,8 @@ func (w *SlidingWindow) Result() (float64, error) {
 func (w *SlidingWindow) Count() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.config.WindowType == WindowTypeTime && w.items.Len() > 0 {
-		back := w.items.Back()
-		lastItem := back.Value.(*windowItem)
-		w.evictLocked(lastItem.timestamp)
+	if w.config.WindowType == WindowTypeTime {
+		w.evictLocked(time.Now())
 	}
 	return w.items.Len()
 }

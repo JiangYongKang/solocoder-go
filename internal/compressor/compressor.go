@@ -275,7 +275,7 @@ func analyzePatterns(data []byte) float64 {
 		patterns := make(map[string]int)
 		maxOccurrences := 0
 
-		for i := 0; i <= size-patternLen; i += patternLen {
+		for i := 0; i <= size-patternLen; i++ {
 			pattern := string(data[i : i+patternLen])
 			patterns[pattern]++
 			if patterns[pattern] > maxOccurrences {
@@ -286,8 +286,8 @@ func analyzePatterns(data []byte) float64 {
 		if maxOccurrences >= 2 {
 			patternCount++
 			uniquePatterns := len(patterns)
-			expectedUnique := float64(size) / float64(patternLen)
-			patternDensity := 1.0 - (float64(uniquePatterns) / expectedUnique)
+			totalWindows := float64(size - patternLen + 1)
+			patternDensity := 1.0 - (float64(uniquePatterns) / totalWindows)
 			if patternDensity > score {
 				score = patternDensity
 			}
@@ -399,9 +399,7 @@ func (a *adaptiveStreamWriter) Write(p []byte) (int, error) {
 
 	if remaining < len(p) {
 		n, err := a.actual.Write(p[remaining:])
-		if err != nil {
-			return remaining + n, err
-		}
+		return remaining + n, err
 	}
 
 	return len(p), nil
@@ -452,9 +450,14 @@ type adaptiveStreamReader struct {
 	reader  io.Reader
 	actual  io.ReadCloser
 	buf     []byte
+	err     error
 }
 
 func (a *adaptiveStreamReader) Read(p []byte) (int, error) {
+	if a.err != nil {
+		return 0, a.err
+	}
+
 	if a.actual != nil {
 		return a.actual.Read(p)
 	}
@@ -463,11 +466,13 @@ func (a *adaptiveStreamReader) Read(p []byte) (int, error) {
 		preview := make([]byte, 4096)
 		n, err := io.ReadFull(a.reader, preview)
 		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+			a.err = err
 			return 0, err
 		}
 		a.buf = preview[:n]
 
 		if n == 0 {
+			a.err = io.EOF
 			return 0, io.EOF
 		}
 
@@ -498,6 +503,7 @@ func (a *adaptiveStreamReader) Read(p []byte) (int, error) {
 			}
 		}
 
+		a.err = ErrCorruptedData
 		return 0, ErrCorruptedData
 	}
 
