@@ -1,6 +1,6 @@
 产物不满意：
-1. executeCompensations 方法中原有的虚假补偿成功日志已正确移除，当 CompensateFunc 为 nil 时直接跳过不再记录 OpTypeCompensation + StatusSuccess 的日志条目。GetLogs 和 GetExecution 均已改用新增的 ErrExecutionNotFound 哨兵错误，与 ErrSagaNotFound 的语义混淆已消除。CompensationFailure 的 StepID 和 ForwardStepID 现已分别赋值为 compStepID（步骤ID-compensate）和 step.ID，两个字段不再指向相同值。Execute 方法中添加了 runningSagas 并发保护，ErrSagaRunning 和 ErrCompensationFailed 两个哨兵错误均已实际返回或写入执行结果。37 个测试全部通过，6 条新增测试覆盖了并发保护、错误链检查、StepID 区分、错误分类等场景。未发现明显缺陷。
+1. executeCompensations 中原有的虚假补偿成功日志已正确移除，CompensateFunc 为 nil 时直接跳过不再记录。GetLogs 和 GetExecution 已改用新增的 ErrExecutionNotFound 哨兵错误，与 ErrSagaNotFound 的语义混淆已消除。CompensationFailure 的 StepID 和 ForwardStepID 已分别赋值为 compStepID 和 step.ID，不再指向相同值。Execute 中添加了 runningSagas 并发保护，ErrSagaRunning 和 ErrCompensationFailed 均已实际返回或写入执行结果。37 个测试全部通过，6 条新增测试覆盖了并发保护、错误链检查、StepID 区分、错误分类等场景。未发现明显缺陷。
 
 过程不满意：
-1. 模型在完成 saga.go 的 6 次字符串替换编辑后，直接使用 Write 工具重写了整个 saga_test.go 文件和 docs/saga.md 文件，而非针对需要更新的断言点做定点编辑。例如测试文件中需要修改的只是一部分断言（如 ErrSagaNotFound 改为 ErrExecutionNotFound、补偿 StepID 改为步骤ID-compensate 格式、ResolveIntervention 调用参数更新等），但模型选择了全量重写，这增加了无意中改变原有测试行为或删减测试逻辑的风险。正确做法是先梳理受影响的测试断言点，然后对每个变更点做定点编辑而非全文件替换。
-2. 模型在阅读 saga.go、saga_test.go 和 docs/saga.md 三个文件后立即在第 4 步创建了 8 项 Todo 列表，随后直接开始逐项编辑 saga.go，直到所有代码修改和测试重写完成后才第一次运行 go test。整个过程未在每次源代码修改后进行增量编译或测试验证，而是把所有变更一次性提交到测试环节。如果某一步修改引入了编译错误或逻辑缺陷，事后追溯定位会变得困难。正确做法是在 saga.go 完成关键修改后先运行一次编译检查或快速测试，确认核心变更正确后再继续调整测试文件。
+1. 模型完成 saga.go 的编辑后，直接使用 Write 工具重写了整个 saga_test.go 和 docs/saga.md 文件，而非对需要更新的断言点做定点编辑。测试中只需修改部分断言（如 ErrSagaNotFound 改为 ErrExecutionNotFound、补偿 StepID 格式更新等），但模型全量重写，增加了无意中改变原有测试行为或删减测试逻辑的风险。正确做法是先梳理受影响的断言点，对每个变更做定点编辑。
+2. 模型阅读完三个文件后立即创建了 8 项 Todo 列表，随后逐项编辑 saga.go，直到所有代码修改和测试重写完成后才第一次运行 go test。整个过程未在每次修改后进行增量编译或测试验证，把所有变更一次性提交到测试环节。如果某步修改引入编译错误或逻辑缺陷，事后追溯定位会变得困难。正确做法是先运行编译检查或快速测试确认核心变更正确。

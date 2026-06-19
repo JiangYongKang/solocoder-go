@@ -1,6 +1,7 @@
 产物不满意：
-1. 模型在移除 releaseWithCallbackLocked 方法的 cbErr 参数时将方法重命名为 snapshotAndTransitionLocked，新名称用"snapshot"和"transition"描述内部实现步骤，完全丢弃了原方法名中的核心领域语义"release"。该方法的领域职责是完成屏障释放的状态转移，改名后维护者看到 snapshotAndTransitionLocked 难以立即理解该方法属于屏障释放流程的一环。根因是模型按"方法内部执行了什么步骤"来命名而非"方法在领域中的职责"来命名。正确做法是保留 release 作为核心语义动词，改为 releaseLocked 或 doReleaseLocked，仅去掉冗余的 WithCallback 后缀即可。
-2. 模型在 Break 方法中添加 b.released = false 修复了 released 与 broken 同时为 true 的矛盾状态，但未为"屏障释放后再 Break"的场景添加针对性单元测试。现有 TestBreak 仅验证 Break 基本行为，TestIsReleased 仅验证初始态和正常释放后的 released 变化，两者均未覆盖"先释放再 Break 后 IsReleased 返回 false 且 IsBroken 返回 true"这一被修复场景的回归验证。根因是模型把已有测试通过等同于修复逻辑正确，忽略了修复点自身应由新增测试来保证。正确做法是为该场景编写单元测试显式验证状态组合。
+1. 模型在移除 releaseWithCallbackLocked 方法的 cbErr 参数时将方法重命名为 snapshotAndTransitionLocked，新名称用"snapshot"和"transition"描述内部实现步骤，完全丢弃了核心领域语义"release"。该方法的领域职责是完成屏障释放的状态转移，改名后维护者看到 snapshotAndTransitionLocked 难以立即理解该方法属于屏障释放流程。根因是模型按"方法内部执行了什么步骤"来命名而非"方法在领域中的职责"来命名。正确做法是保留 release 作为核心语义，改为 releaseLocked 或 doReleaseLocked。
+2. 模型在 Break 方法中添加 b.released = false 修复了 released 与 broken 同时为 true 的矛盾状态，但未为"屏障释放后再 Break"的场景添加针对性单元测试。现有测试均未覆盖"先释放再 Break 后 IsReleased 返回 false 且 IsBroken 返回 true"这一被修复场景的回归验证。根因是模型把已有测试通过等同于修复逻辑正确，忽略了修复点自身应由新增测试来保证。正确做法是为该场景编写单元测试显式验证状态组合。
+
 过程不满意：
-1. 模型收到提示词后仅读取 barrier.go 一次就直接进行三处代码修改，未创建 TodoList 也未对两个问题的关联性和影响范围做任何前置分析。两个修复涉及 releaseWithCallbackLocked 调用链中 doRelease 的参数传递调整以及 released 状态在 Reset、ForceReset、Wait、Break 四个入口中的设值路径，跳过调用关系分析直接改代码的做法省略了验证 released 在所有路径下一致性的关键步骤。正确做法是先梳理 released 字段在全部状态入口的设值轨迹，确认修改范围后再逐一执行。
-2. 模型将 releaseWithCallbackLocked 重命名为 snapshotAndTransitionLocked 时仅从方法"执行了 snapshot 和 transition 步骤"出发取名，未思考该方法在屏障释放流程中的领域语义。原方法名中的 release 表达了"将屏障从等待态转为释放态"这一核心领域操作，新名称变成了对内部步骤的机械描述。根因是模型对重命名的思考停留在代码表面，未从领域建模角度审视方法职责。正确做法是识别出该方法的领域语义是"释放"而非"快照"，保持方法名与业务含义对齐。
+1. 模型收到提示词后仅读取 barrier.go 一次就直接进行三处代码修改，未创建 TodoList 也未对两个问题的关联性和影响范围做前置分析。两个修复涉及 doRelease 参数传递调整以及 released 状态在 Reset、ForceReset、Wait、Break 四个入口中的设值路径，跳过调用关系分析直接改代码省略了验证 released 在所有路径下一致性的关键步骤。正确做法是先梳理 released 字段在全部状态入口的设值轨迹再逐一执行。
+2. 模型将 releaseWithCallbackLocked 重命名为 snapshotAndTransitionLocked 时仅从方法"执行了 snapshot 和 transition 步骤"出发取名，未思考该方法在屏障释放流程中的领域语义。原方法名中的 release 表达了"将屏障从等待态转为释放态"这一核心领域操作，新名称变成了对内部步骤的机械描述。根因是模型对重命名的思考停留在代码表面，未从领域建模角度审视方法职责，应保持方法名与业务含义对齐。

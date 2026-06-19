@@ -1,11 +1,11 @@
 产物不满意：
-1. leaderelect.go 的 notify 方法在构造 ElectionEvent 时读取 e.role、e.leaderID、e.term 三个共享字段时只持有 callbacksMu 读锁而未持有 e.mu 互斥锁，而 doHeartbeat、startElection、checkLeader 等方法在 e.mu 保护下修改这些字段后释放锁再调用 notify，形成对字符串和整型字段的并发读写数据竞争。Go 的字符串并发读写不是原子操作，极端情况下读到的 leaderID 可能为损坏值。根因是 notify 在事件数据采集阶段未加锁保护，应在方法内部先获取 e.mu 快照 role、leaderID、term 三个值再释放后构造事件对象。
-2. leaderelect.go 的 checkLeader 方法第 357-362 行调用 GetHolder 返回错误时只处理了 ErrLockNotHeld 和 ErrLockExpired 两种已知错误会触发选举，其他所有错误被静默忽略直接 return 导致本检查周期完全跳过。如果后端连续返回非预期错误如临时不可用，Follower 可能在多个周期内都检测不到 Leader 宕机，实际心跳检测间隔远超配置的 CheckInterval 引起选举延迟。根因是缺少对所有错误类型的兜底处理，应至少对非预期错误记录日志并继续运行。
-3. leaderelect.go 的 notify 方法第 232-234 行在主事件循环 goroutine 中同步执行所有回调函数，而文档第 380 行明确宣称"回调函数在单独的 goroutine 中执行，不会阻塞选举主循环"。如果一个回调执行了耗时操作如写数据库，将直接拖慢心跳发送和 Leader 检查的下一个周期，可能导致 Leader 心跳间隔实际值远超 HeartbeatInterval 引起误判宕机。根因是实现不符合文档声明，应在 notify 中为每个回调启动新 goroutine 或删除文档中的不实描述。
-4. leaderelect.go 第 180 行定义了 heartbeatCh 字段（类型为 `chan struct{}`），在构造函数中初始化为缓冲大小为 1 的通道，但整个文件没有任何地方向该通道发送或接收数据，属于死代码。这个字段的存在给人造成心跳通道被用于某种信号传递的假象，实际它从未参与任何逻辑。应删除该字段及相关初始化代码。
-5. leaderelect_test.go 缺少对 doHeartbeat 心跳失败场景的独立覆盖。TestLeaderElector_HeartbeatRenewsLease 验证了心跳成功，TestLeaderElector_LeaderFailureReElection 通过 Stop 模拟 Leader 宕机，但没有测试 Leader 在运行中心跳续约失败时 doHeartbeat 是否正确触发 EventLeaderLost 和 EventBecomeFollower 并转为 Follower 角色。心跳失败和主动退出走的是不同代码路径，缺少覆盖意味着这条关键故障恢复路径没有自动化验证。
+1. leaderelect.go 的 notify 方法读取 e.role、e.leaderID、e.term 三个共享字段时只持有 callbacksMu 读锁而未持有 e.mu 互斥锁，而 doHeartbeat、startElection 等方法在 e.mu 保护下修改这些字段后再调用 notify，形成对字符串和整型的并发读写数据竞争。极端情况下读到的 leaderID 可能为损坏值。根因是 notify 在事件数据采集阶段未加锁保护，应先获取 e.mu 快照 role、leaderID、term 三个值再构造事件对象。
+2. leaderelect.go 的 checkLeader 方法调用 GetHolder 返回错误时只处理了 ErrLockNotHeld 和 ErrLockExpired 两种已知错误触发选举，其他所有错误被静默忽略直接 return 导致本检查周期完全跳过。如果后端连续返回临时不可用等非预期错误，Follower 可能在多个周期都检测不到 Leader 宕机，实际检测间隔远超 CheckInterval 引起选举延迟。根因是缺少对所有错误的兜底处理，应至少对非预期错误记录日志并继续运行。
+3. leaderelect.go 的 notify 方法在主事件循环 goroutine 中同步执行所有回调函数，而文档明确宣称"回调函数在单独的 goroutine 中执行不会阻塞选举主循环"。如果一个回调执行了写数据库等耗时操作，将直接拖慢心跳发送和 Leader 检查周期，可能导致心跳间隔实际值远超 HeartbeatInterval 引起误判宕机。根因是实现不符合文档声明，应在 notify 中为每个回调启动新 goroutine 或删除文档中的不实描述。
+4. leaderelect.go 定义了 heartbeatCh 字段（类型为 `chan struct{}`），在构造函数中初始化为缓冲大小为 1 的通道，但整个文件没有任何地方向该通道发送或接收数据，属于死代码。这个字段的存在给人造成心跳通道被用于某种信号传递的假象，实际它从未参与任何逻辑。应删除该字段及相关初始化代码。
+5. leaderelect_test.go 缺少对 doHeartbeat 心跳失败场景的独立覆盖。已有测试验证了心跳成功和通过 Stop 模拟 Leader 宕机，但没有测试 Leader 在运行中心跳续约失败时 doHeartbeat 是否正确触发 EventLeaderLost 和 EventBecomeFollower 并转为 Follower。心跳失败和主动退出走的代码路径不同，缺少覆盖意味着这条关键故障恢复路径没有自动化验证。
 
 过程不满意：
-1. 模型在收到提示词后第一步就调用了 todo_write 创建了 5 项子任务计划（session-cot-1.md 第 4 行），此时还没有阅读任何项目文件或分析 Leader 选举模块的需求边界。之后才开始查看 distlock.go、distlock_test.go 和 go.mod。这属于"不能在刚收到任务时就直接创建 TodoList"的反模式，应先在阅读相关代码基础之上再制定计划。
-2. 模型用一次 Write 写完整个 leaderelect.go（470 行）后又用一次 Write 写完整个 leaderelect_test.go（938 行），然后才首次运行 go test。首次运行即发现一个测试失败，模型随后定位到是选举器启动后需等待第一个检查周期才触发选举。虽然修复正确，但"全量编写后一次性测试"的模式导致编译和逻辑错误堆积到最后集中排查，合理做法是将模块按构造函数、核心循环、回调机制三个层次分步编写并每步编译验证。
+1. 模型在收到提示词后第一步就调用了 todo_write 创建了 5 项子任务计划，此时还没有阅读任何项目文件或分析 Leader 选举模块的需求边界。之后才开始查看 distlock.go、distlock_test.go 和 go.mod。这属于"不能在刚收到任务时就直接创建 TodoList"的反模式，应先在阅读相关代码基础之上再制定计划。
+2. 模型用一次 Write 写完整个 leaderelect.go（470 行）后又用一次 Write 写完整个 leaderelect_test.go（938 行），然后才首次运行 go test 发现一个测试失败。虽然修复正确，但"全量编写后一次性测试"的模式导致编译和逻辑错误堆积到最后集中排查，合理做法是将模块按构造函数、核心循环、回调机制分步编写并每步编译验证。
 3. 模型在编写 docs/leaderelect.md 之前先去查看了 docs/pubsub.md 作为文档模板参考。pubsub 是另一个任务包的功能模块，与 Leader 选举无任何关联，这种不必要的跨任务探索浪费了上下文窗口空间。应直接参考提示词第 7 条列出的文档内容要求来组织，或参考同批次其他 leader 相关模块的文档模式。

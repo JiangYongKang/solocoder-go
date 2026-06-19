@@ -1,7 +1,7 @@
 产物不满意：
-1. attemptLock 方法中原先使用 `start.Add(ttl)` 统一记录所有节点的过期时间，然后 `minExpiry` 再减去 `elapsed + ClockDrift`，导致 elapsed 被扣除了两次。修复后改为每个节点加锁成功后立即用 `time.Now().Add(ttl)` 记录该节点的实际过期时间，最终仅扣除一次 ClockDrift。Heartbeat 方法做了对应的同样修复。这两个修复逻辑正确，TTL 不再被双倍缩短，38 个单元测试全部通过。
-2. 对于提示词第 2 条提到的"重入校验逻辑缺失"和 `ErrReentrantNotAllowed` 变量未使用两个问题，模型经分析后认定 `lockInternal` 方法中已有的 `entry.reentrancy >= lm.cfg.MaxReentrancy` 校验逻辑本身就正确，TestLockManager_MaxReentrancy 测试用例执行结果也验证了这一点，因此只删除了未使用的 `ErrReentrantNotAllowed` 变量，未对 lockInternal 做额外改动。模型的正确定位避免了重复添加已有逻辑的冗余修改，处理恰当。
-3. docs/distlock.md 补充了完整的 Redlock 多节点加锁步骤级详解，用 3 节点 TTL=10s ClockDrift=50ms 的具体数值示例展示了从 T=0ms 到最终 Expiry=9950ms 的完整时间轴流程，还补充了解锁流程和心跳续期流程说明，以及 4 个包含 `package main` 和 `func main()` 的完整可运行使用示例。文档内容从之前的段落级描述提升到了步骤级，满足提示词第 5 条要求。
+1. attemptLock 方法中原先使用 start.Add(ttl) 统一记录所有节点过期时间，然后 minExpiry 再减去 elapsed + ClockDrift，导致 elapsed 被扣除了两次。修复后改为每个节点加锁成功后立即用 time.Now().Add(ttl) 记录实际过期时间，最终仅扣除一次 ClockDrift，Heartbeat 方法做了同样修复。修复逻辑正确，TTL 不再被双倍缩短，38 个测试全部通过。
+2. 对于提示词提到的重入校验逻辑缺失和 ErrReentrantNotAllowed 变量未使用两个问题，模型分析后认定 lockInternal 方法中已有的 entry.reentrancy >= lm.cfg.MaxReentrancy 校验逻辑本身正确，测试结果也验证了这一点，因此只删除未使用的变量，未对 lockInternal 做额外改动。模型的正确定位避免了重复添加已有逻辑的冗余修改，处理恰当。
+3. docs/distlock.md 补充了完整的 Redlock 多节点加锁步骤级详解，用具体数值示例展示了从 T=0ms 到最终 Expiry 的完整时间轴流程，还补充了解锁和心跳续期流程说明，以及 4 个包含 package main 和 func main() 的完整可运行使用示例。文档从段落级描述提升到了步骤级，满足提示词第 5 条要求。
 过程不满意：
-1. 模型在刚收到提示词后，未经完整阅读代码就在第 2 步直接调用 todo_write 创建了 4 项子任务计划，此时尚未查看 distlock.go 的完整内容，仅依靠提示词中描述的问题就做出了任务拆分。之后在第 3 步才开始阅读代码，但任务计划并未随代码理解深入而调整。正确做法是先分析需求文档和现有代码，理清问题根因和修改范围后再制定执行计划，避免提前规划与实际修改不匹配。
-2. 模型在第 3 步和第 4 步连续两次调用了 view_files 读取同一个文件 internal/distlock/distlock.go，两次读取之间该文件没有任何代码变更也没有任何中间编辑操作。第二次读取没有引入新的分析视角或发现，属于毫无增量信息的重复读取，降低了任务执行效率。正确做法是第一次读取后记录关键代码区域，如果信息已足够就直接进入修改环节，不需要在未做任何变更的情况下二次读取同一个文件。
+1. 模型在刚收到提示词后，未经完整阅读代码就在第 2 步直接调用 todo_write 创建了 4 项子任务计划，此时尚未查看 distlock.go 内容，仅依靠提示词描述就做出了任务拆分。之后在第 3 步才开始阅读代码，但任务计划并未随理解深入而调整。正确做法是先分析现有代码和问题根因后再制定执行计划。
+2. 模型在第 3 步和第 4 步连续两次调用了 view_files 读取同一个文件 internal/distlock/distlock.go，两次读取之间该文件没有任何代码变更。第二次读取没有引入新的分析视角，属于毫无增量信息的重复读取，降低了任务执行效率。正确做法是第一次读取后记录关键代码区域，信息足够就直接进入修改，无需未做任何变更就二次读取同一文件。

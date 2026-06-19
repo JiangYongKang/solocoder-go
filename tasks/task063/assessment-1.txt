@@ -1,7 +1,7 @@
 产物不满意：
-1. chaosfault.go 中存在锁策略不一致的问题。ApplyDelay 和 CheckError 方法在释放 mu 锁之后访问 fi.randSrc 进行随机数生成，而 CheckDisconnect 和 IsDisconnected 方法始终在持锁状态下访问同一字段，同一对象内对同一共享状态的并发保护策略存在矛盾。释放锁后访问 randSrc 时可能出现与其他持锁写入的并发冲突，虽然 Go 的 rand 包在单实例并发调用时有一定安全性但这不是代码级保证，应统一在锁保护下访问共享状态。
+1. chaosfault.go 中存在锁策略不一致的问题。ApplyDelay 和 CheckError 在释放 mu 锁之后访问 fi.randSrc 做随机数生成，而 CheckDisconnect 和 IsDisconnected 始终在持锁下访问同一字段，同一对象内对同一共享状态的并发保护策略矛盾。释放锁后访问 randSrc 可能与持锁写入产生并发冲突，应统一在锁保护下访问共享状态。
 2. chaosfault.go 中定义了 delayFault、errorFault、disconnectFault 三个结构体但从未在代码中被使用，属于死代码遗留。同时 errors.go 中定义了 ErrInjected 和 ErrFaultNotEnabled 两个哨兵错误变量但从未被任何函数返回或检查。这些未使用的类型和错误变量增加了代码阅读者的认知负担，让人误以为存在对应的使用场景，应清理或补充对应的使用逻辑。
-3. chaosfault.go 中配置化 disconnect 模式在 TargetRatio 小于 1.0 时变成了每次请求随机判定是否断开而非提示词要求的持久断开。提示词描述"连接断开时正在进行的请求立即返回连接中断错误，后续请求在恢复之前也全部返回连接中断错误"，而随机模式使每次请求独立判决，失去了持久断开的语义。随机断开和持久断开是两种不同的故障注入场景，不应共用同一个配置。
+3. chaosfault.go 中 disconnect 模式在 TargetRatio 小于 1.0 时变成了每次请求随机判定是否断开，而不是提示词要求的持久断开。提示词要求"连接断开时正在进行的请求立即返回连接中断错误，后续请求在恢复之前也全部返回连接中断错误"，但随机模式使每次请求独立判决失去了持久断开语义。随机断开和持久断开是两种不同故障注入场景，不应共用同一配置。
 4. chaosfault_test.go 中错误注入缺少按概率触发的测试覆盖。延迟注入有 TestApplyDelay_Ratio 验证 TargetRatio 的统计分布，但错误注入只有对 ErrorType 和 ErrorMessage 的断言，没有对 TargetRatio 统计命中率的验证，无法自动发现概率实现是否使用正确的随机数算法。
 
 过程不满意：

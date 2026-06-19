@@ -1,8 +1,8 @@
 产物不满意：
-1. timeoutprop.go 的 Execute 方法在 stage 返回非超时类错误时将其状态设为 StageStatusTimedOut 而非 types.go 中已定义但从未使用的 StageStatusFailed。当业务错误如 `"file not found"` 发生时报告展示的是 TIMED_OUT 而非 FAILED，调用方无法区分是超时失败还是业务逻辑失败。根因是错误处理分支未区分 context.DeadlineExceeded 和普通 error，应在非超时路径使用 StageStatusFailed。
-2. timeoutprop.go 的 Execute 方法第 143 行最小阈值检查的条件是 `stageBudget < p.minThreshold` 而非提示词要求的"剩余时间不足最小阈值则跳过"。例如某阶段分配预算仅 5ms 但根 context 剩余时间仍有 1000ms，minThreshold 为 10ms 时该阶段被错误跳过，剩余时间实际充裕。根因是混淆了阶段预算与剩余时间两个概念，应将检查条件改为 `remainingTime < p.minThreshold`。
+1. timeoutprop.go 的 Execute 方法在 stage 返回非超时类错误时将其状态设为 StageStatusTimedOut 而非 StageStatusFailed。当业务错误如 `"file not found"` 发生时报告展示 TIMED_OUT 而非 FAILED，调用方无法区分超时失败和业务逻辑失败。根因是错误处理未区分 context.DeadlineExceeded 和普通 error，非超时路径应使用 StageStatusFailed。
+2. timeoutprop.go 的 Execute 方法最小阈值检查的条件是 `stageBudget < p.minThreshold` 而非提示词要求的"剩余时间不足最小阈值则跳过"。例如某阶段分配预算仅 5ms 但根 context 剩余时间仍有 1000ms，minThreshold 为 10ms 时该阶段被错误跳过，剩余时间实际充裕。根因是混淆了阶段预算与剩余时间两个概念，应将检查条件改为 `remainingTime < p.minThreshold`。
 3. timeoutprop.go 的 Execute 方法中当 hasBudget 为 false 时最小阈值检查被完全跳过，零预算阶段即使剩余时间仅剩 1ns 也会执行，与提示词要求每个环节都应检查剩余时间的逻辑矛盾。根因是设计中去掉了零预算阶段的阈值保护，应统一检查 `remainingTime < p.minThreshold`。
-4. errors.go 中 StageTimeoutError 的 Unwrap 方法返回自定义 deadlineExceededError 类型而非标准库 context.DeadlineExceeded，调用方通过 `errors.Is(err, context.DeadlineExceeded)` 判断时返回 false，与 Go 超时错误的惯用判断方式不一致。根因是为在 Unwrap 中自定义类型，应直接返回 context.DeadlineExceeded。
+4. errors.go 中 StageTimeoutError 的 Unwrap 方法返回自定义 deadlineExceededError 类型而非标准库 context.DeadlineExceeded，调用方通过 `errors.Is(err, context.DeadlineExceeded)` 判断时返回 false，与 Go 超时错误的惯用判断方式不一致。根因是在 Unwrap 中自定义类型，应直接返回 context.DeadlineExceeded。
 5. timeoutprop_test.go 的 TestExecute_MinThresholdSkip 测试体内无任何实质断言，仅对三种状态各做空 if 分支处理，其余情况仅输出 Logf 不触发 t.Errorf，该测试恒为 PASS 无法验证最小阈值跳过逻辑是否正确。应编写明确断言验证 stage 状态和超时类型。
 
 过程不满意：

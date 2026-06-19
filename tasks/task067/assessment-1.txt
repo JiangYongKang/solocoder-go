@@ -1,5 +1,5 @@
 产物不满意：
-1. engine.go 的 ResumeWorkflow 方法是整个模块最严重的缺陷。该方法完全没有读取 state.CompletedNodes 或 state.CurrentNodeID 来判断哪些节点已执行完毕，而是直接从根节点重新执行整个工作流。假设一个由 5 个 TaskNode 组成的顺序工作流执行完前 3 个节点后状态保存，恢复后前 3 个节点会被重复执行产生重复的副作用（如重复写入数据库）。提示词明确要求从上次中断的位置继续执行而不是从头开始，当前实现完全违反了这一核心需求。sequential.go 的 RestoreState 方法是空实现仅返回 nil，GetState 也只返回 CurrentIndex 始终为 0 的新状态对象。根因是模型对断点续传的语义理解不足，把状态保存恢复简化为了上下文变量保存恢复，应在 ResumeWorkflow 中读取已完成节点列表跳过已执行节点并定位到当前节点继续执行。
+1. engine.go 的 ResumeWorkflow 没有读取 CompletedNodes 或 CurrentNodeID 判断节点进度，直接重新执行工作流。顺序工作流执行完部分节点后保存状态，恢复后已完成节点重复执行产生副作用。提示词明确要求从上次中断位置继续而非从头开始。sequential.go 的 RestoreState 是空实现，GetState 始终返回零值。根因是模型把状态恢复简化为上下文恢复，应在 ResumeWorkflow 中跳过已执行节点定位到当前节点继续执行。
 2. engine.go 的 ExecuteWorkflow 方法将 execCtx.Values() 中的所有上下文变量以 NodeResult 的形式注入到 result.Results 中，导致通过 execCtx.Set 设置的变量与真实节点结果混合在一起。调用方可能误以为存在额外的节点执行，造成对工作流输出结构的错误解读。根因是结果输出逻辑未区分真实节点执行结果和上下文传递变量，不应将上下文变量包装为 NodeResult。
 3. node.go 的 RetryLinear 和 RetryExponential 在 cfg.Interval <= 0 时 base 默认为 100ms，但 RetryFixed 也会走这个默认逻辑，意味着 Interval: 0 配合 RetryFixed 也会产生 100ms 间隔而非立即重试。虽然这可能符合设计意图但文档中未有说明，调用方期望零间隔立即重试时会产生多余等待。应在文档中明确说明默认间隔行为或在配置校验时拒绝零间隔值。
 4. loop.go 的 LoopNode 只接受单个子节点 Node 字段，而提示词描述支持对一个或多个子节点进行循环执行。虽然可以通过将多个子节点包在 SequentialNode 中作为 LoopNode 子节点来间接实现，但 API 层面对提示词的直接覆盖不完整。应在 LoopNode 中支持子节点切片使多节点循环成为一等公民。

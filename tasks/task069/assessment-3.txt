@@ -1,7 +1,8 @@
 产物不满意：
-1. 在 sendHeartbeats 方法中，当 Leader 并发向多个落后 Follower 发送快照时，不同 goroutine 对 snapshotInstalling 布尔字段独立执行 set 和 reset。如果 goroutine A 为 Follower-X 先完成快照发送将字段重置为 false，此时 goroutine B 为 Follower-Y 的 n.sm.Snapshot() 仍在执行，Propose 方法检查到字段为 false 即可继续提交新日志，导致快照生成期间产生的新日志未被快照包含。根因是使用布尔值而非原子计数器跟踪并发快照操作数量，应改用 atomic.Int32 计数器实现 add/sub/load 语义，Propose 中判断计数器是否大于零。
-2. sendHeartbeats 方法末尾新增的 `if n.heartbeatTimer != nil` 检查是为消除 TestSnapshotInstallingError 中手动设置 node.state = Leader 触发的 nil panic 而添加的防卫代码。该分支在正常流程中永远不会执行，因为 Start() 方法已初始化 heartbeatTimer，属于生产代码向测试代码妥协的典型案例，每次心跳周期都多执行一次无意义的 nil 判断。正确做法是在测试代码中调用 node.Start() 或手动初始化 timer，然后移除生产代码中的 nil 检查。
-3. TestSnapshotInstallingError 测试直接赋值 node.snapshotInstalling = true 来触发 ErrSnapshotInstalling，仅验证了 Propose 中分支的语法可达性而未通过真实快照发送流程验证。提示词指出核心问题是该判断分支成为死代码，该测试证明了分支可手动触发但未证明可通过 sendHeartbeats 中快照发送路径自然触达。根因是模型将问题理解为标志位验证而非可达性证明，应构造包含落后 Follower 的场景，通过日志压缩和快照发送实际触发标志位而非手动赋值。
+1. 在 sendHeartbeats 方法中，当 Leader 并发向多个落后 Follower 发送快照时，不同 goroutine 对 snapshotInstalling 布尔字段独立执行 set 和 reset。如果 goroutine A 先完成快照发送将字段重置为 false，此时 goroutine B 的 n.sm.Snapshot() 仍在执行，Propose 检查到字段为 false 即可继续提交新日志，导致快照生成期间产生的新日志未被快照包含。根因是使用布尔值而非原子计数器跟踪并发快照操作数量，应改用 atomic.Int32 计数器。
+2. sendHeartbeats 方法末尾新增的 `if n.heartbeatTimer != nil` 检查是为消除测试中手动设置 node.state = Leader 触发的 nil panic 而添加的防卫代码。该分支在正常流程中永远不会执行，因为 Start() 方法已初始化 heartbeatTimer，属于生产代码向测试妥协，每次心跳周期都多执行一次无意义的 nil 判断。正确做法是在测试中调用 node.Start() 初始化 timer，然后移除生产代码中的 nil 检查。
+3. TestSnapshotInstallingError 测试直接赋值 node.snapshotInstalling = true 来触发 ErrSnapshotInstalling，仅验证了 Propose 分支的语法可达性而未通过真实快照发送流程验证。提示词指出核心问题是该判断分支成为死代码，该测试证明了分支可手动触发但未证明可通过 sendHeartbeats 中快照发送路径自然触达。应构造包含落后 Follower 的场景实际触发标志位。
+
 过程不满意：
-1. 模型在完成 sendHeartbeats 和 TestMemoryStateMachine_Snapshot 的代码修改后，未先进行编译检查就直接运行 go test，导致首次测试因 `fmt` 包导入缺失而编译失败。虽然在测试文件新增了 fmt.Sprintf 大字符串格式化调用，但模型没有意识到 fmt 包未在现有 import 中声明，属于代码修改阶段缺乏自检意识。正确做法是涉及新增外部包引用时，先执行 go build 验证编译通过再运行测试套件。
-2. 遇到 heartbeatTimer nil panic 后，模型选择了直接修改生产代码 sendHeartbeats 添加 nil 检查的思路，而非分析 panic 的根本原因——测试代码手动设置 node.state = Leader 但绕过了 Start() 方法的定时器初始化流程。模型在思考过程中提到"测试中直接手动设置节点状态为 Leader 而没有初始化 timer"，但后续的操作却是修补生产代码而非修复测试代码。这属于修复症状而非根因的试错思维，正确做法是定位到触发 panic 的测试用例（TestSnapshotInstallingError），在该测试中补全节点初始化，保持生产代码不受测试便利性侵入。
+1. 模型在完成代码修改后未先进行编译检查就直接运行 go test，导致首次测试因 `fmt` 包导入缺失而编译失败。虽然在测试文件新增了 fmt.Sprintf 调用，但模型没有意识到 fmt 包未在现有 import 中声明，属于代码修改阶段缺乏自检意识。正确做法是涉及新增外部包引用时先执行 go build 验证编译通过。
+2. 遇到 heartbeatTimer nil panic 后，模型选择直接修改生产代码 sendHeartbeats 添加 nil 检查，而非分析 panic 根因——测试代码手动设置 node.state = Leader 但绕过了 Start() 方法的定时器初始化。模型在思考过程中提到"测试中手动设置节点状态为 Leader 而没有初始化 timer"，但后续操作却是修补生产代码而非修复测试代码。这属于修复症状而非根因，正确做法是在该测试中补全节点初始化。

@@ -1,6 +1,6 @@
 产物不满意：
-1. 在 timeoutprop.go 的 Execute 方法错误处理部分，模型将 WithCancel 改为 WithTimeout 后又追加了 rootCtx 的双重保障检查，将进入超时分类块的条件从原来的 isDeadline 扩展为 isDeadline 或 isRootDeadline。当 hasBudget 阶段在 goroutine 中返回业务错误而根 context 恰巧也已过期时，尽管 select 拿到的 err 是业务错误而非 DeadlineExceeded，isRootDeadline 为真导致代码错误地进入超时分类分支，将 err 覆盖为 context.DeadlineExceeded 并将阶段状态标记为 TimedOut 而非 Failed。这导致调用方通过 errors.Is 和查看报告都无法区分业务失败与超时，原始错误被永久丢失。根因是模型未分析两个修改之间的交互关系：WithTimeout 修复已确保 select 的所有路径都正确返回 DeadlineExceeded，isRootDeadline 检查完全是多余的叠床架屋，反而打开了非超时错误进入超时分类的旁路。正确做法是只保留 WithTimeout 修改，删除 rootCtx 双重检查逻辑，将条件恢复为仅依赖 isDeadline 判断。
+1. timeoutprop.go 的 Execute 中，WithCancel 改 WithTimeout 后追加 rootCtx 双重检查。当 goroutine 返回业务错误而根 context 恰巧过期时，isRootDeadline 为真导致 err 被覆盖为 DeadlineExceeded、状态误标为 TimedOut，原始错误丢失。根因是 WithTimeout 已确保所有路径正确返回，isRootDeadline 多余且引入旁路。应删除双重检查，只保留 WithTimeout 修改。
 
 过程不满意：
 1. 模型在刚收到提示词后未经任何分析就直接用 todo_write 创建了 4 项子任务计划，之后才开始查看 timeoutprop.go 代码。这种先规划再分析的行为违反了先理解问题再制定执行计划的正确流程，导致后续无法准确评估两个修改之间的冗余关系，进而追加了不必要且有害的 rootCtx 双重检查。正确做法是先阅读代码理解根因，确认 WithTimeout 替换是否足够，再决定是否需要额外修改。
-2. 模型在实施 rootCtx 双重保障时称即使 err 是 context.Canceled 也要检查根 context 是否已超时，但 WithTimeout 修改后 err 已不可能为 context.Canceled，select 两个 context.Done 分支返回的都是 context.DeadlineExceeded。模型在未验证两个修改之间的覆盖关系就宣言这是双重保障，属于对代码行为的错误推演，说明模型在逐个修改时缺乏对变更全局影响的推演能力，正确做法是每完成一个修改后重新分析代码执行路径，确认问题是否已被彻底解决再决定是否需要更多修改。
+2. 模型实施 rootCtx 双重保障时称即使 err 是 Canceled 也要检查根 context 是否超时，但 WithTimeout 修改后 err 已不可能为 Canceled，两个 Done 分支返回的都是 DeadlineExceeded。模型未验证修改间的覆盖关系就宣言这是双重保障，属于对代码行为的错误推演，说明缺乏对变更全局影响的推演能力。正确做法是每完成一个修改后重新分析执行路径，确认问题已彻底解决再决定是否需要更多修改。

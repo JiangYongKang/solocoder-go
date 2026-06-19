@@ -1,10 +1,10 @@
 产物不满意：
-1. saga.go 的 executeCompensations 方法在处理无补偿函数的步骤时调用了 c.logOperation 记录 OpTypeCompensation 类型、StatusSuccess 状态的日志条目，日志详情写的是 Step has no compensation function, skipping。由于该步骤根本没有注册补偿函数也没有实际执行任何补偿操作，日志却以补偿成功的状态记录它，这会在事务完整追踪中产生虚假的成功补偿记录。当查询日志追溯回滚流程时会出现某步骤补偿状态为 Success 但实际上补偿从未执行的情况。正确做法是跳过日志记录而非用 Success 代替未发生的操作。
-2. saga.go 中定义了 ErrCompensationFailed 和 ErrSagaRunning 两个哨兵错误变量，但在整个 saga 包的代码中从未有任何函数返回或使用这两个错误。ErrCompensationFailed 本应在补偿失败时返回给调用方用以区分补偿类错误但 Execute 方法在补偿失败后并未将此类错误写入返回的 SagaExecution.Error。ErrSagaRunning 本应在 Saga 正在运行且不允许并发执行时返回但 Execute 方法未检查是否有正在执行中的事务。遗漏了对应的业务逻辑。
-3. saga.go 的 CompensationFailure 结构体中 ForwardStepID 字段在 executeCompensations 方法中始终被赋值为与 StepID 完全相同的值，提示词要求补偿失败标记包含失败的正向操作和补偿操作的标识，当前虽形式上包含两个标识但两者永远相同无法区分正向和补偿操作的独立标识。如果正补是同一逻辑步骤的两个面则单独维护 ForwardStepID 无意义，如果需区分则当前未做到真正区分，这是设计上的不严谨。
-4. saga.go 中 GetExecution 和 GetLogs 两个方法在传入 ID 不存在时统一返回 ErrSagaNotFound 错误。但 GetExecution 是按执行实例 ID 查询，GetLogs 是按事务 ID 查询，它们查的都是执行或日志维度而非 Saga 定义维度。调用方收到 ErrSagaNotFound 时无法判断是 Saga 不存在还是执行记录或日志不存在，语义混淆导致错误处理粒度不够。应分别定义错误以区分这些不同维度的不存在场景。
+1. saga.go 的 executeCompensations 方法在对无补偿函数的步骤处理时，调用了 c.logOperation 以 OpTypeCompensation 类型、StatusSuccess 状态记录了"Step has no compensation function, skipping"日志。该步骤既无补偿函数也未执行任何补偿操作，日志却以成功状态记录，在事务追踪中产生虚假的成功补偿记录。追溯回滚流程时会看到某步骤补偿状态为 Success 但实际从未执行。正确做法是直接跳过日志记录。
+2. saga.go 中定义了 ErrCompensationFailed 和 ErrSagaRunning 两个哨兵错误，但整个 saga 包中从未有函数返回或使用它们。ErrCompensationFailed 本应在补偿失败时返回以区分补偿类错误，但 Execute 方法在补偿失败后未将其写入 SagaExecution.Error。ErrSagaRunning 本应在 Saga 运行中不允许并发执行时返回，但 Execute 未检查是否有正在执行的事务。遗漏了对应的业务逻辑。
+3. saga.go 的 CompensationFailure 结构体中 ForwardStepID 字段在 executeCompensations 中总被赋值为与 StepID 相同的值。提示词要求补偿失败标记包含正向操作和补偿操作的标识，当前虽有两个字段但永远相同，无法区分正向与补偿操作的独立标识。如果正向和补偿是同一逻辑的两个面则单独维护 ForwardStepID 无意义，如果需区分则当前未做到真正区分，属于设计不严谨。
+4. saga.go 中 GetExecution 和 GetLogs 两个方法在 ID 不存在时统一返回 ErrSagaNotFound。但 GetExecution 是按执行实例 ID 查询，GetLogs 是按事务 ID 查询，查的都是执行或日志维度而非 Saga 定义维度。调用方收到 ErrSagaNotFound 时无法判断是 Saga 不存在还是记录不存在，语义混淆导致错误处理粒度不够。应分别定义错误以区分不同维度。
 
 过程不满意：
-1. 模型在收到提示词后查看了项目文件夹结构找到 go.mod，但紧接着就去查看了 internal/orchestrator/orchestrator.go 的代码，该文件属于 task003（并发任务编排器）与当前 Saga 任务没有任何关联。模型过度依赖外部参考而非聚焦于提示词直接给出的需求，在未理解 Saga 模块需求边界的情况下就创建了 10 项子任务 TodoList，属于先规划再分析的反模式。
-2. 模型写完 saga.go 初版代码后在尚未运行任何测试的情况下立即对同一文件连续调用了 5 次 edit_file_search_replace 进行修复。初版代码存在多处理论错误而非样式问题，说明模型写代码时没有先在脑中推演核心流程（正向执行链、补偿反序、错误传播路径），而是边写边修写完再检查，这种试错式开发与模型预期的工程能力不符。
-3. Execution ID 最初使用 time.Now().UnixNano() 生成，在连续快速调用时必然重复。这是一个在初版设计阶段稍加思考就能预见到的问题，但模型直到测试失败才意识到，反映出设计阶段对并发场景和数据竞争缺乏前置思考采取了试错式的路径。
+1. 模型收到提示词后查看了 go.mod，紧接着就去查看了 internal/orchestrator/orchestrator.go，该文件属于 task003 与当前 Saga 任务无关。模型过度依赖外部参考而非聚焦提示词需求，在未理解 Saga 模块需求边界时就创建了 10 项 TodoList，属于先规划再分析的反模式。
+2. 模型写完 saga.go 初版后在未运行任何测试的情况下对同一文件连续调用了 5 次 edit_file_search_replace 进行修复。初版代码存在多处理论错误而非样式问题，说明模型写代码时没有先在脑中推演正向执行链、补偿反序、错误传播路径等核心流程，而是边写边修，属于试错式开发。
+3. Execution ID 最初使用 time.Now().UnixNano() 生成，在连续快速调用时必然重复。这是一个在设计阶段稍加思考就能预见的问题，但模型直到测试失败才意识到，反映出对并发场景和数据竞争缺乏前置思考，采取了试错式路径。
