@@ -1,0 +1,10 @@
+产物不满意：
+1. errors.go 中 ParseError 结构体定义了 Position 字段用于指示语法错误的精确位置，但在 parser.go 所有调用 NewParseError 的地方 Position 参数始终传 0，从未设置真实的字符偏移量。提示词要求解析失败时返回明确的语法错误提示指出具体哪个字段和位置不符合规范，Position 永远为 0 导致错误信息失去了定位价值。应在解析时根据当前字段在原始表达式中的起始字符索引计算正确的 Position 值。
+2. cronsched_test.go 中 TestScheduler_AddAndExecute 测试用例存在竞态条件。测试用 time.Now().Add(500ms) 作为基准时间计算 Cron 表达式，但 AddWithIDAndLocation 方法内部又独立调用 time.Now().In(loc) 来计算 NextRun，两次时间获取之间存在窗口，当调度器处理延迟时目标时间可能已过期导致 NextTime 返回下一年或更远的时间，wg.Wait() 超时失败。应统一使用同一个参考时间源或在测试中手动设置任务 NextRun 避开时间漂移。
+3. cronsched_test.go 中 TestNextTime_DST_SpringForward 测试验证逻辑过于宽松，仅通过 got.Before(from) 检查结果是否在参考时间之后，未校验实际返回的具体小时和分钟值。表达式为 `0 30 2 * * *` 每天 2:30 执行，但夏令时跳跃日 2:30 不存在，正确行为应是跳过整天返回次日合理时间。当前断言只要结果大于 from 就算通过，即使 adjustForDST 完全失效返回错误时间也无法被检测。应增加对 Hour 和 Minute 的具体断言。
+4. parser.go 中 parseValuePart 函数的步长判断使用 strings.Contains(part, "/")，若用户误输入 `1-2/3/4` 这种多级步长格式，parseStep 按第一个 / 切分后 stepStr=`3/4`，Atoi 失败返回 `"invalid step value: 3/4"` 但不会指出原始输入存在多个 / 分隔符的语法问题。应在 parseStep 中增加对 stepStr 是否包含非法字符的检查提供更精确的语法错误描述。
+
+过程不满意：
+1. 模型在首次编写测试用例时 TestParse_DayWeekdayMutex 使用了表达式 `"0 0 1 * * 1"` 日字段是通配符并未触发日周互斥错误，事后模型自己定位到测试用例本身写错了。这说明模型在编写测试时没有先手工验证每个测试用例的预期输入输出，导致测试无法正确反映需求边界拖累了后续调试节奏，应先在纸面上推演再写测试。
+2. 模型首次实现 adjustForDST 时采用 UTC 时分秒直接映射回本地时区的错误转换逻辑导致时间整体偏移所有时区测试失败。这说明模型编写 DST 处理时未先理解 Go time 包中 .In().UTC().In() 往返转换的底层语义，凭直觉编写了时区转换代码，在涉及平台库底层行为时应先查阅标准库文档或编写独立验证代码确认转换行为。
+3. 模型在 session-cot 结尾声称"全部 53 个测试用例通过，无失败"，但实际 TestScheduler_AddAndExecute 仍然超时失败。模型修改了测试但没有稳定复现验证修改的有效性，仅凭单次测试通过就宣称完成，属于幻觉与虚假完成，对于含有时序依赖的并发测试应连续多次运行如 `-count=5` 确保稳定性。

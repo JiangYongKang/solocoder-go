@@ -1,0 +1,10 @@
+产物不满意：
+1. engine.go 的 ResumeWorkflow 方法是整个模块最严重的缺陷。该方法完全没有读取 state.CompletedNodes 或 state.CurrentNodeID 来判断哪些节点已执行完毕，而是直接从根节点重新执行整个工作流。假设一个由 5 个 TaskNode 组成的顺序工作流执行完前 3 个节点后状态保存，恢复后前 3 个节点会被重复执行产生重复的副作用（如重复写入数据库）。提示词明确要求从上次中断的位置继续执行而不是从头开始，当前实现完全违反了这一核心需求。sequential.go 的 RestoreState 方法是空实现仅返回 nil，GetState 也只返回 CurrentIndex 始终为 0 的新状态对象。根因是模型对断点续传的语义理解不足，把状态保存恢复简化为了上下文变量保存恢复，应在 ResumeWorkflow 中读取已完成节点列表跳过已执行节点并定位到当前节点继续执行。
+2. engine.go 的 ExecuteWorkflow 方法将 execCtx.Values() 中的所有上下文变量以 NodeResult 的形式注入到 result.Results 中，导致通过 execCtx.Set 设置的变量与真实节点结果混合在一起。调用方可能误以为存在额外的节点执行，造成对工作流输出结构的错误解读。根因是结果输出逻辑未区分真实节点执行结果和上下文传递变量，不应将上下文变量包装为 NodeResult。
+3. node.go 的 RetryLinear 和 RetryExponential 在 cfg.Interval <= 0 时 base 默认为 100ms，但 RetryFixed 也会走这个默认逻辑，意味着 Interval: 0 配合 RetryFixed 也会产生 100ms 间隔而非立即重试。虽然这可能符合设计意图但文档中未有说明，调用方期望零间隔立即重试时会产生多余等待。应在文档中明确说明默认间隔行为或在配置校验时拒绝零间隔值。
+4. loop.go 的 LoopNode 只接受单个子节点 Node 字段，而提示词描述支持对一个或多个子节点进行循环执行。虽然可以通过将多个子节点包在 SequentialNode 中作为 LoopNode 子节点来间接实现，但 API 层面对提示词的直接覆盖不完整。应在 LoopNode 中支持子节点切片使多节点循环成为一等公民。
+
+过程不满意：
+1. 模型在刚收到任务后未经分析就直接创建了 14 项子任务计划的 todo_write，此时还没有阅读过任何项目文件或分析需求文档。随后才开始查看 internal/retry、internal/serialize、internal/jobqueue 等其他包的代码试图寻找可复用模式，先制定计划再了解上下文的顺序是错误的，导致后续实际执行中计划粒度与模块结构不匹配，应在前置分析完成后再规划。
+2. 模型在编写所有源文件后第一次编译时出现了大量 fmt.Errorf with non-constant format string 问题涉及 sequential.go、parallel.go、conditional.go、loop.go 共 4 个文件，此后花费至少 6 轮编辑修复这些相同类型错误。这是没有在写完第一个文件后就编译验证而是把所有文件全部写完再一次性编译的后果，同一模式化代码风格问题在多个文件中批量复现后不得不反复修改，应每完成一个模块就编译验证。
+3. 模型在整个过程中没有为 ResumeWorkflow、SequentialNode.RestoreState、循环节点动态迭代错误场景编写任何测试。测试虽然覆盖了 77.7% 的代码行但缺少对状态恢复这一核心需求的真正覆盖，缺少对负面路径如动态迭代次数 key 不存在的验证。模型对 ResumeWorkflow 的实现缺陷也未被自动化测试捕获，说明测试策略与需求权重不匹配。

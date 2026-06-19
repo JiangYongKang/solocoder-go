@@ -1,0 +1,9 @@
+产物不满意：
+1. chaosfault.go 中存在锁策略不一致的问题。ApplyDelay 和 CheckError 方法在释放 mu 锁之后访问 fi.randSrc 进行随机数生成，而 CheckDisconnect 和 IsDisconnected 方法始终在持锁状态下访问同一字段，同一对象内对同一共享状态的并发保护策略存在矛盾。释放锁后访问 randSrc 时可能出现与其他持锁写入的并发冲突，虽然 Go 的 rand 包在单实例并发调用时有一定安全性但这不是代码级保证，应统一在锁保护下访问共享状态。
+2. chaosfault.go 中定义了 delayFault、errorFault、disconnectFault 三个结构体但从未在代码中被使用，属于死代码遗留。同时 errors.go 中定义了 ErrInjected 和 ErrFaultNotEnabled 两个哨兵错误变量但从未被任何函数返回或检查。这些未使用的类型和错误变量增加了代码阅读者的认知负担，让人误以为存在对应的使用场景，应清理或补充对应的使用逻辑。
+3. chaosfault.go 中配置化 disconnect 模式在 TargetRatio 小于 1.0 时变成了每次请求随机判定是否断开而非提示词要求的持久断开。提示词描述"连接断开时正在进行的请求立即返回连接中断错误，后续请求在恢复之前也全部返回连接中断错误"，而随机模式使每次请求独立判决，失去了持久断开的语义。随机断开和持久断开是两种不同的故障注入场景，不应共用同一个配置。
+4. chaosfault_test.go 中错误注入缺少按概率触发的测试覆盖。延迟注入有 TestApplyDelay_Ratio 验证 TargetRatio 的统计分布，但错误注入只有对 ErrorType 和 ErrorMessage 的断言，没有对 TargetRatio 统计命中率的验证，无法自动发现概率实现是否使用正确的随机数算法。
+
+过程不满意：
+1. 模型在浏览 2-3 个现有模块文件后立即创建了 9 项子任务的 TodoList，未充分消化混沌工程三种故障注入模式的差异和需求。之后在开发过程中实际将 TodoList 从 9 项简化为 5 项，说明初始计划粒度划分与实际情况不匹配，应先在理解需求边界后再制定执行计划。
+2. 测试全部通过后模型未执行 go vet 等静态检查工具来发现死代码和未使用变量，而是直接声称完成。delayFault 等三个未使用结构体和 ErrInjected 两个未使用哨兵错误是 go vet 或 IDE 诊断可以自动检测的问题，模型跳过了代码质量检查环节。

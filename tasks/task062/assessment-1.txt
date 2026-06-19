@@ -1,0 +1,9 @@
+产物不满意：
+1. quotamgr.go 的 SetLimitMode 函数在校验无效模式时返回了 ErrInvalidSoftThreshold 而非语义匹配的错误。当传入非法 LimitMode 值时返回的错误信息为 `"soft threshold must be between 1.0 and 2.0"`，与调用者试图设置限制模式的操作完全无关。根因是编写校验分支时直接复用了已有错误常量而未区分校验对象，应定义 ErrInvalidLimitMode 在校验模式合法性时返回。
+2. quotamgr.go 的 GetAllTenantsUsage 函数存在递归读锁隐患。函数持 m.mu.RLock() 后在循环内调用 m.GetTenantUsage(id)，而 GetTenantUsage 内部再次执行 m.mu.RLock()。Go 的 sync.RWMutex 文档禁止同一 goroutine 对读锁的递归重入，在已有写锁等待者的情况下可能导致死锁。根因是未意识到内部调用也会申请同一把锁，应将 GetTenantUsage 的锁内逻辑拆分为不持锁的内部版本。
+3. quotamgr.go 的 AcquireResource 函数存在 TOCTOU 竞态条件。函数持 m.mu.RLock() 读取租户配额后释放读锁再获取 tenantUsage.mu.Lock() 进行使用量检查，若另一 goroutine 在此窗口内通过 AdjustQuota 将配额缩小，本函数仍使用旧配额值放行本应被拒绝的申请。根因是配额读取与使用量检查未在同一临界区内完成，应在整个过程中统一锁策略。
+4. quotamgr.go 的 ReleaseResource 函数存在双重查找竞态问题。函数先持 m.mu.RLock() 检查租户是否存在，释放读锁后若不存在则返回错误，但 getOrCreateTenantUsage 会再次持锁创建新记录，两次检查之间若另一 goroutine 删除了该租户则可能创建出使用量为零的新记录导致合法释放操作被拒绝。根因是存在性检查与实际操作之间未保持原子性。
+
+过程不满意：
+1. 模型在浏览了几个现有模块文件后未阅读 go.mod 和 docs 目录下的已有文档，就在第 73 步直接创建了 7 项子任务 TodoList。之后对 TenantQuota 中 Quota 字段是命名嵌入而非匿名嵌入的理解不充分，导致初始代码字段访问路径大面积出错需多轮修复才编译通过，这正是跳过深入分析的直接后果，应先分析再规划。
+2. 模型编写 quotamgr.go 和 quotamgr_test.go 后首次运行 go test 即抛出大量编译错误（字段访问路径 quota.CPU 应为 quota.Quota.CPU），随后多次执行 edit_file_search_replace 在实现文件和测试文件中反复修复。这是试错式编写模式，应在定义类型后立即编写一个简单函数编译验证结构体访问路径是否正确，确认设计无误后再展开完整实现。
