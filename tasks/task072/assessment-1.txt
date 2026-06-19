@@ -1,0 +1,10 @@
+产物不满意：
+1. restclient.go 的 GetTemplate 用 `tmplCopy := *tmpl` 浅拷贝返回模板，DefaultHeaders 是 map 引用类型，副本与内部模板共享底层 map。调用方改副本 DefaultHeaders 时原始模板头也被同步篡改，与文档"修改不影响内部状态"矛盾。测试只验证了 Path 隔离未覆盖 DefaultHeaders 深拷贝。根因是没对 map 字段深拷贝，应在 GetTemplate 建新 map 逐 key 复制切片值。
+2. restclient.go 的 Do 重试仅对 http.Client.Do 返 error 触发，doRequest 未查响应状态码。后端返 500 时当作正常响应，不触发 isRetryableError 使重试失效。与提示词第 4 条"请求失败按配置自动重试"不符，MaxRetries=3 遇 500 不重试。测试靠 retryableTransport 把5xx转error绕过缺状态码判断。应在 doRequest 查 resp.StatusCode 将非 2xx 视为可重试失败。
+3. restclient.go 的 RegisterTemplate 不对 AuthProvider 做存在校验，模板引用未注册的认证提供器注册时静默通过，直到 Do 发请求才报 ErrAuthProviderNotFound。用户误写 `"bearer"` 为 `"brearer"` 后注册成功，问题延迟到运行时暴露且错误缺模板名难排查。根因是只校验了数值合法性未校验外部引用完整性，注册时 AuthProvider 非空应调 GetAuthProvider 预检。
+4. restclient.go 的 Do 在重试耗尽且 lastResp 不为 nil 时，用 io.NopCloser 清空 body 后同时返回被篡改的 lastResp 和 ErrMaxRetriesExceeded。调用方拿错误同时读到一个 body 被清空的响应，易误判为"服务返回空"。根因是错误路径返回了污染响应，应直接返 `(nil, error)`。
+
+过程不满意：
+1. 模型收到提示词后第一件事就调 todo_write 创建 5 项子任务，之后才查看 go.mod 和 retry.go 了解项目。这违反先分析再规划的原则，因缺前置理解初始实现中请求构建错误仍进重试循环、路径编码判断不对，三轮调试才收敛。应先通读 7 条需求确认范围，查看 go.mod 和已有模块理解风格再定计划。
+2. 模型在 restclient_test.go 定义 retryableTransport 把 500 转 error 触发重试，而 doRequest 完全不检查状态码。发现 http.Client.Do 不把 5xx 当错误后选测试 Transport 绕过而非在 doRequest 加状态码检查，属生产代码向测试妥协。应在生产层判断状态码，测试仅验证既有能力。
+3. 模型首轮实现后 go test 发现失败，未先逐个读失败信息就同时改 restclient.go 和 restclient_test.go，第二轮仍有 2 个错误包装失败才加 requestBuildError。三轮修改运行再修改的试错循环，路径编码和 Unwrap 问题可在初始 API 设计时避免，属低效试错式调试。

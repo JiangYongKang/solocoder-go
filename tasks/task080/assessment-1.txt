@@ -1,0 +1,8 @@
+产物不满意：
+1. 在 structlog.go 的 log 方法中，系统字段 ts、level、msg 先写入 entry map，随后遍历 l.fields 将用户自定义字段追加入 map。由于 Go 中 map 键唯一，当用户通过 WithFields 传入名为 "ts"、"level" 或 "msg" 的字段时，会覆盖系统生成的真实值。例如 `WithFields({"level":"FAKE"}).Info("test")` 输出的 JSON 中 level 字段为 "FAKE" 而非 "INFO"，导致日志采集系统按级别过滤和按时间排序的功能完全失效。根因是字段写入顺序不当，应将用户字段先写入 entry、系统字段后写入以确保 ts、level、msg 不被覆盖。caller 和 stack 因写在用户字段之后而受保护，但 ts、level、msg 三个核心标识字段处于风险中，测试中缺少字段名冲突用例。
+2. shouldSample 函数命名与其返回值语义存在矛盾。函数返回 true 时表示日志应被采样丢弃，但函数名 shouldSample 字面含义是"是否应该采样"。调用处 `if l.shouldSample(level) { return }` 读起来像是"如果需要采样则跳过日志"，语义上构成双重否定，增加了代码维护者的理解成本。根因是命名未准确反映"丢弃"的业务意图，且内部逻辑 `(counter-1)%rate != 0` 计算的即为"不通过采样"条件，与函数名形成了天然不一致。应更名为 isSampledOut 或 shouldDrop 等直观反映丢弃语义的名称。
+3. TestNonErrorHasCaller 测试仅校验 caller 字段包含 ".go:" 模式，未验证其实际指向调用源文件。由于 captureCaller 使用 `strings.HasPrefix(frame.Function, pkgPrefix)` 过滤内部帧，而 pkgPrefix 硬编码为 "solocoder-go/internal/structlog."，同包的测试函数如 TestNonErrorHasCaller 本身也因满足此前缀而被误过滤，实际返回的 caller 是 testing.tRunner 所在的 testing.go 而非 structlog_test.go 中的调用行。测试断言过弱，未能暴露调用者在包内测试场景下的定位偏差，在产品环境下虽不影响，但暴露了 caller 验证逻辑对同包代码的误伤。
+
+过程不满意：
+1. 模型在实现阶段采用了大爆炸式开发方式，一次性写完 structlog.go 全部生产代码和 structlog_test.go 全部测试代码后才首次运行 go test。这导致测试代码中的两处问题——TestTimestampISO8601 引用了未定义的 entry 变量，以及 TestLargeSamplingRate 的断言预期错误——都被推迟到全体代码完成后才暴露。正确做法是按功能模块逐项实现并立即运行对应测试，例如先实现 JSON 输出和级别过滤并验证通过，再叠加 WithFields 和采样功能，以更小粒度的反馈循环降低调试复杂度。
+2. 模型在编写 structlog_test.go 初稿时，TestTimestampISO8601 在一个新的 func 作用域中直接使用了未定义的 entry 变量，这属于基本的变量作用域错误，说明模型在生成测试代码时缺乏对代码正确性的即时核验意识。虽然模型随后通过重新读取文件自行发现了该问题并修正，但根本问题在于生成测试代码时未做正向推演——先确定变量来源再编写引用逻辑。此外 TestLargeSamplingRate 的首版预期值也不正确，两处测试问题在同一次运行中暴露，反映出模型生成测试代码阶段存在系统性质量疏忽。

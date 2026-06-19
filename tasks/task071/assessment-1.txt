@@ -1,0 +1,11 @@
+产物不满意：
+1. schema.go 的 parseTypeReference 方法对所有命名类型统一设为 TypeKindObject，例如字段 `id: ID!` 中 ID 本是标量却被标为对象类型，导致 validator.go 的 validateField 和 executor.go 的 executeField 各维护了一套"从 Schema 重新查找真实类型"的补救逻辑。同一类型分类问题在两个模块重复修补，增加了代码冗余和维护成本。根因是解析阶段未区分标量和对象，应在 parseTypeReference 创建 Type 时就查 Schema 中该名称对应的已注册类型确定正确的 Kind。
+2. 提示词第 4 条要求 DataLoader 在嵌套查询中批量收集键并统一加载数据，但 setupTestExecutor 创建的 userDL 和 postDL 实例传递给了 Execute 后，所有解析器如 Query.user、Post.author、User.posts 全部直接从内存 map 读取数据，从未调用过 dl.Load。DataLoader 的批量加载能力在执行器中从未被测试覆盖，N+1 查询优化在生产级嵌套查询中实际上不会生效。根因是解析器设计时未将 DataLoader 作为默认数据获取通道，应在解析器内部通过 DataLoader 加载子字段数据。
+3. executor.go 的 executeObject 方法使用 `fmt.Sprintf("%T", value)` 获取 Go 运行时类型名去 Schema 中查类型，传入 `map[string]interface{}` 时返回的 `"map[string]interface {}"` 永远匹配不到任何 GraphQL 类型名，第 244 行这条查询是一条死代码路径。根因是混淆了 Go 类型名和 GraphQL 类型名两个不同命名空间，应通过 value 的内容结构推断其 GraphQL 类型或在调用点确保 objType 参数不为 nil。
+4. validator.go 的 validateArguments 方法在检查必选参数时对 VariableRef 类型直接返回 true 不做类型校验和值存在性检查。当查询声明 `query GetUser($id: ID!)` 但调用方未在 variables map 中提供 `id` 的实际值时，查询会在执行阶段才因 nil 参数出错而非在验证阶段被拦截。根因是变量引用的校验路径与常量参数脱钩，应将变量引用也纳入统一的参数值校验逻辑中。
+
+过程不满意：
+1. 模型在第 64 行刚探索完项目结构就通过 todo_write 一次创建了 11 项子任务计划，随后才开始分析需求文档。这导致后续在 validator.go 和 executor.go 之间反复调整类型查找逻辑，因为初始计划未能预见到 SDL 解析阶段的类型分类缺陷会影响多个下游模块。正确做法是先理清 Schema 解析、查询验证、执行引擎、DataLoader 之间的依赖关系，再制定与模块边界对齐的计划。
+2. 模型在第 507 行确认根因为"SDL 解析的 Type 对象未引用 Schema 中的实际类型"后在 validator.go 中做了修复，但约 1600 行日志后又在 executor.go 遇到了同一根因独立再修。同根因问题分两处独立修复，说明模型没在第一次修复后扫描所有受影响的代码路径，正确做法是发现根因后搜索所有 parseTypeReference 的调用方（validator.go 和 executor.go 均有引用）一次性全部修正。
+3. 模型在调试 DataLoader 测试时经历了三轮试错循环：第 1081 行加 `time.Sleep(10ms)` 修 Load 测试，第 1171 行 LoadMany 又加 Sleep，第 1850 行 Clear 再加 Sleep。同一类竞态条件出现三次，每次用固定时间休眠修补而非用 channel 或 WaitGroup 做同步，直到第 710 行才引入 readyWg。依赖固定间隔的测试在慢 CI 环境不可靠，应从第一次失败就用同步原语保证 goroutine 执行顺序。
+4. 模型在第 462 行创建 debug_test.go 用于调试验证器问题，运行 TestDebug_Validator 排查了类型关联错误，但问题修复后又将此文件删除而未将"解析器字段类型是否关联到 Schema 中注册类型"这一边界场景转化为正式测试用例。该场景能防止未来代码修改引入类型关联回归，应保留为正式单元测试。

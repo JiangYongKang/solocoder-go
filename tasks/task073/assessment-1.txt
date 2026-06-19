@@ -1,0 +1,7 @@
+产物不满意：
+1. contentneg.go的WriteNotAcceptable方法在json.MarshalIndent失败时走备选路径手动拼接JSON，supported_formats数组经strings.Join生成后元素缺失双引号包裹导致输出非法JSON字符串。根因是手动拼接未对数组字符串元素做引号处理，正确做法是用json.Marshal单独序列化formats切片而非手动拼装。
+2. contentneg_test.go的TestMarshalProtobuf测试仅验证len(data)==0判空，未像TestMarshalJSON和TestMarshalXML那样做序列化-反序列化往返验证。当marshalProtobuf因字段编号映射错误输出损坏数据时测试无法检测，与提示词第4条"完整的单元测试"要求不符。根因是未参照JSON和XML的测试标准，正确做法是用Unmarshal反序列化后逐一比对ID、Name、Age等字段值。
+
+过程不满意：
+1. 模型在刚收到提示词后尚未阅读任何项目代码就调用todo_write创建了7项子任务计划，随后才开始查看go.mod、serialize包和apikey包。此时模型对项目模块边界和已有序列化依赖关系完全不了解，先定计划再了解上下文导致最初任务划分粒度与实际工作不匹配，深入代码后又新建5项TodoList替换原计划。正确做法是先分析现有代码骨架和依赖关系，再制定执行计划。
+2. 模型在最终总结中声称"27个测试函数，覆盖100+子测试用例"，但实际contentneg_test.go包含35个测试函数、通过t.Run组织的子测试约68个、加16个独立用例共约84个测试用例，函数数量被低估约23%而子测试数反被高估。虽然全部测试确已运行通过，但总结中的数字统计与事实严重不符，正确做法应基于实际代码做精确统计而非凭感觉估算。
