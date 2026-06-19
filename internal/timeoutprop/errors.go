@@ -1,6 +1,7 @@
 package timeoutprop
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -32,19 +33,9 @@ func (e *StageTimeoutError) Error() string {
 
 func (e *StageTimeoutError) Unwrap() error {
 	switch e.TimeoutType {
-	case TimeoutTypeTotal:
-		return contextDeadlineExceeded
-	case TimeoutTypeBudget:
-		return contextDeadlineExceeded
+	case TimeoutTypeTotal, TimeoutTypeBudget:
+		return context.DeadlineExceeded
 	default:
 		return nil
 	}
 }
-
-var contextDeadlineExceeded = deadlineExceededError{}
-
-type deadlineExceededError struct{}
-
-func (deadlineExceededError) Error() string   { return "context deadline exceeded" }
-func (deadlineExceededError) Timeout() bool   { return true }
-func (deadlineExceededError) Temporary() bool { return true }

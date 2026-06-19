@@ -1,0 +1,7 @@
+你实现的 Cron 表达式解析与调度器模块存在一些问题，需要修复：
+1. ParseError 结构体定义了 Position 字段用于指示语法错误位置，但 parser.go 中所有创建 ParseError 的地方 Position 始终传 0，从未设置真实的字符偏移量，导致解析失败时错误信息无法指示表达式中具体哪个位置出了问题。
+2. TestScheduler_AddAndExecute 测试存在时序竞态条件，测试中使用 time.Now().Add(500ms) 计算 Cron 表达式，但 AddWithIDAndLocation 内部又独立调用 time.Now() 获取时间，两次时间获取之间发生延迟时目标执行时间可能已过期导致 wg.Wait 超时失败。
+3. TestNextTime_DST_SpringForward 测试只通过 got.Before(from) 检查结果，未校验实际返回的具体小时和分钟值，即使 DST 处理完全失效返回了错误时间也无法被检测到。
+4. parser.go 中 parseValuePart 对多级步长格式（如 `1-2/3/4`）只按第一个 `/` 切分后 Atoi 失败返回模糊错误，未能明确指出输入存在多个 `/` 分隔符的语法问题。
+5. 修复后运行 go test ./internal/cronsched/ -v，需要让所有测试通过。
+6. 在 docs/cronsched.md 中更新模块需求文档，说明修复后的语法错误定位机制和夏令时处理的验证策略。

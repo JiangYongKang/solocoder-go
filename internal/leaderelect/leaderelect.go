@@ -160,24 +160,23 @@ func (b *lockManagerBackend) IsLocked(key string) (bool, error) {
 }
 
 type LeaderElector struct {
-	nodeID       string
-	electionKey  string
-	cfg          Config
-	backend      LockBackend
-	callbacks    []ElectionCallback
-	callbacksMu  sync.RWMutex
+	nodeID      string
+	electionKey string
+	cfg         Config
+	backend     LockBackend
+	callbacks   []ElectionCallback
+	callbacksMu sync.RWMutex
 
-	mu           sync.Mutex
-	role         NodeRole
-	term         int64
-	leaderID     string
-	running      bool
-	stopped      bool
-	stopCh       chan struct{}
-	heartbeatCh  chan struct{}
-	wg           sync.WaitGroup
+	mu      sync.Mutex
+	role    NodeRole
+	term    int64
+	leaderID string
+	running bool
+	stopped bool
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
 
-	nowFunc      func() time.Time
+	nowFunc func() time.Time
 }
 
 func NewLeaderElector(nodeID string, electionKey string, cfg Config, backend LockBackend) (*LeaderElector, error) {
@@ -201,7 +200,6 @@ func NewLeaderElector(nodeID string, electionKey string, cfg Config, backend Loc
 		backend:     backend,
 		role:        RoleFollower,
 		stopCh:      make(chan struct{}),
-		heartbeatCh: make(chan struct{}, 1),
 		nowFunc:     time.Now,
 	}, nil
 }
@@ -213,25 +211,35 @@ func (e *LeaderElector) RegisterCallback(cb ElectionCallback) {
 }
 
 func (e *LeaderElector) notify(eventType ElectionEventType) {
-	e.callbacksMu.RLock()
-	defer e.callbacksMu.RUnlock()
+	e.mu.Lock()
+	role := e.role
+	leaderID := e.leaderID
+	term := e.term
+	e.mu.Unlock()
 
+	e.callbacksMu.RLock()
 	if len(e.callbacks) == 0 {
+		e.callbacksMu.RUnlock()
 		return
 	}
+	callbacks := make([]ElectionCallback, len(e.callbacks))
+	copy(callbacks, e.callbacks)
+	e.callbacksMu.RUnlock()
 
 	event := ElectionEvent{
 		Type:      eventType,
 		NodeID:    e.nodeID,
-		Role:      e.role,
-		LeaderID:  e.leaderID,
-		Term:      e.term,
+		Role:      role,
+		LeaderID:  leaderID,
+		Term:      term,
 		Timestamp: e.nowFunc(),
 	}
 
-	for _, cb := range e.callbacks {
-		cb(event)
-	}
+	go func() {
+		for _, cb := range callbacks {
+			cb(event)
+		}
+	}()
 }
 
 func (e *LeaderElector) Start() error {
@@ -355,10 +363,7 @@ func (e *LeaderElector) doHeartbeat() {
 func (e *LeaderElector) checkLeader() {
 	holder, _, _, err := e.backend.GetHolder(e.electionKey)
 	if err != nil {
-		if errors.Is(err, distlock.ErrLockNotHeld) || errors.Is(err, distlock.ErrLockExpired) {
-			e.startElection()
-			return
-		}
+		e.startElection()
 		return
 	}
 

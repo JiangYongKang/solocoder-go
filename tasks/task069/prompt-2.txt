@@ -1,0 +1,7 @@
+你实现的 Raft 共识日志模块存在一些问题，需要修复：
+1. run 方法中 applyCommitted 在独立 goroutine 中无锁调用，而 propose 方法在 Leader 处理客户端请求时也在持锁状态下调用 applyCommitted，两条协程同时对 stateMachine 进行 Apply 操作形成并发数据竞争，破坏了状态机的线性一致性。
+2. updateCommitIndex 方法在集群处于 JointConfig 状态时直接 return 不推进提交索引。提示词要求成员变更期间集群仍可正常处理客户端请求，但当前实现在联合共识期间所有普通日志条目无法被提交。
+3. 快照的 Data 字段仅存储一个 int 计数器值而非完整状态机状态，ApplySnapshot 安装快照后状态机只恢复了计数值而丢失了其他所有状态，无法实现真正意义上的状态恢复。
+4. TestAddNode 和 TestRemoveNode 测试在早期失败后断言逻辑被放宽为只验证变更"已启动"而未验证变更"已完成"，无法检测联合共识第二阶段是否正确完成。同时 ErrNoLeader、ErrNodeExists、ErrNotInitialized、ErrNotInCluster 四个哨兵错误定义了但从未被任何函数返回。
+5. 修复后运行 go test ./internal/raftlog/ -v，需要让所有测试通过。特别需要补充对成员变更实际完成的验证测试。
+6. 在 docs/raftlog.md 中更新模块需求文档，说明修复后的日志提交并发安全保障、联合共识期间的请求处理策略和快照状态完整性保证。

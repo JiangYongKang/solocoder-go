@@ -405,17 +405,43 @@ func NextTimeWithConfig(expr *CronExpression, from time.Time, config *SchedulerC
 		}
 
 		if !expr.Hour.Matches(hour) {
-			candidate = time.Date(year, time.Month(month), day, hour+1, 0, 0, 0, loc)
+			targetHour := hour + 1
+			candidate = time.Date(year, time.Month(month), day, targetHour, 0, 0, 0, loc)
+			for candidate.Hour() != targetHour && candidate.Year() == year && int(candidate.Month()) == month && candidate.Day() == day {
+				targetHour++
+				if targetHour > 23 {
+					candidate = time.Date(year, time.Month(month), day+1, 0, 0, 0, 0, loc)
+					break
+				}
+				candidate = time.Date(year, time.Month(month), day, targetHour, 0, 0, 0, loc)
+			}
 			continue
 		}
 
 		if !expr.Minute.Matches(minute) {
 			candidate = time.Date(year, time.Month(month), day, hour, minute+1, 0, 0, loc)
+			if candidate.Hour() != hour || candidate.Day() != day {
+				candidate = time.Date(year, time.Month(month), day, hour+1, 0, 0, 0, loc)
+				for candidate.Hour() != hour+1 && candidate.Year() == year && int(candidate.Month()) == month && candidate.Day() == day {
+					hour++
+					if hour > 23 {
+						candidate = time.Date(year, time.Month(month), day+1, 0, 0, 0, 0, loc)
+						break
+					}
+					candidate = time.Date(year, time.Month(month), day, hour+1, 0, 0, 0, loc)
+				}
+			}
 			continue
 		}
 
 		if !expr.Second.Matches(second) {
 			candidate = time.Date(year, time.Month(month), day, hour, minute, second+1, 0, loc)
+			if candidate.Minute() != minute || candidate.Hour() != hour {
+				candidate = time.Date(year, time.Month(month), day, hour, minute+1, 0, 0, loc)
+				if candidate.Hour() != hour || candidate.Day() != day {
+					candidate = time.Date(year, time.Month(month), day, hour+1, 0, 0, 0, loc)
+				}
+			}
 			continue
 		}
 
@@ -450,7 +476,7 @@ func adjustForDST(t time.Time, loc *time.Location) time.Time {
 	tInLoc := t.In(loc)
 	utc := tInLoc.UTC()
 	convertedBack := utc.In(loc)
-	if !tInLoc.Equal(convertedBack) {
+	if tInLoc.Hour() != convertedBack.Hour() || tInLoc.Minute() != convertedBack.Minute() || tInLoc.Second() != convertedBack.Second() {
 		return convertedBack
 	}
 	return tInLoc

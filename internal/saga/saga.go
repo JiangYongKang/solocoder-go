@@ -10,15 +10,16 @@ import (
 )
 
 var (
-	ErrSagaNotFound       = errors.New("saga: saga not found")
-	ErrSagaAlreadyExists  = errors.New("saga: saga already exists")
-	ErrStepNotFound       = errors.New("saga: step not found")
-	ErrStepAlreadyExists  = errors.New("saga: step already exists")
-	ErrSagaRunning        = errors.New("saga: saga is currently running")
-	ErrNoStepsRegistered  = errors.New("saga: no steps registered")
-	ErrInvalidStepID      = errors.New("saga: invalid step id")
-	ErrCompensationFailed = errors.New("saga: compensation failed")
+	ErrSagaNotFound         = errors.New("saga: saga not found")
+	ErrSagaAlreadyExists    = errors.New("saga: saga already exists")
+	ErrStepNotFound         = errors.New("saga: step not found")
+	ErrStepAlreadyExists    = errors.New("saga: step already exists")
+	ErrSagaRunning          = errors.New("saga: saga is currently running")
+	ErrNoStepsRegistered    = errors.New("saga: no steps registered")
+	ErrInvalidStepID        = errors.New("saga: invalid step id")
+	ErrCompensationFailed   = errors.New("saga: compensation failed")
 	ErrInterventionNotFound = errors.New("saga: intervention not found")
+	ErrExecutionNotFound    = errors.New("saga: execution not found")
 )
 
 type OperationStatus int
@@ -129,23 +130,25 @@ type SagaExecution struct {
 }
 
 type Coordinator struct {
-	nextLogID          int64
-	nextExecID         int64
-	mu                 sync.RWMutex
-	sagas              map[string]*Saga
-	executions         map[string]*SagaExecution
-	logs               []*LogEntry
-	logsByTransaction  map[string][]*LogEntry
+	nextLogID            int64
+	nextExecID           int64
+	mu                   sync.RWMutex
+	sagas                map[string]*Saga
+	executions           map[string]*SagaExecution
+	logs                 []*LogEntry
+	logsByTransaction    map[string][]*LogEntry
 	pendingInterventions []*CompensationFailure
+	runningSagas         map[string]bool
 }
 
 func NewCoordinator() *Coordinator {
 	return &Coordinator{
-		sagas:              make(map[string]*Saga),
-		executions:         make(map[string]*SagaExecution),
-		logs:               make([]*LogEntry, 0),
-		logsByTransaction:  make(map[string][]*LogEntry),
+		sagas:                make(map[string]*Saga),
+		executions:           make(map[string]*SagaExecution),
+		logs:                 make([]*LogEntry, 0),
+		logsByTransaction:    make(map[string][]*LogEntry),
 		pendingInterventions: make([]*CompensationFailure, 0),
+		runningSagas:         make(map[string]bool),
 	}
 }
 
@@ -225,6 +228,13 @@ func (c *Coordinator) Execute(ctx context.Context, sagaID string, initialData ma
 		return nil, ErrNoStepsRegistered
 	}
 
+	if c.runningSagas[sagaID] {
+		c.mu.Unlock()
+		return nil, ErrSagaRunning
+	}
+
+	c.runningSagas[sagaID] = true
+
 	execID := atomic.AddInt64(&c.nextExecID, 1)
 	executionID := fmt.Sprintf("%s-exec-%d", sagaID, execID)
 	data := make(map[string]interface{})
@@ -251,6 +261,12 @@ func (c *Coordinator) Execute(ctx context.Context, sagaID string, initialData ma
 
 	c.executions[executionID] = execution
 	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		delete(c.runningSagas, sagaID)
+		c.mu.Unlock()
+	}()
 
 	c.logOperation(executionID, "", OpTypeForward, StatusRunning, nil, "Saga execution started")
 
@@ -291,6 +307,10 @@ func (c *Coordinator) Execute(ctx context.Context, sagaID string, initialData ma
 		c.logOperation(executionID, "", OpTypeForward, StatusFailed, executionErr, "Saga execution failed, starting compensation")
 
 		c.executeCompensations(ctx, execution, successfulSteps)
+
+		if execution.NeedsIntervention {
+			execution.Error = fmt.Errorf("%w: forward failed: %v", ErrCompensationFailed, executionErr)
+		}
 	} else {
 		execution.Status = StatusSuccess
 		c.logOperation(executionID, "", OpTypeForward, StatusSuccess, nil, "Saga execution completed successfully")
@@ -338,17 +358,17 @@ func (c *Coordinator) executeCompensations(ctx context.Context, execution *SagaE
 		step := successfulSteps[i]
 
 		if step.CompensateFunc == nil {
-			c.logOperation(execution.ID, step.ID, OpTypeCompensation, StatusSuccess, nil, fmt.Sprintf("Step %s has no compensation function, skipping", step.Name))
 			continue
 		}
 
-		compResult := c.executeCompensation(ctx, execution, step)
-		execution.Compensations[step.ID] = compResult
+		compStepID := step.ID + "-compensate"
+		compResult := c.executeCompensation(ctx, execution, step, compStepID)
+		execution.Compensations[compStepID] = compResult
 
 		if compResult.Status == StatusFailed {
 			failure := &CompensationFailure{
 				TransactionID: execution.ID,
-				StepID:        step.ID,
+				StepID:        compStepID,
 				ForwardStepID: step.ID,
 				FailureReason: compResult.Error.Error(),
 				Error:         compResult.Error,
@@ -363,17 +383,17 @@ func (c *Coordinator) executeCompensations(ctx context.Context, execution *SagaE
 			c.pendingInterventions = append(c.pendingInterventions, failure)
 			c.mu.Unlock()
 
-			c.logOperation(execution.ID, step.ID, OpTypeCompensation, StatusFailed, compResult.Error,
+			c.logOperation(execution.ID, compStepID, OpTypeCompensation, StatusFailed, compResult.Error,
 				fmt.Sprintf("Compensation for step %s failed, marked for manual intervention", step.Name))
 		}
 	}
 }
 
-func (c *Coordinator) executeCompensation(ctx context.Context, execution *SagaExecution, step *Step) *StepResult {
-	c.logOperation(execution.ID, step.ID, OpTypeCompensation, StatusRunning, nil, fmt.Sprintf("Compensation for step %s starting", step.Name))
+func (c *Coordinator) executeCompensation(ctx context.Context, execution *SagaExecution, step *Step, compStepID string) *StepResult {
+	c.logOperation(execution.ID, compStepID, OpTypeCompensation, StatusRunning, nil, fmt.Sprintf("Compensation for step %s starting", step.Name))
 
 	result := &StepResult{
-		StepID:    step.ID,
+		StepID:    compStepID,
 		Status:    StatusRunning,
 		StartTime: time.Now(),
 	}
@@ -386,10 +406,10 @@ func (c *Coordinator) executeCompensation(ctx context.Context, execution *SagaEx
 	if err != nil {
 		result.Status = StatusFailed
 		result.Error = err
-		c.logOperation(execution.ID, step.ID, OpTypeCompensation, StatusFailed, err, fmt.Sprintf("Compensation for step %s failed", step.Name))
+		c.logOperation(execution.ID, compStepID, OpTypeCompensation, StatusFailed, err, fmt.Sprintf("Compensation for step %s failed", step.Name))
 	} else {
 		result.Status = StatusSuccess
-		c.logOperation(execution.ID, step.ID, OpTypeCompensation, StatusSuccess, nil, fmt.Sprintf("Compensation for step %s completed successfully", step.Name))
+		c.logOperation(execution.ID, compStepID, OpTypeCompensation, StatusSuccess, nil, fmt.Sprintf("Compensation for step %s completed successfully", step.Name))
 	}
 
 	return result
@@ -431,7 +451,7 @@ func (c *Coordinator) GetLogs(transactionID string) ([]*LogEntry, error) {
 
 	logs, exists := c.logsByTransaction[transactionID]
 	if !exists {
-		return nil, ErrSagaNotFound
+		return nil, ErrExecutionNotFound
 	}
 
 	result := make([]*LogEntry, len(logs))
@@ -497,7 +517,7 @@ func (c *Coordinator) GetExecution(executionID string) (*SagaExecution, error) {
 
 	execution, exists := c.executions[executionID]
 	if !exists {
-		return nil, ErrSagaNotFound
+		return nil, ErrExecutionNotFound
 	}
 	return execution, nil
 }

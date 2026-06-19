@@ -1,0 +1,6 @@
+你实现的工作流引擎模块存在一些问题，需要修复：
+1. ResumeWorkflow 方法完全没有使用 state.CompletedNodes 或 state.CurrentNodeID 来判断已执行节点，而是直接从根节点重新执行整个工作流。提示词要求从上次中断位置继续执行而非从头开始，但当前实现会在恢复后重复执行已完成节点产生重复副作用。sequential.go 的 RestoreState 方法是空实现，GetState 也始终返回 CurrentIndex 为零的新状态对象。
+2. ExecuteWorkflow 方法将 execCtx.Values() 中的所有上下文变量以 NodeResult 的形式混入到 result.Results 中，导致通过 Set 传递的上下文变量与真实节点执行结果混合在一起，调用方可能误判为存在额外的节点执行。
+3. node.go 中当 RetryConfig.Interval 为零时，RetryFixed 也会走 100ms 默认间隔而非立即重试，与调用方设零间隔期望立即重试的预期不符，但此行为未在文档中说明。
+4. 修复后运行 go test ./internal/workflow/ -v，需要让所有测试通过。特别需要补充：状态恢复从断点继续执行的测试、恢复后上下文变量正确传递的测试、已执行节点不被重复执行的测试。
+5. 在 docs/workflow.md 中更新模块需求文档，说明修复后的状态持久化恢复机制和断点续传的实现流程。

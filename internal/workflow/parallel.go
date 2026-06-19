@@ -12,16 +12,18 @@ import (
 type ParallelNode struct {
 	baseNode
 	Nodes           []Node
-	MaxFailures    int
-	Timeout        time.Duration
+	MaxFailures     int
+	Timeout         time.Duration
+	completedNodes  map[string]bool
 }
 
 func NewParallelNode(name string, nodes ...Node) *ParallelNode {
 	return &ParallelNode{
-		baseNode:    newBaseNode(NodeTypeParallel, name),
-		Nodes:       nodes,
-		MaxFailures: 0,
-		Timeout:     0,
+		baseNode:       newBaseNode(NodeTypeParallel, name),
+		Nodes:          nodes,
+		MaxFailures:    0,
+		Timeout:        0,
+		completedNodes: make(map[string]bool),
 	}
 }
 
@@ -41,10 +43,30 @@ func (n *ParallelNode) SetTimeout(timeout time.Duration) *ParallelNode {
 }
 
 func (n *ParallelNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
+	return n.ExecuteWithState(ctx, execCtx, nil)
+}
+
+func (n *ParallelNode) ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error) {
 	return executeWithRetry(ctx, n, execCtx, func(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
 		result := newNodeResult(n.ID)
 		childResults := make(map[string]*NodeResult)
 		childResultsMu := sync.Mutex{}
+		wfState := GetWorkflowState(ctx)
+
+		if nodeState == nil {
+			n.completedNodes = make(map[string]bool)
+		} else if nodeState.InternalState != nil {
+			if state, ok := nodeState.InternalState.(map[string]interface{}); ok {
+				if completed, ok := state["completed_nodes"].(map[string]interface{}); ok {
+					n.completedNodes = make(map[string]bool)
+					for k, v := range completed {
+						if b, ok := v.(bool); ok {
+							n.completedNodes[k] = b
+						}
+					}
+				}
+			}
+		}
 
 		if len(n.Nodes) == 0 {
 			return completeResult(result, childResults, nil), nil
@@ -64,6 +86,23 @@ func (n *ParallelNode) Execute(ctx context.Context, execCtx *ExecutionContext) (
 		var terminated int32
 
 		for _, node := range n.Nodes {
+			nodeID := node.GetID()
+
+			if wfState != nil && isNodeCompleted(nodeID, wfState) {
+				childResult := getCompletedNodeResult(nodeID, wfState)
+				if childResult != nil {
+					childResultsMu.Lock()
+					childResults[nodeID] = childResult
+					childResultsMu.Unlock()
+					n.completedNodes[nodeID] = true
+				}
+				continue
+			}
+
+			if n.completedNodes[nodeID] {
+				continue
+			}
+
 			wg.Add(1)
 			go func(node Node) {
 				defer wg.Done()
@@ -83,7 +122,13 @@ func (n *ParallelNode) Execute(ctx context.Context, execCtx *ExecutionContext) (
 				default:
 				}
 
-				childResult, err := node.Execute(ctx, execCtxForChildren)
+				var childResult *NodeResult
+				var err error
+				if wfState != nil {
+					childResult, err = executeNodeWithState(ctx, node, execCtxForChildren, wfState)
+				} else {
+					childResult, err = node.Execute(ctx, execCtxForChildren)
+				}
 
 				childResultsMu.Lock()
 				if childResult != nil {
@@ -140,6 +185,37 @@ func (n *ParallelNode) Execute(ctx context.Context, execCtx *ExecutionContext) (
 			return result, ctx.Err()
 		}
 
+		for id := range childResults {
+			n.completedNodes[id] = true
+		}
+
 		return completeResult(result, childResults, nil), nil
 	})
+}
+
+func (n *ParallelNode) GetState() NodeStateData {
+	completed := make(map[string]bool)
+	for k, v := range n.completedNodes {
+		completed[k] = v
+	}
+	return map[string]interface{}{
+		"node_id":         n.ID,
+		"completed_nodes": completed,
+	}
+}
+
+func (n *ParallelNode) RestoreState(state NodeStateData) {
+	if state == nil {
+		return
+	}
+	if stateMap, ok := state.(map[string]interface{}); ok {
+		if completed, ok := stateMap["completed_nodes"].(map[string]interface{}); ok {
+			n.completedNodes = make(map[string]bool)
+			for k, v := range completed {
+				if b, ok := v.(bool); ok {
+					n.completedNodes[k] = b
+				}
+			}
+		}
+	}
 }

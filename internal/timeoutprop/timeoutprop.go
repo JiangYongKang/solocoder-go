@@ -134,15 +134,15 @@ func (p *Propagator) Execute(parentCtx context.Context) (*ChainReport, error) {
 
 		remainingTime := getRemainingTime(rootCtx)
 
+		if remainingTime < p.minThreshold {
+			markStageSkipped(stage, TimeoutTypeMinThreshold)
+			continue
+		}
+
 		hasBudget := stage.allocatedBudget > 0 || carryOverBudget > 0
 		stageBudget := stage.allocatedBudget + carryOverBudget
 		if stageBudget > remainingTime {
 			stageBudget = remainingTime
-		}
-
-		if hasBudget && stageBudget < p.minThreshold {
-			markStageSkipped(stage, TimeoutTypeMinThreshold)
-			continue
 		}
 
 		var stageCtx context.Context
@@ -189,7 +189,9 @@ func (p *Propagator) Execute(parentCtx context.Context) (*ChainReport, error) {
 			}
 
 			timeoutType := TimeoutTypeNone
+			stageStatus := StageStatusFailed
 			if errors.Is(err, context.DeadlineExceeded) {
+				stageStatus = StageStatusTimedOut
 				if !hasBudget || errors.Is(rootCtx.Err(), context.DeadlineExceeded) {
 					timeoutType = TimeoutTypeTotal
 					timeoutReason = "total timeout exceeded"
@@ -208,7 +210,7 @@ func (p *Propagator) Execute(parentCtx context.Context) (*ChainReport, error) {
 				lastError = err
 			}
 
-			updateStageEnd(stage, endTime, usedTime, StageStatusTimedOut, timeoutType, err)
+			updateStageEnd(stage, endTime, usedTime, stageStatus, timeoutType, err)
 
 			for j := i + 1; j < len(p.stages); j++ {
 				markStageSkipped(p.stages[j], timeoutType)

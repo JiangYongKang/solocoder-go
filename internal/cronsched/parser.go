@@ -6,6 +6,30 @@ import (
 	"time"
 )
 
+type fieldPos struct {
+	value string
+	pos   int
+}
+
+func fieldsWithPositions(expr string) []fieldPos {
+	var result []fieldPos
+	i := 0
+	for i < len(expr) {
+		for i < len(expr) && (expr[i] == ' ' || expr[i] == '\t') {
+			i++
+		}
+		if i >= len(expr) {
+			break
+		}
+		start := i
+		for i < len(expr) && expr[i] != ' ' && expr[i] != '\t' {
+			i++
+		}
+		result = append(result, fieldPos{value: expr[start:i], pos: start})
+	}
+	return result
+}
+
 var fieldRanges = map[FieldType][2]int{
 	FieldSecond:  {0, 59},
 	FieldMinute:  {0, 59},
@@ -37,23 +61,28 @@ func ParseWithLocation(expr string, loc *time.Location) (*CronExpression, error)
 		return nil, ErrInvalidTimezone
 	}
 
-	fields := strings.Fields(expr)
-	if len(fields) != 6 && len(fields) != 7 {
+	fp := fieldsWithPositions(expr)
+	if len(fp) != 6 && len(fp) != 7 {
 		return nil, NewParseError(FieldSecond, 0, expr,
 			"expected 6 or 7 fields (second, minute, hour, day, month, weekday[, year])")
 	}
 
-	hasYear := len(fields) == 7
+	hasYear := len(fp) == 7
 	if !hasYear {
-		fields = append(fields, "*")
+		lastEnd := 0
+		if len(fp) > 0 {
+			last := fp[len(fp)-1]
+			lastEnd = last.pos + len(last.value)
+		}
+		fp = append(fp, fieldPos{value: "*", pos: lastEnd})
 	}
 
 	fieldTypes := []FieldType{FieldSecond, FieldMinute, FieldHour, FieldDay, FieldMonth, FieldWeekday, FieldYear}
 	cronFields := make([]*CronField, 7)
 
-	for i, raw := range fields {
+	for i, f := range fp {
 		ft := fieldTypes[i]
-		cf, err := parseField(raw, ft)
+		cf, err := parseField(f.value, ft, f.pos)
 		if err != nil {
 			return nil, err
 		}
@@ -88,15 +117,15 @@ func isWildcard(cf *CronField) bool {
 	return cf.Values[0].Type == ValueWildcard
 }
 
-func parseField(raw string, ft FieldType) (*CronField, error) {
+func parseField(raw string, ft FieldType, fieldOffset int) (*CronField, error) {
 	minMax, ok := fieldRanges[ft]
 	if !ok {
-		return nil, NewParseError(ft, 0, raw, "unknown field type")
+		return nil, NewParseError(ft, fieldOffset, raw, "unknown field type")
 	}
 	minVal, maxVal := minMax[0], minMax[1]
 
 	if raw == "" {
-		return nil, NewParseError(ft, 0, raw, "empty value")
+		return nil, NewParseError(ft, fieldOffset, raw, "empty value")
 	}
 
 	cf := &CronField{
@@ -107,85 +136,96 @@ func parseField(raw string, ft FieldType) (*CronField, error) {
 	}
 
 	parts := strings.Split(raw, ",")
+	partOffset := 0
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
-			return nil, NewParseError(ft, 0, raw, "empty part in list")
+			return nil, NewParseError(ft, fieldOffset+partOffset, raw, "empty part in list")
 		}
 
-		fv, err := parseValuePart(part, ft, minVal, maxVal)
+		idx := strings.Index(raw[partOffset:], part)
+		partStart := partOffset
+		if idx >= 0 {
+			partStart = fieldOffset + partOffset + idx
+		} else {
+			partStart = fieldOffset + partOffset
+		}
+
+		fv, err := parseValuePart(part, ft, minVal, maxVal, partStart)
 		if err != nil {
 			return nil, err
 		}
 		cf.Values = append(cf.Values, fv)
+		partOffset += len(part) + 1
 	}
 
 	return cf, nil
 }
 
-func parseValuePart(part string, ft FieldType, minVal, maxVal int) (FieldValue, error) {
+func parseValuePart(part string, ft FieldType, minVal, maxVal int, offset int) (FieldValue, error) {
 	if part == "*" {
 		return FieldValue{Type: ValueWildcard}, nil
 	}
 
 	if strings.Contains(part, "/") {
-		return parseStep(part, ft, minVal, maxVal)
+		return parseStep(part, ft, minVal, maxVal, offset)
 	}
 
 	if strings.Contains(part, "-") {
-		return parseRange(part, ft, minVal, maxVal)
+		return parseRange(part, ft, minVal, maxVal, offset)
 	}
 
-	return parseSingle(part, ft, minVal, maxVal)
+	return parseSingle(part, ft, minVal, maxVal, offset)
 }
 
-func parseSingle(part string, ft FieldType, minVal, maxVal int) (FieldValue, error) {
-	val, err := parseNumericValue(part, ft)
+func parseSingle(part string, ft FieldType, minVal, maxVal int, offset int) (FieldValue, error) {
+	val, err := parseNumericValue(part, ft, offset)
 	if err != nil {
 		return FieldValue{}, err
 	}
 	if val < minVal || val > maxVal {
-		return FieldValue{}, NewParseError(ft, 0, part,
+		return FieldValue{}, NewParseError(ft, offset, part,
 			"value %d out of range [%d, %d]", val, minVal, maxVal)
 	}
 	return FieldValue{Type: ValueSingle, Value: val}, nil
 }
 
-func parseRange(part string, ft FieldType, minVal, maxVal int) (FieldValue, error) {
+func parseRange(part string, ft FieldType, minVal, maxVal int, offset int) (FieldValue, error) {
 	rangeParts := strings.Split(part, "-")
 	if len(rangeParts) != 2 {
-		return FieldValue{}, NewParseError(ft, 0, part, "invalid range format")
+		return FieldValue{}, NewParseError(ft, offset, part, "invalid range format")
 	}
 
 	lowStr := strings.TrimSpace(rangeParts[0])
 	highStr := strings.TrimSpace(rangeParts[1])
 
 	if lowStr == "" || highStr == "" {
-		return FieldValue{}, NewParseError(ft, 0, part, "empty bound in range")
+		return FieldValue{}, NewParseError(ft, offset, part, "empty bound in range")
 	}
 
-	low, err := parseNumericValue(lowStr, ft)
+	low, err := parseNumericValue(lowStr, ft, offset)
 	if err != nil {
 		return FieldValue{}, err
 	}
 
-	high, err := parseNumericValue(highStr, ft)
+	highOffset := offset + strings.Index(part, "-") + 1
+	high, err := parseNumericValue(highStr, ft, highOffset)
 	if err != nil {
 		return FieldValue{}, err
 	}
 
 	if low < minVal || low > maxVal {
-		return FieldValue{}, NewParseError(ft, 0, part,
+		return FieldValue{}, NewParseError(ft, offset, part,
 			"range lower bound %d out of range [%d, %d]", low, minVal, maxVal)
 	}
 
 	if high < minVal || high > maxVal {
-		return FieldValue{}, NewParseError(ft, 0, part,
+		return FieldValue{}, NewParseError(ft, offset, part,
 			"range upper bound %d out of range [%d, %d]", high, minVal, maxVal)
 	}
 
 	if low > high {
-		return FieldValue{}, NewParseError(ft, 0, part,
+		return FieldValue{}, NewParseError(ft, offset, part,
 			"range lower bound %d greater than upper bound %d", low, high)
 	}
 
@@ -196,26 +236,32 @@ func parseRange(part string, ft FieldType, minVal, maxVal int) (FieldValue, erro
 	}, nil
 }
 
-func parseStep(part string, ft FieldType, minVal, maxVal int) (FieldValue, error) {
+func parseStep(part string, ft FieldType, minVal, maxVal int, offset int) (FieldValue, error) {
 	stepParts := strings.Split(part, "/")
+	if len(stepParts) > 2 {
+		slashCount := strings.Count(part, "/")
+		return FieldValue{}, NewParseError(ft, offset, part,
+			"invalid step format: found %d '/' separators, expected at most 1", slashCount)
+	}
 	if len(stepParts) != 2 {
-		return FieldValue{}, NewParseError(ft, 0, part, "invalid step format")
+		return FieldValue{}, NewParseError(ft, offset, part, "invalid step format")
 	}
 
 	rangePart := strings.TrimSpace(stepParts[0])
 	stepStr := strings.TrimSpace(stepParts[1])
 
 	if stepStr == "" {
-		return FieldValue{}, NewParseError(ft, 0, part, "empty step value")
+		return FieldValue{}, NewParseError(ft, offset, part, "empty step value")
 	}
 
+	stepOffset := offset + strings.Index(part, "/") + 1
 	step, err := strconv.Atoi(stepStr)
 	if err != nil {
-		return FieldValue{}, NewParseError(ft, 0, part, "invalid step value: %s", stepStr)
+		return FieldValue{}, NewParseError(ft, stepOffset, part, "invalid step value: %s", stepStr)
 	}
 
 	if step <= 0 {
-		return FieldValue{}, NewParseError(ft, 0, part, "step value must be positive, got %d", step)
+		return FieldValue{}, NewParseError(ft, stepOffset, part, "step value must be positive, got %d", step)
 	}
 
 	if rangePart == "*" {
@@ -230,34 +276,36 @@ func parseStep(part string, ft FieldType, minVal, maxVal int) (FieldValue, error
 	if strings.Contains(rangePart, "-") {
 		rangeParts := strings.Split(rangePart, "-")
 		if len(rangeParts) != 2 {
-			return FieldValue{}, NewParseError(ft, 0, part, "invalid range in step")
+			return FieldValue{}, NewParseError(ft, offset, part, "invalid range in step")
 		}
 
 		lowStr := strings.TrimSpace(rangeParts[0])
 		highStr := strings.TrimSpace(rangeParts[1])
 
-		low, err := parseNumericValue(lowStr, ft)
+		low, err := parseNumericValue(lowStr, ft, offset)
 		if err != nil {
 			return FieldValue{}, err
 		}
 
-		high, err := parseNumericValue(highStr, ft)
+		dashIdx := strings.Index(rangePart, "-")
+		highOffset := offset + dashIdx + 1
+		high, err := parseNumericValue(highStr, ft, highOffset)
 		if err != nil {
 			return FieldValue{}, err
 		}
 
 		if low < minVal || low > maxVal {
-			return FieldValue{}, NewParseError(ft, 0, part,
+			return FieldValue{}, NewParseError(ft, offset, part,
 				"range lower bound %d out of range [%d, %d]", low, minVal, maxVal)
 		}
 
 		if high < minVal || high > maxVal {
-			return FieldValue{}, NewParseError(ft, 0, part,
+			return FieldValue{}, NewParseError(ft, offset, part,
 				"range upper bound %d out of range [%d, %d]", high, minVal, maxVal)
 		}
 
 		if low > high {
-			return FieldValue{}, NewParseError(ft, 0, part,
+			return FieldValue{}, NewParseError(ft, offset, part,
 				"range lower bound %d greater than upper bound %d", low, high)
 		}
 
@@ -269,13 +317,13 @@ func parseStep(part string, ft FieldType, minVal, maxVal int) (FieldValue, error
 		}, nil
 	}
 
-	low, err := parseNumericValue(rangePart, ft)
+	low, err := parseNumericValue(rangePart, ft, offset)
 	if err != nil {
 		return FieldValue{}, err
 	}
 
 	if low < minVal || low > maxVal {
-		return FieldValue{}, NewParseError(ft, 0, part,
+		return FieldValue{}, NewParseError(ft, offset, part,
 			"value %d out of range [%d, %d]", low, minVal, maxVal)
 	}
 
@@ -287,7 +335,7 @@ func parseStep(part string, ft FieldType, minVal, maxVal int) (FieldValue, error
 	}, nil
 }
 
-func parseNumericValue(s string, ft FieldType) (int, error) {
+func parseNumericValue(s string, ft FieldType, offset int) (int, error) {
 	if ft == FieldWeekday {
 		if v, ok := weekdayNames[s]; ok {
 			return v, nil
@@ -302,7 +350,7 @@ func parseNumericValue(s string, ft FieldType) (int, error) {
 
 	v, err := strconv.Atoi(s)
 	if err != nil {
-		return 0, NewParseError(ft, 0, s, "invalid numeric value: %s", s)
+		return 0, NewParseError(ft, offset, s, "invalid numeric value: %s", s)
 	}
 	return v, nil
 }

@@ -1,6 +1,8 @@
 package raftlog
 
 import (
+	"bytes"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"sync"
@@ -198,21 +200,38 @@ func (sm *MemoryStateMachine) Apply(entry *LogEntry) error {
 	}
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	sm.data[string(entry.Command)] = "applied"
+	sm.data[string(entry.Command)] = string(entry.Command)
 	return nil
 }
 
 func (sm *MemoryStateMachine) ApplySnapshot(snapshot *Snapshot) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	sm.data = make(map[string]string)
+
+	if len(snapshot.Data) == 0 {
+		sm.data = make(map[string]string)
+		return nil
+	}
+
+	decoder := gob.NewDecoder(bytes.NewReader(snapshot.Data))
+	var data map[string]string
+	if err := decoder.Decode(&data); err != nil {
+		return err
+	}
+	sm.data = data
 	return nil
 }
 
 func (sm *MemoryStateMachine) Snapshot() ([]byte, error) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	return []byte(fmt.Sprintf("%d", len(sm.data))), nil
+
+	var buf bytes.Buffer
+	encoder := gob.NewEncoder(&buf)
+	if err := encoder.Encode(sm.data); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func (sm *MemoryStateMachine) Get(key string) (string, bool) {
@@ -295,6 +314,7 @@ type RaftNode struct {
 	randState int64
 
 	configChangeInFlight bool
+	snapshotInstalling   bool
 }
 
 type Transport interface {
@@ -307,9 +327,10 @@ type Transport interface {
 }
 
 type MemoryTransport struct {
-	mu    sync.RWMutex
-	nodes map[string]*RaftNode
-	delay time.Duration
+	mu     sync.RWMutex
+	nodes  map[string]*RaftNode
+	delay  time.Duration
+	closed bool
 }
 
 func NewMemoryTransport() *MemoryTransport {
@@ -340,17 +361,27 @@ func (t *MemoryTransport) UnregisterNode(id string) {
 func (t *MemoryTransport) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.closed = true
 	t.nodes = make(map[string]*RaftNode)
 }
 
 func (t *MemoryTransport) getNode(id string) (*RaftNode, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	if t.closed {
+		return nil, false
+	}
 	n, ok := t.nodes[id]
 	return n, ok
 }
 
 func (t *MemoryTransport) SendRequestVote(target string, req *RequestVoteRequest) (*RequestVoteReply, error) {
+	t.mu.RLock()
+	if t.closed {
+		t.mu.RUnlock()
+		return nil, ErrTransportClosed
+	}
+	t.mu.RUnlock()
 	node, ok := t.getNode(target)
 	if !ok {
 		return nil, ErrNodeNotFound
@@ -362,6 +393,12 @@ func (t *MemoryTransport) SendRequestVote(target string, req *RequestVoteRequest
 }
 
 func (t *MemoryTransport) SendAppendEntries(target string, req *AppendEntriesRequest) (*AppendEntriesReply, error) {
+	t.mu.RLock()
+	if t.closed {
+		t.mu.RUnlock()
+		return nil, ErrTransportClosed
+	}
+	t.mu.RUnlock()
 	node, ok := t.getNode(target)
 	if !ok {
 		return nil, ErrNodeNotFound
@@ -373,6 +410,12 @@ func (t *MemoryTransport) SendAppendEntries(target string, req *AppendEntriesReq
 }
 
 func (t *MemoryTransport) SendInstallSnapshot(target string, req *InstallSnapshotRequest) (*InstallSnapshotReply, error) {
+	t.mu.RLock()
+	if t.closed {
+		t.mu.RUnlock()
+		return nil, ErrTransportClosed
+	}
+	t.mu.RUnlock()
 	node, ok := t.getNode(target)
 	if !ok {
 		return nil, ErrNodeNotFound
@@ -497,6 +540,19 @@ func (n *RaftNode) getLogEntry(index int) *LogEntry {
 	return n.log[idx]
 }
 
+func (n *RaftNode) GetLogEntry(index int) (*LogEntry, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if index < n.logOffset {
+		return nil, ErrLogCompacted
+	}
+	entry := n.getLogEntry(index)
+	if entry == nil {
+		return nil, ErrInvalidIndex
+	}
+	return entry, nil
+}
+
 func (n *RaftNode) appendEntry(entry *LogEntry) {
 	n.log = append(n.log, entry)
 }
@@ -585,7 +641,7 @@ func (n *RaftNode) run() {
 		case <-n.heartbeatTimer.C:
 			n.handleHeartbeatTimeout()
 		case <-n.commitReady:
-			n.applyCommitted()
+			n.notifyApply()
 		}
 	}
 }
@@ -1047,6 +1103,42 @@ func (n *RaftNode) updateCommitIndex() {
 	}
 
 	if n.joint != nil {
+		for i := n.commitIndex + 1; i <= n.lastLogIndex(); i++ {
+			entry := n.getLogEntry(i)
+			if entry == nil {
+				continue
+			}
+			if entry.Term != n.currentTerm {
+				continue
+			}
+			if entry.Type == LogEntryConfigJoint || entry.Type == LogEntryConfigNew {
+				continue
+			}
+
+			oldMatch := 1
+			newMatch := 1
+			for nodeID := range n.joint.Old.Nodes {
+				if nodeID == n.id {
+					continue
+				}
+				if n.matchIndex[nodeID] >= i {
+					oldMatch++
+				}
+			}
+			for nodeID := range n.joint.New.Nodes {
+				if nodeID == n.id {
+					continue
+				}
+				if n.matchIndex[nodeID] >= i {
+					newMatch++
+				}
+			}
+
+			if oldMatch >= n.joint.OldQuorum() && newMatch >= n.joint.NewQuorum() {
+				n.commitIndex = i
+				n.notifyApply()
+			}
+		}
 		return
 	}
 
@@ -1185,11 +1277,12 @@ func (n *RaftNode) applyCommitted() {
 			continue
 		}
 
+		applyErr := error(nil)
 		if entry.Type == LogEntryConfigJoint {
 		} else if entry.Type == LogEntryConfigNew {
 		} else {
 			if err := n.sm.Apply(entry); err != nil {
-				continue
+				applyErr = fmt.Errorf("%w: %v", ErrApplyFailed, err)
 			}
 		}
 
@@ -1197,7 +1290,7 @@ func (n *RaftNode) applyCommitted() {
 		case n.applyCh <- &ApplyResult{
 			Index: entry.Index,
 			Term:  entry.Term,
-			Err:   nil,
+			Err:   applyErr,
 		}:
 		default:
 		}
@@ -1236,6 +1329,10 @@ func (n *RaftNode) Propose(command []byte) (int, int, error) {
 	if n.configChangeInFlight {
 		n.mu.Unlock()
 		return 0, 0, ErrConfigChangeInFlight
+	}
+	if n.snapshotInstalling {
+		n.mu.Unlock()
+		return 0, 0, ErrSnapshotInstalling
 	}
 
 	entry := &LogEntry{

@@ -238,6 +238,28 @@ func (ctx *ExecutionContext) Values() map[string]interface{} {
 	return result
 }
 
+type NodeStateData interface{}
+
+type NodeExecutionState struct {
+	NodeID        string
+	Completed     bool
+	Result        *NodeResult
+	InternalState NodeStateData
+}
+
+type workflowStateKey struct{}
+
+func WithWorkflowState(ctx context.Context, state *WorkflowState) context.Context {
+	return context.WithValue(ctx, workflowStateKey{}, state)
+}
+
+func GetWorkflowState(ctx context.Context) *WorkflowState {
+	if state, ok := ctx.Value(workflowStateKey{}).(*WorkflowState); ok {
+		return state
+	}
+	return nil
+}
+
 type Node interface {
 	GetID() string
 	GetType() NodeType
@@ -246,19 +268,23 @@ type Node interface {
 	GetRetryConfig() RetryConfig
 	SetRetryConfig(RetryConfig)
 	Execute(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error)
+	ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error)
+	GetState() NodeStateData
+	RestoreState(state NodeStateData)
 }
 
 type WorkflowState struct {
-	WorkflowID   string
-	Status       WorkflowStatus
+	WorkflowID    string
+	Status        WorkflowStatus
 	CurrentNodeID string
 	CompletedNodes []string
-	NodeResults  map[string]*NodeResult
-	Context      map[string]interface{}
-	Error        string
-	CreatedAt    time.Time
-	StartedAt    time.Time
-	FinishedAt   time.Time
+	NodeResults   map[string]*NodeResult
+	NodeStates    map[string]*NodeExecutionState
+	Context       map[string]interface{}
+	Error         string
+	CreatedAt     time.Time
+	StartedAt     time.Time
+	FinishedAt    time.Time
 }
 
 type NodeState struct {
@@ -282,6 +308,7 @@ type WorkflowResult struct {
 	WorkflowID string
 	Status     WorkflowStatus
 	Results    map[string]*NodeResult
+	Context    map[string]interface{}
 	Error      string
 	Duration   time.Duration
 }

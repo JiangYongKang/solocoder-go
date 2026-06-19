@@ -38,6 +38,14 @@ func (m *Manager) getOrCreateTenantUsage(tenantID string) *TenantUsage {
 	return usage
 }
 
+func (m *Manager) getTenantUsageIfExists(tenantID string) (*TenantUsage, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	usage, exists := m.tenantUsages[tenantID]
+	return usage, exists
+}
+
 func (m *Manager) getTenantQuotaLocked(tenantID string) *TenantQuota {
 	quota, exists := m.tenantQuotas[tenantID]
 	if !exists {
@@ -154,15 +162,15 @@ func (m *Manager) AcquireResource(tenantID string, resource ResourceType, amount
 
 	tenantUsage := m.getOrCreateTenantUsage(tenantID)
 
+	tenantUsage.mu.Lock()
+	defer tenantUsage.mu.Unlock()
+
 	m.mu.RLock()
 	quota := m.getTenantQuotaLocked(tenantID)
 	m.mu.RUnlock()
 
 	limit := m.getResourceLimit(quota, resource)
 	softLimit := limit * quota.SoftThreshold
-
-	tenantUsage.mu.Lock()
-	defer tenantUsage.mu.Unlock()
 
 	currentUsage := m.getResourceUsage(&tenantUsage.usage, resource)
 	newUsage := currentUsage + amount
@@ -209,15 +217,10 @@ func (m *Manager) ReleaseResource(tenantID string, resource ResourceType, amount
 		return ErrInvalidResourceType
 	}
 
-	m.mu.RLock()
-	_, exists := m.tenantUsages[tenantID]
-	m.mu.RUnlock()
-
+	tenantUsage, exists := m.getTenantUsageIfExists(tenantID)
 	if !exists {
 		return ErrTenantNotFound
 	}
-
-	tenantUsage := m.getOrCreateTenantUsage(tenantID)
 
 	tenantUsage.mu.Lock()
 	defer tenantUsage.mu.Unlock()
@@ -231,18 +234,9 @@ func (m *Manager) ReleaseResource(tenantID string, resource ResourceType, amount
 	return nil
 }
 
-func (m *Manager) GetTenantUsage(tenantID string) (*TenantQuotaInfo, error) {
-	if tenantID == "" {
-		return nil, ErrInvalidTenantID
-	}
-
-	m.mu.RLock()
-	quota := m.getTenantQuotaLocked(tenantID)
-	usage, exists := m.tenantUsages[tenantID]
-	m.mu.RUnlock()
-
+func (m *Manager) buildTenantQuotaInfo(tenantID string, quota *TenantQuota, usage *TenantUsage) *TenantQuotaInfo {
 	var currentUsage Usage
-	if exists {
+	if usage != nil {
 		usage.mu.RLock()
 		currentUsage = usage.usage
 		usage.mu.RUnlock()
@@ -274,29 +268,62 @@ func (m *Manager) GetTenantUsage(tenantID string) (*TenantQuotaInfo, error) {
 		Usage:     currentUsage,
 		LimitMode: quota.LimitMode,
 		Resources: resources,
-	}, nil
+	}
+}
+
+func (m *Manager) GetTenantUsage(tenantID string) (*TenantQuotaInfo, error) {
+	if tenantID == "" {
+		return nil, ErrInvalidTenantID
+	}
+
+	m.mu.RLock()
+	quota := m.getTenantQuotaLocked(tenantID)
+	usage, exists := m.tenantUsages[tenantID]
+	m.mu.RUnlock()
+
+	var tenantUsage *TenantUsage
+	if exists {
+		tenantUsage = usage
+	}
+
+	return m.buildTenantQuotaInfo(tenantID, quota, tenantUsage), nil
 }
 
 func (m *Manager) GetAllTenantsUsage() []*TenantQuotaInfo {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 
-	tenantIDs := make([]string, 0, len(m.tenantUsages))
+	tenantSet := make(map[string]struct{})
 	for id := range m.tenantUsages {
-		tenantIDs = append(tenantIDs, id)
+		tenantSet[id] = struct{}{}
 	}
 	for id := range m.tenantQuotas {
-		if _, ok := m.tenantUsages[id]; !ok {
-			tenantIDs = append(tenantIDs, id)
-		}
+		tenantSet[id] = struct{}{}
 	}
 
-	result := make([]*TenantQuotaInfo, 0, len(tenantIDs))
-	for _, id := range tenantIDs {
-		info, _ := m.GetTenantUsage(id)
-		if info != nil {
-			result = append(result, info)
-		}
+	snapshot := make([]struct {
+		id    string
+		quota *TenantQuota
+		usage *TenantUsage
+	}, 0, len(tenantSet))
+
+	for id := range tenantSet {
+		snapshot = append(snapshot, struct {
+			id    string
+			quota *TenantQuota
+			usage *TenantUsage
+		}{
+			id:    id,
+			quota: m.getTenantQuotaLocked(id),
+			usage: m.tenantUsages[id],
+		})
+	}
+
+	m.mu.RUnlock()
+
+	result := make([]*TenantQuotaInfo, 0, len(snapshot))
+	for _, item := range snapshot {
+		info := m.buildTenantQuotaInfo(item.id, item.quota, item.usage)
+		result = append(result, info)
 	}
 
 	return result
@@ -343,7 +370,7 @@ func (m *Manager) SetLimitMode(tenantID string, mode LimitMode) error {
 		return ErrInvalidTenantID
 	}
 	if mode != LimitModeHard && mode != LimitModeSoft {
-		return ErrInvalidSoftThreshold
+		return ErrInvalidLimitMode
 	}
 
 	m.mu.Lock()

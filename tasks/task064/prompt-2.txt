@@ -1,0 +1,8 @@
+你实现的 Leader 选举模块存在一些问题，需要修复：
+1. notify 方法在构造 ElectionEvent 时读取 e.role、e.leaderID、e.term 三个共享字段时只持有 callbacksMu 读锁而不持有 e.mu 互斥锁，而 doHeartbeat、startElection 等方法在 e.mu 保护下修改这些字段后释放锁再调用 notify，存在对字符串和整型字段的并发读写数据竞争。
+2. checkLeader 方法对 backeEnd 返回的错误只处理了 ErrLockNotHeld 和 ErrLockExpired，对其他所有错误类型直接静默 return 跳过本检查周期。如果后端连续返回非预期错误，Follower 可能在多个周期内都检测不到 Leader 宕机导致选举延迟。
+3. notify 方法在当前 goroutine 中同步执行所有回调函数，而文档宣称回调在单独 goroutine 中执行不阻塞选举主循环，实现与文档不一致。如果回调执行耗时操作会拖慢心跳发送和 Leader 检查的下一个周期。
+4. LeaderElector 结构体中定义了 heartbeatCh 字段（chan struct{}），在构造函数中初始化为缓冲大小为 1 的通道，但整个代码中没有任何地方向该通道发送或接收数据，属于无效代码。
+5. 缺少对 doHeartbeat 心跳失败场景的独立测试覆盖，未验证 Leader 在运行过程中心跳续约失败时是否正确地触发 EventLeaderLost 和角色转换。
+6. 修复后运行 go test ./internal/leaderelect/ -v，需要让所有测试通过。
+7. 在 docs/leaderelect.md 中更新模块需求文档，确保文档声明与代码实现一致。

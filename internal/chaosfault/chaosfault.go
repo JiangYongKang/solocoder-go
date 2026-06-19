@@ -90,9 +90,6 @@ func (fi *FaultInjector) SetErrorConfig(cfg ErrorConfig) error {
 }
 
 func (fi *FaultInjector) SetDisconnectConfig(cfg DisconnectConfig) error {
-	if err := validateTargetRatio(cfg.TargetRatio); err != nil {
-		return err
-	}
 	if cfg.TimeWindow != nil {
 		if err := validateTimeWindow(cfg.TimeWindow); err != nil {
 			return err
@@ -133,25 +130,22 @@ func (fi *FaultInjector) isDisconnectedLocked() bool {
 	if fi.disconnectCfg.TimeWindow != nil && !fi.isTimeWindowActive(fi.disconnectCfg.TimeWindow) {
 		return false
 	}
-	return fi.hitTargetRatio(fi.disconnectCfg.TargetRatio)
+	return true
 }
 
 func (fi *FaultInjector) ApplyDelay() {
+	var delay time.Duration
 	fi.mu.RLock()
 	cfg := fi.delayCfg
+	if cfg.Enabled {
+		if cfg.TimeWindow == nil || fi.isTimeWindowActive(cfg.TimeWindow) {
+			if fi.hitTargetRatio(cfg.TargetRatio) {
+				delay = fi.calculateDelay(cfg)
+			}
+		}
+	}
 	fi.mu.RUnlock()
 
-	if !cfg.Enabled {
-		return
-	}
-	if cfg.TimeWindow != nil && !fi.isTimeWindowActive(cfg.TimeWindow) {
-		return
-	}
-	if !fi.hitTargetRatio(cfg.TargetRatio) {
-		return
-	}
-
-	delay := fi.calculateDelay(cfg)
 	if delay > 0 {
 		fi.sleepFunc(delay)
 	}
@@ -173,17 +167,18 @@ func (fi *FaultInjector) calculateDelay(cfg DelayConfig) time.Duration {
 }
 
 func (fi *FaultInjector) CheckError() error {
+	var hit bool
+	var cfg ErrorConfig
 	fi.mu.RLock()
-	cfg := fi.errorCfg
+	cfg = fi.errorCfg
+	if cfg.Enabled {
+		if cfg.TimeWindow == nil || fi.isTimeWindowActive(cfg.TimeWindow) {
+			hit = fi.hitTargetRatio(cfg.TargetRatio)
+		}
+	}
 	fi.mu.RUnlock()
 
-	if !cfg.Enabled {
-		return nil
-	}
-	if cfg.TimeWindow != nil && !fi.isTimeWindowActive(cfg.TimeWindow) {
-		return nil
-	}
-	if !fi.hitTargetRatio(cfg.TargetRatio) {
+	if !hit {
 		return nil
 	}
 
@@ -200,9 +195,10 @@ func (fi *FaultInjector) CheckError() error {
 
 func (fi *FaultInjector) CheckDisconnect() error {
 	fi.mu.RLock()
-	defer fi.mu.RUnlock()
+	disconnected := fi.isDisconnectedLocked()
+	fi.mu.RUnlock()
 
-	if !fi.isDisconnectedLocked() {
+	if !disconnected {
 		return nil
 	}
 	return &ConnectionBrokenError{
@@ -309,8 +305,7 @@ func (fi *FaultInjector) DisableError() {
 
 func (fi *FaultInjector) EnableDisconnect() error {
 	cfg := DisconnectConfig{
-		Enabled:     true,
-		TargetRatio: 1.0,
+		Enabled: true,
 	}
 	return fi.SetDisconnectConfig(cfg)
 }

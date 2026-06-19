@@ -1,0 +1,7 @@
+你实现的超时传播器模块存在一些问题，需要修复：
+1. Execute 方法在 stage 执行返回业务错误时将阶段状态设为 StageStatusTimedOut，导致报告中超时失败和业务逻辑失败无法区分，调用方无法根据报告判断失败类型。types.go 中定义了 StageStatusFailed 但从未被使用。
+2. 最小阈值检查的条件使用了阶段预算而非剩余时间进行比对，当阶段自身预算很小但根 context 剩余时间充足时该阶段被错误跳过，与"剩余时间不足最小阈值才跳过"的语义不符。零预算阶段的最小阈值检查也被完全绕过。
+3. errors.go 中 StageTimeoutError 的 Unwrap 返回自定义类型而非 context.DeadlineExceeded，导致调用方通过 errors.Is 判断时失败，不符合 Go 语言超时错误的惯用处理方式。
+4. timeoutprop_test.go 的 TestExecute_MinThresholdSkip 测试函数内无实质断言，仅在空 if 分支中处理三种状态，其余情况只输出 Logf 不触发 t.Errorf，该测试恒为 PASS 且无法验证最小阈值跳过逻辑的正确性。
+5. 修复后运行 go test ./internal/timeoutprop/ -v，需要让所有测试通过。
+6. 在 docs/timeoutprop.md 中更新模块需求文档，说明修复后的错误类型区分策略和最小阈值检查的判定逻辑。

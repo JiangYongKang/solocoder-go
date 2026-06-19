@@ -46,7 +46,7 @@ The workflow engine module provides a flexible and extensible framework for defi
 ## Core Structures and Responsibilities
 
 ### Node Interface
-All node types implement the `Node` interface:
+All node types implement the `Node` interface, which has been extended with state management methods for breakpoint resume support:
 
 ```go
 type Node interface {
@@ -57,8 +57,16 @@ type Node interface {
     GetRetryConfig() RetryConfig
     SetRetryConfig(RetryConfig)
     Execute(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error)
+    ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error)
+    GetState() NodeStateData
+    RestoreState(state NodeStateData)
 }
 ```
+
+**State Management Methods**:
+- `ExecuteWithState` - Executes the node with awareness of previous execution state, enabling skip completed nodes
+- `GetState` - Returns the node's internal execution progress (e.g., current index for sequential nodes)
+- `RestoreState` - Restores the node's internal state from saved data
 
 ### ExecutionContext
 Thread-safe context for passing variables between nodes:
@@ -84,12 +92,25 @@ Represents a workflow blueprint:
 - Optional version and description
 
 ### WorkflowState
-Represents the runtime state of a workflow instance:
+Represents the runtime state of a workflow instance with breakpoint resume support:
 - Workflow ID and current status
-- Completed nodes list
-- Node execution results
-- Variable context
+- Completed nodes list (`CompletedNodes`)
+- Node execution results (`NodeResults`)
+- Per-node execution states (`NodeStates`) - tracks whether each node has completed
+- Variable context (`Context`) - separate from node results
 - Timestamps (created, started, finished)
+- Error information
+
+**Key Fields**:
+- `NodeStates map[string]*NodeExecutionState` - Global state tracking for all nodes
+- `Context map[string]interface{}` - Context variables, separate from `NodeResults`
+
+### NodeExecutionState
+Tracks the execution state of a single node for breakpoint resume:
+- `NodeID` - Unique node identifier
+- `Completed` - Whether the node has successfully completed (failed nodes are NOT marked as completed)
+- `Result` - The node's execution result if completed
+- `InternalState` - Node-specific progress data (e.g., current index for sequential nodes)
 
 ### NodeResult
 Represents the execution result of a single node:
@@ -102,8 +123,12 @@ Represents the execution result of a single node:
 Configuration for node retry behavior:
 - `MaxRetries` - Maximum retry attempts
 - `Interval` - Base interval between retries
+  - `0` means immediate retry (no wait)
+  - Negative values use 100ms default interval
 - `Strategy` - Retry strategy (fixed, linear, exponential)
 - `BackoffFactor` - Multiplier for interval calculation
+
+**Important**: Setting `Interval = 0` enables immediate retry without any delay, which is different from negative intervals that default to 100ms.
 
 ## Node Types and Execution Flow
 
@@ -404,6 +429,132 @@ loadedState.Status = workflow.WorkflowStatusPaused
 // Resume from where it left off
 resumedState, err := engine.ResumeWorkflow(context.Background(), loadedState)
 ```
+
+## State Persistence and Breakpoint Resume Mechanism
+
+### Architecture Overview
+
+The breakpoint resume system uses a **two-tier state tracking architecture**:
+
+1. **Global State Tracking** (`WorkflowState.NodeStates`)
+   - A `map[string]*NodeExecutionState` that tracks execution state for every node in the workflow
+   - Each entry contains: completion status, execution result, and node-specific internal state
+   - Accessible via `context.Context` using `WithWorkflowState()` / `GetWorkflowState()`
+
+2. **Node-Internal State**
+   - Each node type tracks its own execution progress
+   - `SequentialNode`: `currentIndex` - the next child node to execute
+   - `ParallelNode`: `completedNodes` - which children have finished
+   - `ConditionalNode`: `selectedNodeID`, `executed` - which branch was selected
+   - `LoopNode`: `currentIteration` - current loop iteration
+
+### Core Execution Flow with State Awareness
+
+#### `executeNodeWithState()` - The State-Aware Executor
+
+This is the core function that enables breakpoint resume. Before executing any node:
+
+1. **Check Completion**: Look up the node in `state.NodeStates`
+   - If `nodeState.Completed == true`: skip execution, return saved result
+   - If not completed: proceed to execute
+
+2. **Execute with State**: Call `node.ExecuteWithState()` instead of `node.Execute()`
+   - Passes the saved `NodeExecutionState` to enable internal state restoration
+   - Node can resume from its saved progress (e.g., sequential node from saved index)
+
+3. **Update State**: After execution completes
+   - Mark as `Completed` **only if execution succeeded** (status = `NodeStatusCompleted`)
+   - Failed nodes are NOT marked as completed, allowing retry on resume
+   - Save execution result and node-internal state
+
+### Breakpoint Resume Implementation Flow
+
+When `ResumeWorkflow()` is called with a saved state:
+
+```
+1. Validate State
+   └─ Check that workflow exists and state is in Paused/Failed status
+
+2. Initialize State Structures
+   └─ Ensure NodeStates, NodeResults, CompletedNodes, Context maps are initialized
+
+3. Restore Node Internal States
+   └─ Call restoreNodeState() for each node with saved internal state
+      └─ Recursively walks the node tree
+      └─ Calls node.RestoreState() to restore progress (e.g., currentIndex)
+
+4. Restore Execution Context
+   └─ Copy all context variables from saved state into new ExecutionContext
+
+5. Execute with State Awareness
+   └─ Call executeNodeWithState() on root node
+      └─ For each node:
+         ├─ Skip if already completed (uses saved result)
+         ├─ Execute if not completed (or failed previously)
+         └─ Update state after execution
+
+6. Update Final State
+   └─ Update context with new variables from resumed execution
+   └─ Set final status (Completed or Failed)
+   └─ Return resumed state
+```
+
+### Key Design Decisions
+
+#### 1. Failed Nodes Are Not Marked as Completed
+- **Rationale**: Failed nodes should be re-executed when resuming
+- **Behavior**: Only nodes with `Status == NodeStatusCompleted` are marked as completed
+- **Result**: On resume, failed nodes will retry, completed nodes will skip
+
+#### 2. Context Variables Are Separate From Node Results
+- **Rationale**: Prevent callers from confusing context variables with actual node execution results
+- **Implementation**: 
+  - `WorkflowResult.Context` stores context variables
+  - `WorkflowResult.Results` stores only actual node execution results
+  - No mixing of the two
+
+#### 3. Context Passing Through `context.Context`
+- **Rationale**: Avoid modifying every node's Execute method signature
+- **Implementation**:
+  - `WithWorkflowState(ctx, state)` attaches state to context
+  - `GetWorkflowState(ctx)` retrieves state from context
+  - Child nodes can access global state without explicit parameter passing
+
+#### 4. Composite Nodes Check State Before Executing Children
+- **SequentialNode**: 
+  - Resumes from saved `currentIndex`
+  - Checks each child node's completion status before execution
+  - Uses `executeNodeWithState()` for child execution
+
+- **ParallelNode**:
+  - Skips children marked as completed before launching goroutines
+  - Uses `executeNodeWithState()` in each goroutine for state tracking
+
+- **ConditionalNode**:
+  - Reuses previously selected branch (from `selectedNodeID`)
+  - Avoids re-evaluating conditions on resume
+  - Checks branch completion status before execution
+
+- **LoopNode**:
+  - Resumes from saved `currentIteration`
+  - Uses synthetic keys (`{nodeID}_iter_{i}`) to track iteration completion
+  - Skips completed iterations
+
+### JSON Serialization Considerations
+
+When saving/loading state via JSON:
+- Integer values may be deserialized as `float64`
+- All `RestoreState()` implementations handle both `int` and `float64` types
+- Node state data uses `map[string]interface{}` for maximum flexibility
+
+### Zero Interval Retry Behavior
+
+Retry interval calculation follows these rules:
+- `Interval == 0`: Immediate retry (no delay)
+- `Interval < 0`: Default to 100ms
+- `Interval > 0`: Use the specified interval
+
+This allows callers to explicitly request zero-delay retries, which is different from unset/negative intervals that use a safe default.
 
 ## Error Handling
 

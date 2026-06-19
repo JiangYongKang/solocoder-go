@@ -10,6 +10,98 @@ import (
 	"solocoder-go/internal/distlock"
 )
 
+type mockBackend struct {
+	mu              sync.Mutex
+	tryLockFn       func(key, token string, ttl time.Duration) (bool, error)
+	heartbeatFn     func(key, token string, ttl time.Duration) error
+	unlockFn        func(key, token string) error
+	getHolderFn     func(key string) (string, int, time.Duration, error)
+	isLockedFn      func(key string) (bool, error)
+}
+
+func newMockBackend() *mockBackend {
+	lm := distlock.NewLockManager()
+	return &mockBackend{
+		tryLockFn: func(key, token string, ttl time.Duration) (bool, error) {
+			return lm.TryLock(key, token, ttl)
+		},
+		heartbeatFn: func(key, token string, ttl time.Duration) error {
+			return lm.Heartbeat(key, token, ttl)
+		},
+		unlockFn: func(key, token string) error {
+			return lm.Unlock(key, token)
+		},
+		getHolderFn: func(key string) (string, int, time.Duration, error) {
+			return lm.GetHolder(key)
+		},
+		isLockedFn: func(key string) (bool, error) {
+			return lm.IsLocked(key)
+		},
+	}
+}
+
+func (m *mockBackend) TryLock(key, token string, ttl time.Duration) (bool, error) {
+	m.mu.Lock()
+	fn := m.tryLockFn
+	m.mu.Unlock()
+	return fn(key, token, ttl)
+}
+
+func (m *mockBackend) Heartbeat(key, token string, ttl time.Duration) error {
+	m.mu.Lock()
+	fn := m.heartbeatFn
+	m.mu.Unlock()
+	return fn(key, token, ttl)
+}
+
+func (m *mockBackend) Unlock(key, token string) error {
+	m.mu.Lock()
+	fn := m.unlockFn
+	m.mu.Unlock()
+	return fn(key, token)
+}
+
+func (m *mockBackend) GetHolder(key string) (string, int, time.Duration, error) {
+	m.mu.Lock()
+	fn := m.getHolderFn
+	m.mu.Unlock()
+	return fn(key)
+}
+
+func (m *mockBackend) IsLocked(key string) (bool, error) {
+	m.mu.Lock()
+	fn := m.isLockedFn
+	m.mu.Unlock()
+	return fn(key)
+}
+
+func (m *mockBackend) setHeartbeatFn(fn func(key, token string, ttl time.Duration) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.heartbeatFn = fn
+}
+
+func (m *mockBackend) setGetHolderFn(fn func(key string) (string, int, time.Duration, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getHolderFn = fn
+}
+
+func (m *mockBackend) setTryLockFn(fn func(key, token string, ttl time.Duration) (bool, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tryLockFn = fn
+}
+
+func waitForEvent(ch chan ElectionEvent, timeout time.Duration) (ElectionEvent, bool) {
+	select {
+	case evt := <-ch:
+		return evt, true
+	case <-time.After(timeout):
+		return ElectionEvent{}, false
+	}
+}
+
 func TestNodeRole_String(t *testing.T) {
 	tests := []struct {
 		role     NodeRole
@@ -297,11 +389,9 @@ func TestLeaderElector_SingleNodeBecomesLeader(t *testing.T) {
 		t.Fatalf("NewLeaderElector() error: %v", err)
 	}
 
-	var becameLeader int32
+	eventCh := make(chan ElectionEvent, 10)
 	elector.RegisterCallback(func(event ElectionEvent) {
-		if event.Type == EventBecomeLeader {
-			atomic.StoreInt32(&becameLeader, 1)
-		}
+		eventCh <- event
 	})
 
 	if err := elector.Start(); err != nil {
@@ -309,7 +399,19 @@ func TestLeaderElector_SingleNodeBecomesLeader(t *testing.T) {
 	}
 	defer elector.Stop()
 
-	time.Sleep(150 * time.Millisecond)
+	foundBecomeLeader := false
+	timeout := time.After(300 * time.Millisecond)
+loop:
+	for {
+		select {
+		case evt := <-eventCh:
+			if evt.Type == EventBecomeLeader {
+				foundBecomeLeader = true
+			}
+		case <-timeout:
+			break loop
+		}
+	}
 
 	if !elector.IsLeader() {
 		t.Error("Expected node to become leader")
@@ -323,7 +425,7 @@ func TestLeaderElector_SingleNodeBecomesLeader(t *testing.T) {
 	if elector.Term() < 1 {
 		t.Errorf("Term() = %d, want >= 1", elector.Term())
 	}
-	if atomic.LoadInt32(&becameLeader) == 0 {
+	if !foundBecomeLeader {
 		t.Error("Expected EventBecomeLeader callback")
 	}
 }
@@ -400,10 +502,11 @@ func TestLeaderElector_HeartbeatRenewsLease(t *testing.T) {
 		t.Fatalf("NewLeaderElector() error: %v", err)
 	}
 
-	var heartbeatCount int32
+	eventCh := make(chan ElectionEvent, 100)
 	elector.RegisterCallback(func(event ElectionEvent) {
-		if event.Type == EventHeartbeat {
-			atomic.AddInt32(&heartbeatCount, 1)
+		select {
+		case eventCh <- event:
+		default:
 		}
 	})
 
@@ -418,9 +521,22 @@ func TestLeaderElector_HeartbeatRenewsLease(t *testing.T) {
 		t.Fatal("Expected node to be leader")
 	}
 
-	heartbeats := atomic.LoadInt32(&heartbeatCount)
-	if heartbeats < 1 {
-		t.Errorf("Expected at least 1 heartbeat, got %d", heartbeats)
+	heartbeatCount := 0
+	timeout := time.After(50 * time.Millisecond)
+loop:
+	for {
+		select {
+		case evt := <-eventCh:
+			if evt.Type == EventHeartbeat {
+				heartbeatCount++
+			}
+		case <-timeout:
+			break loop
+		}
+	}
+
+	if heartbeatCount < 1 {
+		t.Errorf("Expected at least 1 heartbeat, got %d", heartbeatCount)
 	}
 
 	time.Sleep(100 * time.Millisecond)
@@ -494,15 +610,9 @@ func TestLeaderElector_Resign(t *testing.T) {
 		t.Fatalf("NewLeaderElector() error: %v", err)
 	}
 
-	var lostLeader int32
-	var becameFollower int32
+	eventCh := make(chan ElectionEvent, 100)
 	elector.RegisterCallback(func(event ElectionEvent) {
-		if event.Type == EventLeaderLost {
-			atomic.StoreInt32(&lostLeader, 1)
-		}
-		if event.Type == EventBecomeFollower && event.Role == RoleFollower {
-			atomic.StoreInt32(&becameFollower, 1)
-		}
+		eventCh <- event
 	})
 
 	if err := elector.Start(); err != nil {
@@ -526,10 +636,29 @@ func TestLeaderElector_Resign(t *testing.T) {
 	if elector.Role() != RoleFollower {
 		t.Errorf("Role() = %v, want %v", elector.Role(), RoleFollower)
 	}
-	if atomic.LoadInt32(&lostLeader) == 0 {
+
+	foundLeaderLost := false
+	foundBecomeFollower := false
+	timeout := time.After(200 * time.Millisecond)
+loop:
+	for {
+		select {
+		case evt := <-eventCh:
+			if evt.Type == EventLeaderLost {
+				foundLeaderLost = true
+			}
+			if evt.Type == EventBecomeFollower && evt.Role == RoleFollower {
+				foundBecomeFollower = true
+			}
+		case <-timeout:
+			break loop
+		}
+	}
+
+	if !foundLeaderLost {
 		t.Error("Expected EventLeaderLost callback")
 	}
-	if atomic.LoadInt32(&becameFollower) == 0 {
+	if !foundBecomeFollower {
 		t.Error("Expected EventBecomeFollower callback after resign")
 	}
 }
@@ -660,12 +789,9 @@ func TestLeaderElector_ElectionCallbacks(t *testing.T) {
 		t.Fatalf("NewLeaderElector() error: %v", err)
 	}
 
-	var mu sync.Mutex
-	var events []ElectionEventType
+	eventCh := make(chan ElectionEvent, 100)
 	elector.RegisterCallback(func(event ElectionEvent) {
-		mu.Lock()
-		defer mu.Unlock()
-		events = append(events, event.Type)
+		eventCh <- event
 	})
 
 	if err := elector.Start(); err != nil {
@@ -673,28 +799,27 @@ func TestLeaderElector_ElectionCallbacks(t *testing.T) {
 	}
 	defer elector.Stop()
 
-	time.Sleep(150 * time.Millisecond)
-
-	mu.Lock()
-	eventList := make([]ElectionEventType, len(events))
-	copy(eventList, events)
-	mu.Unlock()
-
 	foundElectionStart := false
 	foundElectionEnd := false
 	foundBecomeLeader := false
 	foundHeartbeat := false
-
-	for _, e := range eventList {
-		switch e {
-		case EventElectionStart:
-			foundElectionStart = true
-		case EventElectionEnd:
-			foundElectionEnd = true
-		case EventBecomeLeader:
-			foundBecomeLeader = true
-		case EventHeartbeat:
-			foundHeartbeat = true
+	timeout := time.After(300 * time.Millisecond)
+loop:
+	for {
+		select {
+		case evt := <-eventCh:
+			switch evt.Type {
+			case EventElectionStart:
+				foundElectionStart = true
+			case EventElectionEnd:
+				foundElectionEnd = true
+			case EventBecomeLeader:
+				foundBecomeLeader = true
+			case EventHeartbeat:
+				foundHeartbeat = true
+			}
+		case <-timeout:
+			break loop
 		}
 	}
 
@@ -726,17 +851,23 @@ func TestLeaderElector_MultipleCallbacks(t *testing.T) {
 		t.Fatalf("NewLeaderElector() error: %v", err)
 	}
 
-	var count1 int32
-	var count2 int32
+	ch1 := make(chan struct{}, 1)
+	ch2 := make(chan struct{}, 1)
 
 	elector.RegisterCallback(func(event ElectionEvent) {
 		if event.Type == EventBecomeLeader {
-			atomic.AddInt32(&count1, 1)
+			select {
+			case ch1 <- struct{}{}:
+			default:
+			}
 		}
 	})
 	elector.RegisterCallback(func(event ElectionEvent) {
 		if event.Type == EventBecomeLeader {
-			atomic.AddInt32(&count2, 1)
+			select {
+			case ch2 <- struct{}{}:
+			default:
+			}
 		}
 	})
 
@@ -745,13 +876,16 @@ func TestLeaderElector_MultipleCallbacks(t *testing.T) {
 	}
 	defer elector.Stop()
 
-	time.Sleep(150 * time.Millisecond)
-
-	if atomic.LoadInt32(&count1) != 1 {
-		t.Errorf("Callback 1 called %d times, want 1", atomic.LoadInt32(&count1))
+	select {
+	case <-ch1:
+	case <-time.After(500 * time.Millisecond):
+		t.Error("Callback 1 not called")
 	}
-	if atomic.LoadInt32(&count2) != 1 {
-		t.Errorf("Callback 2 called %d times, want 1", atomic.LoadInt32(&count2))
+
+	select {
+	case <-ch2:
+	case <-time.After(500 * time.Millisecond):
+		t.Error("Callback 2 not called")
 	}
 }
 
@@ -933,5 +1067,205 @@ func TestLeaderElector_ResignWhenStopped(t *testing.T) {
 	err = elector.Resign()
 	if !errors.Is(err, ErrElectorStopped) {
 		t.Errorf("Resign() when stopped error = %v, want %v", err, ErrElectorStopped)
+	}
+}
+
+func TestLeaderElector_HeartbeatFailure(t *testing.T) {
+	mock := newMockBackend()
+	cfg := Config{
+		LeaseDuration:   100 * time.Millisecond,
+		HeartbeatFactor: 0.2,
+		CheckFactor:     0.5,
+	}
+
+	elector, err := NewLeaderElector("node-1", "test-election", cfg, mock)
+	if err != nil {
+		t.Fatalf("NewLeaderElector() error: %v", err)
+	}
+
+	eventCh := make(chan ElectionEvent, 100)
+	elector.RegisterCallback(func(event ElectionEvent) {
+		eventCh <- event
+	})
+
+	if err := elector.Start(); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	defer elector.Stop()
+
+	timeout := time.After(300 * time.Millisecond)
+	becameLeader := false
+loop1:
+	for {
+		select {
+		case evt := <-eventCh:
+			if evt.Type == EventBecomeLeader {
+				becameLeader = true
+			}
+		case <-timeout:
+			break loop1
+		}
+	}
+	if !becameLeader {
+		t.Fatal("Expected node to become leader before heartbeat failure test")
+	}
+	if !elector.IsLeader() {
+		t.Fatal("Expected node to be leader")
+	}
+
+	heartbeatErr := errors.New("mock heartbeat failure")
+	mock.setHeartbeatFn(func(key, token string, ttl time.Duration) error {
+		return heartbeatErr
+	})
+	mock.setGetHolderFn(func(key string) (string, int, time.Duration, error) {
+		return "", 0, 0, distlock.ErrLockNotHeld
+	})
+	mock.setTryLockFn(func(key, token string, ttl time.Duration) (bool, error) {
+		return false, nil
+	})
+
+	foundLeaderLost := false
+	foundBecomeFollower := false
+	timeout2 := time.After(500 * time.Millisecond)
+loop2:
+	for {
+		select {
+		case evt := <-eventCh:
+			if evt.Type == EventLeaderLost {
+				foundLeaderLost = true
+				if evt.Role != RoleFollower {
+					t.Errorf("EventLeaderLost event Role = %v, want %v", evt.Role, RoleFollower)
+				}
+			}
+			if evt.Type == EventBecomeFollower {
+				foundBecomeFollower = true
+				if evt.Role != RoleFollower {
+					t.Errorf("EventBecomeFollower event Role = %v, want %v", evt.Role, RoleFollower)
+				}
+			}
+			if foundLeaderLost && foundBecomeFollower {
+				break loop2
+			}
+		case <-timeout2:
+			break loop2
+		}
+	}
+
+	if elector.IsLeader() {
+		t.Error("Expected node to lose leadership after heartbeat failure")
+	}
+	if elector.Role() != RoleFollower {
+		t.Errorf("Role() = %v, want %v", elector.Role(), RoleFollower)
+	}
+	if !foundLeaderLost {
+		t.Error("Expected EventLeaderLost callback on heartbeat failure")
+	}
+	if !foundBecomeFollower {
+		t.Error("Expected EventBecomeFollower callback on heartbeat failure")
+	}
+}
+
+func TestLeaderElector_CheckLeaderBackendErrorTriggersElection(t *testing.T) {
+	mock := newMockBackend()
+	cfg := Config{
+		LeaseDuration:   100 * time.Millisecond,
+		HeartbeatFactor: 0.3,
+		CheckFactor:     0.5,
+	}
+
+	elector, err := NewLeaderElector("node-1", "test-election", cfg, mock)
+	if err != nil {
+		t.Fatalf("NewLeaderElector() error: %v", err)
+	}
+
+	eventCh := make(chan ElectionEvent, 100)
+	elector.RegisterCallback(func(event ElectionEvent) {
+		select {
+		case eventCh <- event:
+		default:
+		}
+	})
+
+	backendErr := errors.New("mock backend error")
+	mock.setGetHolderFn(func(key string) (string, int, time.Duration, error) {
+		return "", 0, 0, backendErr
+	})
+
+	if err := elector.Start(); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	defer elector.Stop()
+
+	foundElectionStart := false
+	timeout := time.After(500 * time.Millisecond)
+loop:
+	for {
+		select {
+		case evt := <-eventCh:
+			if evt.Type == EventElectionStart {
+				foundElectionStart = true
+			}
+		case <-timeout:
+			break loop
+		}
+	}
+
+	if !foundElectionStart {
+		t.Error("Expected election to be triggered when GetHolder returns unexpected error")
+	}
+}
+
+func TestLeaderElector_CallbacksAsync(t *testing.T) {
+	lm := distlock.NewLockManager()
+	backend := NewLockManagerBackend(lm)
+	cfg := Config{
+		LeaseDuration:   100 * time.Millisecond,
+		HeartbeatFactor: 0.3,
+		CheckFactor:     0.5,
+	}
+
+	elector, err := NewLeaderElector("node-1", "test-election", cfg, backend)
+	if err != nil {
+		t.Fatalf("NewLeaderElector() error: %v", err)
+	}
+
+	var callbackStarted int32
+	var callbackDone int32
+	doneCh := make(chan struct{})
+	var once sync.Once
+
+	elector.RegisterCallback(func(event ElectionEvent) {
+		if !atomic.CompareAndSwapInt32(&callbackStarted, 0, 1) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+		atomic.StoreInt32(&callbackDone, 1)
+		once.Do(func() {
+			close(doneCh)
+		})
+	})
+
+	if err := elector.Start(); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	defer elector.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if atomic.LoadInt32(&callbackStarted) == 0 {
+		t.Fatal("Expected callback to start executing")
+	}
+	if atomic.LoadInt32(&callbackDone) == 1 {
+		t.Error("Expected callback to not complete synchronously (should be async)")
+	}
+
+	select {
+	case <-doneCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Error("Callback did not complete within timeout")
+	}
+
+	if atomic.LoadInt32(&callbackDone) == 0 {
+		t.Error("Expected callback to complete eventually")
 	}
 }

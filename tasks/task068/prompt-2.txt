@@ -1,0 +1,7 @@
+你实现的 Saga 分布式事务协调器模块存在一些问题，需要修复：
+1. executeCompensations 方法在处理无补偿函数的步骤时以 OpTypeCompensation 类型、StatusSuccess 状态记录了日志条目，但该步骤实际并未执行任何补偿操作，这会在事务日志中产生虚假的"补偿成功"记录，查询日志追溯回滚时会误判某步骤的补偿已完成。
+2. ErrCompensationFailed 和 ErrSagaRunning 两个哨兵错误变量已定义但从未被任何函数返回或使用，Execute 方法在补偿失败后未将补偿失败错误写入 SagaExecution.Error，也未检查是否有正在执行中的事务防止并发执行。
+3. CompensationFailure 的 ForwardStepID 字段在 executeCompensations 中始终被赋值为与 StepID 相同的值，无法区分正向操作标识和补偿操作标识，提示词要求补偿失败标记应包含两者的独立标识。
+4. GetExecution 和 GetLogs 在查询的执行记录或日志不存在时统一返回 ErrSagaNotFound 错误，但前者按执行实例 ID 查、后者按事务 ID 查，ErrSagaNotFound 无法区分是 Saga 定义不存在还是执行记录不存在，错误语义混淆。
+5. 修复后运行 go test ./internal/saga/ -v，需要让所有测试通过。
+6. 在 docs/saga.md 中更新模块需求文档，说明修复后的错误分类策略和人工干预标记的字段含义。

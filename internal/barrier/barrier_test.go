@@ -846,8 +846,14 @@ func TestCyclicBarrier_Basic(t *testing.T) {
 
 func TestCyclicBarrier_WithCallback(t *testing.T) {
 	var callbackCount int32
-	cbFunc := func() error {
+	var lastRound uint64
+	var mu sync.Mutex
+
+	cbFunc := func(round uint64) error {
 		atomic.AddInt32(&callbackCount, 1)
+		mu.Lock()
+		lastRound = round
+		mu.Unlock()
 		return nil
 	}
 
@@ -873,6 +879,12 @@ func TestCyclicBarrier_WithCallback(t *testing.T) {
 	if atomic.LoadInt32(&callbackCount) != 3 {
 		t.Fatalf("expected 3 callback invocations, got %d", callbackCount)
 	}
+
+	mu.Lock()
+	if lastRound != 2 {
+		t.Fatalf("expected last round 2, got %d", lastRound)
+	}
+	mu.Unlock()
 }
 
 func TestCyclicBarrier_Timeout(t *testing.T) {
@@ -1006,5 +1018,200 @@ func TestMultipleTimeoutsCascadeRelease(t *testing.T) {
 
 	if successCount == 0 {
 		t.Fatal("at least one goroutine should have succeeded")
+	}
+}
+
+func TestCallback_CallsBarrierMethods_NoDeadlock(t *testing.T) {
+	b, err := New(2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var participants int
+	var arrived int
+	var waiting int
+
+	cb := func() error {
+		participants = b.Participants()
+		arrived = b.Arrived()
+		waiting = b.Waiting()
+		return nil
+	}
+	b.SetCallback(cb)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				b.Wait(time.Second)
+			}()
+		}
+		wg.Wait()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback calling barrier methods caused deadlock")
+	}
+
+	if participants != 2 {
+		t.Errorf("expected participants=2 in callback, got %d", participants)
+	}
+	_ = arrived
+	_ = waiting
+}
+
+func TestIsReleased(t *testing.T) {
+	b, err := New(2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if b.IsReleased() {
+		t.Fatal("expected IsReleased should be false initially")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b.Wait(time.Second)
+		}()
+	}
+	wg.Wait()
+
+	if !b.IsReleased() {
+		t.Fatal("expected IsReleased to be true after release")
+	}
+
+	b.Reset()
+
+	if b.IsReleased() {
+		t.Fatal("expected IsReleased to be false after reset")
+	}
+}
+
+func TestCyclicBarrier_GetRound(t *testing.T) {
+	cb, err := NewCyclic(2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cb.GetRound() != 0 {
+		t.Fatalf("expected round 0, got %d", cb.GetRound())
+	}
+
+	for round := 0; round < 3; round++ {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			cb.Await(time.Second)
+		}()
+		go func() {
+			defer wg.Done()
+			cb.Await(time.Second)
+		}()
+		wg.Wait()
+
+		if cb.GetRound() != uint64(round) {
+			t.Fatalf("round %d: expected round %d, got %d", round, round, cb.GetRound())
+		}
+	}
+}
+
+func TestCyclicBarrier_ResetBarrier(t *testing.T) {
+	cb, err := NewCyclic(2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			cb.Await(time.Second)
+		}()
+		go func() {
+			defer wg.Done()
+			cb.Await(time.Second)
+		}()
+		wg.Wait()
+	}
+
+	if cb.GetRound() != 2 {
+		t.Fatalf("expected round 2, got %d", cb.GetRound())
+	}
+
+	err = cb.ResetBarrier(3)
+	if err != nil {
+		t.Fatalf("unexpected reset error: %v", err)
+	}
+
+	if cb.GetRound() != 0 {
+		t.Fatalf("expected round 0 after reset, got %d", cb.GetRound())
+	}
+
+	if cb.GetParties() != 3 {
+		t.Fatalf("expected 3 parties after reset, got %d", cb.GetParties())
+	}
+}
+
+func TestCyclicBarrier_ResetWhileWaiting(t *testing.T) {
+	cb, err := NewCyclic(3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cb.Await(200 * time.Millisecond)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	err = cb.ResetBarrier()
+	if !errors.Is(err, ErrResetWhileWaiting) {
+		t.Fatalf("expected ErrResetWhileWaiting, got %v", err)
+	}
+
+	wg.Wait()
+}
+
+func TestCyclicBarrier_SetCallback(t *testing.T) {
+	cb, err := NewCyclic(2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var lastRound uint64 = 999
+	cb.SetCallback(func(round uint64) error {
+		lastRound = round
+		return nil
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		cb.Await(time.Second)
+	}()
+	go func() {
+		defer wg.Done()
+		cb.Await(time.Second)
+	}()
+	wg.Wait()
+
+	if lastRound != 0 {
+		t.Fatalf("expected lastRound 0, got %d", lastRound)
 	}
 }

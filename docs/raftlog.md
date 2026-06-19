@@ -302,6 +302,13 @@ Follower 状态
 - 每个节点独立应用，但最终状态一致
 - `lastApplied` 记录已应用到状态机的最高日志索引
 
+**日志提交并发安全保障**:
+- 所有日志应用操作统一由 `applyLoop()` 协程单线程处理
+- `run()` 协程仅负责发送通知信号 (`notifyApply()`)，不直接调用应用操作
+- `applyCommitted()` 方法始终在持锁状态下被 `applyLoop()` 调用
+- 状态机的 Apply 操作严格按日志顺序执行，保证线性一致性
+- 应用结果通过 `applyCh` 通道异步通知调用方
+
 #### 4.2.3 AppendEntries RPC
 
 追加日志 RPC，由 Leader 发起，用于日志复制和心跳。
@@ -358,6 +365,14 @@ Follower 状态
 - 日志同时复制到旧配置和新配置中的所有节点
 - 选举和提交需要同时获得旧配置多数派和新配置多数派
 - 保证变更期间集群仍能正常处理请求
+
+**联合共识期间的请求处理策略**:
+- 联合共识期间（`joint != nil`），普通日志条目仍可正常提交
+- 普通日志提交需要同时获得旧配置和新配置两边的多数派同意
+- 配置变更日志（`LogEntryConfigJoint` 和 `LogEntryConfigNew`）由 `checkConfigProgress()` 单独处理
+- 客户端请求（`Propose`）在配置变更第一阶段完成前会返回 `ErrConfigChangeInFlight`
+- 配置变更进行中可以进行正常的 Leader 选举和日志复制
+- 只有当联合配置和新配置都完成提交后，才会清除 `joint` 状态
 
 **安全性保证**:
 - 不会出现两个独立的多数派
@@ -431,6 +446,25 @@ Follower 截断日志到快照索引
 5. 更新 lastSnapshotIndex/lastSnapshotTerm
 6. 截断本地日志到快照索引
 7. 更新 commitIndex 和 lastApplied
+
+### 5.4 快照状态完整性保证
+
+**快照数据序列化**:
+- 快照 `Data` 字段使用 `encoding/gob` 完整序列化状态机的所有数据
+- `MemoryStateMachine` 将完整的 `map[string]string` 数据结构编码为二进制
+- 编码格式为 Go 标准库 gob 格式，支持跨版本兼容性
+
+**快照数据完整性**:
+- 快照包含状态机在 `LastIncludedIndex` 处的完整状态
+- `ApplySnapshot` 时完整反序列化并替换整个状态机数据
+- 空快照（`Data` 为 `nil` 或空）会清空状态机
+- 解码失败时返回错误，不修改状态机状态
+
+**快照安装原子性**:
+- 快照安装是原子操作，要么完全成功，要么完全失败
+- 安装失败时状态机保持原有状态不变
+- 安装成功后状态机被完整替换为快照中的状态
+- 日志截断和索引更新在状态机应用成功后才执行
 
 ## 6. 使用示例
 
@@ -607,15 +641,15 @@ node.Start()
 |----------|------|----------|
 | `ErrNodeStopped` | 节点已停止 | 对已停止的节点调用操作 |
 | `ErrNotLeader` | 节点不是 Leader | 向 Follower 提交日志或变更配置 |
-| `ErrInvalidIndex` | 索引无效 | 压缩索引大于提交索引 |
-| `ErrLogCompacted` | 日志已被压缩 | 访问已压缩的日志条目 |
-| `ErrSnapshotInstalling` | 快照安装中 | 预留错误，当前未使用 |
+| `ErrInvalidIndex` | 索引无效 | 压缩索引大于提交索引，或访问不存在的日志索引 |
+| `ErrLogCompacted` | 日志已被压缩 | 通过 `GetLogEntry()` 访问已压缩的日志条目 |
+| `ErrSnapshotInstalling` | 快照安装中 | Leader 正在进行快照安装时接收新的 Propose 请求 |
 | `ErrConfigChangeInFlight` | 配置变更进行中 | 已有变更时再次发起变更 |
 | `ErrEmptyConfig` | 配置为空 | 移除最后一个节点 |
 | `ErrNodeNotFound` | 节点不存在 | 访问不存在的节点 |
 | `ErrNodeExists` | 节点已存在 | 添加已存在的节点 |
-| `ErrTransportClosed` | 传输层已关闭 | 预留错误，当前未使用 |
-| `ErrApplyFailed` | 应用失败 | 状态机应用失败 |
+| `ErrTransportClosed` | 传输层已关闭 | 传输层关闭后发送 RPC 请求 |
+| `ErrApplyFailed` | 应用失败 | 状态机 Apply 操作返回错误 |
 
 ## 8. 性能与并发特征
 

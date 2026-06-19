@@ -29,6 +29,9 @@ func TestNewCoordinator(t *testing.T) {
 	if c.pendingInterventions == nil {
 		t.Error("pendingInterventions slice not initialized")
 	}
+	if c.runningSagas == nil {
+		t.Error("runningSagas map not initialized")
+	}
 }
 
 func TestNewSaga(t *testing.T) {
@@ -269,6 +272,12 @@ func TestExecute_FailureOnFirstStep(t *testing.T) {
 	if len(result.Compensations) != 0 {
 		t.Errorf("expected 0 compensations, got %d", len(result.Compensations))
 	}
+	if result.NeedsIntervention {
+		t.Error("expected no intervention needed since no compensations ran")
+	}
+	if errors.Is(result.Error, ErrCompensationFailed) {
+		t.Error("expected ErrCompensationFailed NOT to be in error chain since no compensation failed")
+	}
 }
 
 func TestExecute_FailureOnThirdStep(t *testing.T) {
@@ -327,10 +336,28 @@ func TestExecute_FailureOnThirdStep(t *testing.T) {
 	if len(result.Compensations) != 2 {
 		t.Errorf("expected 2 compensations, got %d", len(result.Compensations))
 	}
+
+	if _, ok := result.Compensations["step2-compensate"]; !ok {
+		t.Error("expected compensation key 'step2-compensate'")
+	}
+	if _, ok := result.Compensations["step1-compensate"]; !ok {
+		t.Error("expected compensation key 'step1-compensate'")
+	}
+
 	for _, compResult := range result.Compensations {
 		if compResult.Status != StatusSuccess {
 			t.Errorf("compensation %s expected StatusSuccess, got %v", compResult.StepID, compResult.Status)
 		}
+		if compResult.StepID != "step1-compensate" && compResult.StepID != "step2-compensate" {
+			t.Errorf("unexpected compensation StepID: %s", compResult.StepID)
+		}
+	}
+
+	if result.NeedsIntervention {
+		t.Error("expected no intervention since all compensations succeeded")
+	}
+	if errors.Is(result.Error, ErrCompensationFailed) {
+		t.Error("expected ErrCompensationFailed NOT to be in error chain since all compensations succeeded")
 	}
 }
 
@@ -379,9 +406,22 @@ func TestExecute_CompensationFailure(t *testing.T) {
 	if len(result.InterventionNotes) != 1 {
 		t.Errorf("expected 1 intervention note, got %d", len(result.InterventionNotes))
 	}
-	if result.InterventionNotes[0].StepID != "step1" {
-		t.Errorf("expected intervention for step1, got %s", result.InterventionNotes[0].StepID)
+
+	note := result.InterventionNotes[0]
+	if note.StepID != "step1-compensate" {
+		t.Errorf("expected intervention StepID 'step1-compensate', got '%s'", note.StepID)
 	}
+	if note.ForwardStepID != "step1" {
+		t.Errorf("expected intervention ForwardStepID 'step1', got '%s'", note.ForwardStepID)
+	}
+	if note.StepID == note.ForwardStepID {
+		t.Error("StepID and ForwardStepID should be distinct")
+	}
+
+	if !errors.Is(result.Error, ErrCompensationFailed) {
+		t.Errorf("expected ErrCompensationFailed in error chain, got %v", result.Error)
+	}
+
 	if !comp2Called {
 		t.Error("step2 compensation should still be called even if step1 compensation fails")
 	}
@@ -390,8 +430,11 @@ func TestExecute_CompensationFailure(t *testing.T) {
 	if len(pending) != 1 {
 		t.Errorf("expected 1 pending intervention, got %d", len(pending))
 	}
-	if pending[0].StepID != "step1" {
-		t.Errorf("expected pending intervention for step1, got %s", pending[0].StepID)
+	if pending[0].StepID != "step1-compensate" {
+		t.Errorf("expected pending intervention StepID 'step1-compensate', got '%s'", pending[0].StepID)
+	}
+	if pending[0].ForwardStepID != "step1" {
+		t.Errorf("expected pending intervention ForwardStepID 'step1', got '%s'", pending[0].ForwardStepID)
 	}
 }
 
@@ -435,9 +478,21 @@ func TestExecute_MultipleCompensationFailures(t *testing.T) {
 		t.Errorf("expected 2 intervention notes, got %d", len(result.InterventionNotes))
 	}
 
+	if !errors.Is(result.Error, ErrCompensationFailed) {
+		t.Errorf("expected ErrCompensationFailed in error chain, got %v", result.Error)
+	}
+
 	pending := c.GetPendingInterventions()
 	if len(pending) != 2 {
 		t.Errorf("expected 2 pending interventions, got %d", len(pending))
+	}
+
+	stepIDs := make(map[string]bool)
+	for _, p := range pending {
+		stepIDs[p.StepID] = true
+	}
+	if !stepIDs["step1-compensate"] || !stepIDs["step2-compensate"] {
+		t.Errorf("expected pending intervention StepIDs 'step1-compensate' and 'step2-compensate', got %v", stepIDs)
 	}
 }
 
@@ -472,6 +527,13 @@ func TestExecute_NoCompensationFunction(t *testing.T) {
 	if len(result.Compensations) != 0 {
 		t.Errorf("expected 0 compensations recorded, got %d", len(result.Compensations))
 	}
+
+	logs, _ := c.GetLogs(result.ID)
+	for _, log := range logs {
+		if log.OperationType == OpTypeCompensation && log.Status == StatusSuccess {
+			t.Errorf("found fake compensation success log: stepID=%s, details=%s", log.StepID, log.Details)
+		}
+	}
 }
 
 func TestExecute_NoSteps(t *testing.T) {
@@ -490,6 +552,113 @@ func TestExecute_NonexistentSaga(t *testing.T) {
 	_, err := c.Execute(context.Background(), "nonexistent", nil)
 	if !errors.Is(err, ErrSagaNotFound) {
 		t.Errorf("expected ErrSagaNotFound, got %v", err)
+	}
+}
+
+func TestExecute_SagaRunningConcurrentGuard(t *testing.T) {
+	c := NewCoordinator()
+	saga, _ := c.NewSaga("guarded-saga", "Guarded Saga")
+
+	saga.AddStep("step1", "Step 1",
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			time.Sleep(200 * time.Millisecond)
+			return nil, nil
+		},
+		nil,
+	)
+
+	var wg sync.WaitGroup
+	var firstErr error
+	var secondErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, firstErr = c.Execute(context.Background(), "guarded-saga", nil)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	go func() {
+		defer wg.Done()
+		_, secondErr = c.Execute(context.Background(), "guarded-saga", nil)
+	}()
+	wg.Wait()
+
+	if firstErr != nil {
+		t.Errorf("first execution should succeed, got %v", firstErr)
+	}
+	if !errors.Is(secondErr, ErrSagaRunning) {
+		t.Errorf("second execution should return ErrSagaRunning, got %v", secondErr)
+	}
+}
+
+func TestExecute_SagaRunningAllowsSequentialExecution(t *testing.T) {
+	c := NewCoordinator()
+	saga, _ := c.NewSaga("seq-saga", "Sequential Saga")
+
+	saga.AddStep("step1", "Step 1",
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			return nil, nil
+		},
+		nil,
+	)
+
+	result1, err1 := c.Execute(context.Background(), "seq-saga", nil)
+	if err1 != nil {
+		t.Fatalf("first execution failed: %v", err1)
+	}
+	if result1.Status != StatusSuccess {
+		t.Errorf("first execution expected StatusSuccess, got %v", result1.Status)
+	}
+
+	result2, err2 := c.Execute(context.Background(), "seq-saga", nil)
+	if err2 != nil {
+		t.Fatalf("second execution failed: %v", err2)
+	}
+	if result2.Status != StatusSuccess {
+		t.Errorf("second execution expected StatusSuccess, got %v", result2.Status)
+	}
+}
+
+func TestExecute_DifferentSagasConcurrent(t *testing.T) {
+	c := NewCoordinator()
+	saga1, _ := c.NewSaga("saga-1", "Saga 1")
+	saga2, _ := c.NewSaga("saga-2", "Saga 2")
+
+	saga1.AddStep("step1", "Step 1",
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			time.Sleep(100 * time.Millisecond)
+			return nil, nil
+		},
+		nil,
+	)
+
+	saga2.AddStep("step1", "Step 1",
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			time.Sleep(100 * time.Millisecond)
+			return nil, nil
+		},
+		nil,
+	)
+
+	var wg sync.WaitGroup
+	var err1, err2 error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err1 = c.Execute(context.Background(), "saga-1", nil)
+	}()
+	go func() {
+		defer wg.Done()
+		_, err2 = c.Execute(context.Background(), "saga-2", nil)
+	}()
+	wg.Wait()
+
+	if err1 != nil {
+		t.Errorf("saga-1 execution failed: %v", err1)
+	}
+	if err2 != nil {
+		t.Errorf("saga-2 execution failed: %v", err2)
 	}
 }
 
@@ -597,6 +766,45 @@ func TestExecute_CompensationPanicRecovery(t *testing.T) {
 	if len(result.InterventionNotes) != 1 {
 		t.Errorf("expected 1 intervention note, got %d", len(result.InterventionNotes))
 	}
+	if result.InterventionNotes[0].StepID != "step1-compensate" {
+		t.Errorf("expected intervention StepID 'step1-compensate', got '%s'", result.InterventionNotes[0].StepID)
+	}
+	if result.InterventionNotes[0].ForwardStepID != "step1" {
+		t.Errorf("expected intervention ForwardStepID 'step1', got '%s'", result.InterventionNotes[0].ForwardStepID)
+	}
+	if !errors.Is(result.Error, ErrCompensationFailed) {
+		t.Errorf("expected ErrCompensationFailed in error chain, got %v", result.Error)
+	}
+}
+
+func TestExecute_ErrCompensationFailedInErrorChain(t *testing.T) {
+	c := NewCoordinator()
+	saga, _ := c.NewSaga("test-saga", "Test Saga")
+
+	saga.AddStep("step1", "Step 1",
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			return "result1", nil
+		},
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			return nil, errors.New("compensation failed")
+		},
+	)
+
+	saga.AddStep("step2", "Step 2",
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			return nil, errors.New("step 2 forward failed")
+		},
+		nil,
+	)
+
+	result, _ := c.Execute(context.Background(), "test-saga", nil)
+
+	if !errors.Is(result.Error, ErrCompensationFailed) {
+		t.Errorf("expected ErrCompensationFailed in error chain, got %v", result.Error)
+	}
+	if !result.NeedsIntervention {
+		t.Error("expected NeedsIntervention to be true")
+	}
 }
 
 func TestGetLogs(t *testing.T) {
@@ -639,8 +847,8 @@ func TestGetLogs(t *testing.T) {
 	}
 
 	_, err = c.GetLogs("nonexistent")
-	if !errors.Is(err, ErrSagaNotFound) {
-		t.Errorf("expected ErrSagaNotFound, got %v", err)
+	if !errors.Is(err, ErrExecutionNotFound) {
+		t.Errorf("expected ErrExecutionNotFound, got %v", err)
 	}
 }
 
@@ -712,6 +920,12 @@ func TestGetPendingInterventions(t *testing.T) {
 	if pending[0].FailureTime.IsZero() {
 		t.Error("expected non-zero failure time")
 	}
+	if pending[0].StepID != "step1-compensate" {
+		t.Errorf("expected StepID 'step1-compensate', got '%s'", pending[0].StepID)
+	}
+	if pending[0].ForwardStepID != "step1" {
+		t.Errorf("expected ForwardStepID 'step1', got '%s'", pending[0].ForwardStepID)
+	}
 }
 
 func TestResolveIntervention(t *testing.T) {
@@ -736,7 +950,7 @@ func TestResolveIntervention(t *testing.T) {
 
 	result, _ := c.Execute(context.Background(), "test-saga", nil)
 
-	err := c.ResolveIntervention(result.ID, "step1", "Manually compensated")
+	err := c.ResolveIntervention(result.ID, "step1-compensate", "Manually compensated")
 	if err != nil {
 		t.Fatalf("ResolveIntervention failed: %v", err)
 	}
@@ -751,7 +965,7 @@ func TestResolveIntervention(t *testing.T) {
 		t.Error("expected NeedsIntervention to be false after all resolved")
 	}
 
-	err = c.ResolveIntervention("nonexistent", "step1", "test")
+	err = c.ResolveIntervention("nonexistent", "step1-compensate", "test")
 	if !errors.Is(err, ErrInterventionNotFound) {
 		t.Errorf("expected ErrInterventionNotFound, got %v", err)
 	}
@@ -788,7 +1002,7 @@ func TestResolveMultipleInterventions(t *testing.T) {
 
 	result, _ := c.Execute(context.Background(), "test-saga", nil)
 
-	err := c.ResolveIntervention(result.ID, "step2", "Resolved step2")
+	err := c.ResolveIntervention(result.ID, "step2-compensate", "Resolved step2")
 	if err != nil {
 		t.Fatalf("ResolveIntervention for step2 failed: %v", err)
 	}
@@ -803,7 +1017,7 @@ func TestResolveMultipleInterventions(t *testing.T) {
 		t.Error("expected NeedsIntervention to still be true")
 	}
 
-	err = c.ResolveIntervention(result.ID, "step1", "Resolved step1")
+	err = c.ResolveIntervention(result.ID, "step1-compensate", "Resolved step1")
 	if err != nil {
 		t.Fatalf("ResolveIntervention for step1 failed: %v", err)
 	}
@@ -841,8 +1055,8 @@ func TestGetExecution(t *testing.T) {
 	}
 
 	_, err = c.GetExecution("nonexistent")
-	if !errors.Is(err, ErrSagaNotFound) {
-		t.Errorf("expected ErrSagaNotFound, got %v", err)
+	if !errors.Is(err, ErrExecutionNotFound) {
+		t.Errorf("expected ErrExecutionNotFound, got %v", err)
 	}
 }
 
@@ -907,7 +1121,7 @@ func TestRemoveSaga(t *testing.T) {
 
 func TestOperationStatus_String(t *testing.T) {
 	tests := []struct {
-		status OperationStatus
+		status   OperationStatus
 		expected string
 	}{
 		{StatusPending, "Pending"},
@@ -928,7 +1142,7 @@ func TestOperationStatus_String(t *testing.T) {
 
 func TestOperationType_String(t *testing.T) {
 	tests := []struct {
-		opType OperationType
+		opType   OperationType
 		expected string
 	}{
 		{OpTypeForward, "Forward"},
@@ -945,44 +1159,43 @@ func TestOperationType_String(t *testing.T) {
 	}
 }
 
-func TestConcurrentExecute(t *testing.T) {
+func TestConcurrentExecute_DifferentSagas(t *testing.T) {
 	c := NewCoordinator()
-	saga, _ := c.NewSaga("concurrent-saga", "Concurrent Saga")
 
 	var counter int
 	var mu sync.Mutex
 
-	saga.AddStep("step1", "Step 1",
-		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
-			mu.Lock()
-			counter++
-			mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
-			return nil, nil
-		},
-		nil,
-	)
+	for i := 0; i < 10; i++ {
+		sagaID := fmt.Sprintf("concurrent-saga-%d", i)
+		saga, _ := c.NewSaga(sagaID, fmt.Sprintf("Concurrent Saga %d", i))
+		saga.AddStep("step1", "Step 1",
+			func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+				mu.Lock()
+				counter++
+				mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
+				return nil, nil
+			},
+			nil,
+		)
+	}
 
 	var wg sync.WaitGroup
 	numRuns := 10
 
 	for i := 0; i < numRuns; i++ {
 		wg.Add(1)
-		go func() {
+		go func(idx int) {
 			defer wg.Done()
-			c.Execute(context.Background(), "concurrent-saga", nil)
-		}()
+			sagaID := fmt.Sprintf("concurrent-saga-%d", idx)
+			c.Execute(context.Background(), sagaID, nil)
+		}(i)
 	}
 
 	wg.Wait()
 
 	if counter != numRuns {
 		t.Errorf("expected counter to be %d, got %d", numRuns, counter)
-	}
-
-	execs := c.GetExecutionsBySaga("concurrent-saga")
-	if len(execs) != numRuns {
-		t.Errorf("expected %d executions, got %d", numRuns, len(execs))
 	}
 
 	allLogs := c.GetAllLogs()
@@ -1023,6 +1236,7 @@ func TestLogEntry_CompleteTrace(t *testing.T) {
 	hasCompStart := false
 	hasCompSuccess := false
 	hasSagaFail := false
+	hasNoCompensationLogForStep2 := true
 
 	for _, log := range logs {
 		switch {
@@ -1036,12 +1250,16 @@ func TestLogEntry_CompleteTrace(t *testing.T) {
 			hasStep2Start = true
 		case log.StepID == "step2" && log.OperationType == OpTypeForward && log.Status == StatusFailed:
 			hasStep2Fail = true
-		case log.StepID == "step1" && log.OperationType == OpTypeCompensation && log.Status == StatusRunning:
+		case log.StepID == "step1-compensate" && log.OperationType == OpTypeCompensation && log.Status == StatusRunning:
 			hasCompStart = true
-		case log.StepID == "step1" && log.OperationType == OpTypeCompensation && log.Status == StatusSuccess:
+		case log.StepID == "step1-compensate" && log.OperationType == OpTypeCompensation && log.Status == StatusSuccess:
 			hasCompSuccess = true
 		case log.StepID == "" && log.OperationType == OpTypeForward && log.Status == StatusFailed:
 			hasSagaFail = true
+		}
+
+		if log.StepID == "step2" && log.OperationType == OpTypeCompensation {
+			hasNoCompensationLogForStep2 = false
 		}
 	}
 
@@ -1068,6 +1286,9 @@ func TestLogEntry_CompleteTrace(t *testing.T) {
 	}
 	if !hasSagaFail {
 		t.Error("missing saga fail log")
+	}
+	if !hasNoCompensationLogForStep2 {
+		t.Error("step2 (nil CompensateFunc) should not produce compensation log entries")
 	}
 }
 
@@ -1272,5 +1493,95 @@ func TestCompensationOrderPreserved(t *testing.T) {
 		if compOrder[i] != v {
 			t.Errorf("expected compensation step %d at index %d, got %d", v, i, compOrder[i])
 		}
+	}
+}
+
+func TestCompensationFailure_DistinctStepIDs(t *testing.T) {
+	c := NewCoordinator()
+	saga, _ := c.NewSaga("distinct-id-saga", "Distinct ID Saga")
+
+	saga.AddStep("forward-op", "Forward Operation",
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			return "forward-result", nil
+		},
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			return nil, errors.New("compensation error")
+		},
+	)
+
+	saga.AddStep("fail-step", "Fail Step",
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			return nil, errors.New("trigger failure")
+		},
+		nil,
+	)
+
+	result, _ := c.Execute(context.Background(), "distinct-id-saga", nil)
+
+	if len(result.InterventionNotes) != 1 {
+		t.Fatalf("expected 1 intervention note, got %d", len(result.InterventionNotes))
+	}
+
+	note := result.InterventionNotes[0]
+	if note.StepID == note.ForwardStepID {
+		t.Errorf("StepID and ForwardStepID should be distinct, both are '%s'", note.StepID)
+	}
+	if note.ForwardStepID != "forward-op" {
+		t.Errorf("expected ForwardStepID 'forward-op', got '%s'", note.ForwardStepID)
+	}
+	if note.StepID != "forward-op-compensate" {
+		t.Errorf("expected StepID 'forward-op-compensate', got '%s'", note.StepID)
+	}
+
+	compResult, ok := result.Compensations["forward-op-compensate"]
+	if !ok {
+		t.Error("expected compensation result at key 'forward-op-compensate'")
+	} else {
+		if compResult.StepID != "forward-op-compensate" {
+			t.Errorf("expected StepResult.StepID 'forward-op-compensate', got '%s'", compResult.StepID)
+		}
+	}
+}
+
+func TestErrorClassification(t *testing.T) {
+	c := NewCoordinator()
+	sagaNotFound, _ := c.NewSaga("saga-not-found", "Saga Not Found")
+
+	_, err := c.GetSaga("nonexistent")
+	if !errors.Is(err, ErrSagaNotFound) {
+		t.Errorf("GetSaga: expected ErrSagaNotFound, got %v", err)
+	}
+
+	_, err = c.GetExecution("nonexistent")
+	if !errors.Is(err, ErrExecutionNotFound) {
+		t.Errorf("GetExecution: expected ErrExecutionNotFound, got %v", err)
+	}
+
+	_, err = c.GetLogs("nonexistent")
+	if !errors.Is(err, ErrExecutionNotFound) {
+		t.Errorf("GetLogs: expected ErrExecutionNotFound, got %v", err)
+	}
+
+	sagaNotFound.AddStep("step1", "Step 1",
+		func(ctx context.Context, data map[string]interface{}) (interface{}, error) {
+			return nil, nil
+		},
+		nil,
+	)
+
+	execResult, _ := c.Execute(context.Background(), "saga-not-found", nil)
+
+	_, err = c.GetExecution(execResult.ID)
+	if err != nil {
+		t.Errorf("GetExecution for existing: unexpected error %v", err)
+	}
+
+	_, err = c.GetLogs(execResult.ID)
+	if err != nil {
+		t.Errorf("GetLogs for existing: unexpected error %v", err)
+	}
+
+	if errors.Is(err, ErrSagaNotFound) {
+		t.Error("GetLogs for existing execution should NOT return ErrSagaNotFound")
 	}
 }

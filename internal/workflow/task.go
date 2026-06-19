@@ -27,6 +27,10 @@ func NewTaskNode(name string, handler TaskHandler) *TaskNode {
 }
 
 func (n *TaskNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
+	return n.ExecuteWithState(ctx, execCtx, nil)
+}
+
+func (n *TaskNode) ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error) {
 	return executeWithRetry(ctx, n, execCtx, func(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
 		result := newNodeResult(n.ID)
 
@@ -43,6 +47,13 @@ func (n *TaskNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*Nod
 	})
 }
 
+func (n *TaskNode) GetState() NodeStateData {
+	return nil
+}
+
+func (n *TaskNode) RestoreState(state NodeStateData) {
+}
+
 type CallbackTaskNode struct {
 	baseNode
 	OnExecute func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error)
@@ -56,6 +67,10 @@ func NewCallbackTaskNode(name string, fn func(ctx context.Context, execCtx *Exec
 }
 
 func (n *CallbackTaskNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
+	return n.ExecuteWithState(ctx, execCtx, nil)
+}
+
+func (n *CallbackTaskNode) ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error) {
 	if n.OnExecute == nil {
 		result := newNodeResult(n.ID)
 		return completeResult(result, nil, nil), nil
@@ -68,6 +83,13 @@ func (n *CallbackTaskNode) Execute(ctx context.Context, execCtx *ExecutionContex
 		}
 		return completeResult(result, output, nil), nil
 	})
+}
+
+func (n *CallbackTaskNode) GetState() NodeStateData {
+	return nil
+}
+
+func (n *CallbackTaskNode) RestoreState(state NodeStateData) {
 }
 
 type SetContextTask struct {
@@ -85,11 +107,22 @@ func NewSetContextTask(name string, key string, value interface{}) *SetContextTa
 }
 
 func (n *SetContextTask) Execute(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
+	return n.ExecuteWithState(ctx, execCtx, nil)
+}
+
+func (n *SetContextTask) ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error) {
 	return executeWithRetry(ctx, n, execCtx, func(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
 		result := newNodeResult(n.ID)
 		execCtx.Set(n.Key, n.Value)
 		return completeResult(result, map[string]interface{}{n.Key: n.Value}, nil), nil
 	})
+}
+
+func (n *SetContextTask) GetState() NodeStateData {
+	return nil
+}
+
+func (n *SetContextTask) RestoreState(state NodeStateData) {
 }
 
 type FailTask struct {
@@ -108,10 +141,21 @@ func NewFailTask(name string, err error) *FailTask {
 }
 
 func (n *FailTask) Execute(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
+	return n.ExecuteWithState(ctx, execCtx, nil)
+}
+
+func (n *FailTask) ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error) {
 	return executeWithRetry(ctx, n, execCtx, func(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
 		result := newNodeResult(n.ID)
 		return completeResult(result, nil, n.Error), n.Error
 	})
+}
+
+func (n *FailTask) GetState() NodeStateData {
+	return nil
+}
+
+func (n *FailTask) RestoreState(state NodeStateData) {
 }
 
 type DelayTask struct {
@@ -129,6 +173,10 @@ func NewDelayTask(name string, duration time.Duration, output interface{}) *Dela
 }
 
 func (n *DelayTask) Execute(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
+	return n.ExecuteWithState(ctx, execCtx, nil)
+}
+
+func (n *DelayTask) ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error) {
 	return executeWithRetry(ctx, n, execCtx, func(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
 		result := newNodeResult(n.ID)
 		if n.Duration > 0 {
@@ -140,6 +188,13 @@ func (n *DelayTask) Execute(ctx context.Context, execCtx *ExecutionContext) (*No
 		}
 		return completeResult(result, n.Output, nil), nil
 	})
+}
+
+func (n *DelayTask) GetState() NodeStateData {
+	return nil
+}
+
+func (n *DelayTask) RestoreState(state NodeStateData) {
 }
 
 type FlakyTask struct {
@@ -159,6 +214,10 @@ func NewFlakyTask(name string, failCount int, output interface{}) *FlakyTask {
 }
 
 func (n *FlakyTask) Execute(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
+	return n.ExecuteWithState(ctx, execCtx, nil)
+}
+
+func (n *FlakyTask) ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error) {
 	return executeWithRetry(ctx, n, execCtx, func(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
 		n.mu.Lock()
 		n.failures++
@@ -172,6 +231,25 @@ func (n *FlakyTask) Execute(ctx context.Context, execCtx *ExecutionContext) (*No
 		}
 		return completeResult(result, n.Output, nil), nil
 	})
+}
+
+func (n *FlakyTask) GetState() NodeStateData {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return map[string]interface{}{"failures": n.failures}
+}
+
+func (n *FlakyTask) RestoreState(state NodeStateData) {
+	if state == nil {
+		return
+	}
+	if stateMap, ok := state.(map[string]interface{}); ok {
+		if failures, ok := stateMap["failures"].(int); ok {
+			n.mu.Lock()
+			n.failures = failures
+			n.mu.Unlock()
+		}
+	}
 }
 
 func (n *FlakyTask) Reset() {

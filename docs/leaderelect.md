@@ -204,7 +204,7 @@ type LeaderElector struct {
 
 #### Follower → Candidate
 
-- **触发条件**：Follower 定期检查 Leader 状态，发现 Leader 不存在或租约已过期
+- **触发条件**：Follower 定期检查 Leader 状态，发现 Leader 不存在、租约已过期或后端返回任何错误（保守策略，避免漏检 Leader 宕机）
 - **行为**：节点角色变为 Candidate，任期号递增，发送 EventElectionStart 事件
 
 #### Candidate → Leader
@@ -251,7 +251,7 @@ type LeaderElector struct {
 1. **定时检查**：Follower 按 CheckInterval 定时检查 Leader 状态
 2. **查询持有者**：调用 GetHolder 查询当前锁的持有者
 3. **Leader 存在**：更新 Leader ID，若检测到新 Leader 则发送 EventElectionEnd 事件
-4. **Leader 不存在**：触发新一轮选举
+4. **Leader 不存在或查询失败**：如果后端返回任何错误（包括 Leader 不存在、租约过期或其他异常），采用保守策略触发新一轮选举，避免因后端异常导致选举延迟
 
 ### 4.4 故障恢复流程
 
@@ -377,9 +377,15 @@ if elector.IsLeader() {
 
 ## 7. 并发安全
 
-LeaderElector 的所有公共方法均为并发安全，可在多个 goroutine 中同时调用。内部使用互斥锁保护共享状态，回调函数在单独的 goroutine 中执行，不会阻塞选举主循环。
+LeaderElector 的所有公共方法均为并发安全，可在多个 goroutine 中同时调用。内部使用互斥锁（`mu`）保护共享状态（`role`、`term`、`leaderID`、`running`、`stopped` 等字段），使用读写锁（`callbacksMu`）保护回调函数列表。
+
+事件通知机制的并发设计：
+- `notify` 方法在构造 `ElectionEvent` 时先持有 `mu` 互斥锁读取共享字段（`role`、`leaderID`、`term`）的快照，确保不会出现并发读写的数据竞争
+- 回调函数在单独的 goroutine 中异步执行，不会阻塞选举主循环（包括心跳发送和 Leader 检查）
+- 回调函数列表在调用前会复制一份快照，避免后续注册/注销操作影响当前通知
 
 回调函数注意事项：
-- 回调函数应尽量简短，避免长时间阻塞
+- 回调函数应尽量简短，虽然不会阻塞选举主循环，但会占用独立的 goroutine 资源
 - 回调函数中不应调用选举器的阻塞方法（如 Stop）
-- 多个回调函数按注册顺序依次调用
+- 多个回调函数按注册顺序依次在同一个异步 goroutine 中执行
+- 由于回调是异步执行的，事件到达顺序可能与实际状态变化存在微小时间差

@@ -9,10 +9,10 @@
 5. [错误注入原理](#5-错误注入原理)
 6. [连接断开模拟原理](#6-连接断开模拟原理)
 7. [时间窗口与目标比例控制](#7-时间窗口与目标比例控制)
-8. [使用示例](#8-使用示例)
-9. [错误定义](#9-错误定义)
-10. [配置说明](#10-配置说明)
-11. [并发安全](#11-并发安全)
+8. [并发安全策略](#8-并发安全策略)
+9. [使用示例](#9-使用示例)
+10. [错误定义](#10-错误定义)
+11. [配置说明](#11-配置说明)
 12. [最佳实践](#12-最佳实践)
 
 ---
@@ -26,9 +26,10 @@
 **设计目标**:
 - 提供标准化的故障注入能力，支持延迟、错误、连接断开三种故障模式
 - 支持时间窗口控制，故障仅在指定时间段内生效
-- 支持目标比例控制，可精确控制受故障影响的请求百分比
+- 延迟和错误注入支持目标比例控制，可精确控制受故障影响的请求百分比
+- 连接断开采用持久断开语义，一旦断开所有后续请求持续失败直到恢复
 - 提供便捷的启用/禁用接口，支持动态调整故障注入策略
-- 完全并发安全，可在多 goroutine 环境下安全使用
+- 完全并发安全，所有共享状态访问统一在 `sync.RWMutex` 保护下进行
 - 支持自定义随机源、睡眠函数和时间函数，便于单元测试
 
 ---
@@ -37,11 +38,11 @@
 
 | 功能 | 描述 |
 |------|------|
-| 延迟注入 | 向目标函数调用注入人工延迟，支持固定时长和随机范围两种模式 |
-| 错误注入 | 向目标函数调用注入预定义错误，被注入函数直接返回错误而不执行原有逻辑 |
-| 连接断开模拟 | 模拟目标服务连接断开的行为，支持手动断开/恢复和配置化控制 |
+| 延迟注入 | 向目标函数调用注入人工延迟，支持固定时长和随机范围两种模式，按比例触发 |
+| 错误注入 | 向目标函数调用注入预定义错误，按概率触发，命中时直接返回错误不执行原逻辑 |
+| 连接断开模拟 | 模拟目标服务连接断开，采用持久断开语义，断开后所有请求持续失败直到恢复 |
 | 时间窗口控制 | 所有故障注入支持设置生效的时间窗口，仅在窗口内故障生效 |
-| 目标比例控制 | 支持配置目标比例，精确控制受到故障影响的请求占总请求的百分比 |
+| 目标比例控制 | 延迟和错误注入支持配置目标比例，控制受影响请求的百分比 |
 | 综合注入入口 | 提供 `Inject()` 方法，按优先级依次应用断开、错误、延迟故障 |
 | 配置化管理 | 支持完整的配置结构和便捷的启用/禁用辅助方法 |
 
@@ -55,14 +56,14 @@
 
 ```go
 type FaultInjector struct {
-    mu           sync.RWMutex
-    delayCfg     DelayConfig
-    errorCfg     ErrorConfig
+    mu            sync.RWMutex
+    delayCfg      DelayConfig
+    errorCfg      ErrorConfig
     disconnectCfg DisconnectConfig
-    disconnected bool
-    randSrc      *rand.Rand
-    sleepFunc    func(time.Duration)
-    timeNowFunc  func() time.Time
+    disconnected  bool
+    randSrc       *rand.Rand
+    sleepFunc     func(time.Duration)
+    timeNowFunc   func() time.Time
 }
 ```
 
@@ -80,12 +81,12 @@ type FaultInjector struct {
 
 ```go
 type DelayConfig struct {
-    Enabled    bool
-    Mode       DelayMode
-    Fixed      time.Duration
-    Min        time.Duration
-    Max        time.Duration
-    TimeWindow *TimeWindow
+    Enabled     bool
+    Mode        DelayMode
+    Fixed       time.Duration
+    Min         time.Duration
+    Max         time.Duration
+    TimeWindow  *TimeWindow
     TargetRatio float64
 }
 ```
@@ -105,10 +106,10 @@ type DelayConfig struct {
 
 ```go
 type ErrorConfig struct {
-    Enabled    bool
-    Err        error
-    Message    string
-    TimeWindow *TimeWindow
+    Enabled     bool
+    Err         error
+    Message     string
+    TimeWindow  *TimeWindow
     TargetRatio float64
 }
 ```
@@ -128,14 +129,14 @@ type ErrorConfig struct {
 type DisconnectConfig struct {
     Enabled    bool
     TimeWindow *TimeWindow
-    TargetRatio float64
 }
 ```
 
 **字段说明**:
 - `Enabled`: 是否启用连接断开模拟
 - `TimeWindow`: 生效时间窗口
-- `TargetRatio`: 目标比例
+
+**注意**: `DisconnectConfig` 不包含 `TargetRatio` 字段。连接断开采用持久断开语义，与延迟/错误注入的逐请求概率模型有本质区别，详见[第6节](#6-连接断开模拟原理)。
 
 ### 3.5 TimeWindow
 
@@ -195,10 +196,13 @@ type ConnectionBrokenError struct {
 ```
 调用 ApplyDelay()
     │
-    ├─ 检查是否启用 → 未启用则直接返回
-    ├─ 检查时间窗口 → 不在窗口内则直接返回
-    ├─ 检查目标比例 → 未命中则直接返回
-    └─ 计算延迟时长 → 调用 sleepFunc 阻塞等待
+    ├─ 获取读锁，读取配置
+    ├─ 检查是否启用 → 未启用则释放锁并返回
+    ├─ 检查时间窗口 → 不在窗口内则释放锁并返回
+    ├─ 检查目标比例 → 未命中则释放锁并返回
+    ├─ 计算延迟时长（在锁内完成随机数生成）
+    ├─ 释放读锁
+    └─ 调用 sleepFunc 阻塞等待（不持锁）
 ```
 
 ### 4.2 固定延迟模式
@@ -245,10 +249,12 @@ delay = Min + rand(0, Max - Min)
 ```
 调用 CheckError()
     │
-    ├─ 检查是否启用 → 未启用则返回 nil
-    ├─ 检查时间窗口 → 不在窗口内则返回 nil
-    ├─ 检查目标比例 → 未命中则返回 nil
-    └─ 返回 InjectedError（包含配置的错误和消息）
+    ├─ 获取读锁，读取配置
+    ├─ 检查是否启用 → 未启用则释放锁并返回 nil
+    ├─ 检查时间窗口 → 不在窗口内则释放锁并返回 nil
+    ├─ 检查目标比例（在锁内完成随机数生成）
+    ├─ 释放读锁
+    └─ 命中则返回 InjectedError（在锁外构造错误对象）
 ```
 
 ### 5.2 错误类型
@@ -267,9 +273,16 @@ delay = Min + rand(0, Max - Min)
 
 ## 6. 连接断开模拟原理
 
-### 6.1 工作机制
+### 6.1 持久断开语义
 
-连接断开模拟用于模拟目标服务不可用的场景。当连接处于断开状态时，所有请求都会立即返回连接中断错误，不会执行实际的业务逻辑。连接断开具有"粘性"——一旦断开，所有后续请求在恢复之前都会失败。
+连接断开模拟采用**持久断开**语义：一旦连接进入断开状态，所有后续请求都会立即返回连接中断错误，直到连接被显式恢复。这与延迟/错误注入的逐请求概率模型有本质区别：
+
+| 维度 | 延迟/错误注入 | 连接断开模拟 |
+|------|-------------|------------|
+| 触发方式 | 每次请求独立概率判定 | 状态切换（连通 ↔ 断开） |
+| 影响范围 | 仅命中比例的请求受影响 | 断开后所有请求持续受影响 |
+| 恢复方式 | 无需恢复，每次请求重新判定 | 需要显式恢复操作 |
+| TargetRatio | 适用 | 不适用 |
 
 ### 6.2 两种控制方式
 
@@ -280,23 +293,43 @@ delay = Min + rand(0, Max - Min)
 ```go
 fi.Disconnect()   // 手动断开连接
 // ... 所有请求都会失败 ...
-fi.Reconnect()    // 恢复连接
+fi.Reconnect()    // 恢复连接（仅清除手动断开标志）
 ```
+
+**重要**: `Reconnect()` 仅清除手动断开标志（`disconnected = false`）。如果 `DisconnectConfig.Enabled` 仍为 true 且在时间窗口内，连接仍会处于断开状态。要完全恢复连接，需要同时调用 `DisableDisconnect()` 或等待时间窗口结束。
 
 #### 方式二：配置化控制
 
-通过 `DisconnectConfig` 配置连接断开，结合时间窗口和目标比例使用。适用于需要自动化、概率性断开的场景。
+通过 `DisconnectConfig` 配置连接断开，结合时间窗口使用。当配置启用且处于时间窗口内时，连接持续处于断开状态。
 
 ```go
 cfg := DisconnectConfig{
-    Enabled:     true,
-    TargetRatio: 0.1,  // 10% 的概率触发断开
+    Enabled: true,
+    TimeWindow: &TimeWindow{
+        StartTime: start,
+        EndTime:   end,
+    },
 }
+fi.SetDisconnectConfig(cfg)
 ```
 
-**注意**: 配置化的连接断开是基于请求的概率判断，每次请求独立计算是否命中。而手动断开是全局状态，一旦断开所有请求都会失败，直到手动恢复。
+配置化断开的特点:
+- **无 TargetRatio**: 断开是持久状态，不适用逐请求概率判定
+- **时间窗口内持续断开**: 只要配置启用且在窗口内，所有请求都会失败
+- **恢复方式**: 调用 `DisableDisconnect()` 或等待时间窗口结束
 
-### 6.3 优先级
+### 6.3 断开状态判定逻辑
+
+```
+isDisconnectedLocked()
+    │
+    ├─ 检查手动断开标志 → 已断开则返回 true
+    ├─ 检查配置是否启用 → 未启用则返回 false
+    ├─ 检查时间窗口 → 不在窗口内则返回 false
+    └─ 在窗口内 → 返回 true（持久断开）
+```
+
+### 6.4 优先级
 
 连接断开放在综合注入的最前面检查，具有最高优先级。只要连接处于断开状态，不管其他故障是否启用，都会立即返回连接断开错误。
 
@@ -317,7 +350,7 @@ cfg := DisconnectConfig{
 - 如果 `EndTime` 为零值，表示无结束时间限制（只要过了开始时间都有效）
 - 如果 `TimeWindow` 为 nil，表示始终生效
 
-### 7.2 目标比例机制
+### 7.2 目标比例机制（仅限延迟和错误注入）
 
 目标比例（Target Ratio）用于控制受故障影响的请求占总请求的百分比。取值范围为 [0, 1.0]，其中:
 - `0.0`: 所有请求都不受影响
@@ -326,6 +359,8 @@ cfg := DisconnectConfig{
 
 目标比例使用随机数判断，每次请求独立计算是否命中。对于大量请求，实际受影响的比例会趋近于配置值。
 
+**注意**: `DisconnectConfig` 不支持 `TargetRatio`。连接断开是持久状态，不适用逐请求概率判定。如需模拟"部分请求遇到连接错误"的效果，应使用 `ErrorConfig` 配合连接相关的错误类型。
+
 ### 7.3 组合使用
 
 时间窗口和目标比例可以组合使用，形成"在指定时间段内，对 N% 的请求注入故障"的效果。
@@ -333,15 +368,46 @@ cfg := DisconnectConfig{
 判断顺序:
 1. 首先检查故障是否启用
 2. 然后检查是否在时间窗口内
-3. 最后检查是否命中目标比例
+3. 最后检查是否命中目标比例（仅延迟和错误注入）
 
 只有同时满足所有条件，故障才会真正生效。
 
 ---
 
-## 8. 使用示例
+## 8. 并发安全策略
 
-### 8.1 基本使用
+### 8.1 统一锁保护原则
+
+`FaultInjector` 内部使用单个 `sync.RWMutex` 保护所有共享可变状态的访问，确保并发安全策略的一致性。核心共享状态包括：
+
+- `delayCfg`、`errorCfg`、`disconnectCfg`：故障配置
+- `disconnected`：手动断开标志
+- `randSrc`：随机数生成器（`math/rand.Rand` 非并发安全）
+
+### 8.2 各方法的锁使用策略
+
+| 方法 | 锁类型 | randSrc 访问 | 说明 |
+|------|--------|-------------|------|
+| `ApplyDelay()` | RLock | ✓ 锁内 | 读取配置、判断比例、计算延迟均在锁内完成；sleepFunc 在锁外调用 |
+| `CheckError()` | RLock | ✓ 锁内 | 读取配置、判断比例均在锁内完成；构造 InjectedError 在锁外完成 |
+| `CheckDisconnect()` | RLock | 不涉及 | 读取断开状态在锁内完成；构造 ConnectionBrokenError 在锁外完成 |
+| `IsDisconnected()` | RLock | 不涉及 | 持久断开语义无需随机数 |
+| `SetDelayConfig()` 等 | Lock | 不涉及 | 写锁保护配置更新 |
+| `Disconnect()`/`Reconnect()` | Lock | 不涉及 | 写锁保护状态变更 |
+
+### 8.3 关键设计决策
+
+**randSrc 必须在锁内访问**: `math/rand.Rand` 不是并发安全的，其内部状态在每次调用 `Float64()`/`Int63n()` 时都会修改。所有对 `randSrc` 的访问（包括 `hitTargetRatio()` 和 `calculateDelay()` 中的随机数生成）均在持有 `mu` 读锁的状态下完成，避免数据竞争。
+
+**sleepFunc 在锁外调用**: `ApplyDelay()` 在锁内完成所有判断和计算后释放锁，然后在锁外调用 `sleepFunc`。这确保延迟等待期间不会阻塞其他 goroutine 的正常访问。
+
+**错误对象在锁外构造**: `CheckError()` 和 `CheckDisconnect()` 在锁内完成状态判定后释放锁，然后在锁外构造并返回错误对象。错误对象构造不涉及共享状态访问，无需持锁。
+
+---
+
+## 9. 使用示例
+
+### 9.1 基本使用
 
 ```go
 package main
@@ -368,7 +434,7 @@ func main() {
 }
 ```
 
-### 8.2 随机延迟注入
+### 9.2 随机延迟注入
 
 ```go
 fi := chaosfault.NewFaultInjector()
@@ -378,35 +444,31 @@ cfg := chaosfault.DelayConfig{
     Mode:        chaosfault.DelayModeRandom,
     Min:         50 * time.Millisecond,
     Max:         200 * time.Millisecond,
-    TargetRatio: 0.3, // 30% 的请求会被注入延迟
+    TargetRatio: 0.3,
 }
 fi.SetDelayConfig(cfg)
 ```
 
-### 8.3 错误注入
+### 9.3 错误注入（按概率触发）
 
 ```go
 fi := chaosfault.NewFaultInjector()
 
 customErr := errors.New("database connection refused")
-fi.EnableError(customErr, "模拟数据库连接失败")
-
-err := fi.Inject(func() error {
-    // 这段代码不会执行
-    return queryDatabase()
-})
-
-if errors.Is(err, customErr) {
-    fmt.Println("检测到注入的数据库错误")
+cfg := chaosfault.ErrorConfig{
+    Enabled:     true,
+    Err:         customErr,
+    Message:     "模拟数据库连接失败",
+    TargetRatio: 0.1, // 10% 的请求会被注入此错误
 }
+fi.SetErrorConfig(cfg)
 ```
 
-### 8.4 连接断开模拟
+### 9.4 连接断开模拟（手动控制）
 
 ```go
 fi := chaosfault.NewFaultInjector()
 
-// 手动断开
 fi.Disconnect()
 
 err := fi.Inject(func() error {
@@ -417,11 +479,29 @@ if errors.Is(err, chaosfault.ErrConnectionBroken) {
     fmt.Println("连接已断开，请求失败")
 }
 
-// 恢复连接
 fi.Reconnect()
 ```
 
-### 8.5 时间窗口控制
+### 9.5 连接断开模拟（配置化持久断开）
+
+```go
+fi := chaosfault.NewFaultInjector()
+
+now := time.Now()
+cfg := chaosfault.DisconnectConfig{
+    Enabled: true,
+    TimeWindow: &chaosfault.TimeWindow{
+        StartTime: now.Add(1 * time.Hour),
+        EndTime:   now.Add(2 * time.Hour),
+    },
+}
+fi.SetDisconnectConfig(cfg)
+
+// 在时间窗口内，所有请求都会返回连接断开错误
+// 恢复方式：等待窗口结束，或调用 fi.DisableDisconnect()
+```
+
+### 9.6 时间窗口控制
 
 ```go
 fi := chaosfault.NewFaultInjector()
@@ -431,35 +511,19 @@ cfg := chaosfault.ErrorConfig{
     Enabled: true,
     Message: "计划内故障注入",
     TimeWindow: &chaosfault.TimeWindow{
-        StartTime: now.Add(1 * time.Hour),  // 1小时后开始
-        EndTime:   now.Add(2 * time.Hour),  // 2小时后结束
+        StartTime: now.Add(1 * time.Hour),
+        EndTime:   now.Add(2 * time.Hour),
     },
     TargetRatio: 0.5,
 }
 fi.SetErrorConfig(cfg)
 ```
 
-### 8.6 目标比例控制
+### 9.7 综合使用多种故障
 
 ```go
 fi := chaosfault.NewFaultInjector()
 
-// 对 20% 的请求注入延迟
-cfg := chaosfault.DelayConfig{
-    Enabled:     true,
-    Mode:        chaosfault.DelayModeFixed,
-    Fixed:       500 * time.Millisecond,
-    TargetRatio: 0.2,
-}
-fi.SetDelayConfig(cfg)
-```
-
-### 8.7 综合使用多种故障
-
-```go
-fi := chaosfault.NewFaultInjector()
-
-// 配置延迟：100ms 固定延迟，50% 概率
 fi.SetDelayConfig(chaosfault.DelayConfig{
     Enabled:     true,
     Mode:        chaosfault.DelayModeFixed,
@@ -467,7 +531,6 @@ fi.SetDelayConfig(chaosfault.DelayConfig{
     TargetRatio: 0.5,
 })
 
-// 配置错误：10% 概率返回错误
 testErr := errors.New("injected timeout")
 fi.SetErrorConfig(chaosfault.ErrorConfig{
     Enabled:     true,
@@ -476,7 +539,6 @@ fi.SetErrorConfig(chaosfault.ErrorConfig{
     TargetRatio: 0.1,
 })
 
-// 执行调用
 for i := 0; i < 100; i++ {
     err := fi.Inject(func() error {
         return actualBusinessLogic()
@@ -487,7 +549,7 @@ for i := 0; i < 100; i++ {
 }
 ```
 
-### 8.8 用于单元测试
+### 9.8 用于单元测试
 
 ```go
 func TestMyFunction_WithDelay(t *testing.T) {
@@ -513,18 +575,16 @@ func TestMyFunction_WithDelay(t *testing.T) {
 
 ---
 
-## 9. 错误定义
+## 10. 错误定义
 
 | 错误变量 | 含义 | 触发场景 |
 |----------|------|----------|
 | `ErrInvalidConfig` | 配置无效 | 配置参数不合法时返回 |
 | `ErrConnectionBroken` | 连接已断开 | 连接断开状态下发起请求 |
-| `ErrInjected` | 注入的故障 | 作为无具体错误时的默认 cause |
-| `ErrFaultNotEnabled` | 故障未启用 | 预留错误常量 |
 | `ErrInvalidTargetRatio` | 目标比例无效 | 比例超出 [0, 1.0] 范围 |
 | `ErrInvalidTimeWindow` | 时间窗口无效 | 开始时间晚于结束时间 |
 
-### 9.1 错误类型
+### 10.1 错误类型
 
 | 错误类型 | 说明 |
 |---------|------|
@@ -553,9 +613,9 @@ if errors.Is(err, dbErr) {
 
 ---
 
-## 10. 配置说明
+## 11. 配置说明
 
-### 10.1 DelayConfig 完整参数
+### 11.1 DelayConfig 完整参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -567,7 +627,7 @@ if errors.Is(err, dbErr) {
 | `TimeWindow` | `*TimeWindow` | `nil` | 生效时间窗口，nil 表示始终生效 |
 | `TargetRatio` | `float64` | `0` | 目标比例 [0, 1.0] |
 
-### 10.2 ErrorConfig 完整参数
+### 11.2 ErrorConfig 完整参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -577,42 +637,27 @@ if errors.Is(err, dbErr) {
 | `TimeWindow` | `*TimeWindow` | `nil` | 生效时间窗口 |
 | `TargetRatio` | `float64` | `0` | 目标比例 |
 
-### 10.3 DisconnectConfig 完整参数
+### 11.3 DisconnectConfig 完整参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `Enabled` | `bool` | `false` | 是否启用连接断开模拟 |
 | `TimeWindow` | `*TimeWindow` | `nil` | 生效时间窗口 |
-| `TargetRatio` | `float64` | `0` | 目标比例 |
 
-### 10.4 配置验证规则
+**注意**: `DisconnectConfig` 不包含 `TargetRatio`。连接断开是持久状态，启用后在时间窗口内所有请求持续失败。
+
+### 11.4 配置验证规则
 
 创建或更新配置时，以下非法值会导致错误:
 
-| 非法情况 | 错误类型 |
-|---------|---------|
-| `TargetRatio < 0` 或 `> 1.0` | `ErrInvalidTargetRatio` |
-| 时间窗口 StartTime > EndTime | `ErrInvalidTimeWindow` |
-| 固定延迟模式下 Fixed <= 0 | `ErrInvalidConfig` |
-| 随机延迟模式下 Min 或 Max <= 0 | `ErrInvalidConfig` |
-| 随机延迟模式下 Min >= Max | `ErrInvalidConfig` |
-| 错误注入启用但 Err 和 Message 都为空 | `ErrInvalidConfig` |
-
----
-
-## 11. 并发安全
-
-| 维度 | 安全状态 | 说明 |
-|------|---------|------|
-| 配置读写 | ✓ 安全 | 内部使用 `sync.RWMutex` 保护配置状态 |
-| 多 goroutine 并发调用 `Inject()` | ✓ 安全 | 每个请求独立判断，互不干扰 |
-| 并发配置更新和请求处理 | ✓ 安全 | 读写锁保证并发安全 |
-
-**内部锁使用说明**:
-- 配置更新操作（`SetDelayConfig`、`SetErrorConfig` 等）使用写锁
-- 配置读取和故障判断操作使用读锁
-- 手动断开/恢复操作使用写锁
-- 延迟执行（sleep）期间不持有锁，不阻塞其他请求
+| 非法情况 | 适用配置 | 错误类型 |
+|---------|---------|---------|
+| `TargetRatio < 0` 或 `> 1.0` | DelayConfig、ErrorConfig | `ErrInvalidTargetRatio` |
+| 时间窗口 StartTime > EndTime | 所有配置 | `ErrInvalidTimeWindow` |
+| 固定延迟模式下 Fixed <= 0 | DelayConfig | `ErrInvalidConfig` |
+| 随机延迟模式下 Min 或 Max <= 0 | DelayConfig | `ErrInvalidConfig` |
+| 随机延迟模式下 Min >= Max | DelayConfig | `ErrInvalidConfig` |
+| 错误注入启用但 Err 和 Message 都为空 | ErrorConfig | `ErrInvalidConfig` |
 
 ---
 
@@ -655,7 +700,18 @@ fi.EnableError(dbErr, "")
 
 ---
 
-❌ **反模式 3: 延迟注入阻塞关键路径**
+❌ **反模式 3: 期望 Reconnect() 恢复配置化断开**
+```go
+// 危险：Reconnect() 不会覆盖配置化的持久断开
+fi.EnableDisconnect()
+fi.Reconnect() // 连接仍然是断开的！
+```
+
+✅ **修正**: 使用 `DisableDisconnect()` 禁用配置，或等待时间窗口结束。
+
+---
+
+❌ **反模式 4: 延迟注入阻塞关键路径**
 ```go
 // 危险：在主循环中使用长延迟
 for {

@@ -1,0 +1,8 @@
+你实现的同步屏障模块存在一些问题，需要修复：
+1. barrier.go 中导入了 fmt 包但实际上没有任何地方调用 fmt 包的函数，仅在文件末尾用 `var _ = fmt.Sprintf` 压制编译错误，这是无效代码噪声。
+2. Wait 方法在持锁状态下直接调用用户提供的回调函数 callback()，而 Barrier 的查询方法和修改方法都会尝试获取同一把互斥锁，当用户回调中调用了任意 Barrier 方法时会导致死锁，barrier.md 文档也未对此做任何警告。
+3. barrier.md 文档的状态查询方法列表中列出了 IsReleased() 方法，但 barrier.go 中完全没有实现该方法，文档与代码不一致。
+4. CyclicBarrier 结构体嵌入 Barrier 后仅做了方法重命名，未带来任何超出基础 Barrier 的额外行为，基础 Barrier 每次释放后本身就已可复用，CyclicBarrier 要么应实现真正的自动循环语义，要么应移除。
+5. 超时回调 AfterFunc 中的释放路径与常规 Wait 中的释放路径各自独立调用了回调并执行了解除阻塞逻辑，两处释放逻辑完全重复，且缺少统一的释放入口。
+6. 修复后运行 go test ./internal/barrier/ -v，需要让所有测试通过。
+7. 在 docs/barrier.md 中更新模块需求文档，确保文档中列出的所有方法在代码中均有对应实现，并补充回调执行的并发安全说明。

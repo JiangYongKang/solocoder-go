@@ -19,7 +19,7 @@ Cron 表达式解析与调度器（Cron Scheduler）是一个功能完整的秒�
   - **范围** (`1-5`)：匹配闭区间内的所有值
   - **步长** (`*/15` 或 `10-30/5`)：从起始值开始按固定步长匹配
 - 支持月份和星期的英文缩写（`JAN`-`DEC`、`MON`-`SUN`）
-- 解析失败时返回**明确的语法错误提示**，指出具体哪个字段、哪个位置不符合规范
+- 解析失败时返回**明确的语法错误提示**，通过字符偏移量精确指示出错位置，包含具体哪个字段、在表达式中第几个字符、哪个原始值不符合规范
 
 ### 2.2 下次执行时间计算
 
@@ -260,9 +260,11 @@ type ParseError struct {
 
 自定义解析错误类型，包含精确的错误位置信息：
 - `Field`：出错的字段类型
-- `Position`：出错的字符位置
+- `Position`：出错位置在原始表达式中的字符偏移量（从 0 开始计数），由 `fieldsWithPositions` 函数在表达式拆分阶段追踪每个字段的起始位置，并在逗号分隔的子项中累加偏移量，确保错误定位精确到具体字符
 - `RawValue`：原始字段值
-- `Message`：错误描述
+- `Message`：错误描述（对于多级步长格式如 `1-2/3/4`，错误信息会明确指出发现的 `/` 分隔符数量，而非仅报告 Atoi 失败）
+
+**语法错误定位机制**：解析管线通过 `fieldsWithPositions` 函数替代 `strings.Fields`，在拆分表达式字段时同时记录每个字段在原始字符串中的起始字符位置。该位置信息沿解析调用链逐层传递：`ParseWithLocation` → `parseField`（含 `fieldOffset` 参数）→ `parseValuePart`（含 `offset` 参数）→ `parseSingle`/`parseRange`/`parseStep`/`parseNumericValue`（均含 `offset` 参数）。在逗号分隔的列表中（如 `1,3-5,*/10`），每个子项的偏移量基于字段起始位置加上前面子项的长度和逗号分隔符的累计偏移。所有 `NewParseError` 调用均使用计算后的真实偏移量而非 0。
 
 ## 4. Cron 表达式语法规范
 
@@ -555,13 +557,13 @@ if err != nil {
 
 ## 7. 测试覆盖
 
-单元测试位于 `internal/cronsched/cronsched_test.go`，当前共 **53** 个测试用例，覆盖以下维度：
+单元测试位于 `internal/cronsched/cronsched_test.go`，当前共 **57** 个测试用例，覆盖以下维度：
 
 ### 7.1 解析测试
 
 - `TestParse_Basic`：基础解析测试，覆盖六段式、七段式、单值、范围、步长、列表、月份名、星期名等
 - `TestParse_InvalidFieldCount`：字段数量错误测试
-- `TestParse_InvalidValues`：各种无效值测试（越界、非法字符、逆序范围等）
+- `TestParse_InvalidValues`：各种无效值测试（越界、非法字符、逆序范围、多级步长格式等）
 - `TestParse_DayWeekdayMutex`：日和周字段互斥测试
 - `TestParse_InvalidTimezone`：空时区测试
 
@@ -589,7 +591,10 @@ if err != nil {
 
 - `TestParseWithLocation`：带时区解析测试
 - `TestNextTime_Timezone`：时区感知计算测试
-- `TestNextTime_DST_SpringForward`：夏令时开始（时间跳过）测试
+- `TestNextTime_DST_SpringForward`：夏令时开始（时间跳过）测试，包含：
+  - 从 DST 前一天（3 月 8 日）计算，校验返回时间的小时（2）、分钟（30）、秒（0）和日期（March 8）的精确值
+  - 从 DST 当天（3 月 9 日）计算，校验在不存在的小时（2:00 AM 被跳过）情况下，算法正确跳过 DST 间隙并返回下一个有效时间
+  - 验证 DST 间隙跳过后返回时间的小时和分钟仍然匹配表达式要求
 - `TestNextTime_DST_FallBack`：夏令时结束（时间重复）测试
 
 ### 7.5 验证与描述测试
@@ -624,6 +629,8 @@ if err != nil {
 - `TestFieldValue_Expand`：字段值展开测试
 - `TestCronField_Expand`：Cron 字段展开测试
 - `TestParseError_Error`：解析错误格式化测试
+- `TestParseError_PositionOffset`：解析错误位置偏移量验证测试，校验不同字段出错时 Position 值精确反映字段在原始表达式中的字符位置（非零值）
+- `TestParseError_MultipleSlashes`：多级步长格式（如 `1-2/3/4`）错误提示测试，校验错误信息明确指出发现的 `/` 分隔符数量
 - `TestIsValidDay`：日期有效性测试
 - `TestStringMethods`：字符串方法测试
 - `TestTaskStatus_String`：任务状态字符串测试
@@ -656,7 +663,18 @@ if err != nil {
 - **Spring Forward**（时间跳过）：不存在的时间点自动跳过，不执行
 - **Fall Back**（时间重复）：重复的时间点只执行第一次
 
-**实现方式**：通过 Go 标准库 `time` 包的时区转换能力，检测时间在 UTC 和本地时区之间转换的一致性。如果转换后时间不一致，说明遇到了夏令时边界，使用转换后的时间作为基准。
+**实现方式**：
+
+`NextTimeWithConfig` 算法在逐层推进候选时间时，对每次 `time.Date` 调用的结果进行 DST 间隙检测。Go 的 `time.Date` 在创建不存在的本地时间（如春季夏令时切换期间 2:00 AM - 2:59 AM）时，会将时间规范化到前一个有效时区（如 1:00 AM EST），导致 `time.Date` 返回的小时与请求的小时不一致。算法通过以下机制检测并跳过 DST 间隙：
+
+1. **小时推进时的间隙检测**：当推进到 `targetHour` 后，检查 `candidate.Hour()` 是否等于 `targetHour`。若不等（说明该小时不存在），持续递增 `targetHour` 直到找到实际存在的有效小时，或溢出到下一天
+2. **分钟推进时的溢出检测**：当 `minute+1` 导致小时溢出时，检查 `candidate.Hour()` 是否仍等于原小时。若不等，说明溢出后进入了 DST 间隙，按小时推进的间隙检测逻辑处理
+3. **秒推进时的溢出检测**：类似分钟推进的溢出检测，当 `second+1` 导致分钟或小时溢出并进入 DST 间隙时，逐级回退到更粗粒度的推进逻辑
+
+**验证策略**：
+- 从 DST 前一天开始计算，断言返回时间的小时、分钟、秒和日期精确值，确保不仅 `Before(from)` 成立，而且实际时间值正确
+- 从 DST 当天开始计算，验证算法能正确跳过不存在的小时并返回下一个有效匹配时间，而非陷入无限循环
+- 对 DST 当天的返回结果再次校验小时和分钟值，确保跳过间隙后仍符合表达式要求
 
 ### 8.4 异步执行模型
 

@@ -8,19 +8,18 @@ import (
 )
 
 var (
-	ErrLockNotHeld         = errors.New("distlock: lock is not held")
-	ErrLockAlreadyHeld     = errors.New("distlock: lock is already held by another token")
-	ErrInvalidToken        = errors.New("distlock: token mismatch, cannot release lock")
-	ErrLockExpired         = errors.New("distlock: lock has expired")
-	ErrEmptyKey            = errors.New("distlock: lock key is empty")
-	ErrEmptyToken          = errors.New("distlock: token is empty")
-	ErrInvalidTTL          = errors.New("distlock: ttl must be positive")
-	ErrMaxReentrancy       = errors.New("distlock: max reentrancy count exceeded")
-	ErrNodeFailure         = errors.New("distlock: node operation failed")
-	ErrQuorumNotReached    = errors.New("distlock: could not acquire lock on majority of nodes")
-	ErrInvalidNodeCount    = errors.New("distlock: node count must be odd and positive")
-	ErrLockManagerStopped  = errors.New("distlock: lock manager is stopped")
-	ErrReentrantNotAllowed = errors.New("distlock: reentrant lock not allowed for different token")
+	ErrLockNotHeld        = errors.New("distlock: lock is not held")
+	ErrLockAlreadyHeld    = errors.New("distlock: lock is already held by another token")
+	ErrInvalidToken       = errors.New("distlock: token mismatch, cannot release lock")
+	ErrLockExpired        = errors.New("distlock: lock has expired")
+	ErrEmptyKey           = errors.New("distlock: lock key is empty")
+	ErrEmptyToken         = errors.New("distlock: token is empty")
+	ErrInvalidTTL         = errors.New("distlock: ttl must be positive")
+	ErrMaxReentrancy      = errors.New("distlock: max reentrancy count exceeded")
+	ErrNodeFailure        = errors.New("distlock: node operation failed")
+	ErrQuorumNotReached   = errors.New("distlock: could not acquire lock on majority of nodes")
+	ErrInvalidNodeCount   = errors.New("distlock: node count must be odd and positive")
+	ErrLockManagerStopped = errors.New("distlock: lock manager is stopped")
 )
 
 const (
@@ -602,13 +601,12 @@ func (r *Redlock) TryLock(key, token string, ttl time.Duration) (*LockAcquisitio
 func (r *Redlock) attemptLock(key, token string, ttl time.Duration) (*LockAcquisition, error) {
 	nodeExpiries := make(map[string]time.Time)
 	successCount := 0
-	start := time.Now()
 
 	for _, node := range r.nodes {
 		err := node.Lock(key, token, ttl)
 		if err == nil {
 			successCount++
-			nodeExpiries[node.ID()] = start.Add(ttl)
+			nodeExpiries[node.ID()] = time.Now().Add(ttl)
 		}
 	}
 
@@ -632,8 +630,7 @@ func (r *Redlock) attemptLock(key, token string, ttl time.Duration) (*LockAcquis
 		}
 	}
 
-	elapsed := time.Since(start)
-	minExpiry = minExpiry.Add(-(elapsed + r.cfg.ClockDrift))
+	minExpiry = minExpiry.Add(-r.cfg.ClockDrift)
 
 	if !minExpiry.After(time.Now()) {
 		acq := &LockAcquisition{
@@ -717,7 +714,6 @@ func (r *Redlock) Heartbeat(acq *LockAcquisition, ttl time.Duration) (*LockAcqui
 
 	nodeExpiries := make(map[string]time.Time)
 	successCount := 0
-	start := time.Now()
 
 	for nodeID := range acq.NodeExpiries {
 		for _, node := range r.nodes {
@@ -725,7 +721,7 @@ func (r *Redlock) Heartbeat(acq *LockAcquisition, ttl time.Duration) (*LockAcqui
 				err := node.Heartbeat(acq.Key, acq.Token, ttl)
 				if err == nil {
 					successCount++
-					nodeExpiries[node.ID()] = start.Add(ttl)
+					nodeExpiries[node.ID()] = time.Now().Add(ttl)
 				}
 				break
 			}
@@ -745,8 +741,7 @@ func (r *Redlock) Heartbeat(acq *LockAcquisition, ttl time.Duration) (*LockAcqui
 		}
 	}
 
-	elapsed := time.Since(start)
-	minExpiry = minExpiry.Add(-(elapsed + r.cfg.ClockDrift))
+	minExpiry = minExpiry.Add(-r.cfg.ClockDrift)
 
 	if !minExpiry.After(time.Now()) {
 		return nil, ErrQuorumNotReached

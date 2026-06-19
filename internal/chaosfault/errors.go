@@ -6,12 +6,10 @@ import (
 )
 
 var (
-	ErrInvalidConfig       = errors.New("chaosfault: invalid configuration")
-	ErrConnectionBroken    = errors.New("chaosfault: connection is broken")
-	ErrInjected            = errors.New("chaosfault: injected fault")
-	ErrFaultNotEnabled     = errors.New("chaosfault: fault is not enabled")
-	ErrInvalidTargetRatio  = errors.New("chaosfault: invalid target ratio")
-	ErrInvalidTimeWindow   = errors.New("chaosfault: invalid time window")
+	ErrInvalidConfig      = errors.New("chaosfault: invalid configuration")
+	ErrConnectionBroken   = errors.New("chaosfault: connection is broken")
+	ErrInvalidTargetRatio = errors.New("chaosfault: invalid target ratio")
+	ErrInvalidTimeWindow  = errors.New("chaosfault: invalid time window")
 )
 
 func wrapError(err error, msg string) error {

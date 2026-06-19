@@ -62,13 +62,14 @@ func (e *WorkflowEngine) StartWorkflow(ctx context.Context, workflowID string, i
 	}
 
 	state := &WorkflowState{
-		WorkflowID:   workflowID,
-		Status:       WorkflowStatusRunning,
-		NodeResults:  make(map[string]*NodeResult),
+		WorkflowID:     workflowID,
+		Status:         WorkflowStatusRunning,
+		NodeResults:    make(map[string]*NodeResult),
+		NodeStates:     make(map[string]*NodeExecutionState),
 		CompletedNodes: make([]string, 0),
-		Context:      make(map[string]interface{}),
-		CreatedAt:    time.Now(),
-		StartedAt:    time.Now(),
+		Context:        make(map[string]interface{}),
+		CreatedAt:      time.Now(),
+		StartedAt:      time.Now(),
 	}
 
 	if initialContext != nil {
@@ -126,15 +127,7 @@ func (e *WorkflowEngine) ExecuteWorkflow(ctx context.Context, workflowID string,
 		result.Status = WorkflowStatusCompleted
 	}
 
-	for k, v := range execCtx.Values() {
-		if _, exists := result.Results[k]; !exists {
-			result.Results[k] = &NodeResult{
-				NodeID: k,
-				Status: NodeStatusCompleted,
-				Output: v,
-			}
-		}
-	}
+	result.Context = execCtx.Values()
 
 	return result, err
 }
@@ -158,6 +151,84 @@ func collectNodeResults(result *NodeResult, results map[string]*NodeResult) {
 	}
 }
 
+func collectCompletedNodes(result *NodeResult, completedNodes *[]string) {
+	if result == nil || result.Status != NodeStatusCompleted {
+		return
+	}
+	if !containsString(*completedNodes, result.NodeID) {
+		*completedNodes = append(*completedNodes, result.NodeID)
+	}
+
+	if outputMap, ok := result.Output.(map[string]*NodeResult); ok {
+		for _, childResult := range outputMap {
+			collectCompletedNodes(childResult, completedNodes)
+		}
+	} else if outputMap, ok := result.Output.(map[string]interface{}); ok {
+		for _, v := range outputMap {
+			if childResult, ok := v.(*NodeResult); ok {
+				collectCompletedNodes(childResult, completedNodes)
+			}
+		}
+	}
+}
+
+func executeNodeWithState(ctx context.Context, node Node, execCtx *ExecutionContext, state *WorkflowState) (*NodeResult, error) {
+	nodeID := node.GetID()
+
+	if nodeState, exists := state.NodeStates[nodeID]; exists && nodeState.Completed {
+		if nodeState.Result != nil {
+			collectNodeResults(nodeState.Result, state.NodeResults)
+			return nodeState.Result, nil
+		}
+	}
+
+	if state.NodeStates == nil {
+		state.NodeStates = make(map[string]*NodeExecutionState)
+	}
+
+	nodeState := &NodeExecutionState{
+		NodeID: nodeID,
+	}
+	state.NodeStates[nodeID] = nodeState
+
+	result, err := node.ExecuteWithState(ctx, execCtx, nodeState)
+
+	nodeState.Completed = (err == nil && result != nil && result.Status == NodeStatusCompleted)
+	nodeState.Result = result
+	nodeState.InternalState = node.GetState()
+
+	if result != nil {
+		state.NodeResults[nodeID] = result
+		collectNodeResults(result, state.NodeResults)
+		collectCompletedNodes(result, &state.CompletedNodes)
+	}
+
+	if nodeState.Completed && !containsString(state.CompletedNodes, nodeID) {
+		state.CompletedNodes = append(state.CompletedNodes, nodeID)
+	}
+
+	return result, err
+}
+
+func isNodeCompleted(nodeID string, state *WorkflowState) bool {
+	if state.NodeStates == nil {
+		return false
+	}
+	nodeState, exists := state.NodeStates[nodeID]
+	return exists && nodeState.Completed
+}
+
+func getCompletedNodeResult(nodeID string, state *WorkflowState) *NodeResult {
+	if state.NodeStates == nil {
+		return nil
+	}
+	nodeState, exists := state.NodeStates[nodeID]
+	if !exists || !nodeState.Completed {
+		return nil
+	}
+	return nodeState.Result
+}
+
 func (e *WorkflowEngine) ExecuteWorkflowWithState(ctx context.Context, workflowID string, initialContext map[string]interface{}) (*WorkflowState, error) {
 	wf, ok := e.GetWorkflow(workflowID)
 	if !ok {
@@ -165,13 +236,14 @@ func (e *WorkflowEngine) ExecuteWorkflowWithState(ctx context.Context, workflowI
 	}
 
 	state := &WorkflowState{
-		WorkflowID:   workflowID,
-		Status:       WorkflowStatusRunning,
-		NodeResults:  make(map[string]*NodeResult),
+		WorkflowID:     workflowID,
+		Status:         WorkflowStatusRunning,
+		NodeResults:    make(map[string]*NodeResult),
+		NodeStates:     make(map[string]*NodeExecutionState),
 		CompletedNodes: make([]string, 0),
-		Context:      make(map[string]interface{}),
-		CreatedAt:  time.Now(),
-		StartedAt:  time.Now(),
+		Context:        make(map[string]interface{}),
+		CreatedAt:      time.Now(),
+		StartedAt:      time.Now(),
 	}
 
 	if initialContext != nil {
@@ -185,12 +257,8 @@ func (e *WorkflowEngine) ExecuteWorkflowWithState(ctx context.Context, workflowI
 		execCtx.Set(k, v)
 	}
 
-	rootResult, err := wf.RootNode.Execute(ctx, execCtx)
-	if rootResult != nil {
-		state.NodeResults[wf.RootNode.GetID()] = rootResult
-		state.CompletedNodes = append(state.CompletedNodes, wf.RootNode.GetID())
-		collectNodeResults(rootResult, state.NodeResults)
-	}
+	ctxWithState := WithWorkflowState(ctx, state)
+	rootResult, err := executeNodeWithState(ctxWithState, wf.RootNode, execCtx, state)
 
 	state.FinishedAt = time.Now()
 
@@ -204,6 +272,7 @@ func (e *WorkflowEngine) ExecuteWorkflowWithState(ctx context.Context, workflowI
 			state.Error = err.Error()
 		} else if rootResult != nil {
 			state.Error = rootResult.Error
+			err = fmt.Errorf("%s", state.Error)
 		}
 	} else {
 		state.Status = WorkflowStatusCompleted
@@ -214,7 +283,7 @@ func (e *WorkflowEngine) ExecuteWorkflowWithState(ctx context.Context, workflowI
 	e.instances[instanceID] = state
 	e.mu.Unlock()
 
-	return state, nil
+	return state, err
 }
 
 func (e *WorkflowEngine) ResumeWorkflow(ctx context.Context, state *WorkflowState) (*WorkflowState, error) {
@@ -231,6 +300,25 @@ func (e *WorkflowEngine) ResumeWorkflow(ctx context.Context, state *WorkflowStat
 		return nil, fmt.Errorf("cannot resume workflow in status %s", state.Status)
 	}
 
+	if state.NodeStates == nil {
+		state.NodeStates = make(map[string]*NodeExecutionState)
+	}
+	if state.NodeResults == nil {
+		state.NodeResults = make(map[string]*NodeResult)
+	}
+	if state.CompletedNodes == nil {
+		state.CompletedNodes = make([]string, 0)
+	}
+	if state.Context == nil {
+		state.Context = make(map[string]interface{})
+	}
+
+	for nodeID, nodeState := range state.NodeStates {
+		if nodeState != nil && nodeState.InternalState != nil {
+			restoreNodeState(wf.RootNode, nodeID, nodeState.InternalState)
+		}
+	}
+
 	execCtx := NewExecutionContext()
 	for k, v := range state.Context {
 		execCtx.Set(k, v)
@@ -239,14 +327,8 @@ func (e *WorkflowEngine) ResumeWorkflow(ctx context.Context, state *WorkflowStat
 	state.Status = WorkflowStatusRunning
 	state.StartedAt = time.Now()
 
-	rootResult, err := wf.RootNode.Execute(ctx, execCtx)
-	if rootResult != nil {
-		state.NodeResults[wf.RootNode.GetID()] = rootResult
-		if !containsString(state.CompletedNodes, wf.RootNode.GetID()) {
-			state.CompletedNodes = append(state.CompletedNodes, wf.RootNode.GetID())
-		}
-		collectNodeResults(rootResult, state.NodeResults)
-	}
+	ctxWithState := WithWorkflowState(ctx, state)
+	rootResult, err := executeNodeWithState(ctxWithState, wf.RootNode, execCtx, state)
 
 	state.FinishedAt = time.Now()
 
@@ -260,12 +342,40 @@ func (e *WorkflowEngine) ResumeWorkflow(ctx context.Context, state *WorkflowStat
 			state.Error = err.Error()
 		} else if rootResult != nil {
 			state.Error = rootResult.Error
+			err = fmt.Errorf("%s", state.Error)
 		}
 	} else {
 		state.Status = WorkflowStatusCompleted
 	}
 
-	return state, nil
+	return state, err
+}
+
+func restoreNodeState(node Node, targetID string, state NodeStateData) {
+	if node.GetID() == targetID {
+		node.RestoreState(state)
+		return
+	}
+
+	switch n := node.(type) {
+	case *SequentialNode:
+		for _, child := range n.Nodes {
+			restoreNodeState(child, targetID, state)
+		}
+	case *ParallelNode:
+		for _, child := range n.Nodes {
+			restoreNodeState(child, targetID, state)
+		}
+	case *ConditionalNode:
+		for _, branch := range n.Branches {
+			restoreNodeState(branch.Node, targetID, state)
+		}
+		if n.DefaultBranch != nil {
+			restoreNodeState(n.DefaultBranch, targetID, state)
+		}
+	case *LoopNode:
+		restoreNodeState(n.Node, targetID, state)
+	}
 }
 
 func containsString(slice []string, s string) bool {
@@ -310,6 +420,9 @@ func (e *WorkflowEngine) LoadState(data []byte) (*WorkflowState, error) {
 
 	if state.NodeResults == nil {
 		state.NodeResults = make(map[string]*NodeResult)
+	}
+	if state.NodeStates == nil {
+		state.NodeStates = make(map[string]*NodeExecutionState)
 	}
 	if state.CompletedNodes == nil {
 		state.CompletedNodes = make([]string, 0)

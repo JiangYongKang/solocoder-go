@@ -120,8 +120,12 @@ func executeWithRetry(ctx context.Context, node Node, execCtx *ExecutionContext,
 
 func calculateRetryInterval(cfg RetryConfig, attempt int) time.Duration {
 	base := cfg.Interval
-	if base <= 0 {
+	if base < 0 {
 		base = 100 * time.Millisecond
+	}
+
+	if base == 0 {
+		return 0
 	}
 
 	switch cfg.Strategy {

@@ -1,0 +1,7 @@
+你实现的资源配额管理器模块存在一些问题，需要修复：
+1. SetLimitMode 函数在校验非法 LimitMode 值时返回了 ErrInvalidSoftThreshold 错误，错误信息提示的是软阈值范围问题，而调用者传入的是无效的限制模式枚举值，错误语义与操作不匹配。
+2. GetAllTenantsUsage 函数持有全局读锁后在循环内调用了 GetTenantUsage，而 GetTenantUsage 内部会再次获取同一把全局读锁，形成对 sync.RWMutex 的递归读锁重入，在存在并发写锁等待者时可能触发死锁。
+3. AcquireResource 函数先持全局读锁读取租户配额后释放读锁，再获取租户级写锁进行使用量检查和更新，两次加锁之间存在时间窗口，另一 goroutine 可在此窗口内通过 AdjustQuota 缩小配额，导致旧配额值放行了本应被拒绝的申请。
+4. ReleaseResource 函数先持读锁检查租户使用量记录是否存在后释放读锁，不存在则返回错误；但随后 getOrCreateTenantUsage 会再次持写锁可能创建新记录，两次检查之间若另一 goroutine 删除了该租户，会创建出使用量为零的记录导致原本合法的释放操作被拒绝。
+5. 修复后运行 go test ./internal/quotamgr/ -v，需要让所有测试通过。
+6. 在 docs/quotamgr.md 中更新模块需求文档，说明修复后的并发安全保证策略和锁策略设计。

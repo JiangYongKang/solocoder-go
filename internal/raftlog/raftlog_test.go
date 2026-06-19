@@ -590,13 +590,18 @@ func TestSnapshotInstall(t *testing.T) {
 
 	node := NewRaftNode("n1", cfg, sm, transport, []string{"n1", "n2"})
 
+	snapData, err := sm.Snapshot()
+	if err != nil {
+		t.Fatalf("Failed to create snapshot data: %v", err)
+	}
+
 	req := &InstallSnapshotRequest{
 		Term:              1,
 		LeaderID:          "n2",
 		LastIncludedIndex: 100,
 		LastIncludedTerm:  5,
 		Config:            NewConfiguration([]string{"n1", "n2"}),
-		Data:              []byte("snapshot-data"),
+		Data:              snapData,
 		Done:              true,
 	}
 
@@ -750,8 +755,8 @@ func TestMemoryStateMachine(t *testing.T) {
 	if !ok {
 		t.Error("Expected key to exist")
 	}
-	if val != "applied" {
-		t.Errorf("Expected value 'applied', got '%s'", val)
+	if val != "test-key" {
+		t.Errorf("Expected value 'test-key', got '%s'", val)
 	}
 
 	if sm.Count() != 1 {
@@ -762,12 +767,13 @@ func TestMemoryStateMachine(t *testing.T) {
 func TestMemoryStateMachine_Snapshot(t *testing.T) {
 	sm := NewMemoryStateMachine()
 
-	for i := 0; i < 5; i++ {
+	keys := []string{"key-A", "key-B", "key-C", "key-D", "key-E"}
+	for i, key := range keys {
 		entry := &LogEntry{
 			Term:    1,
 			Index:   i + 1,
 			Type:    LogEntryNormal,
-			Command: []byte("key-" + string(rune('A'+i))),
+			Command: []byte(key),
 		}
 		sm.Apply(entry)
 	}
@@ -781,19 +787,44 @@ func TestMemoryStateMachine_Snapshot(t *testing.T) {
 		t.Error("Snapshot data should not be empty")
 	}
 
+	sm2 := NewMemoryStateMachine()
 	snap := &Snapshot{
 		LastIncludedIndex: 5,
 		LastIncludedTerm:  1,
 		Data:              snapData,
 	}
 
-	err = sm.ApplySnapshot(snap)
+	err = sm2.ApplySnapshot(snap)
 	if err != nil {
 		t.Fatalf("ApplySnapshot failed: %v", err)
 	}
 
-	if sm.Count() != 0 {
-		t.Errorf("Expected count 0 after snapshot apply, got %d", sm.Count())
+	if sm2.Count() != 5 {
+		t.Errorf("Expected count 5 after snapshot restore, got %d", sm2.Count())
+	}
+
+	for _, key := range keys {
+		val, ok := sm2.Get(key)
+		if !ok {
+			t.Errorf("Expected key %s to exist after restore", key)
+		}
+		if val != key {
+			t.Errorf("Expected value %s for key %s after restore, got %s", key, key, val)
+		}
+	}
+
+	smEmpty := NewMemoryStateMachine()
+	emptySnap := &Snapshot{
+		LastIncludedIndex: 0,
+		LastIncludedTerm:  0,
+		Data:              nil,
+	}
+	err = smEmpty.ApplySnapshot(emptySnap)
+	if err != nil {
+		t.Fatalf("ApplySnapshot with nil data failed: %v", err)
+	}
+	if smEmpty.Count() != 0 {
+		t.Errorf("Expected count 0 after empty snapshot apply, got %d", smEmpty.Count())
 	}
 }
 
@@ -823,28 +854,34 @@ func TestAddNode(t *testing.T) {
 		t.Fatalf("AddNode failed: %v", err)
 	}
 
-	deadline := time.Now().Add(1 * time.Second)
-	configUpdated := false
+	deadline := time.Now().Add(3 * time.Second)
+	configCompleted := false
 	for time.Now().Before(deadline) {
 		cfg := leader.Config()
-		if cfg.Contains("n4") {
-			configUpdated = true
-			break
-		}
-		if leader.configChangeInFlight {
-			configUpdated = true
+		if cfg.Contains("n4") && !leader.configChangeInFlight && leader.joint == nil {
+			configCompleted = true
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	if !configUpdated {
-		t.Error("Expected config change to be in flight or config to be updated")
+	if !configCompleted {
+		t.Errorf("Config change not completed. leader.config.Contains(n4)=%v, configChangeInFlight=%v, joint=%v",
+			leader.Config().Contains("n4"), leader.configChangeInFlight, leader.joint != nil)
 	}
 
 	leaderCfg := leader.Config()
-	if !leaderCfg.Contains("n4") && !leader.configChangeInFlight {
-		t.Error("Config should either contain n4 or change be in flight")
+	if !leaderCfg.Contains("n4") {
+		t.Error("Final config should contain n4")
+	}
+	if leaderCfg.Size() != 4 {
+		t.Errorf("Expected config size 4, got %d", leaderCfg.Size())
+	}
+	if leader.configChangeInFlight {
+		t.Error("Config change should be completed")
+	}
+	if leader.joint != nil {
+		t.Error("Joint config should be cleared")
 	}
 }
 
@@ -874,28 +911,34 @@ func TestRemoveNode(t *testing.T) {
 		t.Fatalf("RemoveNode failed: %v", err)
 	}
 
-	deadline := time.Now().Add(1 * time.Second)
-	configUpdated := false
+	deadline := time.Now().Add(3 * time.Second)
+	configCompleted := false
 	for time.Now().Before(deadline) {
 		cfg := leader.Config()
-		if !cfg.Contains("n5") {
-			configUpdated = true
-			break
-		}
-		if leader.configChangeInFlight {
-			configUpdated = true
+		if !cfg.Contains("n5") && !leader.configChangeInFlight && leader.joint == nil {
+			configCompleted = true
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	if !configUpdated {
-		t.Error("Expected config change to be in flight or config to be updated")
+	if !configCompleted {
+		t.Errorf("Config change not completed. leader.config.Contains(n5)=%v, configChangeInFlight=%v, joint=%v",
+			leader.Config().Contains("n5"), leader.configChangeInFlight, leader.joint != nil)
 	}
 
 	leaderCfg := leader.Config()
-	if leaderCfg.Contains("n5") && !leader.configChangeInFlight {
-		t.Error("Config should either not contain n5 or change be in flight")
+	if leaderCfg.Contains("n5") {
+		t.Error("Final config should not contain n5")
+	}
+	if leaderCfg.Size() != 4 {
+		t.Errorf("Expected config size 4, got %d", leaderCfg.Size())
+	}
+	if leader.configChangeInFlight {
+		t.Error("Config change should be completed")
+	}
+	if leader.joint != nil {
+		t.Error("Joint config should be cleared")
 	}
 }
 
@@ -1344,5 +1387,304 @@ func TestProposeMultipleEntries(t *testing.T) {
 
 	if !committed {
 		t.Errorf("Not all entries committed, commitIndex=%d, expected >=%d", leader.CommitIndex(), numEntries)
+	}
+}
+
+func TestJointConfig_LogReplicationDuringConfigChange(t *testing.T) {
+	nodeIDs := []string{"n1", "n2", "n3"}
+	cfg := RaftConfig{
+		ElectionTimeoutMin: 150 * time.Millisecond,
+		ElectionTimeoutMax: 300 * time.Millisecond,
+		HeartbeatInterval:  50 * time.Millisecond,
+	}
+
+	var sms []*MemoryStateMachine
+	smFactory := func() StateMachine {
+		sm := NewMemoryStateMachine()
+		sms = append(sms, sm)
+		return sm
+	}
+
+	cluster, err := NewCluster(nodeIDs, cfg, smFactory)
+	if err != nil {
+		t.Fatalf("NewCluster failed: %v", err)
+	}
+	defer cluster.Stop()
+
+	cluster.Start()
+
+	leader, err := cluster.WaitForLeader(2 * time.Second)
+	if err != nil {
+		t.Fatalf("Failed to elect leader: %v", err)
+	}
+
+	preCommitIndex := leader.CommitIndex()
+
+	err = leader.AddNode("n4")
+	if err != nil {
+		t.Fatalf("AddNode failed: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	leader = cluster.Leader()
+	if leader == nil {
+		leader, err = cluster.WaitForLeader(2 * time.Second)
+		if err != nil {
+			t.Fatalf("No leader after config change start: %v", err)
+		}
+	}
+
+	var entriesDuringChange []int
+	for i := 0; i < 5; i++ {
+		idx, _, err := leader.Propose([]byte("during-config-" + string(rune('A'+i))))
+		if err == nil {
+			entriesDuringChange = append(entriesDuringChange, idx)
+		} else if errors.Is(err, ErrNotLeader) {
+			leader = cluster.Leader()
+			if leader == nil {
+				leader, err = cluster.WaitForLeader(1 * time.Second)
+				if err != nil {
+					t.Fatalf("No leader during config change: %v", err)
+				}
+			}
+			i--
+			continue
+		} else if !errors.Is(err, ErrConfigChangeInFlight) {
+			t.Fatalf("Propose during config change failed: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if len(entriesDuringChange) == 0 {
+		t.Fatal("No entries were proposed during config change")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	allCommitted := false
+	configDone := false
+	for time.Now().Before(deadline) {
+		leader = cluster.Leader()
+		if leader == nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		allCommitted = true
+		for _, idx := range entriesDuringChange {
+			if leader.CommitIndex() < idx {
+				allCommitted = false
+				break
+			}
+		}
+
+		if !leader.configChangeInFlight && leader.joint == nil {
+			configDone = true
+		}
+
+		if allCommitted && configDone {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !allCommitted {
+		t.Errorf("Not all entries committed during config change. commitIndex=%d, expected >=%d",
+			leader.CommitIndex(), entriesDuringChange[len(entriesDuringChange)-1])
+	}
+
+	if leader.CommitIndex() <= preCommitIndex {
+		t.Errorf("Commit index should have advanced during config change. Before: %d, After: %d",
+			preCommitIndex, leader.CommitIndex())
+	}
+
+	leader = cluster.Leader()
+	if leader == nil {
+		leader, err = cluster.WaitForLeader(2 * time.Second)
+		if err != nil {
+			t.Fatalf("No leader at end of test: %v", err)
+		}
+	}
+
+	leaderCfg := leader.Config()
+	if !leaderCfg.Contains("n4") {
+		t.Errorf("Final config should contain n4. Config nodes: %v", leaderCfg.NodeIDs())
+	}
+	if leader.configChangeInFlight {
+		t.Error("Config change should be completed")
+	}
+	if leader.joint != nil {
+		t.Error("Joint config should be cleared")
+	}
+}
+
+func TestMemoryStateMachine_SnapshotIntegrity(t *testing.T) {
+	sm := NewMemoryStateMachine()
+
+	keys := []string{"key1", "key2", "key3", "key4", "key5"}
+	for i, key := range keys {
+		entry := &LogEntry{
+			Term:    1,
+			Index:   i + 1,
+			Type:    LogEntryNormal,
+			Command: []byte(key),
+		}
+		err := sm.Apply(entry)
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+	}
+
+	for _, key := range keys {
+		val, ok := sm.Get(key)
+		if !ok {
+			t.Errorf("Expected key %s to exist", key)
+		}
+		if val != key {
+			t.Errorf("Expected value %s for key %s, got %s", key, key, val)
+		}
+	}
+
+	if sm.Count() != 5 {
+		t.Errorf("Expected count 5, got %d", sm.Count())
+	}
+
+	snapData, err := sm.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+
+	if len(snapData) == 0 {
+		t.Fatal("Snapshot data should not be empty")
+	}
+
+	sm2 := NewMemoryStateMachine()
+	snap := &Snapshot{
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Data:              snapData,
+	}
+
+	err = sm2.ApplySnapshot(snap)
+	if err != nil {
+		t.Fatalf("ApplySnapshot failed: %v", err)
+	}
+
+	if sm2.Count() != 5 {
+		t.Errorf("Expected count 5 after snapshot restore, got %d", sm2.Count())
+	}
+
+	for _, key := range keys {
+		val, ok := sm2.Get(key)
+		if !ok {
+			t.Errorf("Expected key %s to exist after restore", key)
+		}
+		if val != key {
+			t.Errorf("Expected value %s for key %s after restore, got %s", key, key, val)
+		}
+	}
+}
+
+func TestAddNode_WithConcurrentPropose(t *testing.T) {
+	nodeIDs := []string{"n1", "n2", "n3"}
+	cfg := RaftConfig{
+		ElectionTimeoutMin: 50 * time.Millisecond,
+		ElectionTimeoutMax: 100 * time.Millisecond,
+		HeartbeatInterval:  10 * time.Millisecond,
+	}
+
+	cluster, err := NewCluster(nodeIDs, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewCluster failed: %v", err)
+	}
+	defer cluster.Stop()
+
+	cluster.Start()
+
+	leader, err := cluster.WaitForLeader(2 * time.Second)
+	if err != nil {
+		t.Fatalf("Failed to elect leader: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var proposeErr error
+	var addNodeErr error
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		addNodeErr = leader.AddNode("n4")
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			_, _, err := leader.Propose([]byte("concurrent-" + string(rune('A'+i%10))))
+			if err != nil && !errors.Is(err, ErrNotLeader) && !errors.Is(err, ErrConfigChangeInFlight) {
+				proposeErr = err
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+
+	if addNodeErr != nil {
+		t.Fatalf("AddNode failed: %v", addNodeErr)
+	}
+
+	if proposeErr != nil {
+		t.Fatalf("Concurrent propose failed: %v", proposeErr)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	configCompleted := false
+	for time.Now().Before(deadline) {
+		cfg := leader.Config()
+		if cfg.Contains("n4") && !leader.configChangeInFlight && leader.joint == nil {
+			configCompleted = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !configCompleted {
+		t.Error("Config change not completed")
+	}
+
+	leaderCfg := leader.Config()
+	if !leaderCfg.Contains("n4") {
+		t.Error("Final config should contain n4")
+	}
+	if leaderCfg.Size() != 4 {
+		t.Errorf("Expected config size 4, got %d", leaderCfg.Size())
+	}
+}
+
+func TestLogCompactedError(t *testing.T) {
+	transport := NewMemoryTransport()
+	sm := NewMemoryStateMachine()
+	cfg := DefaultRaftConfig()
+
+	node := NewRaftNode("n1", cfg, sm, transport, []string{"n1"})
+	node.state = Leader
+	node.currentTerm = 1
+
+	for i := 1; i <= 20; i++ {
+		node.appendEntry(&LogEntry{Term: 1, Index: i, Type: LogEntryNormal, Command: nil})
+	}
+	node.commitIndex = 15
+	node.lastApplied = 15
+
+	err := node.CompactLog(10)
+	if err != nil {
+		t.Fatalf("CompactLog failed: %v", err)
+	}
+
+	entry := node.getLogEntry(5)
+	if entry != nil {
+		t.Error("Expected nil entry for compacted index")
 	}
 }

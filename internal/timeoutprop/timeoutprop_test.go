@@ -269,7 +269,7 @@ func TestExecute_MinThresholdSkip(t *testing.T) {
 		MinThreshold: 50 * time.Millisecond,
 	})
 
-	p.AddStage("stage1", 80*time.Millisecond, func(ctx context.Context) error {
+	p.AddStage("stage1", 60*time.Millisecond, func(ctx context.Context) error {
 		time.Sleep(60 * time.Millisecond)
 		return nil
 	})
@@ -279,10 +279,60 @@ func TestExecute_MinThresholdSkip(t *testing.T) {
 
 	report, _ := p.Execute(context.Background())
 
-	if report.Stages[1].Status == StageStatusSkipped && report.Stages[1].TimeoutType == TimeoutTypeMinThreshold {
-	} else if report.Stages[1].Status == StageStatusCompleted {
-	} else {
-		t.Logf("stage2 status: %v, timeout type: %v", report.Stages[1].Status, report.Stages[1].TimeoutType)
+	if report.Stages[0].Status != StageStatusCompleted {
+		t.Errorf("expected stage1 completed, got %v", report.Stages[0].Status)
+	}
+
+	if report.Stages[1].Status != StageStatusSkipped {
+		t.Errorf("expected stage2 skipped due to min threshold, got %v", report.Stages[1].Status)
+	}
+	if report.Stages[1].TimeoutType != TimeoutTypeMinThreshold {
+		t.Errorf("expected stage2 timeout type MIN_THRESHOLD, got %v", report.Stages[1].TimeoutType)
+	}
+}
+
+func TestExecute_MinThresholdSkip_ZeroBudgetStage(t *testing.T) {
+	p := NewPropagatorWithConfig(Config{
+		TotalTimeout: 100 * time.Millisecond,
+		MinThreshold: 50 * time.Millisecond,
+	})
+
+	p.AddStage("stage1", 60*time.Millisecond, func(ctx context.Context) error {
+		time.Sleep(60 * time.Millisecond)
+		return nil
+	})
+	p.AddStage("stage2", 0, func(ctx context.Context) error {
+		return nil
+	})
+
+	report, _ := p.Execute(context.Background())
+
+	if report.Stages[1].Status != StageStatusSkipped {
+		t.Errorf("expected zero-budget stage2 skipped due to min threshold, got %v", report.Stages[1].Status)
+	}
+	if report.Stages[1].TimeoutType != TimeoutTypeMinThreshold {
+		t.Errorf("expected stage2 timeout type MIN_THRESHOLD, got %v", report.Stages[1].TimeoutType)
+	}
+}
+
+func TestExecute_MinThresholdSkip_SufficientTime(t *testing.T) {
+	p := NewPropagatorWithConfig(Config{
+		TotalTimeout: 200 * time.Millisecond,
+		MinThreshold: 50 * time.Millisecond,
+	})
+
+	p.AddStage("stage1", 50*time.Millisecond, func(ctx context.Context) error {
+		time.Sleep(10 * time.Millisecond)
+		return nil
+	})
+	p.AddStage("stage2", 30*time.Millisecond, func(ctx context.Context) error {
+		return nil
+	})
+
+	report, _ := p.Execute(context.Background())
+
+	if report.Stages[1].Status != StageStatusCompleted {
+		t.Errorf("expected stage2 completed (sufficient time), got %v", report.Stages[1].Status)
 	}
 }
 
@@ -379,8 +429,11 @@ func TestExecute_StageReturnsError(t *testing.T) {
 	if report.FailedStage != "stage1" {
 		t.Errorf("expected failed stage stage1, got %s", report.FailedStage)
 	}
-	if report.Stages[0].Status != StageStatusTimedOut {
-		t.Errorf("expected stage1 status timed out (failed), got %v", report.Stages[0].Status)
+	if report.Stages[0].Status != StageStatusFailed {
+		t.Errorf("expected stage1 status failed (business error), got %v", report.Stages[0].Status)
+	}
+	if report.Stages[0].TimeoutType != TimeoutTypeNone {
+		t.Errorf("expected stage1 timeout type NONE (business error), got %v", report.Stages[0].TimeoutType)
 	}
 	if report.Stages[1].Status != StageStatusSkipped {
 		t.Errorf("expected stage2 skipped, got %v", report.Stages[1].Status)
@@ -578,6 +631,38 @@ func TestStageTimeoutError_Error(t *testing.T) {
 	msg := err.Error()
 	if msg == "" {
 		t.Error("expected non-empty error message")
+	}
+}
+
+func TestStageTimeoutError_Unwrap_ContextDeadlineExceeded(t *testing.T) {
+	budgetErr := &StageTimeoutError{
+		StageName:   "test",
+		TimeoutType: TimeoutTypeBudget,
+		Allocated:   100 * time.Millisecond,
+		Used:        200 * time.Millisecond,
+	}
+	if !errors.Is(budgetErr, context.DeadlineExceeded) {
+		t.Error("expected errors.Is to return true for budget timeout")
+	}
+
+	totalErr := &StageTimeoutError{
+		StageName:   "test",
+		TimeoutType: TimeoutTypeTotal,
+		Allocated:   100 * time.Millisecond,
+		Used:        200 * time.Millisecond,
+	}
+	if !errors.Is(totalErr, context.DeadlineExceeded) {
+		t.Error("expected errors.Is to return true for total timeout")
+	}
+
+	noTimeoutErr := &StageTimeoutError{
+		StageName:   "test",
+		TimeoutType: TimeoutTypeNone,
+		Allocated:   100 * time.Millisecond,
+		Used:        50 * time.Millisecond,
+	}
+	if errors.Is(noTimeoutErr, context.DeadlineExceeded) {
+		t.Error("expected errors.Is to return false for no timeout type")
 	}
 }
 

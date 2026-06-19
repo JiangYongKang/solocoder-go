@@ -2,6 +2,7 @@ package quotamgr
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -811,6 +812,18 @@ func TestSetLimitMode_InvalidTenant(t *testing.T) {
 	}
 }
 
+func TestSetLimitMode_InvalidMode(t *testing.T) {
+	mgr := NewManager(nil)
+
+	err := mgr.SetLimitMode("tenant1", LimitMode(999))
+	if !errors.Is(err, ErrInvalidLimitMode) {
+		t.Errorf("expected ErrInvalidLimitMode, got %v", err)
+	}
+	if errors.Is(err, ErrInvalidSoftThreshold) {
+		t.Error("should not return ErrInvalidSoftThreshold for invalid limit mode")
+	}
+}
+
 func TestSetSoftThreshold_InvalidTenant(t *testing.T) {
 	mgr := NewManager(nil)
 
@@ -909,5 +922,162 @@ func TestMultipleTenants(t *testing.T) {
 	}
 	if info2.Usage.CPU != 5.0 {
 		t.Errorf("tenant2 CPU usage should be 5.0, got %.2f", info2.Usage.CPU)
+	}
+}
+
+func TestAcquireResource_ConcurrentAdjustQuota(t *testing.T) {
+	mgr := NewManager(nil)
+
+	mgr.SetTenantQuota("tenant1", TenantQuota{
+		Quota:     Quota{CPU: 10.0},
+		LimitMode: LimitModeHard,
+	})
+
+	var wg sync.WaitGroup
+	acquireCount := int32(0)
+	rejectCount := int32(0)
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := mgr.AcquireResource("tenant1", ResourceCPU, 1.0)
+			if err == nil {
+				atomic.AddInt32(&acquireCount, 1)
+			} else {
+				atomic.AddInt32(&rejectCount, 1)
+			}
+		}()
+
+		if i == 50 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mgr.AdjustQuota("tenant1", ResourceCPU, 5.0)
+			}()
+		}
+	}
+
+	wg.Wait()
+
+	info, _ := mgr.GetTenantUsage("tenant1")
+
+	if info.Usage.CPU > 10.0 {
+		t.Errorf("CPU usage should not exceed original quota of 10.0, got %.2f", info.Usage.CPU)
+	}
+	if info.Usage.CPU < 5.0 {
+		t.Errorf("CPU usage should be at least 5.0 (adjusted quota), got %.2f", info.Usage.CPU)
+	}
+	if info.Quota.CPU != 5.0 {
+		t.Errorf("CPU quota should be 5.0 after adjustment, got %.2f", info.Quota.CPU)
+	}
+
+	err := mgr.AcquireResource("tenant1", ResourceCPU, 1.0)
+	if info.Usage.CPU > 5.0 && err == nil {
+		t.Error("expected error when acquiring after quota adjustment while usage exceeds new quota")
+	}
+}
+
+func TestReleaseResource_ConcurrentRemoveTenant(t *testing.T) {
+	mgr := NewManager(nil)
+
+	mgr.SetTenantQuota("tenant1", TenantQuota{
+		Quota:     Quota{CPU: 10.0},
+		LimitMode: LimitModeHard,
+	})
+
+	err := mgr.AcquireResource("tenant1", ResourceCPU, 5.0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	releaseSuccess := int32(0)
+	releaseFailed := int32(0)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := mgr.ReleaseResource("tenant1", ResourceCPU, 0.5)
+			if err == nil {
+				atomic.AddInt32(&releaseSuccess, 1)
+			} else if errors.Is(err, ErrTenantNotFound) {
+				atomic.AddInt32(&releaseFailed, 1)
+			}
+		}()
+
+		if i == 5 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mgr.RemoveTenant("tenant1")
+			}()
+		}
+	}
+
+	wg.Wait()
+
+	info, _ := mgr.GetTenantUsage("tenant1")
+	if info.Usage.CPU > 5.0 {
+		t.Errorf("CPU usage should not be negative, got %.2f", info.Usage.CPU)
+	}
+}
+
+func TestGetAllTenantsUsage_NoDeadlock(t *testing.T) {
+	mgr := NewManager(nil)
+
+	for i := 0; i < 10; i++ {
+		tenantID := fmt.Sprintf("tenant%d", i)
+		mgr.SetTenantQuota(tenantID, TenantQuota{
+			Quota:     Quota{CPU: 4.0},
+			LimitMode: LimitModeHard,
+		})
+		mgr.AcquireResource(tenantID, ResourceCPU, 1.0)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			infos := mgr.GetAllTenantsUsage()
+			if len(infos) != 10 {
+				t.Errorf("expected 10 tenant infos, got %d", len(infos))
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetAllTenantsUsage appears to be deadlocked")
+	}
+}
+
+func TestAcquireResource_AdjustQuotaRace(t *testing.T) {
+	mgr := NewManager(nil)
+	mgr.SetTenantQuota("tenant1", TenantQuota{
+		Quota:     Quota{CPU: 10.0},
+		LimitMode: LimitModeHard,
+	})
+
+	err := mgr.AcquireResource("tenant1", ResourceCPU, 8.0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	go func() {
+		mgr.AdjustQuota("tenant1", ResourceCPU, 5.0)
+	}()
+
+	time.Sleep(time.Millisecond)
+
+	err = mgr.AcquireResource("tenant1", ResourceCPU, 3.0)
+	if err == nil {
+		info, _ := mgr.GetTenantUsage("tenant1")
+		if info.Usage.CPU > 5.0 {
+			t.Errorf("race condition detected: usage %.2f exceeds quota %.2f", info.Usage.CPU, info.Quota.CPU)
+		}
 	}
 }

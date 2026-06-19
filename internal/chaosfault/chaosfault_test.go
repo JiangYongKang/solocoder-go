@@ -411,6 +411,84 @@ func TestCheckError_MessageOnly(t *testing.T) {
 	}
 }
 
+func TestTargetRatio_Error(t *testing.T) {
+	customRand := rand.New(rand.NewSource(42))
+	fi := NewFaultInjector(
+		WithRandSource(customRand),
+	)
+
+	testErr := errors.New("injected error")
+	cfg := ErrorConfig{
+		Enabled:     true,
+		Err:         testErr,
+		Message:     "probabilistic error",
+		TargetRatio: 0.5,
+	}
+	err := fi.SetErrorConfig(cfg)
+	if err != nil {
+		t.Fatalf("SetErrorConfig failed: %v", err)
+	}
+
+	total := 10000
+	errorCount := 0
+	for i := 0; i < total; i++ {
+		if fi.CheckError() != nil {
+			errorCount++
+		}
+	}
+
+	ratio := float64(errorCount) / float64(total)
+	if ratio < 0.4 || ratio > 0.6 {
+		t.Errorf("expected ratio ~0.5, got %f (count: %d)", ratio, errorCount)
+	}
+}
+
+func TestTargetRatio_ErrorZero(t *testing.T) {
+	fi := NewFaultInjector()
+
+	testErr := errors.New("injected error")
+	cfg := ErrorConfig{
+		Enabled:     true,
+		Err:         testErr,
+		Message:     "zero ratio error",
+		TargetRatio: 0.0,
+	}
+	err := fi.SetErrorConfig(cfg)
+	if err != nil {
+		t.Fatalf("SetErrorConfig failed: %v", err)
+	}
+
+	for i := 0; i < 1000; i++ {
+		if fi.CheckError() != nil {
+			t.Error("expected no errors with ratio 0")
+			break
+		}
+	}
+}
+
+func TestTargetRatio_ErrorOne(t *testing.T) {
+	fi := NewFaultInjector()
+
+	testErr := errors.New("injected error")
+	cfg := ErrorConfig{
+		Enabled:     true,
+		Err:         testErr,
+		Message:     "full ratio error",
+		TargetRatio: 1.0,
+	}
+	err := fi.SetErrorConfig(cfg)
+	if err != nil {
+		t.Fatalf("SetErrorConfig failed: %v", err)
+	}
+
+	for i := 0; i < 100; i++ {
+		if fi.CheckError() == nil {
+			t.Error("expected error with ratio 1.0")
+			break
+		}
+	}
+}
+
 func TestDisconnect_Manual(t *testing.T) {
 	fi := NewFaultInjector()
 
@@ -433,8 +511,7 @@ func TestSetDisconnectConfig(t *testing.T) {
 	fi := NewFaultInjector()
 
 	cfg := DisconnectConfig{
-		Enabled:     true,
-		TargetRatio: 1.0,
+		Enabled: true,
 	}
 	err := fi.SetDisconnectConfig(cfg)
 	if err != nil {
@@ -447,16 +524,23 @@ func TestSetDisconnectConfig(t *testing.T) {
 	}
 }
 
-func TestSetDisconnectConfig_InvalidRatio(t *testing.T) {
+func TestSetDisconnectConfig_InvalidTimeWindow(t *testing.T) {
 	fi := NewFaultInjector()
+	now := time.Now()
 
 	cfg := DisconnectConfig{
-		Enabled:     true,
-		TargetRatio: 2.0,
+		Enabled: true,
+		TimeWindow: &TimeWindow{
+			StartTime: now.Add(1 * time.Hour),
+			EndTime:   now,
+		},
 	}
 	err := fi.SetDisconnectConfig(cfg)
 	if err == nil {
-		t.Error("expected error for invalid target ratio")
+		t.Error("expected error for invalid time window")
+	}
+	if !errors.Is(err, ErrInvalidTimeWindow) {
+		t.Errorf("expected ErrInvalidTimeWindow, got %v", err)
 	}
 }
 
@@ -464,8 +548,7 @@ func TestCheckDisconnect(t *testing.T) {
 	fi := NewFaultInjector()
 
 	cfg := DisconnectConfig{
-		Enabled:     true,
-		TargetRatio: 1.0,
+		Enabled: true,
 	}
 	err := fi.SetDisconnectConfig(cfg)
 	if err != nil {
@@ -491,8 +574,7 @@ func TestCheckDisconnect_Disabled(t *testing.T) {
 	fi := NewFaultInjector()
 
 	cfg := DisconnectConfig{
-		Enabled:     false,
-		TargetRatio: 1.0,
+		Enabled: false,
 	}
 	err := fi.SetDisconnectConfig(cfg)
 	if err != nil {
@@ -502,6 +584,46 @@ func TestCheckDisconnect_Disabled(t *testing.T) {
 	result := fi.CheckDisconnect()
 	if result != nil {
 		t.Errorf("expected nil when disabled, got %v", result)
+	}
+}
+
+func TestDisconnect_PersistentWhenConfigEnabled(t *testing.T) {
+	fi := NewFaultInjector()
+
+	fi.EnableDisconnect()
+
+	for i := 0; i < 100; i++ {
+		if !fi.IsDisconnected() {
+			t.Errorf("request %d: expected persistent disconnect when config enabled", i)
+			break
+		}
+	}
+
+	fi.DisableDisconnect()
+
+	for i := 0; i < 100; i++ {
+		if fi.IsDisconnected() {
+			t.Errorf("request %d: expected connected after disable", i)
+			break
+		}
+	}
+}
+
+func TestDisconnect_ReconnectDoesNotOverrideConfig(t *testing.T) {
+	fi := NewFaultInjector()
+
+	fi.EnableDisconnect()
+
+	fi.Reconnect()
+
+	if !fi.IsDisconnected() {
+		t.Error("Reconnect() should not override config-based persistent disconnect")
+	}
+
+	fi.DisableDisconnect()
+
+	if fi.IsDisconnected() {
+		t.Error("DisableDisconnect() should stop config-based disconnect")
 	}
 }
 
@@ -650,8 +772,7 @@ func TestDisconnectWithTimeWindow(t *testing.T) {
 	)
 
 	cfg := DisconnectConfig{
-		Enabled:     true,
-		TargetRatio: 1.0,
+		Enabled: true,
 		TimeWindow: &TimeWindow{
 			StartTime: now.Add(-1 * time.Hour),
 			EndTime:   now.Add(1 * time.Hour),
@@ -1097,10 +1218,10 @@ func TestInject_AllFaultsCombined(t *testing.T) {
 		t.Errorf("expected disconnect error, got %v", err)
 	}
 
-	fi.Reconnect()
 	fi.DisableDisconnect()
 
 	slept = 0
+	fnCalled = false
 	err = fi.Inject(func() error {
 		fnCalled = true
 		return nil
@@ -1140,8 +1261,7 @@ func TestManualDisconnectOverridesConfig(t *testing.T) {
 	fi := NewFaultInjector()
 
 	cfg := DisconnectConfig{
-		Enabled:     false,
-		TargetRatio: 0.0,
+		Enabled: false,
 	}
 	fi.SetDisconnectConfig(cfg)
 
@@ -1154,5 +1274,23 @@ func TestManualDisconnectOverridesConfig(t *testing.T) {
 	result := fi.CheckDisconnect()
 	if result == nil {
 		t.Error("CheckDisconnect should return error after manual disconnect")
+	}
+}
+
+func TestManualReconnectAfterConfigDisconnect(t *testing.T) {
+	fi := NewFaultInjector()
+
+	fi.EnableDisconnect()
+
+	fi.Reconnect()
+
+	if !fi.IsDisconnected() {
+		t.Error("Reconnect() should not override config-based persistent disconnect")
+	}
+
+	fi.DisableDisconnect()
+
+	if fi.IsDisconnected() {
+		t.Error("after DisableDisconnect(), connection should be restored")
 	}
 }

@@ -652,8 +652,14 @@ func TestRetryInterval_Calculation(t *testing.T) {
 			expected: 400 * time.Millisecond,
 		},
 		{
-			name:    "zero interval default",
-			cfg:     RetryConfig{Strategy: RetryFixed},
+			name:    "zero interval immediate retry",
+			cfg:     RetryConfig{Strategy: RetryFixed, Interval: 0},
+			attempt: 1,
+			expected: 0,
+		},
+		{
+			name:    "negative interval default",
+			cfg:     RetryConfig{Strategy: RetryFixed, Interval: -1},
 			attempt: 1,
 			expected: 100 * time.Millisecond,
 		},
@@ -1171,5 +1177,582 @@ func TestCompareNumbers(t *testing.T) {
 				t.Errorf("expected %d, got %d", tt.expected, result)
 			}
 		})
+	}
+}
+
+func TestResumeWorkflow_Sequential_ResumeFromBreakpoint(t *testing.T) {
+	engine := NewWorkflowEngine()
+
+	var executionCount map[string]int
+	var mu sync.Mutex
+	executionCount = make(map[string]int)
+
+	task1 := NewCallbackTaskNode("task1", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		mu.Lock()
+		executionCount["task1"]++
+		mu.Unlock()
+		execCtx.Set("task1_done", true)
+		return "task1_result", nil
+	})
+
+	task2 := NewCallbackTaskNode("task2", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		mu.Lock()
+		executionCount["task2"]++
+		mu.Unlock()
+		execCtx.Set("task2_done", true)
+		return nil, fmt.Errorf("task2 failed intentionally")
+	})
+
+	task3 := NewCallbackTaskNode("task3", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		mu.Lock()
+		executionCount["task3"]++
+		mu.Unlock()
+		execCtx.Set("task3_done", true)
+		return "task3_result", nil
+	})
+
+	root := NewSequentialNode("root", task1, task2, task3)
+
+	wf := &WorkflowDefinition{
+		ID:       "resume_seq_wf",
+		RootNode: root,
+	}
+	engine.RegisterWorkflow(wf)
+
+	state, err := engine.ExecuteWorkflowWithState(context.Background(), "resume_seq_wf", nil)
+	if err == nil {
+		t.Fatal("expected error from failing workflow")
+	}
+	if state.Status != WorkflowStatusFailed {
+		t.Errorf("expected failed status, got %v", state.Status)
+	}
+
+	mu.Lock()
+	if executionCount["task1"] != 1 {
+		t.Errorf("expected task1 to execute once, got %d", executionCount["task1"])
+	}
+	if executionCount["task2"] != 1 {
+		t.Errorf("expected task2 to execute once, got %d", executionCount["task2"])
+	}
+	if executionCount["task3"] != 0 {
+		t.Errorf("expected task3 to not execute, got %d", executionCount["task3"])
+	}
+	mu.Unlock()
+
+	task1Done, _ := state.Context["task1_done"].(bool)
+	if !task1Done {
+		t.Error("expected task1_done in context")
+	}
+
+	task2Fixed := NewCallbackTaskNode("task2", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		mu.Lock()
+		executionCount["task2"]++
+		mu.Unlock()
+		execCtx.Set("task2_done", true)
+		return "task2_fixed_result", nil
+	})
+
+	task2.ID = root.Nodes[1].GetID()
+	root.Nodes[1] = task2Fixed
+
+	state.Status = WorkflowStatusPaused
+
+	resumedState, err := engine.ResumeWorkflow(context.Background(), state)
+	if err != nil {
+		t.Fatalf("resume failed: %v", err)
+	}
+	if resumedState.Status != WorkflowStatusCompleted {
+		t.Errorf("expected completed status, got %v (error: %v)", resumedState.Status, resumedState.Error)
+	}
+
+	mu.Lock()
+	if executionCount["task1"] != 1 {
+		t.Errorf("task1 should not be re-executed, expected 1 got %d", executionCount["task1"])
+	}
+	if executionCount["task2"] != 2 {
+		t.Errorf("task2 should be executed again, expected 2 got %d", executionCount["task2"])
+	}
+	if executionCount["task3"] != 1 {
+		t.Errorf("task3 should be executed once, expected 1 got %d", executionCount["task3"])
+	}
+	mu.Unlock()
+
+	task1Done, _ = resumedState.Context["task1_done"].(bool)
+	if !task1Done {
+		t.Error("task1_done should persist after resume")
+	}
+	task2Done, _ := resumedState.Context["task2_done"].(bool)
+	if !task2Done {
+		t.Error("task2_done should be set after resume")
+	}
+	task3Done, _ := resumedState.Context["task3_done"].(bool)
+	if !task3Done {
+		t.Error("task3_done should be set after resume")
+	}
+
+	if len(resumedState.CompletedNodes) < 3 {
+		t.Errorf("expected at least 3 completed nodes, got %d", len(resumedState.CompletedNodes))
+	}
+}
+
+func TestResumeWorkflow_ContextVariablesPreserved(t *testing.T) {
+	engine := NewWorkflowEngine()
+
+	task1 := NewCallbackTaskNode("task1", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		execCtx.Set("user_id", 123)
+		execCtx.Set("username", "testuser")
+		execCtx.Set("settings", map[string]string{"theme": "dark"})
+		return nil, fmt.Errorf("fail after setting context")
+	})
+
+	task2 := NewCallbackTaskNode("task2", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		userId, _ := execCtx.GetInt("user_id")
+		username, _ := execCtx.GetString("username")
+		execCtx.Set("verified", true)
+		return map[string]interface{}{"user_id": userId, "username": username}, nil
+	})
+
+	root := NewSequentialNode("root", task1, task2)
+
+	wf := &WorkflowDefinition{
+		ID:       "resume_ctx_wf",
+		RootNode: root,
+	}
+	engine.RegisterWorkflow(wf)
+
+	state, err := engine.ExecuteWorkflowWithState(context.Background(), "resume_ctx_wf", nil)
+	if err == nil {
+		t.Fatal("expected error from failing workflow")
+	}
+
+	userId, _ := state.Context["user_id"]
+	if userId == nil {
+		t.Error("user_id should be in failed state context")
+	}
+	username, _ := state.Context["username"]
+	if username == nil {
+		t.Error("username should be in failed state context")
+	}
+
+	task1Fixed := NewCallbackTaskNode("task1", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		execCtx.Set("user_id", 123)
+		execCtx.Set("username", "testuser")
+		execCtx.Set("settings", map[string]string{"theme": "dark"})
+		return "task1 done", nil
+	})
+	task1Fixed.ID = root.Nodes[0].GetID()
+	root.Nodes[0] = task1Fixed
+	state.Status = WorkflowStatusPaused
+
+	resumedState, err := engine.ResumeWorkflow(context.Background(), state)
+	if err != nil {
+		t.Fatalf("resume failed: %v", err)
+	}
+	if resumedState.Status != WorkflowStatusCompleted {
+		t.Errorf("expected completed status, got %v (error: %v)", resumedState.Status, resumedState.Error)
+	}
+
+	resumedUserId, _ := resumedState.Context["user_id"]
+	var userIdInt int
+	switch v := resumedUserId.(type) {
+	case int:
+		userIdInt = v
+	case float64:
+		userIdInt = int(v)
+	}
+	if userIdInt != 123 {
+		t.Errorf("user_id should be preserved, expected 123 got %v", resumedUserId)
+	}
+
+	resumedUsername, _ := resumedState.Context["username"].(string)
+	if resumedUsername != "testuser" {
+		t.Errorf("username should be preserved, expected 'testuser' got '%v'", resumedUsername)
+	}
+
+	verified, _ := resumedState.Context["verified"].(bool)
+	if !verified {
+		t.Error("verified should be set after resume")
+	}
+}
+
+func TestResumeWorkflow_CompletedNodesNotReexecuted(t *testing.T) {
+	engine := NewWorkflowEngine()
+
+	var executedNodes []string
+	var mu sync.Mutex
+
+	createTrackedTask := func(name string) *CallbackTaskNode {
+		return NewCallbackTaskNode(name, func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+			mu.Lock()
+			executedNodes = append(executedNodes, name)
+			mu.Unlock()
+			execCtx.Set(fmt.Sprintf("%s_done", name), true)
+			return name, nil
+		})
+	}
+
+	task1 := createTrackedTask("task1")
+	task2 := createTrackedTask("task2")
+	failTask := NewFailTask("failTask", errors.New("intentional failure"))
+	task3 := createTrackedTask("task3")
+	task4 := createTrackedTask("task4")
+
+	root := NewSequentialNode("root", task1, task2, failTask, task3, task4)
+
+	wf := &WorkflowDefinition{
+		ID:       "no_reexec_wf",
+		RootNode: root,
+	}
+	engine.RegisterWorkflow(wf)
+
+	state, err := engine.ExecuteWorkflowWithState(context.Background(), "no_reexec_wf", nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	mu.Lock()
+	initialExecution := make([]string, len(executedNodes))
+	copy(initialExecution, executedNodes)
+	mu.Unlock()
+
+	if len(initialExecution) != 2 || initialExecution[0] != "task1" || initialExecution[1] != "task2" {
+		t.Errorf("expected [task1 task2] executed initially, got %v", initialExecution)
+	}
+
+	fixedTask := createTrackedTask("failTask")
+	fixedTask.ID = root.Nodes[2].GetID()
+	root.Nodes[2] = fixedTask
+
+	state.Status = WorkflowStatusPaused
+
+	resumedState, err := engine.ResumeWorkflow(context.Background(), state)
+	if err != nil {
+		t.Fatalf("resume failed: %v", err)
+	}
+
+	mu.Lock()
+	finalExecution := make([]string, len(executedNodes))
+	copy(finalExecution, executedNodes)
+	mu.Unlock()
+
+	task1Count := 0
+	task2Count := 0
+	for _, name := range finalExecution {
+		if name == "task1" {
+			task1Count++
+		}
+		if name == "task2" {
+			task2Count++
+		}
+	}
+
+	if task1Count != 1 {
+		t.Errorf("task1 should be executed exactly once, got %d times. Full execution: %v", task1Count, finalExecution)
+	}
+	if task2Count != 1 {
+		t.Errorf("task2 should be executed exactly once, got %d times. Full execution: %v", task2Count, finalExecution)
+	}
+
+	if len(resumedState.CompletedNodes) != 6 {
+		t.Errorf("expected 6 completed nodes, got %d: %v", len(resumedState.CompletedNodes), resumedState.CompletedNodes)
+	}
+
+	task1Done, _ := resumedState.Context["task1_done"].(bool)
+	if !task1Done {
+		t.Error("task1_done should be true")
+	}
+	task2Done, _ := resumedState.Context["task2_done"].(bool)
+	if !task2Done {
+		t.Error("task2_done should be true")
+	}
+	task3Done, _ := resumedState.Context["task3_done"].(bool)
+	if !task3Done {
+		t.Error("task3_done should be true")
+	}
+	task4Done, _ := resumedState.Context["task4_done"].(bool)
+	if !task4Done {
+		t.Error("task4_done should be true")
+	}
+}
+
+func TestResumeWorkflow_ParallelResume(t *testing.T) {
+	engine := NewWorkflowEngine()
+
+	var mu sync.Mutex
+	executionCount := make(map[string]int)
+
+	createTask := func(name string, shouldFail bool) *CallbackTaskNode {
+		return NewCallbackTaskNode(name, func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+			mu.Lock()
+			executionCount[name]++
+			mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			if shouldFail {
+				return nil, fmt.Errorf("%s failed", name)
+			}
+			return name, nil
+		})
+	}
+
+	task1 := createTask("p_task1", false)
+	task2 := createTask("p_task2", true)
+	task3 := createTask("p_task3", false)
+
+	parallel := NewParallelNode("parallel", task1, task2, task3)
+	parallel.SetMaxFailures(0)
+
+	wf := &WorkflowDefinition{
+		ID:       "resume_parallel_wf",
+		RootNode: parallel,
+	}
+	engine.RegisterWorkflow(wf)
+
+	state, err := engine.ExecuteWorkflowWithState(context.Background(), "resume_parallel_wf", nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	mu.Lock()
+	if executionCount["p_task1"] != 1 {
+		t.Errorf("expected p_task1=1, got %d", executionCount["p_task1"])
+	}
+	if executionCount["p_task2"] != 1 {
+		t.Errorf("expected p_task2=1, got %d", executionCount["p_task2"])
+	}
+	if executionCount["p_task3"] != 1 {
+		t.Errorf("expected p_task3=1, got %d", executionCount["p_task3"])
+	}
+	mu.Unlock()
+
+	task2Fixed := createTask("p_task2", false)
+	task2Fixed.ID = parallel.Nodes[1].GetID()
+	parallel.Nodes[1] = task2Fixed
+
+	state.Status = WorkflowStatusPaused
+
+	resumedState, err := engine.ResumeWorkflow(context.Background(), state)
+	if err != nil {
+		t.Fatalf("resume failed: %v", err)
+	}
+	if resumedState.Status != WorkflowStatusCompleted {
+		t.Errorf("expected completed, got %v: %v", resumedState.Status, resumedState.Error)
+	}
+
+	mu.Lock()
+	if executionCount["p_task1"] != 1 {
+		t.Errorf("p_task1 should not re-execute, expected 1 got %d", executionCount["p_task1"])
+	}
+	if executionCount["p_task2"] != 2 {
+		t.Errorf("p_task2 should execute again, expected 2 got %d", executionCount["p_task2"])
+	}
+	if executionCount["p_task3"] != 1 {
+		t.Errorf("p_task3 should not re-execute, expected 1 got %d", executionCount["p_task3"])
+	}
+	mu.Unlock()
+}
+
+func TestResumeWorkflow_SaveLoadResume(t *testing.T) {
+	engine := NewWorkflowEngine()
+
+	var execOrder []string
+	var mu sync.Mutex
+
+	task1 := NewCallbackTaskNode("task1", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		mu.Lock()
+		execOrder = append(execOrder, "task1")
+		mu.Unlock()
+		execCtx.Set("step", 1)
+		return 1, nil
+	})
+
+	task2 := NewCallbackTaskNode("task2", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		mu.Lock()
+		execOrder = append(execOrder, "task2")
+		mu.Unlock()
+		return nil, fmt.Errorf("task2 failed")
+	})
+
+	task3 := NewCallbackTaskNode("task3", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		mu.Lock()
+		execOrder = append(execOrder, "task3")
+		mu.Unlock()
+		execCtx.Set("step", 3)
+		return 3, nil
+	})
+
+	root := NewSequentialNode("root", task1, task2, task3)
+
+	wf := &WorkflowDefinition{
+		ID:       "save_load_resume_wf",
+		RootNode: root,
+	}
+	engine.RegisterWorkflow(wf)
+
+	state, err := engine.ExecuteWorkflowWithState(context.Background(), "save_load_resume_wf", nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	data, err := engine.SaveState(state)
+	if err != nil {
+		t.Fatalf("save state failed: %v", err)
+	}
+
+	loadedState, err := engine.LoadState(data)
+	if err != nil {
+		t.Fatalf("load state failed: %v", err)
+	}
+
+	stepVal := loadedState.Context["step"]
+	var stepInt int
+	switch v := stepVal.(type) {
+	case int:
+		stepInt = v
+	case float64:
+		stepInt = int(v)
+	}
+	if stepInt != 1 {
+		t.Errorf("expected step=1 in loaded state, got %v", stepVal)
+	}
+
+	task2Fixed := NewCallbackTaskNode("task2", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		mu.Lock()
+		execOrder = append(execOrder, "task2")
+		mu.Unlock()
+		execCtx.Set("step", 2)
+		return 2, nil
+	})
+	task2Fixed.ID = root.Nodes[1].GetID()
+	root.Nodes[1] = task2Fixed
+
+	loadedState.Status = WorkflowStatusPaused
+
+	resumedState, err := engine.ResumeWorkflow(context.Background(), loadedState)
+	if err != nil {
+		t.Fatalf("resume failed: %v", err)
+	}
+	if resumedState.Status != WorkflowStatusCompleted {
+		t.Errorf("expected completed, got %v", resumedState.Status)
+	}
+
+	mu.Lock()
+	task1Count := 0
+	for _, name := range execOrder {
+		if name == "task1" {
+			task1Count++
+		}
+	}
+	mu.Unlock()
+
+	if task1Count != 1 {
+		t.Errorf("task1 should execute once, got %d times: %v", task1Count, execOrder)
+	}
+
+	resumedStepVal := resumedState.Context["step"]
+	switch v := resumedStepVal.(type) {
+	case int:
+		stepInt = v
+	case float64:
+		stepInt = int(v)
+	}
+	if stepInt != 3 {
+		t.Errorf("expected step=3 after resume, got %v", resumedStepVal)
+	}
+}
+
+func TestWorkflowResult_ContextNotMixedWithResults(t *testing.T) {
+	engine := NewWorkflowEngine()
+
+	task := NewCallbackTaskNode("testTask", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		execCtx.Set("user_id", 123)
+		execCtx.Set("role", "admin")
+		return "task_result", nil
+	})
+
+	wf := &WorkflowDefinition{
+		ID:       "ctx_separate_wf",
+		RootNode: task,
+	}
+	engine.RegisterWorkflow(wf)
+
+	result, err := engine.ExecuteWorkflow(context.Background(), "ctx_separate_wf", nil)
+	if err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+	if result.Status != WorkflowStatusCompleted {
+		t.Errorf("expected completed, got %v", result.Status)
+	}
+
+	for key := range result.Results {
+		if key == "user_id" || key == "role" {
+			t.Errorf("context key '%s' should not be in Results, context should be separate", key)
+		}
+	}
+
+	if result.Context == nil {
+		t.Fatal("result.Context should not be nil")
+	}
+
+	userId, ok := result.Context["user_id"]
+	if !ok {
+		t.Error("user_id should be in result.Context")
+	}
+	if userId != 123 {
+		t.Errorf("expected user_id=123, got %v", userId)
+	}
+
+	role, ok := result.Context["role"]
+	if !ok {
+		t.Error("role should be in result.Context")
+	}
+	if role != "admin" {
+		t.Errorf("expected role=admin, got %v", role)
+	}
+
+	taskResult, ok := result.Results[task.GetID()]
+	if !ok {
+		t.Fatalf("task result should be in Results with key %s", task.GetID())
+	}
+	if taskResult.Output != "task_result" {
+		t.Errorf("expected task output 'task_result', got %v", taskResult.Output)
+	}
+}
+
+func TestNodeRetry_ZeroIntervalImmediateRetry(t *testing.T) {
+	var attempts []time.Time
+	mu := sync.Mutex{}
+
+	task := NewCallbackTaskNode("test", func(ctx context.Context, execCtx *ExecutionContext) (interface{}, error) {
+		mu.Lock()
+		attempts = append(attempts, time.Now())
+		mu.Unlock()
+		return nil, errors.New("fail")
+	})
+
+	task.SetRetryConfig(RetryConfig{
+		MaxRetries: 2,
+		Interval:   0,
+		Strategy:   RetryFixed,
+	})
+
+	start := time.Now()
+	result, err := task.Execute(context.Background(), NewExecutionContext())
+	total := time.Since(start)
+
+	if err == nil {
+		t.Error("expected error")
+	}
+	if result.Status != NodeStatusFailed {
+		t.Errorf("expected failed status, got %v", result.Status)
+	}
+
+	mu.Lock()
+	if len(attempts) != 3 {
+		t.Errorf("expected 3 attempts, got %d", len(attempts))
+	}
+	mu.Unlock()
+
+	if total > 50*time.Millisecond {
+		t.Errorf("expected immediate retry (total time < 50ms), took %v", total)
 	}
 }

@@ -257,7 +257,15 @@ type Option    func(*Config)
 
 ### 4.3 最小阈值跳过机制
 
-当阶段可用预算小于配置的最小阈值（`MinThreshold`）时，该阶段直接被跳过，不执行实际业务逻辑。
+在每个阶段开始执行前，检查**根 context 的剩余时间**是否小于配置的最小阈值（`MinThreshold`）。如果剩余时间不足，该阶段直接被跳过，不执行实际业务逻辑。
+
+**判定逻辑**:
+```
+剩余时间 = 根 context 截止时间 - 当前系统时间
+如果 剩余时间 < MinThreshold:
+    标记阶段为 SKIPPED，超时类型为 MIN_THRESHOLD_SKIP
+    跳过当前阶段，继续下一阶段
+```
 
 **应用场景**:
 - 避免为了极短的剩余时间而启动一个可能来不及完成的操作
@@ -265,9 +273,10 @@ type Option    func(*Config)
 - 快速失败，将剩余时间留给更重要的环节
 
 **注意**:
-- 仅当阶段有预算限制时才检查最小阈值
-- 无预算限制的阶段（预算为 0）不受最小阈值限制
+- 使用根 context 的**剩余时间**进行判断，而非阶段自身的预算
+- **零预算阶段也会检查最小阈值**，不设例外
 - 被跳过的阶段状态标记为 `SKIPPED`，超时类型为 `MIN_THRESHOLD_SKIP`
+- 当 `MinThreshold = 0` 时，不进行最小阈值检查
 
 ---
 
@@ -289,9 +298,19 @@ type Option    func(*Config)
 | `StageStatusPending` | 0 | 待执行 |
 | `StageStatusRunning` | 1 | 正在执行 |
 | `StageStatusCompleted` | 2 | 成功完成 |
-| `StageStatusSkipped` | 3 | 被跳过 |
-| `StageStatusTimedOut` | 4 | 超时或出错 |
-| `StageStatusFailed` | 5 | 执行失败 |
+| `StageStatusSkipped` | 3 | 被跳过（因最小阈值或前置阶段失败） |
+| `StageStatusTimedOut` | 4 | **超时**（因总超时或预算超时，错误为 `context.DeadlineExceeded`） |
+| `StageStatusFailed` | 5 | **业务失败**（阶段返回非超时类的业务错误或 panic） |
+
+**错误类型区分策略**:
+
+| 错误场景 | 阶段状态 | 超时类型 | 返回错误 | `errors.Is(err, context.DeadlineExceeded)` |
+|----------|----------|----------|----------|-------------------------------------------|
+| 根 context 超时 | `TimedOut` | `Total` | `*StageTimeoutError` | ✅ `true` |
+| 阶段预算超时 | `TimedOut` | `Budget` | `*StageTimeoutError` | ✅ `true` |
+| 阶段返回业务错误 | `Failed` | `None` | 原始业务错误 | ❌ `false` |
+| 阶段发生 panic | `Failed` | `None` | 包装后的 panic 错误 | ❌ `false` |
+| 低于最小阈值被跳过 | `Skipped` | `MinThreshold` | 无（不返回错误） | - |
 
 ---
 
@@ -417,8 +436,17 @@ func myHandler(ctx context.Context) error {
 ### 7.4 检查超时类型
 
 ```go
+import "errors"
+import "context"
+
 report, err := p.Execute(ctx)
 if err != nil {
+    // 使用标准的 errors.Is 判断是否为超时错误（推荐）
+    if errors.Is(err, context.DeadlineExceeded) {
+        log.Println("发生超时错误")
+    }
+
+    // 使用 errors.As 提取详细的超时信息
     var stageErr *timeoutprop.StageTimeoutError
     if errors.As(err, &stageErr) {
         switch stageErr.TimeoutType {
@@ -427,6 +455,17 @@ if err != nil {
         case timeoutprop.TimeoutTypeBudget:
             log.Printf("阶段 %s 预算超时：分配 %v，使用 %v",
                 stageErr.StageName, stageErr.Allocated, stageErr.Used)
+        }
+    }
+
+    // 通过报告判断具体的失败类型
+    if report.FailedStage != "" {
+        stageInfo := report.Stages[0] // 获取第一个失败的阶段
+        switch stageInfo.Status {
+        case timeoutprop.StageStatusTimedOut:
+            log.Printf("阶段 %s 超时失败", stageInfo.Name)
+        case timeoutprop.StageStatusFailed:
+            log.Printf("阶段 %s 业务错误失败: %v", stageInfo.Name, stageInfo.Error)
         }
     }
 }
@@ -473,9 +512,23 @@ p.AddStage("unlimited", 0, func(ctx context.Context) error {
 | `ErrNegativeBudget` | 预算为负 | 添加阶段时预算为负数 |
 | `ErrChainAlreadyExecuted` | 调用链已执行 | 已执行后再添加阶段或重复执行 |
 | `ErrNoStages` | 没有注册阶段 | 执行时没有任何阶段 |
-| `*StageTimeoutError` | 阶段超时错误 | 阶段因超时或错误失败时 |
+| `*StageTimeoutError` | 阶段超时错误 | 阶段因总超时或预算超时而失败时 |
 
-**注意**: 调用方应通过 `errors.As(err, &stageErr)` 来提取 `StageTimeoutError` 的详细信息。
+**`StageTimeoutError` 结构**:
+```go
+type StageTimeoutError struct {
+    StageName   string        // 超时阶段名称
+    TimeoutType TimeoutType   // 超时类型（Total/Budget）
+    Allocated   time.Duration // 分配的预算
+    Used        time.Duration // 实际消耗的时间
+}
+```
+
+**错误处理约定**:
+- `StageTimeoutError` 实现了 `Unwrap() error` 方法，对于超时类型为 `Total` 或 `Budget` 的错误，返回标准的 `context.DeadlineExceeded`
+- 调用方可以使用 `errors.Is(err, context.DeadlineExceeded)` 来判断是否为超时错误
+- 调用方可以使用 `errors.As(err, &stageErr)` 来提取 `StageTimeoutError` 的详细信息
+- 业务错误（非超时）不会被包装为 `StageTimeoutError`，而是直接返回原始错误，此时阶段状态为 `Failed`，超时类型为 `None`
 
 ---
 
@@ -486,7 +539,7 @@ p.AddStage("unlimited", 0, func(ctx context.Context) error {
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `TotalTimeout` | `time.Duration` | 10s | 调用链总超时时间（正数） |
-| `MinThreshold` | `time.Duration` | 10ms | 最小执行阈值，预算低于此值则跳过 |
+| `MinThreshold` | `time.Duration` | 10ms | 最小执行阈值，**根 context 剩余时间**低于此值则跳过阶段 |
 
 ### 9.2 配置归一化规则
 

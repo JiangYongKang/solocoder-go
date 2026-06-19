@@ -15,20 +15,22 @@ const (
 
 type LoopNode struct {
 	baseNode
-	Node           Node
-	LoopType       LoopType
-	Iterations     int
-	IterationsKey  string
+	Node            Node
+	LoopType        LoopType
+	Iterations      int
+	IterationsKey   string
 	ContinueOnError bool
+	currentIteration int
 }
 
 func NewLoopNode(name string, node Node) *LoopNode {
 	return &LoopNode{
-		baseNode:        newBaseNode(NodeTypeLoop, name),
-		Node:            node,
-		LoopType:        LoopTypeFixed,
-		Iterations:      1,
-		ContinueOnError: false,
+		baseNode:         newBaseNode(NodeTypeLoop, name),
+		Node:             node,
+		LoopType:         LoopTypeFixed,
+		Iterations:       1,
+		ContinueOnError:  false,
+		currentIteration: 0,
 	}
 }
 
@@ -72,8 +74,23 @@ func (n *LoopNode) getIterations(execCtx *ExecutionContext) (int, error) {
 }
 
 func (n *LoopNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
+	return n.ExecuteWithState(ctx, execCtx, nil)
+}
+
+func (n *LoopNode) ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error) {
 	return executeWithRetry(ctx, n, execCtx, func(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
 		result := newNodeResult(n.ID)
+		wfState := GetWorkflowState(ctx)
+
+		if nodeState == nil {
+			n.currentIteration = 0
+		} else if nodeState.InternalState != nil {
+			if state, ok := nodeState.InternalState.(map[string]interface{}); ok {
+				if iter, ok := state["current_iteration"].(int); ok {
+					n.currentIteration = iter
+				}
+			}
+		}
 
 		iterations, err := n.getIterations(execCtx)
 		if err != nil {
@@ -87,10 +104,13 @@ func (n *LoopNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*Nod
 		iterationIndexKey := fmt.Sprintf("iteration_index_%s", n.ID)
 		iterationCountKey := fmt.Sprintf("iteration_count_%s", n.ID)
 
-		for i := 0; i < iterations; i++ {
+		startIteration := n.currentIteration
+		for i := startIteration; i < iterations; i++ {
 			if ctx.Err() != nil {
 				return completeResult(result, iterationResults, ctx.Err()), ctx.Err()
 			}
+
+			n.currentIteration = i
 
 			execCtx.Set(iterationIndexKey, i)
 			execCtx.Set(iterationCountKey, iterations)
@@ -99,7 +119,24 @@ func (n *LoopNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*Nod
 			childExecCtx.Set("iteration_index", i)
 			childExecCtx.Set("iteration_count", iterations)
 
-			childResult, err := n.Node.Execute(ctx, childExecCtx)
+			var childResult *NodeResult
+			var childErr error
+
+			childNodeKey := fmt.Sprintf("%s_iter_%d", n.Node.GetID(), i)
+			if wfState != nil && isNodeCompleted(childNodeKey, wfState) {
+				childResult = getCompletedNodeResult(childNodeKey, wfState)
+			} else if wfState != nil {
+				childResult, childErr = executeNodeWithState(ctx, n.Node, childExecCtx, wfState)
+				if childResult != nil && childResult.Status == NodeStatusCompleted {
+					wfState.NodeStates[childNodeKey] = &NodeExecutionState{
+						NodeID:    childNodeKey,
+						Completed: true,
+						Result:    childResult,
+					}
+				}
+			} else {
+				childResult, childErr = n.Node.Execute(ctx, childExecCtx)
+			}
 
 			iterResult := map[string]interface{}{
 				"iteration": i,
@@ -107,10 +144,10 @@ func (n *LoopNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*Nod
 			if childResult != nil {
 				iterResult["result"] = childResult
 			}
-			if err != nil {
-				iterResult["error"] = err.Error()
+			if childErr != nil {
+				iterResult["error"] = childErr.Error()
 				hasErrors = true
-				lastError = err.Error()
+				lastError = childErr.Error()
 			} else if childResult != nil && childResult.Status == NodeStatusFailed {
 				iterResult["error"] = childResult.Error
 				hasErrors = true
@@ -119,7 +156,7 @@ func (n *LoopNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*Nod
 
 			iterationResults = append(iterationResults, iterResult)
 
-			if (err != nil || (childResult != nil && childResult.Status == NodeStatusFailed)) && !n.ContinueOnError {
+			if (childErr != nil || (childResult != nil && childResult.Status == NodeStatusFailed)) && !n.ContinueOnError {
 				result.Status = NodeStatusFailed
 				result.Error = fmt.Sprintf("loop failed at iteration %d: %s", i, lastError)
 				completeResult(result, iterationResults, errors.New(result.Error))
@@ -132,6 +169,8 @@ func (n *LoopNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*Nod
 				}
 			}
 		}
+
+		n.currentIteration = iterations
 
 		output := map[string]interface{}{
 			"total_iterations":  iterations,
@@ -148,4 +187,22 @@ func (n *LoopNode) Execute(ctx context.Context, execCtx *ExecutionContext) (*Nod
 		output["has_errors"] = false
 		return completeResult(result, output, nil), nil
 	})
+}
+
+func (n *LoopNode) GetState() NodeStateData {
+	return map[string]interface{}{
+		"node_id":          n.ID,
+		"current_iteration": n.currentIteration,
+	}
+}
+
+func (n *LoopNode) RestoreState(state NodeStateData) {
+	if state == nil {
+		return
+	}
+	if stateMap, ok := state.(map[string]interface{}); ok {
+		if iter, ok := stateMap["current_iteration"].(int); ok {
+			n.currentIteration = iter
+		}
+	}
 }
