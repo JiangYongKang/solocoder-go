@@ -314,7 +314,7 @@ type RaftNode struct {
 	randState int64
 
 	configChangeInFlight bool
-	snapshotInstalling   bool
+	snapshotInFlight     int
 }
 
 type Transport interface {
@@ -889,7 +889,7 @@ func (n *RaftNode) sendHeartbeats() {
 				lastTerm := n.lastSnapshotTerm
 				cfg := n.config.Clone()
 				curTerm := n.currentTerm
-				n.snapshotInstalling = true
+				n.snapshotInFlight++
 				n.mu.Unlock()
 
 				data, err := n.sm.Snapshot()
@@ -909,7 +909,10 @@ func (n *RaftNode) sendHeartbeats() {
 				}
 
 				n.mu.Lock()
-				n.snapshotInstalling = false
+				n.snapshotInFlight--
+				if n.snapshotInFlight < 0 {
+					n.snapshotInFlight = 0
+				}
 				if err != nil {
 					n.mu.Unlock()
 					return
@@ -958,9 +961,7 @@ func (n *RaftNode) sendHeartbeats() {
 
 	n.mu.Lock()
 	if n.state == Leader && n.running {
-		if n.heartbeatTimer != nil {
-			n.heartbeatTimer.Reset(n.cfg.HeartbeatInterval)
-		}
+		n.heartbeatTimer.Reset(n.cfg.HeartbeatInterval)
 	}
 	n.mu.Unlock()
 }
@@ -1338,7 +1339,7 @@ func (n *RaftNode) Propose(command []byte) (int, int, error) {
 		n.mu.Unlock()
 		return 0, 0, ErrConfigChangeInFlight
 	}
-	if n.snapshotInstalling {
+	if n.snapshotInFlight > 0 {
 		n.mu.Unlock()
 		return 0, 0, ErrSnapshotInstalling
 	}

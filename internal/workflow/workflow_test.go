@@ -1756,3 +1756,113 @@ func TestNodeRetry_ZeroIntervalImmediateRetry(t *testing.T) {
 		t.Errorf("expected immediate retry (total time < 50ms), took %v", total)
 	}
 }
+
+func TestAsInt_TypeCoverage(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    interface{}
+		expected int
+		ok       bool
+	}{
+		{"int", int(42), 42, true},
+		{"int8", int8(42), 42, true},
+		{"int16", int16(42), 42, true},
+		{"int32", int32(42), 42, true},
+		{"int64", int64(42), 42, true},
+		{"uint", uint(42), 42, true},
+		{"uint8", uint8(42), 42, true},
+		{"uint16", uint16(42), 42, true},
+		{"uint32", uint32(42), 42, true},
+		{"uint64", uint64(42), 42, true},
+		{"float32", float32(42.7), 42, true},
+		{"float64", float64(42.9), 42, true},
+		{"string_valid", "42", 42, true},
+		{"string_negative", "-10", -10, true},
+		{"string_invalid", "not_a_number", 0, false},
+		{"bool", true, 0, false},
+		{"nil", nil, 0, false},
+		{"struct", struct{}{}, 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, ok := asInt(tt.input)
+			if ok != tt.ok {
+				t.Errorf("expected ok=%v, got ok=%v", tt.ok, ok)
+			}
+			if ok && result != tt.expected {
+				t.Errorf("expected %d, got %d", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestFlakyTask_RestoreStateResetsFailures(t *testing.T) {
+	task := NewFlakyTask("flaky", 2, "success")
+
+	task.mu.Lock()
+	task.failures = 5
+	task.mu.Unlock()
+
+	task.RestoreState(nil)
+
+	task.mu.Lock()
+	if task.failures != 0 {
+		t.Errorf("expected failures=0 after RestoreState, got %d", task.failures)
+	}
+	task.mu.Unlock()
+}
+
+func TestFlakyTask_ResumeFromBreakpoint_RetryFromScratch(t *testing.T) {
+	engine := NewWorkflowEngine()
+
+	flaky := NewFlakyTask("flaky_task", 10, "success")
+	flaky.SetRetryConfig(RetryConfig{
+		MaxRetries: 2,
+		Interval:   0,
+		Strategy:   RetryFixed,
+	})
+
+	wf := &WorkflowDefinition{
+		ID:       "flaky_resume_wf",
+		RootNode: flaky,
+	}
+	engine.RegisterWorkflow(wf)
+
+	state, err := engine.ExecuteWorkflowWithState(context.Background(), "flaky_resume_wf", nil)
+	if err == nil {
+		t.Fatal("expected error from failing flaky task")
+	}
+
+	flaky.mu.Lock()
+	if flaky.failures <= 0 {
+		t.Errorf("expected failures > 0 after failed execution, got %d", flaky.failures)
+	}
+	prevFailures := flaky.failures
+	flaky.mu.Unlock()
+
+	state.Status = WorkflowStatusPaused
+
+	flakyFixed := NewFlakyTask("flaky_task", 1, "success")
+	flakyFixed.SetRetryConfig(RetryConfig{
+		MaxRetries: 3,
+		Interval:   0,
+		Strategy:   RetryFixed,
+	})
+	flakyFixed.ID = wf.RootNode.GetID()
+	wf.RootNode = flakyFixed
+
+	resumedState, err := engine.ResumeWorkflow(context.Background(), state)
+	if err != nil {
+		t.Fatalf("resume failed: %v", err)
+	}
+	if resumedState.Status != WorkflowStatusCompleted {
+		t.Errorf("expected completed status, got %v (error: %v)", resumedState.Status, resumedState.Error)
+	}
+
+	flakyFixed.mu.Lock()
+	if flakyFixed.failures >= prevFailures {
+		t.Errorf("expected failures to restart from 0 on resume, got %d (was %d before resume)", flakyFixed.failures, prevFailures)
+	}
+	flakyFixed.mu.Unlock()
+}

@@ -294,11 +294,11 @@ func TestExecute_MinThresholdSkip(t *testing.T) {
 func TestExecute_MinThresholdSkip_ZeroBudgetStage(t *testing.T) {
 	p := NewPropagatorWithConfig(Config{
 		TotalTimeout: 100 * time.Millisecond,
-		MinThreshold: 50 * time.Millisecond,
+		MinThreshold: 60 * time.Millisecond,
 	})
 
-	p.AddStage("stage1", 60*time.Millisecond, func(ctx context.Context) error {
-		time.Sleep(60 * time.Millisecond)
+	p.AddStage("stage1", 40*time.Millisecond, func(ctx context.Context) error {
+		time.Sleep(40 * time.Millisecond)
 		return nil
 	})
 	p.AddStage("stage2", 0, func(ctx context.Context) error {
@@ -307,6 +307,9 @@ func TestExecute_MinThresholdSkip_ZeroBudgetStage(t *testing.T) {
 
 	report, _ := p.Execute(context.Background())
 
+	if report.Stages[0].Status != StageStatusCompleted {
+		t.Errorf("expected stage1 completed, got %v", report.Stages[0].Status)
+	}
 	if report.Stages[1].Status != StageStatusSkipped {
 		t.Errorf("expected zero-budget stage2 skipped due to min threshold, got %v", report.Stages[1].Status)
 	}
@@ -437,6 +440,51 @@ func TestExecute_StageReturnsError(t *testing.T) {
 	}
 	if report.Stages[1].Status != StageStatusSkipped {
 		t.Errorf("expected stage2 skipped, got %v", report.Stages[1].Status)
+	}
+}
+
+func TestExecute_BusinessError_NotMisclassifiedAsTimeout(t *testing.T) {
+	p := NewPropagatorWithConfig(Config{
+		TotalTimeout: 100 * time.Millisecond,
+		MinThreshold: 0,
+	})
+
+	businessErr := errors.New("business logic failed")
+
+	p.AddStage("stage1", 80*time.Millisecond, func(ctx context.Context) error {
+		time.Sleep(70 * time.Millisecond)
+		return businessErr
+	})
+
+	report, err := p.Execute(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("business error should not be misclassified as context.DeadlineExceeded, got %v", err)
+	}
+
+	if !errors.Is(err, businessErr) {
+		t.Errorf("expected business error, got %v", err)
+	}
+
+	var stageErr *StageTimeoutError
+	if errors.As(err, &stageErr) {
+		t.Errorf("business error should not be wrapped in StageTimeoutError, got %v", err)
+	}
+
+	if report.Success {
+		t.Error("expected failure")
+	}
+	if report.Stages[0].Status != StageStatusFailed {
+		t.Errorf("expected stage status FAILED (business error), got %v", report.Stages[0].Status)
+	}
+	if report.Stages[0].TimeoutType != TimeoutTypeNone {
+		t.Errorf("expected timeout type NONE (business error), got %v", report.Stages[0].TimeoutType)
+	}
+	if report.FailedStage != "stage1" {
+		t.Errorf("expected failed stage stage1, got %v", report.FailedStage)
 	}
 }
 

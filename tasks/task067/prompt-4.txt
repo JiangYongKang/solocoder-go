@@ -1,0 +1,4 @@
+你修复的工作流引擎模块仍存在两个问题，需要修复：
+1. types.go 中新增的 asInt() 辅助函数覆盖了 int、float64、int32、int64、uint、uint32、uint64 七种类型，但同一文件中已存在的 toFloat64() 函数还额外覆盖了 int8、int16、uint8、uint16、float32 和 string 共六种类型。两个功能定位相似的数值类型转换函数在同一模块中覆盖范围显著不对齐，后续 JSON 反序列化场景若遇到 asInt 未覆盖的类型仍可能类型断言失败。需要使 asInt 与 toFloat64 的覆盖范围对齐并补充对应的单元测试。
+2. task.go 的 FlakyTask.ExecuteWithState 使用 nodeState != nil 作为重置 failures 的触发条件，但 nodeState 非空只能说明当前是状态感知路径而非精确表达断点续传语义。而且 FlakyTask.RestoreState 先将 failures 从持久化状态恢复出来、ExecuteWithState 又立即将其清零，前后逻辑互相拉扯。需要让断点续传时的重置逻辑职责更清晰，避免恢复后又立即归零的冗余操作。
+3. 修复后运行 go test ./internal/workflow/ -v，需要让所有测试通过。

@@ -1,0 +1,7 @@
+产物不满意：
+1. 新增测试用例 TestExecute_BusinessError_NotMisclassifiedAsTimeout 未覆盖提示词描述的核心 bug 场景。提示词明确指出 bug 触发条件是"阶段 goroutine 返回业务错误且根 context 恰巧过期"，但测试中 stage1 sleep 70ms 加根超时 100ms，30ms 的差距彻底排除了根 context 过期的可能性，select 只会命中 `<-done` 拿到 businessErr，rootCtx.Err() 为 nil。即使在修复前的 buggy 代码中 isRootDeadline 也为 false，该测试在修复前后均能通过，不能验证修复有效性。根因是模型在编写回归测试时只关注了"业务错误返回"这一半，忽略了"根 context 同时过期"这一半竞争条件。正确做法是让 stage1 的 sleep 接近根超时（如 95ms），使 select 在 done channel 就绪和 rootCtx.Done() 关闭之间形成竞争，从而验证即使 select 拿到 businessErr 且 rootCtx.Err() 为 DeadlineExceeded 时，业务错误也不会被误判为超时。
+2. 时序测试 TestExecute_MinThresholdSkip_ZeroBudgetStage 的参数调整存在数学漏洞。模型将 MinThreshold 从 50ms 上调至 60ms、stage1 预算从 60ms 降至 40ms，声称"确保剩余时间肯定小于阈值"。但实际计算：TotalTimeout 100ms、stage1 执行约 40ms 加系统调度开销，剩余时间约 60ms 减开销严格小于 MinThreshold 60ms 的条件完全依赖系统调度开销的消耗量，安全余量仅剩不可控的调度开销本身。原始参数的安全余量为约 10ms（剩余 40ms 减开销小于 50ms），新参数的阈值正好压在剩余时间边界上，在慢机器上剩余时间可能刚刚超过 60ms 导致测试误失败，稳定性反而下降。根因是模型只做了直觉参数替换而未验算剩余时间与阈值的大小关系，应先根据 TotalTimeout 和 stage1 执行时间计算预期剩余时间范围，然后将 MinThreshold 设在该范围中间偏上位置。
+
+过程不满意：
+1. 模型在第四轮会话中仍然沿用了先规划再分析的行为模式，这在前三轮评估中已被反复指出。session-cot-4.md 显示模型收到提示词后第一个动作就是 todo_write 创建 4 项子任务计划，之后才开始查看 timeoutprop.go 代码。本轮提示词只有一个核心修复点加一个验证步骤，生成 4 项计划本身就是粒度失控的表现。连续四轮不改的模式证明模型缺乏从前序评估反馈中学习改进的能力，正确做法是先阅读代码理解根因再制定执行计划。
+2. 模型在遇到 TestExecute_MinThresholdSkip_ZeroBudgetStage 时序失败后虽然正确识别了是时序问题并搜索了 getRemainingTime 函数实现，但在参数调整时只做了"增大 MinThreshold 加减小 stage1 执行时间"的直觉操作，没有通过数学推算验证调整后的剩余时间 60ms 减开销与 MinThreshold 60ms 之间是否留有稳定余量。这属于参数调优停留在方向而忽视量值关系，正确做法是进行多轮重复运行验证稳定性或直接推算确保剩余时间与阈值之间存在显著差距。

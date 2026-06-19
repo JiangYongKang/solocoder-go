@@ -1,0 +1,5 @@
+你修复的 Raft 共识日志模块仍存在三个问题，需要修复：
+1. sendHeartbeats 方法中使用布尔字段 snapshotInstalling 跟踪快照发送状态。当 Leader 并发向多个落后 Follower 发送快照时，不同 goroutine 对同一个布尔字段独立 set/reset 存在竞态：一个 goroutine 完成快照清零后，另一个 goroutine 的快照还在生成中，Propose 检查到 false 即可继续提交新日志，导致快照生成期间产生的新日志未被快照包含。应将布尔字段改为原子计数器跟踪并发快照操作数量。
+2. sendHeartbeats 方法末尾新增的 heartbeatTimer nil 检查是为消除测试中手动设置 Leader 状态触发的 panic 而添加的，该分支在正常流程中永远不会执行。测试代码不应通过在生产代码中添加防卫逻辑来绕过初始化，正确做法是在触发 panic 的测试用例中补全节点初始化（调用 Start 或手动初始化 timer），然后移除生产代码中的 nil 检查。
+3. TestSnapshotInstallingError 测试通过直接赋值 node.snapshotInstalling = true 来触发 ErrSnapshotInstalling，仅验证了代码分支的语法可达性但未通过真实快照发送流程验证其流程可达性。应构造包含落后 Follower 的测试场景，使快照发送路径自然触发标志位变更，证明 Propose 中的判定分支可以在真实运行中触达。
+4. 修复后运行 go test ./internal/raftlog/ -v -count=2，需要连续两次运行全部测试通过。

@@ -22,7 +22,9 @@ func asInt(v interface{}) (int, bool) {
 	switch val := v.(type) {
 	case int:
 		return val, true
-	case float64:
+	case int8:
+		return int(val), true
+	case int16:
 		return int(val), true
 	case int32:
 		return int(val), true
@@ -30,10 +32,22 @@ func asInt(v interface{}) (int, bool) {
 		return int(val), true
 	case uint:
 		return int(val), true
+	case uint8:
+		return int(val), true
+	case uint16:
+		return int(val), true
 	case uint32:
 		return int(val), true
 	case uint64:
 		return int(val), true
+	case float32:
+		return int(val), true
+	case float64:
+		return int(val), true
+	case string:
+		var i int
+		_, err := fmt.Sscanf(val, "%d", &i)
+		return i, err == nil
 	default:
 		return 0, false
 	}
