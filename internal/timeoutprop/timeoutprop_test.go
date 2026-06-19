@@ -666,6 +666,79 @@ func TestStageTimeoutError_Unwrap_ContextDeadlineExceeded(t *testing.T) {
 	}
 }
 
+func TestExecute_ZeroBudgetStage_TotalTimeout(t *testing.T) {
+	p := NewPropagatorWithConfig(Config{
+		TotalTimeout: 50 * time.Millisecond,
+		MinThreshold: 0,
+	})
+
+	p.AddStage("stage1", 0, func(ctx context.Context) error {
+		time.Sleep(100 * time.Millisecond)
+		return nil
+	})
+
+	report, err := p.Execute(context.Background())
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context.DeadlineExceeded via errors.Is, got %v", err)
+	}
+
+	var stageErr *StageTimeoutError
+	if !errors.As(err, &stageErr) {
+		t.Errorf("expected StageTimeoutError via errors.As")
+	} else {
+		if stageErr.TimeoutType != TimeoutTypeTotal {
+			t.Errorf("expected TimeoutTypeTotal, got %v", stageErr.TimeoutType)
+		}
+		if stageErr.StageName != "stage1" {
+			t.Errorf("expected stage name stage1, got %v", stageErr.StageName)
+		}
+	}
+
+	if report.Success {
+		t.Error("expected failure")
+	}
+	if report.Stages[0].Status != StageStatusTimedOut {
+		t.Errorf("expected stage status TIMED_OUT, got %v", report.Stages[0].Status)
+	}
+	if report.Stages[0].TimeoutType != TimeoutTypeTotal {
+		t.Errorf("expected timeout type TOTAL, got %v", report.Stages[0].TimeoutType)
+	}
+	if report.FailedStage != "stage1" {
+		t.Errorf("expected failed stage stage1, got %v", report.FailedStage)
+	}
+}
+
+func TestExecute_ZeroBudgetStage_NoTimeout(t *testing.T) {
+	p := NewPropagatorWithConfig(Config{
+		TotalTimeout: 1 * time.Second,
+		MinThreshold: 0,
+	})
+
+	p.AddStage("stage1", 0, func(ctx context.Context) error {
+		time.Sleep(10 * time.Millisecond)
+		return nil
+	})
+
+	report, err := p.Execute(context.Background())
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+
+	if !report.Success {
+		t.Error("expected success")
+	}
+	if report.Stages[0].Status != StageStatusCompleted {
+		t.Errorf("expected stage status COMPLETED, got %v", report.Stages[0].Status)
+	}
+	if report.Stages[0].TimeoutType != TimeoutTypeNone {
+		t.Errorf("expected timeout type NONE, got %v", report.Stages[0].TimeoutType)
+	}
+}
+
 func TestExecute_ZeroBudgetStage(t *testing.T) {
 	p := NewPropagatorWithConfig(Config{
 		TotalTimeout: 1 * time.Second,

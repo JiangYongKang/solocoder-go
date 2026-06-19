@@ -2,6 +2,7 @@ package raftlog
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -775,7 +776,20 @@ func TestMemoryStateMachine_Snapshot(t *testing.T) {
 			Type:    LogEntryNormal,
 			Command: []byte(key),
 		}
-		sm.Apply(entry)
+		err := sm.Apply(entry)
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+	}
+
+	for _, key := range keys {
+		val, ok := sm.Get(key)
+		if !ok {
+			t.Errorf("Expected key %s to exist before snapshot", key)
+		}
+		if val != key {
+			t.Errorf("Expected value %s for key %s before snapshot, got %s", key, key, val)
+		}
 	}
 
 	snapData, err := sm.Snapshot()
@@ -825,6 +839,138 @@ func TestMemoryStateMachine_Snapshot(t *testing.T) {
 	}
 	if smEmpty.Count() != 0 {
 		t.Errorf("Expected count 0 after empty snapshot apply, got %d", smEmpty.Count())
+	}
+
+	smEmpty2 := NewMemoryStateMachine()
+	emptySnap2 := &Snapshot{
+		LastIncludedIndex: 0,
+		LastIncludedTerm:  0,
+		Data:              []byte{},
+	}
+	err = smEmpty2.ApplySnapshot(emptySnap2)
+	if err != nil {
+		t.Fatalf("ApplySnapshot with empty byte slice failed: %v", err)
+	}
+	if smEmpty2.Count() != 0 {
+		t.Errorf("Expected count 0 after empty byte slice snapshot apply, got %d", smEmpty2.Count())
+	}
+
+	sm3 := NewMemoryStateMachine()
+	corruptSnap := &Snapshot{
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Data:              []byte("this-is-not-valid-gob-data"),
+	}
+	err = sm3.ApplySnapshot(corruptSnap)
+	if err == nil {
+		t.Error("Expected error when applying corrupt snapshot data")
+	}
+
+	sm4 := NewMemoryStateMachine()
+	for i := 0; i < 100; i++ {
+		entry := &LogEntry{
+			Term:    1,
+			Index:   i + 1,
+			Type:    LogEntryNormal,
+			Command: []byte(fmt.Sprintf("large-key-%04d", i)),
+		}
+		err := sm4.Apply(entry)
+		if err != nil {
+			t.Fatalf("Apply large data failed: %v", err)
+		}
+	}
+	if sm4.Count() != 100 {
+		t.Fatalf("Expected count 100 for large test, got %d", sm4.Count())
+	}
+	largeSnapData, err := sm4.Snapshot()
+	if err != nil {
+		t.Fatalf("Large snapshot failed: %v", err)
+	}
+	sm5 := NewMemoryStateMachine()
+	err = sm5.ApplySnapshot(&Snapshot{
+		LastIncludedIndex: 100,
+		LastIncludedTerm:  1,
+		Data:              largeSnapData,
+	})
+	if err != nil {
+		t.Fatalf("Apply large snapshot failed: %v", err)
+	}
+	if sm5.Count() != 100 {
+		t.Errorf("Expected count 100 after large snapshot restore, got %d", sm5.Count())
+	}
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("large-key-%04d", i)
+		val, ok := sm5.Get(key)
+		if !ok {
+			t.Errorf("Expected key %s to exist after large restore", key)
+		}
+		if val != key {
+			t.Errorf("Expected value %s for key %s after large restore, got %s", key, key, val)
+		}
+	}
+
+	sm6 := NewMemoryStateMachine()
+	for i, key := range keys {
+		entry := &LogEntry{
+			Term:    1,
+			Index:   i + 1,
+			Type:    LogEntryNormal,
+			Command: []byte(key),
+		}
+		sm6.Apply(entry)
+	}
+	incrementalSnap, _ := sm6.Snapshot()
+	incrementalEntry := &LogEntry{
+		Term:    2,
+		Index:   6,
+		Type:    LogEntryNormal,
+		Command: []byte("key-F"),
+	}
+	sm6.Apply(incrementalEntry)
+
+	sm7 := NewMemoryStateMachine()
+	sm7.ApplySnapshot(&Snapshot{
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Data:              incrementalSnap,
+	})
+	sm7.Apply(incrementalEntry)
+	if sm7.Count() != 6 {
+		t.Errorf("Expected count 6 after incremental apply, got %d", sm7.Count())
+	}
+	if _, ok := sm7.Get("key-F"); !ok {
+		t.Error("Expected key-F to exist after incremental apply")
+	}
+}
+
+func TestSnapshotInstallingError(t *testing.T) {
+	transport := NewMemoryTransport()
+	sm := NewMemoryStateMachine()
+	cfg := DefaultRaftConfig()
+
+	node := NewRaftNode("n1", cfg, sm, transport, []string{"n1", "n2"})
+	node.state = Leader
+	node.currentTerm = 1
+	node.running = true
+
+	node.snapshotInstalling = true
+
+	_, _, err := node.Propose([]byte("test-data"))
+	if !errors.Is(err, ErrSnapshotInstalling) {
+		t.Errorf("Expected ErrSnapshotInstalling, got err=%v", err)
+	}
+
+	node.snapshotInstalling = false
+
+	idx, term, err := node.Propose([]byte("test-data-2"))
+	if err != nil {
+		t.Fatalf("Expected no error after snapshot installing cleared, got err=%v", err)
+	}
+	if idx <= 0 {
+		t.Errorf("Expected positive index, got %d", idx)
+	}
+	if term != 1 {
+		t.Errorf("Expected term 1, got %d", term)
 	}
 }
 
@@ -1518,73 +1664,6 @@ func TestJointConfig_LogReplicationDuringConfigChange(t *testing.T) {
 	}
 }
 
-func TestMemoryStateMachine_SnapshotIntegrity(t *testing.T) {
-	sm := NewMemoryStateMachine()
-
-	keys := []string{"key1", "key2", "key3", "key4", "key5"}
-	for i, key := range keys {
-		entry := &LogEntry{
-			Term:    1,
-			Index:   i + 1,
-			Type:    LogEntryNormal,
-			Command: []byte(key),
-		}
-		err := sm.Apply(entry)
-		if err != nil {
-			t.Fatalf("Apply failed: %v", err)
-		}
-	}
-
-	for _, key := range keys {
-		val, ok := sm.Get(key)
-		if !ok {
-			t.Errorf("Expected key %s to exist", key)
-		}
-		if val != key {
-			t.Errorf("Expected value %s for key %s, got %s", key, key, val)
-		}
-	}
-
-	if sm.Count() != 5 {
-		t.Errorf("Expected count 5, got %d", sm.Count())
-	}
-
-	snapData, err := sm.Snapshot()
-	if err != nil {
-		t.Fatalf("Snapshot failed: %v", err)
-	}
-
-	if len(snapData) == 0 {
-		t.Fatal("Snapshot data should not be empty")
-	}
-
-	sm2 := NewMemoryStateMachine()
-	snap := &Snapshot{
-		LastIncludedIndex: 5,
-		LastIncludedTerm:  1,
-		Data:              snapData,
-	}
-
-	err = sm2.ApplySnapshot(snap)
-	if err != nil {
-		t.Fatalf("ApplySnapshot failed: %v", err)
-	}
-
-	if sm2.Count() != 5 {
-		t.Errorf("Expected count 5 after snapshot restore, got %d", sm2.Count())
-	}
-
-	for _, key := range keys {
-		val, ok := sm2.Get(key)
-		if !ok {
-			t.Errorf("Expected key %s to exist after restore", key)
-		}
-		if val != key {
-			t.Errorf("Expected value %s for key %s after restore, got %s", key, key, val)
-		}
-	}
-}
-
 func TestAddNode_WithConcurrentPropose(t *testing.T) {
 	nodeIDs := []string{"n1", "n2", "n3"}
 	cfg := RaftConfig{
@@ -1683,8 +1762,38 @@ func TestLogCompactedError(t *testing.T) {
 		t.Fatalf("CompactLog failed: %v", err)
 	}
 
-	entry := node.getLogEntry(5)
+	entry, err := node.GetLogEntry(5)
+	if !errors.Is(err, ErrLogCompacted) {
+		t.Errorf("Expected ErrLogCompacted for index 5, got err=%v, entry=%v", err, entry)
+	}
 	if entry != nil {
-		t.Error("Expected nil entry for compacted index")
+		t.Errorf("Expected nil entry for compacted index, got %v", entry)
+	}
+
+	entry, err = node.GetLogEntry(100)
+	if !errors.Is(err, ErrInvalidIndex) {
+		t.Errorf("Expected ErrInvalidIndex for index 100, got err=%v, entry=%v", err, entry)
+	}
+	if entry != nil {
+		t.Errorf("Expected nil entry for invalid index, got %v", entry)
+	}
+
+	entry, err = node.GetLogEntry(15)
+	if err != nil {
+		t.Errorf("Expected no error for valid index 15, got err=%v", err)
+	}
+	if entry == nil {
+		t.Error("Expected non-nil entry for valid index 15")
+	}
+	if entry.Index != 15 {
+		t.Errorf("Expected entry index 15, got %d", entry.Index)
+	}
+
+	entry, err = node.GetLogEntry(10)
+	if err != nil {
+		t.Errorf("Expected no error for index 10 (compaction boundary), got err=%v", err)
+	}
+	if entry == nil {
+		t.Error("Expected non-nil entry for index 10")
 	}
 }

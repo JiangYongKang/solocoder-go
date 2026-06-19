@@ -150,7 +150,7 @@ func (p *Propagator) Execute(parentCtx context.Context) (*ChainReport, error) {
 		if hasBudget {
 			stageCtx, stageCancel = context.WithTimeout(rootCtx, stageBudget)
 		} else {
-			stageCtx, stageCancel = context.WithCancel(rootCtx)
+			stageCtx, stageCancel = context.WithTimeout(rootCtx, remainingTime)
 			stageBudget = remainingTime
 		}
 
@@ -190,11 +190,19 @@ func (p *Propagator) Execute(parentCtx context.Context) (*ChainReport, error) {
 
 			timeoutType := TimeoutTypeNone
 			stageStatus := StageStatusFailed
-			if errors.Is(err, context.DeadlineExceeded) {
+
+			rootCtxErr := rootCtx.Err()
+			isRootDeadline := errors.Is(rootCtxErr, context.DeadlineExceeded)
+			isDeadline := errors.Is(err, context.DeadlineExceeded)
+
+			if isDeadline || isRootDeadline {
 				stageStatus = StageStatusTimedOut
-				if !hasBudget || errors.Is(rootCtx.Err(), context.DeadlineExceeded) {
+				if !hasBudget || isRootDeadline {
 					timeoutType = TimeoutTypeTotal
 					timeoutReason = "total timeout exceeded"
+					if !isDeadline {
+						err = context.DeadlineExceeded
+					}
 				} else {
 					timeoutType = TimeoutTypeBudget
 					timeoutReason = fmt.Sprintf("stage budget exceeded: %v", stageBudget)

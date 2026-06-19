@@ -55,7 +55,7 @@ func New(participants int, callback ...CallbackFunc) (*Barrier, error) {
 	return b, nil
 }
 
-func (b *Barrier) releaseWithCallbackLocked(cbErr error) []chan error {
+func (b *Barrier) snapshotAndTransitionLocked() []chan error {
 	chans := make([]chan error, 0, len(b.waiters))
 	for _, w := range b.waiters {
 		chans = append(chans, w.done)
@@ -72,7 +72,7 @@ func (b *Barrier) releaseWithCallbackLocked(cbErr error) []chan error {
 func (b *Barrier) doRelease() error {
 	var cbErr error
 	callback := b.callback
-	chans := b.releaseWithCallbackLocked(cbErr)
+	chans := b.snapshotAndTransitionLocked()
 	b.mu.Unlock()
 
 	if callback != nil {
@@ -190,6 +190,7 @@ func (b *Barrier) Break() {
 	defer b.mu.Unlock()
 
 	b.broken = true
+	b.released = false
 	b.generation++
 
 	for _, w := range b.waiters {

@@ -18,6 +18,27 @@ var (
 	ErrWorkflowCanceled     = errors.New("workflow: workflow canceled")
 )
 
+func asInt(v interface{}) (int, bool) {
+	switch val := v.(type) {
+	case int:
+		return val, true
+	case float64:
+		return int(val), true
+	case int32:
+		return int(val), true
+	case int64:
+		return int(val), true
+	case uint:
+		return int(val), true
+	case uint32:
+		return int(val), true
+	case uint64:
+		return int(val), true
+	default:
+		return 0, false
+	}
+}
+
 type NodeType string
 
 const (

@@ -1,0 +1,5 @@
+你实现的 Raft 共识日志模块仍存在一些问题，需要修复：
+1. raftlog_test.go 的 TestLogCompactedError 测试中直接调用了私有方法 getLogEntry 而非模型新增的公开方法 GetLogEntry。GetLogEntry 新增目的是作为 ErrLogCompacted 和 ErrInvalidIndex 错误的公开验证入口，但测试绕过了公开 API 调用私有实现，没有验证这两个哨兵错误能否通过公开方法的返回值被外部调用方正确检测。
+2. raftlog.go 中新增的 snapshotInstalling 字段在 HandleInstallSnapshot 方法执行全过程中从未被设置为 true。Propose 方法新增了对该字段的检查，但由于 HandleInstallSnapshot 持锁同步完成快照安装且从未设置标志位，Propose 中的对应判断分支成为永远不可达的死代码，ErrSnapshotInstalling 虽然在语法上被引用但无法在真实场景下被触发。
+3. raftlog_test.go 中新增的 TestMemoryStateMachine_SnapshotIntegrity 测试与同一文件内修改后的 TestMemoryStateMachine_Snapshot 核心逻辑高度重复，二者都创建键值对、导出 gob 快照、创建新实例恢复、逐键验证，差异仅在于键名不同，未引入新的边界条件或异常场景覆盖。
+4. 修复后运行 go test ./internal/raftlog/ -v，需要让所有测试通过。

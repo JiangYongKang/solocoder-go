@@ -218,6 +218,11 @@ func (n *FlakyTask) Execute(ctx context.Context, execCtx *ExecutionContext) (*No
 }
 
 func (n *FlakyTask) ExecuteWithState(ctx context.Context, execCtx *ExecutionContext, nodeState *NodeExecutionState) (*NodeResult, error) {
+	if nodeState != nil {
+		n.mu.Lock()
+		n.failures = 0
+		n.mu.Unlock()
+	}
 	return executeWithRetry(ctx, n, execCtx, func(ctx context.Context, execCtx *ExecutionContext) (*NodeResult, error) {
 		n.mu.Lock()
 		n.failures++
@@ -244,7 +249,7 @@ func (n *FlakyTask) RestoreState(state NodeStateData) {
 		return
 	}
 	if stateMap, ok := state.(map[string]interface{}); ok {
-		if failures, ok := stateMap["failures"].(int); ok {
+		if failures, ok := asInt(stateMap["failures"]); ok {
 			n.mu.Lock()
 			n.failures = failures
 			n.mu.Unlock()

@@ -41,7 +41,7 @@ func (n *SequentialNode) ExecuteWithState(ctx context.Context, execCtx *Executio
 			startIndex = 0
 		} else if nodeState.InternalState != nil {
 			if state, ok := nodeState.InternalState.(map[string]interface{}); ok {
-				if idx, ok := state["current_index"].(int); ok {
+				if idx, ok := asInt(state["current_index"]); ok {
 					startIndex = idx
 					n.currentIndex = idx
 				}
@@ -105,7 +105,7 @@ func (n *SequentialNode) RestoreState(state NodeStateData) {
 		return
 	}
 	if stateMap, ok := state.(map[string]interface{}); ok {
-		if idx, ok := stateMap["current_index"].(int); ok {
+		if idx, ok := asInt(stateMap["current_index"]); ok {
 			n.currentIndex = idx
 		}
 	}

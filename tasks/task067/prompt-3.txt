@@ -1,0 +1,4 @@
+你实现的工作流引擎模块仍存在一些问题，需要修复：
+1. task.go 的 FlakyTask.RestoreState、sequential.go 的 SequentialNode.RestoreState、loop.go 的 LoopNode.RestoreState 三个方法在从 stateMap 中提取整数字段时只判断 int 类型，但 JSON 反序列化会将数值转为 float64，导致类型断言失败、状态恢复静默失效。而 docs/workflow.md 中明确写了三个 RestoreState 方法都兼容 int 和 float64 类型，代码实现与文档承诺不一致。
+2. task.go 的 FlakyTask.ExecuteWithState 在断点续传场景下 failures 计数器被恢复但没有重置。如果节点之前因 flaky 失败且 failures 已超过 FailCount 阈值，恢复后第一次执行就因为 failures 已达上限而成功，未按预期从零开始重试。
+3. 修复后运行 go test ./internal/workflow/ -v，需要让所有测试通过。

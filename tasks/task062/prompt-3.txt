@@ -1,0 +1,4 @@
+你实现的资源配额管理器模块仍存在一些问题，需要修复：
+1. docs/quotamgr.md 第 8.2 节写"禁止在持有租户级锁的情况下获取全局锁"与 8.3.1 节 AcquireResource 实际锁流程（先获取租户级写锁再获取全局读锁）存在内部矛盾，文档前后不一致会误导后续维护者。全局读锁具备共享特性使这种顺序是安全的，文档中的禁止条款应修正为与实际实现一致的描述。
+2. TestAcquireResource_ConcurrentAdjustQuota 测试中在 goroutine 循环内以 i==50 为条件触发 AdjustQuota 缩减配额，依赖不可控的调度时序来保证足够多的申请 goroutine 在配额缩减前执行完。当 AdjustQuota 的 goroutine 被过早调度时 usage 合法地低于 5.0，断言 `info.Usage.CPU < 5.0` 为错误会误报失败。
+3. 修复后运行 go test ./internal/quotamgr/ -v，需要让所有测试通过。

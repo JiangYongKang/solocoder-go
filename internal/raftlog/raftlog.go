@@ -889,12 +889,10 @@ func (n *RaftNode) sendHeartbeats() {
 				lastTerm := n.lastSnapshotTerm
 				cfg := n.config.Clone()
 				curTerm := n.currentTerm
+				n.snapshotInstalling = true
 				n.mu.Unlock()
 
 				data, err := n.sm.Snapshot()
-				if err != nil {
-					return
-				}
 				req := &InstallSnapshotRequest{
 					Term:              curTerm,
 					LeaderID:          leaderID,
@@ -904,8 +902,16 @@ func (n *RaftNode) sendHeartbeats() {
 					Data:              data,
 					Done:              true,
 				}
-				reply, err := n.transport.SendInstallSnapshot(target, req)
+
+				var reply *InstallSnapshotReply
+				if err == nil {
+					reply, err = n.transport.SendInstallSnapshot(target, req)
+				}
+
+				n.mu.Lock()
+				n.snapshotInstalling = false
 				if err != nil {
+					n.mu.Unlock()
 					return
 				}
 				n.handleInstallSnapshotReply(target, reply)
@@ -952,7 +958,9 @@ func (n *RaftNode) sendHeartbeats() {
 
 	n.mu.Lock()
 	if n.state == Leader && n.running {
-		n.heartbeatTimer.Reset(n.cfg.HeartbeatInterval)
+		if n.heartbeatTimer != nil {
+			n.heartbeatTimer.Reset(n.cfg.HeartbeatInterval)
+		}
 	}
 	n.mu.Unlock()
 }

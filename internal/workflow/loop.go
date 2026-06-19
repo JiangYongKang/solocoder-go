@@ -86,7 +86,7 @@ func (n *LoopNode) ExecuteWithState(ctx context.Context, execCtx *ExecutionConte
 			n.currentIteration = 0
 		} else if nodeState.InternalState != nil {
 			if state, ok := nodeState.InternalState.(map[string]interface{}); ok {
-				if iter, ok := state["current_iteration"].(int); ok {
+				if iter, ok := asInt(state["current_iteration"]); ok {
 					n.currentIteration = iter
 				}
 			}
@@ -201,7 +201,7 @@ func (n *LoopNode) RestoreState(state NodeStateData) {
 		return
 	}
 	if stateMap, ok := state.(map[string]interface{}); ok {
-		if iter, ok := stateMap["current_iteration"].(int); ok {
+		if iter, ok := asInt(stateMap["current_iteration"]); ok {
 			n.currentIteration = iter
 		}
 	}
