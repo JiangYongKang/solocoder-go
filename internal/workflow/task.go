@@ -234,7 +234,7 @@ func (n *FlakyTask) ExecuteWithState(ctx context.Context, execCtx *ExecutionCont
 }
 
 func (n *FlakyTask) GetState() NodeStateData {
-	return nil
+	return map[string]interface{}{}
 }
 
 func (n *FlakyTask) RestoreState(state NodeStateData) {

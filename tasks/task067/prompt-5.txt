@@ -1,0 +1,5 @@
+你修复的工作流引擎模块仍存在三个问题，需要修复：
+1. types.go 中 asInt 函数对 uint64 转为 int 时仍未做溢出保护。当 uint64 值超过 math.MaxInt64 时，`return int(val), true` 会将值静默截断为负数但 asInt 仍返回 ok 为 true。这个问题在 assessment-3 中已指出但本轮只修复了类型覆盖对齐而忽视了溢出保护。需要在转换前增加溢出检查，若 uint64 值超过 math.MaxInt64 则返回 0 和 false。
+2. task.go 中 FlakyTask.GetState 被改为返回 nil 使得 RestoreState 在引擎的断点续传路径中成为死代码。引擎的 restoreNodeState 从持久化的 InternalState 中取出数据后调用 node.RestoreState(state)，但 GetState 返回 nil 使得保存时 InternalState 就是 nil，恢复时传入的 state 也为 nil，RestoreState 中的 `n.failures = 0` 在 failures 本就是零值时执行了空操作。需要让 GetState 和 RestoreState 在断点续传闭环中完成有意义的 failures 重置，而非依赖 nil 返回值的副作用。
+3. 新增测试 TestFlakyTask_ResumeFromBreakpoint_RetryFromScratch 使用 NewFlakyTask 创建全新实例来执行第二次执行（FailCount=10 改为 FailCount=1），绕过了 RestoreState 的调用路径——全新实例的 failures 天然为 0。该测试不能证明 RestoreState 的语义正确，需要构造通过 SaveState 和 LoadState 的完整持久化-恢复路径来验证 FlakyTask 在断点续传后 failures 被正确重置。
+4. 修复后运行 go test ./internal/workflow/ -v，需要让所有测试通过。

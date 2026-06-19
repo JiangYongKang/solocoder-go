@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,9 @@ func asInt(v interface{}) (int, bool) {
 	case uint32:
 		return int(val), true
 	case uint64:
+		if val > math.MaxInt64 {
+			return 0, false
+		}
 		return int(val), true
 	case float32:
 		return int(val), true

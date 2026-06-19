@@ -314,7 +314,7 @@ type RaftNode struct {
 	randState int64
 
 	configChangeInFlight bool
-	snapshotInFlight     int
+	snapshotInFlight     int32
 }
 
 type Transport interface {
@@ -889,7 +889,7 @@ func (n *RaftNode) sendHeartbeats() {
 				lastTerm := n.lastSnapshotTerm
 				cfg := n.config.Clone()
 				curTerm := n.currentTerm
-				n.snapshotInFlight++
+				atomic.AddInt32(&n.snapshotInFlight, 1)
 				n.mu.Unlock()
 
 				data, err := n.sm.Snapshot()
@@ -908,13 +908,8 @@ func (n *RaftNode) sendHeartbeats() {
 					reply, err = n.transport.SendInstallSnapshot(target, req)
 				}
 
-				n.mu.Lock()
-				n.snapshotInFlight--
-				if n.snapshotInFlight < 0 {
-					n.snapshotInFlight = 0
-				}
+				atomic.AddInt32(&n.snapshotInFlight, -1)
 				if err != nil {
-					n.mu.Unlock()
 					return
 				}
 				n.handleInstallSnapshotReply(target, reply)
@@ -1326,6 +1321,9 @@ func (n *RaftNode) applyLoop() {
 }
 
 func (n *RaftNode) Propose(command []byte) (int, int, error) {
+	if atomic.LoadInt32(&n.snapshotInFlight) > 0 {
+		return 0, 0, ErrSnapshotInstalling
+	}
 	n.mu.Lock()
 	if n.state != Leader {
 		n.mu.Unlock()
@@ -1339,7 +1337,7 @@ func (n *RaftNode) Propose(command []byte) (int, int, error) {
 		n.mu.Unlock()
 		return 0, 0, ErrConfigChangeInFlight
 	}
-	if n.snapshotInFlight > 0 {
+	if atomic.LoadInt32(&n.snapshotInFlight) > 0 {
 		n.mu.Unlock()
 		return 0, 0, ErrSnapshotInstalling
 	}
@@ -1726,8 +1724,4 @@ func (c *Cluster) NodeCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.nodes)
-}
-
-func init() {
-	_ = atomic.Int32{}
 }

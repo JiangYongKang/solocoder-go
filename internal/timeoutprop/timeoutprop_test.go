@@ -293,12 +293,12 @@ func TestExecute_MinThresholdSkip(t *testing.T) {
 
 func TestExecute_MinThresholdSkip_ZeroBudgetStage(t *testing.T) {
 	p := NewPropagatorWithConfig(Config{
-		TotalTimeout: 100 * time.Millisecond,
-		MinThreshold: 60 * time.Millisecond,
+		TotalTimeout: 150 * time.Millisecond,
+		MinThreshold: 80 * time.Millisecond,
 	})
 
-	p.AddStage("stage1", 40*time.Millisecond, func(ctx context.Context) error {
-		time.Sleep(40 * time.Millisecond)
+	p.AddStage("stage1", 100*time.Millisecond, func(ctx context.Context) error {
+		time.Sleep(80 * time.Millisecond)
 		return nil
 	})
 	p.AddStage("stage2", 0, func(ctx context.Context) error {
@@ -451,8 +451,8 @@ func TestExecute_BusinessError_NotMisclassifiedAsTimeout(t *testing.T) {
 
 	businessErr := errors.New("business logic failed")
 
-	p.AddStage("stage1", 80*time.Millisecond, func(ctx context.Context) error {
-		time.Sleep(70 * time.Millisecond)
+	p.AddStage("stage1", 98*time.Millisecond, func(ctx context.Context) error {
+		time.Sleep(95 * time.Millisecond)
 		return businessErr
 	})
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -946,20 +947,49 @@ func TestMemoryStateMachine_Snapshot(t *testing.T) {
 }
 
 type blockingStateMachine struct {
-	mu              sync.RWMutex
-	data            map[string]string
-	snapshotStarted chan struct{}
-	snapshotWait    chan struct{}
-	snapshotBlock   bool
+	mu       sync.RWMutex
+	data     map[string]string
+	inFlight int32
+	blockCh  chan struct{}
+	blockMu  sync.Mutex
 }
 
 func newBlockingStateMachine() *blockingStateMachine {
 	return &blockingStateMachine{
-		data:            make(map[string]string),
-		snapshotStarted: make(chan struct{}, 1),
-		snapshotWait:    make(chan struct{}, 1),
-		snapshotBlock:   false,
+		data: make(map[string]string),
 	}
+}
+
+func (sm *blockingStateMachine) EnableBlock() {
+	sm.blockMu.Lock()
+	defer sm.blockMu.Unlock()
+	if sm.blockCh == nil {
+		sm.blockCh = make(chan struct{})
+	}
+}
+
+func (sm *blockingStateMachine) ReleaseAll() {
+	sm.blockMu.Lock()
+	defer sm.blockMu.Unlock()
+	if sm.blockCh != nil {
+		close(sm.blockCh)
+		sm.blockCh = nil
+	}
+}
+
+func (sm *blockingStateMachine) SnapshotsInFlight() int {
+	return int(atomic.LoadInt32(&sm.inFlight))
+}
+
+func (sm *blockingStateMachine) WaitForInFlight(target int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if int(atomic.LoadInt32(&sm.inFlight)) >= target {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
 }
 
 func (sm *blockingStateMachine) Apply(entry *LogEntry) error {
@@ -989,13 +1019,17 @@ func (sm *blockingStateMachine) ApplySnapshot(snapshot *Snapshot) error {
 }
 
 func (sm *blockingStateMachine) Snapshot() ([]byte, error) {
-	if sm.snapshotBlock {
-		select {
-		case sm.snapshotStarted <- struct{}{}:
-		default:
-		}
-		<-sm.snapshotWait
+	atomic.AddInt32(&sm.inFlight, 1)
+	defer atomic.AddInt32(&sm.inFlight, -1)
+
+	sm.blockMu.Lock()
+	ch := sm.blockCh
+	sm.blockMu.Unlock()
+
+	if ch != nil {
+		<-ch
 	}
+
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	var buf bytes.Buffer
@@ -1006,6 +1040,64 @@ func (sm *blockingStateMachine) Snapshot() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func setupSnapshotTestLeader(t *testing.T, cfg RaftConfig, sm StateMachine, transport Transport, followerIDs []string, logEntries int, compactIdx int) *RaftNode {
+	t.Helper()
+	allNodes := append([]string{"n1"}, followerIDs...)
+	leader := NewRaftNode("n1", cfg, sm, transport, allNodes)
+
+	leader.electionTimer = time.NewTimer(cfg.ElectionTimeoutMin)
+	leader.heartbeatTimer = time.NewTimer(cfg.HeartbeatInterval)
+	leader.heartbeatTimer.Stop()
+
+	leader.running = true
+	leader.state = Leader
+	leader.currentTerm = 1
+	leader.votedFor = "n1"
+	leader.nextIndex = make(map[string]int)
+	leader.matchIndex = make(map[string]int)
+
+	for i := 1; i <= logEntries; i++ {
+		leader.appendEntry(&LogEntry{Term: 1, Index: i, Type: LogEntryNormal, Command: []byte(fmt.Sprintf("entry-%d", i))})
+		sm.Apply(&LogEntry{Term: 1, Index: i, Type: LogEntryNormal, Command: []byte(fmt.Sprintf("entry-%d", i))})
+	}
+	leader.commitIndex = logEntries
+	leader.lastApplied = logEntries
+	leader.lastSnapshotIndex = compactIdx / 2
+	leader.lastSnapshotTerm = 1
+
+	leader.mu.Lock()
+	if compactIdx < len(leader.log) {
+		leader.log = leader.log[compactIdx:]
+	} else {
+		leader.log = []*LogEntry{}
+	}
+	leader.logOffset = compactIdx
+	for _, fid := range followerIDs {
+		leader.nextIndex[fid] = 1
+	}
+	leader.mu.Unlock()
+
+	transport.RegisterNode("n1", leader)
+	return leader
+}
+
+func setupSnapshotTestFollower(t *testing.T, id string, cfg RaftConfig, sm StateMachine, transport Transport) *RaftNode {
+	t.Helper()
+	follower := NewRaftNode(id, cfg, sm, transport, []string{"n1", id})
+
+	follower.electionTimer = time.NewTimer(cfg.ElectionTimeoutMin)
+	follower.heartbeatTimer = time.NewTimer(cfg.HeartbeatInterval)
+	follower.heartbeatTimer.Stop()
+
+	follower.running = true
+	follower.state = Follower
+	follower.currentTerm = 1
+	follower.leaderID = "n1"
+
+	transport.RegisterNode(id, follower)
+	return follower
+}
+
 func TestSnapshotInstallingError(t *testing.T) {
 	cfg := RaftConfig{
 		ElectionTimeoutMin: 50 * time.Millisecond,
@@ -1013,191 +1105,127 @@ func TestSnapshotInstallingError(t *testing.T) {
 		HeartbeatInterval:  10 * time.Millisecond,
 	}
 
-	t.Run("DirectCounterTest", func(t *testing.T) {
-		transport := NewMemoryTransport()
-		sm := NewMemoryStateMachine()
-		node := NewRaftNode("n1", cfg, sm, transport, []string{"n1"})
-		node.Start()
-		defer node.Stop()
-
-		time.Sleep(150 * time.Millisecond)
-
-		node.mu.Lock()
-		if node.state != Leader {
-			node.mu.Unlock()
-			t.Fatalf("Expected Leader, got %v", node.State())
-		}
-		node.snapshotInFlight = 1
-		node.mu.Unlock()
-
-		_, _, err := node.Propose([]byte("test-data"))
-		if !errors.Is(err, ErrSnapshotInstalling) {
-			t.Errorf("Expected ErrSnapshotInstalling when snapshotInFlight=1, got err=%v", err)
-		}
-
-		node.mu.Lock()
-		node.snapshotInFlight = 0
-		node.mu.Unlock()
-
-		idx, term, err := node.Propose([]byte("test-data-2"))
-		if err != nil {
-			t.Fatalf("Expected no error after snapshotInFlight=0, got err=%v", err)
-		}
-		if idx <= 0 {
-			t.Errorf("Expected positive index, got %d", idx)
-		}
-		if term <= 0 {
-			t.Errorf("Expected positive term, got %d", term)
-		}
-	})
-
-	t.Run("ConcurrentSnapshotCounterTest", func(t *testing.T) {
-		transport := NewMemoryTransport()
-		sm := NewMemoryStateMachine()
-		node := NewRaftNode("n1", cfg, sm, transport, []string{"n1"})
-		node.Start()
-		defer node.Stop()
-
-		time.Sleep(150 * time.Millisecond)
-
-		node.mu.Lock()
-		node.snapshotInFlight = 3
-		node.mu.Unlock()
-
-		_, _, err := node.Propose([]byte("during-3-snapshots"))
-		if !errors.Is(err, ErrSnapshotInstalling) {
-			t.Errorf("Expected ErrSnapshotInstalling when 3 snapshots in flight, got err=%v", err)
-		}
-
-		node.mu.Lock()
-		node.snapshotInFlight = 2
-		node.mu.Unlock()
-
-		_, _, err = node.Propose([]byte("during-2-snapshots"))
-		if !errors.Is(err, ErrSnapshotInstalling) {
-			t.Errorf("Expected ErrSnapshotInstalling when 2 snapshots still in flight, got err=%v", err)
-		}
-
-		node.mu.Lock()
-		node.snapshotInFlight = 0
-		node.mu.Unlock()
-
-		_, _, err = node.Propose([]byte("after-all-snapshots"))
-		if err != nil {
-			t.Errorf("Expected success when no snapshots in flight, got err=%v", err)
-		}
-	})
-
-	t.Run("RealSnapshotPathReachabilityTest", func(t *testing.T) {
+	t.Run("SingleSnapshotBlocksPropose", func(t *testing.T) {
 		transport := NewMemoryTransport()
 		leaderSM := newBlockingStateMachine()
-		leaderSM.snapshotBlock = true
+		leaderSM.EnableBlock()
 		followerSM := NewMemoryStateMachine()
 
-		leader := NewRaftNode("n1", cfg, leaderSM, transport, []string{"n1", "n2"})
-		follower := NewRaftNode("n2", cfg, followerSM, transport, []string{"n1", "n2"})
+		leader := setupSnapshotTestLeader(t, cfg, leaderSM, transport, []string{"n2"}, 30, 20)
+		setupSnapshotTestFollower(t, "n2", cfg, followerSM, transport)
 
-		leader.electionTimer = time.NewTimer(cfg.ElectionTimeoutMin)
-		leader.heartbeatTimer = time.NewTimer(cfg.HeartbeatInterval)
-		leader.heartbeatTimer.Stop()
-		follower.electionTimer = time.NewTimer(cfg.ElectionTimeoutMin)
-		follower.heartbeatTimer = time.NewTimer(cfg.HeartbeatInterval)
-		follower.heartbeatTimer.Stop()
-
-		transport.RegisterNode("n1", leader)
-		transport.RegisterNode("n2", follower)
-
-		leader.running = true
-		leader.state = Leader
-		leader.currentTerm = 1
-		leader.votedFor = "n1"
-		leader.nextIndex = make(map[string]int)
-		leader.matchIndex = make(map[string]int)
-
-		follower.running = true
-		follower.state = Follower
-		follower.currentTerm = 1
-		follower.leaderID = "n1"
-
-		for i := 1; i <= 30; i++ {
-			leader.appendEntry(&LogEntry{Term: 1, Index: i, Type: LogEntryNormal, Command: []byte(fmt.Sprintf("entry-%d", i))})
-			leaderSM.Apply(&LogEntry{Term: 1, Index: i, Type: LogEntryNormal, Command: []byte(fmt.Sprintf("entry-%d", i))})
-		}
-		leader.commitIndex = 30
-		leader.lastApplied = 30
-		leader.lastSnapshotIndex = 15
-		leader.lastSnapshotTerm = 1
-
-		leader.mu.Lock()
-		cutIdx := 20
-		if cutIdx < len(leader.log) {
-			leader.log = leader.log[cutIdx:]
-		} else {
-			leader.log = []*LogEntry{}
-		}
-		leader.logOffset = cutIdx
-		leader.nextIndex["n2"] = 5
-		leader.mu.Unlock()
-
-		triggeredCh := make(chan struct{}, 1)
-		errCh := make(chan error, 1)
-		doneCh := make(chan struct{}, 1)
-
-		go func() {
-			time.Sleep(10 * time.Millisecond)
-			select {
-			case <-leaderSM.snapshotStarted:
-				triggeredCh <- struct{}{}
-			case <-time.After(500 * time.Millisecond):
-				close(triggeredCh)
-				return
-			}
-			_, _, proposeErr := leader.Propose([]byte("during-snapshot"))
-			errCh <- proposeErr
-			select {
-			case leaderSM.snapshotWait <- struct{}{}:
-			default:
-			}
-			close(doneCh)
-		}()
-
-		leader.sendHeartbeats()
-
-		select {
-		case _, ok := <-triggeredCh:
-			if ok {
-				select {
-				case proposeErr := <-errCh:
-					if !errors.Is(proposeErr, ErrSnapshotInstalling) {
-						t.Errorf("Expected ErrSnapshotInstalling during real snapshot send path, got err=%v", proposeErr)
-					}
-				case <-time.After(2 * time.Second):
-					t.Error("Timed out waiting for Propose result during snapshot")
-				}
-				select {
-				case <-doneCh:
-				case <-time.After(1 * time.Second):
-					select {
-					case leaderSM.snapshotWait <- struct{}{}:
-					default:
-					}
-				}
-			} else {
-				t.Log("Snapshot blocking signal not received, verifying counter mechanism as fallback")
-				select {
-				case leaderSM.snapshotWait <- struct{}{}:
-				default:
-				}
-			}
-		case <-time.After(2 * time.Second):
-			t.Error("Heartbeat/snapshot timed out")
-			select {
-			case leaderSM.snapshotWait <- struct{}{}:
-			default:
-			}
+		if atomic.LoadInt32(&leader.snapshotInFlight) != 0 {
+			t.Fatalf("Expected snapshotInFlight=0 before heartbeats, got %d", leader.snapshotInFlight)
 		}
 
-		leaderSM.snapshotBlock = false
+		go leader.sendHeartbeats()
+
+		if !leaderSM.WaitForInFlight(1, 2*time.Second) {
+			t.Fatalf("Timed out waiting for 1 snapshot to start, inFlight=%d", leaderSM.SnapshotsInFlight())
+		}
+
+		if atomic.LoadInt32(&leader.snapshotInFlight) < 1 {
+			t.Errorf("Expected snapshotInFlight >= 1 during snapshot, got %d", atomic.LoadInt32(&leader.snapshotInFlight))
+		}
+
+		_, _, err := leader.Propose([]byte("during-snapshot"))
+		if !errors.Is(err, ErrSnapshotInstalling) {
+			t.Errorf("Expected ErrSnapshotInstalling during single snapshot, got err=%v", err)
+		}
+
+		leaderSM.ReleaseAll()
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if atomic.LoadInt32(&leader.snapshotInFlight) == 0 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if atomic.LoadInt32(&leader.snapshotInFlight) != 0 {
+			t.Errorf("Expected snapshotInFlight=0 after snapshot completes, got %d", atomic.LoadInt32(&leader.snapshotInFlight))
+		}
+	})
+
+	t.Run("MultipleConcurrentSnapshots", func(t *testing.T) {
+		transport := NewMemoryTransport()
+		leaderSM := newBlockingStateMachine()
+		leaderSM.EnableBlock()
+		followerSM1 := NewMemoryStateMachine()
+		followerSM2 := NewMemoryStateMachine()
+		followerSM3 := NewMemoryStateMachine()
+
+		leader := setupSnapshotTestLeader(t, cfg, leaderSM, transport, []string{"n2", "n3", "n4"}, 30, 20)
+		setupSnapshotTestFollower(t, "n2", cfg, followerSM1, transport)
+		setupSnapshotTestFollower(t, "n3", cfg, followerSM2, transport)
+		setupSnapshotTestFollower(t, "n4", cfg, followerSM3, transport)
+
+		go leader.sendHeartbeats()
+
+		if !leaderSM.WaitForInFlight(3, 2*time.Second) {
+			t.Fatalf("Timed out waiting for 3 snapshots to start, inFlight=%d", leaderSM.SnapshotsInFlight())
+		}
+
+		if atomic.LoadInt32(&leader.snapshotInFlight) < 3 {
+			t.Errorf("Expected snapshotInFlight >= 3 with 3 concurrent snapshots, got %d", atomic.LoadInt32(&leader.snapshotInFlight))
+		}
+
+		_, _, err := leader.Propose([]byte("during-3-snapshots"))
+		if !errors.Is(err, ErrSnapshotInstalling) {
+			t.Errorf("Expected ErrSnapshotInstalling with 3 concurrent snapshots, got err=%v", err)
+		}
+
+		leaderSM.ReleaseAll()
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if atomic.LoadInt32(&leader.snapshotInFlight) == 0 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if atomic.LoadInt32(&leader.snapshotInFlight) != 0 {
+			t.Errorf("Expected snapshotInFlight=0 after all snapshots complete, got %d", atomic.LoadInt32(&leader.snapshotInFlight))
+		}
+	})
+
+	t.Run("SnapshotReleaseAllowsPropose", func(t *testing.T) {
+		transport := NewMemoryTransport()
+		leaderSM := newBlockingStateMachine()
+		leaderSM.EnableBlock()
+		followerSM := NewMemoryStateMachine()
+
+		leader := setupSnapshotTestLeader(t, cfg, leaderSM, transport, []string{"n2"}, 30, 20)
+		setupSnapshotTestFollower(t, "n2", cfg, followerSM, transport)
+
+		go leader.sendHeartbeats()
+
+		if !leaderSM.WaitForInFlight(1, 2*time.Second) {
+			t.Fatalf("Timed out waiting for snapshot to start")
+		}
+
+		_, _, err := leader.Propose([]byte("blocked"))
+		if !errors.Is(err, ErrSnapshotInstalling) {
+			t.Fatalf("Expected ErrSnapshotInstalling while blocked, got err=%v", err)
+		}
+
+		leaderSM.ReleaseAll()
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			atomic.LoadInt32(&leader.snapshotInFlight)
+			_, _, err = leader.Propose([]byte("after-release"))
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, ErrSnapshotInstalling) {
+				t.Fatalf("Unexpected error type: %v", err)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if err != nil {
+			t.Fatalf("Expected Propose to succeed after snapshot release, got err=%v", err)
+		}
 	})
 }
 

@@ -1,0 +1,7 @@
+产物不满意：
+1. TestExecute_BusinessError_NotMisclassifiedAsTimeout 的竞争窗口并未真正构造出来。最终参数 stage1 sleep 设为 95ms、根超时 100ms，两者之间 5ms 的间隙保证了 goroutine 的 `done <- businessErr` 始终先于 `rootCtx.Done()` 完成——Go select 在只有一个 case 就绪时是确定性的，不存在竞争行为。修复前后 select 都只会命中 `<-done` 拿到 businessErr，rootCtx.Err() 永远为 nil，isRootDeadline 也永远是 false。提示词要求验证"即使 select 拿到 businessErr 且 rootCtx.Err() 为 DeadlineExceeded 时业务错误也不会被误判"，但当前测试从未进入 rootCtx 已过期的状态，属于逻辑验证层面不达标的测试样板。根因是模型在调整参数时只关注了"让 sleep 接近总超时"而忽略了 select 的语义——接近但不超过就是确定性路径，正确做法是让 sleep 略微超过总超时（如 105ms），使两个 case 真正同时就绪形成竞争，或构造多个阶段使前面阶段的耗时累积恰好导致根超时。
+2. TestExecute_MinThresholdSkip_ZeroBudgetStage 的参数调整后 TotalTimeout 150ms、MinThreshold 80ms、stage1 sleep 80ms，剩余时间约 70ms 减开销严格小于 MinThreshold 80ms，理论上有稳定余量。但模型在 session-cot-5.md 的修正总结中描述 stage1 的 sleep 为 90ms 而代码中实际写入的是 80ms，两处参数不一致表明模型在撰写总结时复述的并非最终代码而是记忆中的旧值。如果实际代码中存在错误的旧参数（如 sleep 从 90ms 改回了 80ms），测试行为可能偏离总结中陈述的设计意图，维护者后续只能通过代码才能获知真实测试参数而无法信任文档描述。
+
+过程不满意：
+1. 模型在第五轮对话中再次沿用了收到提示词后直接创建 TodoList 再读取代码的模式，这已经是连续五轮不改的先规划后分析行为。prompt-5.txt 只有两个测试修改点加一个验证步骤，生成 3 项计划属于轻度失控，但五轮积累的模式证明模型完全无能力从前序评估反馈中学习执行顺序的改进。正确做法是先读取两个测试的当前代码状态和调整需求再制定修改计划。
+2. 模型在遇到 TestExecute_MinThresholdSkip_ZeroBudgetStage 的第二次重复运行失败后，做了参数验算（TotalTimeout 150ms - stage1 90ms = 剩余 60ms < MinThreshold 80ms）然后修改了参数，但从 COT 记录看最终代码中执行时间写回到 80ms 而非总结中声称的 90ms，表明模型在调整参数和最终记录之间产生了认知偏差。这属于过程记录与代码实现不一致的信号——模型声称做了什么和代码中实际存留的修改不相同，如果标注人员只看总结可能被误导而忽略潜在的测试稳定性问题。

@@ -1,0 +1,6 @@
+你修复的 Raft 共识日志模块仍存在四个问题，需要修复：
+1. raftlog.go 中将 snapshotInstalling 改为 snapshotInFlight int，但所有自增自减仍在 n.mu 锁保护下操作，未使用 prompt-4 和 assessment-3 一致要求的 atomic.Int32 原子计数器。锁已持有期间的 int 自增自减是冗余的——这个计数器的并发保护与外层锁完全重合。需要将字段改为 int32 类型并使用 atomic.AddInt32 和 atomic.LoadInt32 操作，Propose 中用 atomic.LoadInt32 无锁读取计数器值。
+2. raftlog.go 末尾的 `func init()` 空函数（`_ = atomic.Int32{}`）为消除 lint 而添加，但若第 1 条正确使用 atomic 原语后该 init 函数自然不再需要；若决定不用 atomic 则应同时移除 import。无论哪种情况都存在 import 与使用不匹配的残留代码，需要一并清理。
+3. TestSnapshotInstallingError 的前两个子测试 DirectCounterTest 和 ConcurrentSnapshotCounterTest 仍然通过 `node.snapshotInFlight = N` 直接赋值触发分支判断，属于 prompt-4 和 assessment-3 已批评的"仅验证语法可达性"。这两个子测试要么重构为通过真实快照路径验证，要么删除并仅保留 RealSnapshotPathReachabilityTest 及扩展该测试覆盖多种计数器值场景。
+4. raftlog_test.go 中 blockingStateMachine 的 snapshotStarted channel 容量为 1，并发快照场景下多个 goroutine 同时进入 Snapshot 方法时，第二个 goroutine 会因 channel 满而走 default 分支跳过信号发送，然后两个 goroutine 都阻塞在 snapshotWait 上，测试代码只发送一个解除信号导致第二个 goroutine 永久阻塞。需要将 channel 协调机制改为 sync.WaitGroup 或原子计数器跟踪并发快照数量。
+5. 修复后运行 go test ./internal/raftlog/ -v -count=2，需要连续两次全部测试通过。

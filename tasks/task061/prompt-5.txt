@@ -1,0 +1,4 @@
+你修复的超时传播器模块测试仍有问题，需要修复：
+1. 新增的 TestExecute_BusinessError_NotMisclassifiedAsTimeout 未覆盖提示词描述的核心 bug 场景——"阶段 goroutine 返回业务错误且根 context 恰巧过期"。当前测试中 stage1 sleep 70ms、根超时 100ms，30ms 差距排除了根 context 过期的竞争窗口，select 只会命中 `<-done` 拿到 businessErr，该测试在修复前后均能通过，无法验证修复有效性。需要让 stage1 的 sleep 时间接近根超时（如 95ms），使 select 在 done channel 就绪和 rootCtx.Done() 关闭之间形成竞争，验证即使 select 拿到 businessErr 且 rootCtx.Err() 为 DeadlineExceeded 时业务错误也不会被误判为超时。
+2. TestExecute_MinThresholdSkip_ZeroBudgetStage 的时序参数调整存在数学漏洞。MinThreshold 从 50ms 上调至 60ms 后正好压在剩余时间的边界上（TotalTimeout 100ms - stage1 约 40ms = 剩余约 60ms - overhead），安全余量仅剩不可控的调度开销，在慢机器上可能误失败。需要验算剩余时间与 MinThreshold 的数值关系后重新设定阈值使之留有稳定余量。
+3. 修复后运行 go test ./internal/timeoutprop/ -v -count=3，需要连续三次全部通过。
