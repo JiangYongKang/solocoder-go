@@ -14,12 +14,14 @@ import (
 )
 
 var (
-	ErrTemplateNotFound     = errors.New("restclient: template not found")
+	ErrTemplateNotFound      = errors.New("restclient: template not found")
 	ErrTemplateNameEmpty    = errors.New("restclient: template name is empty")
 	ErrPathParamMissing     = errors.New("restclient: missing path parameter")
 	ErrRequestBuildFailed   = errors.New("restclient: failed to build request")
 	ErrMaxRetriesExceeded   = errors.New("restclient: max retries exceeded")
 	ErrAuthProviderNotFound = errors.New("restclient: auth provider not found")
+	ErrServerError          = errors.New("restclient: server error")
+	ErrTemplateInvalid       = errors.New("restclient: invalid template")
 )
 
 type requestBuildError struct {
@@ -36,6 +38,53 @@ func (e *requestBuildError) Unwrap() error {
 
 func (e *requestBuildError) Is(target error) bool {
 	return target == ErrRequestBuildFailed
+}
+
+type serverError struct {
+	statusCode int
+	status     string
+}
+
+func (e *serverError) Error() string {
+	return ErrServerError.Error() + ": " + e.status
+}
+
+func (e *serverError) Is(target error) bool {
+	return target == ErrServerError
+}
+
+func (e *serverError) StatusCode() int {
+	return e.statusCode
+}
+
+type templateInvalidError struct {
+	templateName string
+	err          error
+}
+
+func (e *templateInvalidError) Error() string {
+	return fmt.Sprintf("%s: template '%s': %v", ErrTemplateInvalid.Error(), e.templateName, e.err)
+}
+
+func (e *templateInvalidError) Unwrap() error {
+	return e.err
+}
+
+func (e *templateInvalidError) Is(target error) bool {
+	return target == ErrTemplateInvalid
+}
+
+func cloneHeaders(h http.Header) http.Header {
+	if h == nil {
+		return nil
+	}
+	clone := make(http.Header, len(h))
+	for k, v := range h {
+		cloneV := make([]string, len(v))
+		copy(cloneV, v)
+		clone[k] = cloneV
+	}
+	return clone
 }
 
 type AuthProvider interface {
@@ -107,6 +156,8 @@ func (c *Client) RegisterTemplate(tmpl RequestTemplate) error {
 	}
 	if tmpl.DefaultHeaders == nil {
 		tmpl.DefaultHeaders = make(http.Header)
+	} else {
+		tmpl.DefaultHeaders = cloneHeaders(tmpl.DefaultHeaders)
 	}
 	if tmpl.Timeout < 0 {
 		tmpl.Timeout = 0
@@ -120,6 +171,16 @@ func (c *Client) RegisterTemplate(tmpl RequestTemplate) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if tmpl.AuthProvider != "" {
+		if _, ok := c.authProviders[tmpl.AuthProvider]; !ok {
+			return &templateInvalidError{
+				templateName: tmpl.Name,
+				err:          fmt.Errorf("%w: '%s'", ErrAuthProviderNotFound, tmpl.AuthProvider),
+			}
+		}
+	}
+
 	c.templates[tmpl.Name] = &tmpl
 	return nil
 }
@@ -138,6 +199,7 @@ func (c *Client) GetTemplate(name string) (*RequestTemplate, error) {
 		return nil, ErrTemplateNotFound
 	}
 	tmplCopy := *tmpl
+	tmplCopy.DefaultHeaders = cloneHeaders(tmpl.DefaultHeaders)
 	return &tmplCopy, nil
 }
 
@@ -175,7 +237,6 @@ func (c *Client) Do(ctx context.Context, templateName string, opts *RequestOptio
 
 	attempt := 0
 	var lastErr error
-	var lastResp *http.Response
 
 	for {
 		if ctx.Err() != nil {
@@ -196,17 +257,14 @@ func (c *Client) Do(ctx context.Context, templateName string, opts *RequestOptio
 		}
 
 		lastErr = err
-		if resp != nil {
-			if resp.Body != nil {
-				resp.Body.Close()
-			}
-			lastResp = resp
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
 		}
 
-		attempt++
-		if attempt > tmpl.MaxRetries {
+		if attempt >= tmpl.MaxRetries {
 			break
 		}
+		attempt++
 
 		if tmpl.RetryInterval > 0 {
 			timer := time.NewTimer(tmpl.RetryInterval)
@@ -219,11 +277,10 @@ func (c *Client) Do(ctx context.Context, templateName string, opts *RequestOptio
 		}
 	}
 
-	if lastResp != nil {
-		lastResp.Body = io.NopCloser(strings.NewReader(""))
-		return lastResp, fmt.Errorf("%w: %v", ErrMaxRetriesExceeded, lastErr)
+	if tmpl.MaxRetries == 0 {
+		return nil, lastErr
 	}
-	return nil, fmt.Errorf("%w: %v", ErrMaxRetriesExceeded, lastErr)
+	return nil, fmt.Errorf("%w: %w", ErrMaxRetriesExceeded, lastErr)
 }
 
 func isRetryableError(err error) bool {
@@ -236,10 +293,16 @@ func isRetryableError(err error) bool {
 	if errors.Is(err, ErrAuthProviderNotFound) {
 		return false
 	}
+	if errors.Is(err, ErrTemplateInvalid) {
+		return false
+	}
 	if errors.Is(err, context.Canceled) {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, ErrServerError) {
 		return true
 	}
 	return true
@@ -288,6 +351,18 @@ func (c *Client) doRequest(ctx context.Context, tmpl *RequestTemplate, opts *Req
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode >= http.StatusInternalServerError {
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		statusText := resp.Status
+		if readErr == nil && len(body) > 0 {
+			statusText = fmt.Sprintf("%s: %s", resp.Status, string(body))
+		}
+		return resp, &serverError{
+			statusCode: resp.StatusCode,
+			status:     statusText,
+		}
 	}
 	return resp, nil
 }

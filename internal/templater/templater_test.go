@@ -896,3 +896,262 @@ func TestPointerStruct(t *testing.T) {
 		t.Errorf("expected 'Dave - Shanghai', got '%s'", result)
 	}
 }
+
+func TestTemplateInheritanceLoop(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+
+	e.RegisterTemplate("loopA", `{{ extends "loopB" }}{{ block content }}A{{ endblock }}`)
+	e.RegisterTemplate("loopB", `{{ extends "loopA" }}{{ block content }}B{{ endblock }}`)
+
+	_, err := e.Render("loopA", nil)
+	if !errors.Is(err, ErrTemplateInheritanceLoop) {
+		t.Errorf("expected ErrTemplateInheritanceLoop, got %v", err)
+	}
+}
+
+func TestRangeNotIterable(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("rangenoiter", "{{ range $item := range .Value }}{{ $item }}{{ endrange }}")
+
+	_, err := e.Render("rangenoiter", map[string]interface{}{"Value": 42})
+	if !errors.Is(err, ErrRangeNotIterable) {
+		t.Errorf("expected ErrRangeNotIterable, got %v", err)
+	}
+}
+
+func TestRangeNilNotIterable(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("rangenil", "{{ range $item := range .Value }}{{ $item }}{{ endrange }}")
+
+	_, err := e.Render("rangenil", map[string]interface{}{"Value": nil})
+	if !errors.Is(err, ErrRangeNotIterable) {
+		t.Errorf("expected ErrRangeNotIterable, got %v", err)
+	}
+}
+
+func TestRangeStringNotIterable(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("rangestr", "{{ range $item := range .Value }}{{ $item }}{{ endrange }}")
+
+	_, err := e.Render("rangestr", map[string]interface{}{"Value": "hello"})
+	if !errors.Is(err, ErrRangeNotIterable) {
+		t.Errorf("expected ErrRangeNotIterable, got %v", err)
+	}
+}
+
+func TestUnclosedBlockTag(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("unclosedblock", "{{ block header }}Content without endblock")
+
+	_, err := e.Render("unclosedblock", nil)
+	if !errors.Is(err, ErrUnclosedBlock) {
+		t.Errorf("expected ErrUnclosedBlock, got %v", err)
+	}
+}
+
+func TestUnclosedIfTag(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("unclosedif", "{{ if .Show }}Content without endif")
+
+	_, err := e.Render("unclosedif", nil)
+	if !errors.Is(err, ErrUnclosedBlock) {
+		t.Errorf("expected ErrUnclosedBlock, got %v", err)
+	}
+}
+
+func TestUnclosedRangeTag(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("unclosedrange", "{{ range $item := range .Items }}Content without endrange")
+
+	_, err := e.Render("unclosedrange", map[string]interface{}{"Items": []int{1}})
+	if !errors.Is(err, ErrUnclosedBlock) {
+		t.Errorf("expected ErrUnclosedBlock, got %v", err)
+	}
+}
+
+func TestUnclosedVariableTag(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("unclosedvar", "Hello {{ .Name")
+
+	_, err := e.Render("unclosedvar", map[string]interface{}{"Name": "World"})
+	if !errors.Is(err, ErrUnclosedBlock) {
+		t.Errorf("expected ErrUnclosedBlock, got %v", err)
+	}
+}
+
+func TestInvalidRangeSyntax(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("badrange", "{{ range badsyntax }}{{ endrange }}")
+
+	_, err := e.Render("badrange", nil)
+	if !errors.Is(err, ErrInvalidRange) {
+		t.Errorf("expected ErrInvalidRange, got %v", err)
+	}
+}
+
+func TestInvalidBlockSyntax(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("badblock", "{{ block 123 }}content{{ endblock }}")
+
+	_, err := e.Render("badblock", nil)
+	if !errors.Is(err, ErrInvalidBlockSyntax) {
+		t.Errorf("expected ErrInvalidBlockSyntax, got %v", err)
+	}
+}
+
+func TestBlockNotFoundInInheritance(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+
+	e.RegisterTemplate("parentbnf", "{{ block header }}Default{{ endblock }}")
+	e.RegisterTemplate("childbnf", `{{ extends "parentbnf" }}{{ block nonexistent }}Override{{ endblock }}`)
+
+	_, err := e.Render("childbnf", nil)
+	if !errors.Is(err, ErrBlockNotFound) {
+		t.Errorf("expected ErrBlockNotFound, got %v", err)
+	}
+}
+
+func TestElseIfSyntax(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("elseif", "{{ if .Level == 1 }}One{{ else if .Level == 2 }}Two{{ else }}Other{{ endif }}")
+
+	data1 := map[string]interface{}{"Level": 1}
+	result1, err := e.Render("elseif", data1)
+	if err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	if result1 != "One" {
+		t.Errorf("expected 'One', got '%s'", result1)
+	}
+
+	data2 := map[string]interface{}{"Level": 2}
+	result2, err := e.Render("elseif", data2)
+	if err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	if result2 != "Two" {
+		t.Errorf("expected 'Two', got '%s'", result2)
+	}
+
+	data3 := map[string]interface{}{"Level": 3}
+	result3, err := e.Render("elseif", data3)
+	if err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	if result3 != "Other" {
+		t.Errorf("expected 'Other', got '%s'", result3)
+	}
+}
+
+func TestElseIfChained(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("elseifchain", "{{ if .X == 1 }}A{{ else if .X == 2 }}B{{ else if .X == 3 }}C{{ else }}D{{ endif }}")
+
+	data := map[string]interface{}{"X": 3}
+	result, err := e.Render("elseifchain", data)
+	if err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	if result != "C" {
+		t.Errorf("expected 'C', got '%s'", result)
+	}
+}
+
+func TestFunctionNonErrorSecondReturn(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+
+	badFn := func(a int) (int, bool) {
+		return a, true
+	}
+	e.RegisterFunction("badfn", badFn)
+
+	e.RegisterTemplate("badfn", "{{ badfn .Val }}")
+
+	_, err := e.Render("badfn", map[string]interface{}{"Val": 5})
+	if !errors.Is(err, ErrInvalidFunctionCall) {
+		t.Errorf("expected ErrInvalidFunctionCall, got %v", err)
+	}
+}
+
+func TestFunctionNonFuncRegistration(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+
+	e.RegisterFunction("notafunc", 42)
+	e.RegisterTemplate("notafn", "{{ notafunc }}")
+
+	_, err := e.Render("notafn", nil)
+	if !errors.Is(err, ErrInvalidFunctionCall) {
+		t.Errorf("expected ErrInvalidFunctionCall, got %v", err)
+	}
+}
+
+func TestInvalidCondition(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("badcond", "{{ if invalidexpr }}yes{{ endif }}")
+
+	_, err := e.Render("badcond", nil)
+	if !errors.Is(err, ErrInvalidCondition) {
+		t.Errorf("expected ErrInvalidCondition, got %v", err)
+	}
+}
+
+func TestInvalidVariablePath(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+	e.RegisterTemplate("badpath", "{{ .Name. }}")
+
+	_, err := e.Render("badpath", map[string]interface{}{"Name": "test"})
+	if !errors.Is(err, ErrInvalidVariablePath) {
+		t.Errorf("expected ErrInvalidVariablePath, got %v", err)
+	}
+}
+
+func TestRegisterFunctionEmptyName(t *testing.T) {
+	e := NewEngine(Config{})
+	err := e.RegisterFunction("", func() {})
+	if !errors.Is(err, ErrFunctionNotFound) {
+		t.Errorf("expected ErrFunctionNotFound, got %v", err)
+	}
+}
+
+func TestFunctionArgumentCountMismatch(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+
+	addFn := func(a, b int) int { return a + b }
+	e.RegisterFunction("add", addFn)
+
+	e.RegisterTemplate("addtmpl", "{{ add .A }}")
+
+	_, err := e.Render("addtmpl", map[string]interface{}{"A": 1})
+	if !errors.Is(err, ErrInvalidArgumentCount) {
+		t.Errorf("expected ErrInvalidArgumentCount, got %v", err)
+	}
+}
+
+func TestGetTemplateRaceCondition(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+
+	e.RegisterTemplate("race", "v1: {{ .Name }}")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			e.RegisterTemplate("race", fmt.Sprintf("v%d: {{ .Name }}", i))
+		}(i)
+		go func() {
+			defer wg.Done()
+			e.GetTemplate("race")
+		}()
+	}
+	wg.Wait()
+
+	e.RegisterTemplate("race", "final: {{ .Name }}")
+	result, err := e.Render("race", map[string]interface{}{"Name": "test"})
+	if err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	if result != "final: test" {
+		t.Errorf("expected 'final: test', got '%s'", result)
+	}
+}

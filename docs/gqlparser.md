@@ -14,6 +14,7 @@
 10. [使用示例](#10-使用示例)
 11. [错误定义](#11-错误定义)
 12. [并发安全](#12-并发安全)
+13. [修复与改进记录](#13-修复与改进记录)
 
 ---
 
@@ -215,10 +216,31 @@ type Query {
 
 ### 5.2 SDL 解析流程
 
+采用**两阶段解析**策略确保类型分类正确：
+
+**第一阶段（类型发现）**:
 1. 词法扫描：逐字符扫描输入，识别关键字、名称、符号
 2. 类型定义识别：识别 `type` / `scalar` 关键字
-3. 字段解析：解析每个字段的名称、参数、类型引用
-4. 类型注册：将解析出的类型注册到 Schema
+3. 预注册：为每个发现的类型创建骨架，设置正确的 `Kind`（TypeKindScalar 或 TypeKindObject）
+   - `scalar` 关键字定义 → `TypeKindScalar`
+   - `type` 关键字定义 → `TypeKindObject`
+   - 内置标量（Int, Float, String, Boolean, ID）→ `TypeKindScalar`
+4. 注册到 Schema 类型表
+
+**第二阶段（字段解析）**:
+1. 再次遍历所有类型定义
+2. 解析每个字段的名称、参数、类型引用
+3. 解析类型引用时，通过 Schema 类型表查找已注册类型的真实 Kind
+4. 填充类型的 Fields 映射表
+
+### 5.3 类型分类保证
+
+- **内置标量**（Int, Float, String, Boolean, ID）：始终为 `TypeKindScalar`
+- **自定义标量**（`scalar DateTime`）：为 `TypeKindScalar`
+- **对象类型**（`type User { ... }`）：为 `TypeKindObject`
+- **列表/非空包装**：通过 `OfType` 指向内层类型，不改变内层类型的 Kind
+- `parseTypeReference()` 解析类型引用时，**不假设命名类型的 Kind**，而是从 Schema 类型表中查找到实际类型后使用其 Kind
+- 验证器和执行器无需"回头重新查类型"，类型引用在解析阶段就已具备正确的 Kind
 
 ---
 
@@ -227,10 +249,11 @@ type Query {
 ### 6.1 ResolverFunc 签名
 
 ```go
-type ResolverFunc func(parent interface{}, args map[string]interface{}) (interface{}, error)
+type ResolverFunc func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error)
 ```
 
 **参数**:
+- `ctx`: 执行上下文，包含 DataLoader 映射表和 Schema 引用
 - `parent`: 父类型的解析结果（顶层字段为 nil）
 - `args`: 字段参数映射，已解析变量和默认值
 
@@ -240,7 +263,23 @@ type ResolverFunc func(parent interface{}, args map[string]interface{}) (interfa
 - 列表值（slice）
 - error（解析失败时）
 
-### 6.2 注册规则
+### 6.2 ExecutionContext
+
+执行上下文在查询执行期间传递，为解析器提供运行时环境。
+
+```go
+type ExecutionContext struct {
+    Schema      *Schema
+    DataLoaders map[string]*DataLoader
+    Variables   map[string]interface{}
+}
+```
+
+- `Schema`: 当前执行使用的 Schema
+- `DataLoaders`: DataLoader 映射表，按名称索引，解析器可通过 `ctx.DataLoaders["user"]` 获取对应 DataLoader
+- `Variables`: 本次查询的变量值
+
+### 6.3 注册规则
 
 ```go
 func (s *Schema) RegisterResolver(typeName, fieldName string, fn ResolverFunc) error
@@ -349,6 +388,44 @@ type DataLoaderFunc func(keys []interface{}) ([]interface{}, error)
 | `Clear(key)` | 从待加载队列中移除指定键 |
 | `ClearAll()` | 清空所有待加载请求 |
 
+### 8.5 与执行器的集成
+
+DataLoader 通过 `ExecutionContext` 传递给解析器，执行器负责调度并发执行和层级 Flush。
+
+**数据流向**:
+1. 调用 `Executor.Execute(query, variables, dataLoaders)` 时传入 `map[string]*DataLoader`
+2. 执行器创建 `ExecutionContext` 并将 DataLoader 映射表存入
+3. 解析器通过 `ctx.DataLoaders["name"]` 获取对应 DataLoader
+4. 解析器调用 `dl.Load(key)` 或 `dl.LoadMany(keys)` 收集加载请求
+
+### 8.6 层级 Flush 策略
+
+执行器采用**并发执行 + 层级 Flush** 模式最大化批量加载效果：
+
+```
+第 0 层（根字段）
+    │
+    ├─ 并发执行所有根字段的 Resolver
+    │      └─ 每个 Resolver 可调用 DataLoader.Load() 收集键
+    │
+    └─ 该层所有 Resolver 返回后，统一 Flush 所有 DataLoader
+           └─ 批量函数执行，分发结果给所有等待的 Resolver
+
+第 1 层（嵌套对象字段）
+    │
+    ├─ 并发执行该层所有对象的所有字段
+    │
+    └─ 该层全部完成后，再次统一 Flush
+           ...
+```
+
+**策略要点**:
+- 每一层级的所有字段并发执行（goroutine + sync.WaitGroup）
+- 一层执行完毕后立即对所有 DataLoader 调用 `Flush()`
+- DataLoader 的批量加载函数在 Flush 时统一执行
+- 层级深度 = 查询嵌套深度，每层最多一次批量加载
+- 有效解决 N+1 问题：N 个对象的同类字段只需一次批量查询
+
 ---
 
 ## 9. 查询执行引擎
@@ -365,26 +442,62 @@ ParseQuery() → AST (Document)
 Validator.Validate() → 错误列表
     │
     ▼
-Executor.executeOperation()
+Executor.Execute()
     │
-    ├── 解析变量参数（处理 VariableRef 和默认值）
+    ├── validateVariables() → 运行时变量检查
     │
-    └── 遍历选择集
+    ├── 创建 ExecutionContext（注入 DataLoader）
+    │
+    └── executeOperation()
             │
-            ├── executeField()
-            │       │
-            │       ├── 查找并调用 Resolver
-            │       └── 确定字段类型
+            ├── 解析变量参数（处理 VariableRef 和默认值）
             │
-            ├── executeSelectionSetOnValue()
-            │       │
-            │       ├── 列表类型 → executeList()
-            │       └── 对象类型 → executeObject()
-            │
-            └── 递归处理嵌套选择
+            └── 并发遍历选择集
+                    │
+                    ├── executeField()
+                    │       │
+                    │       ├── 查找并调用 Resolver（传入 ctx）
+                    │       └── 确定字段类型
+                    │
+                    ├── executeSelectionSetOnValue()
+                    │       │
+                    │       ├── 列表类型 → executeList()（并发 + Flush）
+                    │       └── 对象类型 → executeObject()（并发 + Flush）
+                    │
+                    └── 递归处理嵌套选择
 ```
 
-### 9.2 值解析
+### 9.2 类型查找策略
+
+`executeObject()` 执行对象类型选择集时，**不依赖 Go 运行时类型名**进行 GraphQL 类型查找，而是采用以下策略：
+
+1. **字段类型驱动**：从字段定义的 `Type` 直接获取 GraphQL 类型（来自 Schema）
+2. **Schema 类型查找**：对于接口/联合类型（当前为对象类型），使用 Schema 中注册的类型名
+3. **解包处理**：通过 `Type.Unwrap()` 获取内层命名类型，处理 NonNull 和 List 包装
+
+**保证**：无论 Resolver 返回 `map[string]interface{}` 还是 struct，都能正确找到对应的 GraphQL 类型定义，不会出现类型名不匹配的问题。
+
+### 9.3 变量验证保证
+
+变量验证分为**静态验证**和**运行时验证**两层：
+
+**静态验证（Validator）**:
+- 验证变量定义的类型是否存在
+- 验证变量引用（VariableRef）的类型与参数类型是否兼容
+- 验证必选参数是否有对应的变量或默认值
+- 类型兼容性遵循协变/逆变规则（变量类型需是参数类型的子类型）
+
+**运行时验证（Executor）**:
+- 在 `Execute()` 开始时检查所有 NonNull 且无默认值的变量
+- 若变量未在 variables map 中提供或值为 nil，立即返回错误
+- 错误在执行阶段早期抛出，避免因 nil 参数导致的深层错误
+
+**变量默认值处理**:
+- 变量定义包含默认值且未提供时，使用默认值
+- 变量已提供时，使用提供的值
+- 必选变量（NonNull 且无默认值）缺失时返回明确错误
+
+### 9.4 值解析
 
 解析器返回值支持以下类型：
 - **标量值**: `string`, `int`, `int64`, `float64`, `bool` → 直接返回
@@ -392,7 +505,7 @@ Executor.executeOperation()
 - **Struct**: 任意结构体 → 通过反射按字段名或 json tag 查找
 - **Slice/Array**: 任意切片或数组 → 遍历每个元素递归执行选择集
 
-### 9.3 别名处理
+### 9.5 别名处理
 
 字段可指定别名：
 ```graphql
@@ -444,16 +557,16 @@ func main() {
     users := map[string]map[string]interface{}{
         "1": {"id": "1", "name": "Alice", "age": 30},
     }
-    s.RegisterResolver("Query", "user", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+    s.RegisterResolver("Query", "user", func(ctx *gqlparser.ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
         id := fmt.Sprintf("%v", args["id"])
         return users[id], nil
     })
 
     // 3. 执行查询
-    e := &gqlparser.Executor{Schema: s, Validator: gqlparser.NewValidator()}
-    result, errs := e.Execute(`{ user(id: "1") { name age } }`, nil, nil)
+    e := gqlparser.NewExecutor(s)
+    result := e.Execute(`{ user(id: "1") { name age } }`, nil, nil)
 
-    fmt.Println(result)  // map[user:map[age:30 name:Alice]]
+    fmt.Println(result.Data)  // map[user:map[age:30 name:Alice]]
 }
 ```
 
@@ -481,17 +594,22 @@ postLoader := gqlparser.NewDataLoader(func(keys []interface{}) ([]interface{}, e
     return results, nil
 })
 
-// User.posts 解析器：返回帖子 ID 列表
-s.RegisterResolver("User", "posts", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+// User.posts 解析器：从 ctx 获取 DataLoader
+s.RegisterResolver("User", "posts", func(ctx *gqlparser.ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
     userMap := parent.(map[string]interface{})
     userId := fmt.Sprintf("%v", userMap["id"])
     postIds := userPosts[userId]
-    result := make([]interface{}, len(postIds))
+    keys := make([]interface{}, len(postIds))
     for i, id := range postIds {
-        val, _ := postLoader.Load(id)
-        result[i] = val
+        keys[i] = id
     }
-    return result, nil
+    vals, errs := ctx.DataLoaders["post"].LoadMany(keys)
+    for _, e := range errs {
+        if e != nil {
+            return nil, e
+        }
+    }
+    return vals, nil
 })
 
 // 执行嵌套查询
@@ -501,13 +619,10 @@ query := `{
         posts { title }
     }
 }`
-dataLoaders := map[string]*gqlparser.DataLoader{"posts": postLoader}
-result, errs := e.Execute(query, nil, dataLoaders)
+dataLoaders := map[string]*gqlparser.DataLoader{"post": postLoader}
+result := e.Execute(query, nil, dataLoaders)
 
-// 在 goroutine 中触发 Flush，或使用单独的调度机制
-go func() {
-    postLoader.Flush()
-}()
+// 执行器自动管理层级 Flush，无需手动调用 Flush()
 ```
 
 ### 10.3 Mutation 操作
@@ -520,7 +635,7 @@ sdl := `
 `
 s.ParseSDL(sdl)
 
-s.RegisterResolver("Mutation", "createUser", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+s.RegisterResolver("Mutation", "createUser", func(ctx *gqlparser.ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
     name := fmt.Sprintf("%v", args["name"])
     age, _ := args["age"].(int)
     newUser := map[string]interface{}{
@@ -537,7 +652,7 @@ mutation := `mutation {
         name
     }
 }`
-result, errs := e.Execute(mutation, nil, nil)
+result := e.Execute(mutation, nil, nil)
 ```
 
 ---
@@ -571,3 +686,55 @@ Message: "field \"invalidField\" not found in type Post"
 - `DataLoader` 使用 `sync.Mutex` 保护 pending 队列
 - `Validator` 无状态，可并发调用
 - `Executor` 执行查询为纯只读操作，同一 Schema 可被多个 Executor 并发使用
+- 字段解析采用并发执行（goroutine + sync.WaitGroup），结合层级 Flush 策略
+
+---
+
+## 13. 修复与改进记录
+
+### 13.1 类型分类策略修复
+
+**问题**: `parseTypeReference` 在解析 SDL 类型引用时对所有命名类型统一标记为对象类型，导致 `ID` 等内置标量被错误分类为 `TypeKindObject`，验证器和执行器各自维护"回头重新查类型"的补救逻辑。
+
+**修复方案**:
+- 采用**两阶段 SDL 解析**：第一阶段预扫描所有类型定义，根据 `type`/`scalar` 关键字设置正确的 Kind 并注册到 Schema；第二阶段解析字段引用时，从 Schema 类型表中查找到已注册的真实类型，使用其 Kind。
+- 类型引用在解析阶段就具备正确的 Kind，验证器和执行器无需额外补救逻辑。
+
+**保证**:
+- 内置标量（Int, Float, String, Boolean, ID）始终为 `TypeKindScalar`
+- 自定义标量（`scalar DateTime`）为 `TypeKindScalar`
+- 对象类型（`type User { ... }`）为 `TypeKindObject`
+
+### 13.2 DataLoader 实际集成
+
+**问题**: 所有字段解析器直接从内存 map 读取数据，从未调用 DataLoader 的 Load 方法，DataLoader 的批量加载能力在执行器中从未被实际使用和测试覆盖。
+
+**修复方案**:
+- `ResolverFunc` 签名增加 `*ExecutionContext` 参数，使解析器能够访问 DataLoader
+- `ExecutionContext` 包含 `DataLoaders map[string]*DataLoader`，按名称索引
+- 执行器实现**并发执行 + 层级 Flush** 策略：
+  - 每一层级的所有字段并发执行（goroutine + sync.WaitGroup）
+  - 一层执行完毕后统一对所有 DataLoader 调用 `Flush()`
+  - 批量加载函数在 Flush 时统一执行，最大化批量效果
+- 测试解析器改为优先使用 DataLoader，验证 N+1 问题得到解决
+
+### 13.3 类型查找路径修复
+
+**问题**: `executeObject` 使用 Go 运行时类型名（`fmt.Sprintf("%T", value)`）去 Schema 中查找 GraphQL 类型，当解析器返回 `map[string]interface{}` 时类型名为 `"map[string]interface {}"`，与任何 GraphQL 类型名都不匹配，导致该路径永远无法正确执行。
+
+**修复方案**:
+- 采用**字段类型驱动**的类型查找策略
+- 从字段定义的 `Type` 直接获取 GraphQL 类型（来自 Schema）
+- 通过 `Type.Unwrap()` 获取内层命名类型，处理 NonNull 和 List 包装
+- 不依赖 Go 运行时类型名，支持 `map[string]interface{}` 和 struct 等多种返回值类型
+
+### 13.4 变量验证增强
+
+**问题**: `validateArguments` 在检查必选参数时对 VariableRef 类型直接放行不做校验，当查询声明了变量但调用方未在 variables map 中提供实际值时，缺失变量的问题在执行阶段才以 nil 参数报错，而非在验证阶段被提前拦截。
+
+**修复方案**:
+- **静态验证**（Validator）：验证变量引用的类型与参数类型是否兼容，遵循协变/逆变规则
+- **运行时验证**（Executor）：在 `Execute()` 开始时检查所有 NonNull 且无默认值的变量
+  - 若变量未提供或值为 nil，立即返回明确的错误信息
+  - 错误在执行阶段早期抛出，避免因 nil 参数导致的深层错误
+- 变量默认值正确处理：有默认值的变量缺失时使用默认值

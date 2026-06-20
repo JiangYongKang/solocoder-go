@@ -475,22 +475,37 @@ func NewSuggestEngineWithConfig(cfg Config) (*SuggestEngine, error) {
 }
 
 func (e *SuggestEngine) AddWord(word string) error {
-	return e.trie.Insert(word)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.trie.InsertWithFreq(word, 0)
 }
 
 func (e *SuggestEngine) AddWordWithFreq(word string, freq int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	return e.trie.InsertWithFreq(word, freq)
 }
 
 func (e *SuggestEngine) RemoveWord(word string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	return e.trie.Delete(word)
 }
 
 func (e *SuggestEngine) HasWord(word string) (bool, int) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	return e.trie.Search(word)
 }
 
 func (e *SuggestEngine) WordCount() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	return e.trie.Size()
 }
 
@@ -499,6 +514,9 @@ func (e *SuggestEngine) Autocomplete(prefix string) ([]Suggestion, error) {
 }
 
 func (e *SuggestEngine) AutocompleteLimit(prefix string, maxResults int) ([]Suggestion, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	return e.trie.StartsWithLimit(prefix, maxResults)
 }
 
@@ -507,6 +525,9 @@ func (e *SuggestEngine) Correct(query string) ([]Suggestion, error) {
 }
 
 func (e *SuggestEngine) CorrectLimit(query string, maxResults int) ([]Suggestion, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	if query == "" {
 		return nil, ErrEmptyQuery
 	}
@@ -585,10 +606,16 @@ func (e *SuggestEngine) SubmitSearch(userID, word string) error {
 }
 
 func (e *SuggestEngine) GetHistory(userID string, n int) ([]*HistoryRecord, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	return e.history.GetRecent(userID, n)
 }
 
 func (e *SuggestEngine) ClearHistory(userID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	return e.history.Clear(userID)
 }
 
@@ -597,6 +624,9 @@ func (e *SuggestEngine) Suggest(query string) ([]Suggestion, error) {
 }
 
 func (e *SuggestEngine) SuggestLimit(query string, maxResults int) ([]Suggestion, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	if query == "" {
 		return nil, ErrEmptyQuery
 	}
@@ -604,7 +634,7 @@ func (e *SuggestEngine) SuggestLimit(query string, maxResults int) ([]Suggestion
 		return nil, ErrInvalidMaxResult
 	}
 
-	autocomplete, err := e.AutocompleteLimit(query, maxResults)
+	autocomplete, err := e.trie.StartsWithLimit(query, maxResults)
 	if err != nil {
 		return nil, err
 	}
@@ -614,7 +644,7 @@ func (e *SuggestEngine) SuggestLimit(query string, maxResults int) ([]Suggestion
 	}
 
 	remaining := maxResults - len(autocomplete)
-	corrections, err := e.CorrectLimit(query, remaining)
+	corrections, err := e.correctNoLock(query, remaining)
 	if err != nil {
 		return autocomplete, nil
 	}
@@ -635,6 +665,9 @@ func (e *SuggestEngine) SuggestLimit(query string, maxResults int) ([]Suggestion
 }
 
 func (e *SuggestEngine) GetHotWords(n int) ([]Suggestion, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	if n <= 0 {
 		return nil, ErrInvalidMaxResult
 	}
@@ -644,4 +677,58 @@ func (e *SuggestEngine) GetHotWords(n int) ([]Suggestion, error) {
 		return all[:n], nil
 	}
 	return all, nil
+}
+
+func (e *SuggestEngine) correctNoLock(query string, maxResults int) ([]Suggestion, error) {
+	if query == "" {
+		return nil, ErrEmptyQuery
+	}
+	if maxResults <= 0 {
+		return nil, ErrInvalidMaxResult
+	}
+
+	exists, _ := e.trie.Search(query)
+	if exists {
+		return []Suggestion{}, nil
+	}
+
+	allWords := e.trie.GetAllWords()
+	if len(allWords) == 0 {
+		return []Suggestion{}, nil
+	}
+
+	type candidate struct {
+		word Suggestion
+		dist int
+	}
+
+	var candidates []candidate
+	for _, w := range allWords {
+		dist := EditDistance(query, w.Word)
+		if dist <= e.maxEditDist {
+			candidates = append(candidates, candidate{word: w, dist: dist})
+		}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].dist != candidates[j].dist {
+			return candidates[i].dist < candidates[j].dist
+		}
+		if candidates[i].word.Frequency != candidates[j].word.Frequency {
+			return candidates[i].word.Frequency > candidates[j].word.Frequency
+		}
+		return candidates[i].word.Word < candidates[j].word.Word
+	})
+
+	resultCount := len(candidates)
+	if resultCount > maxResults {
+		resultCount = maxResults
+	}
+
+	results := make([]Suggestion, resultCount)
+	for i := 0; i < resultCount; i++ {
+		results[i] = candidates[i].word
+	}
+
+	return results, nil
 }

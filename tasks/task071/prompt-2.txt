@@ -1,0 +1,13 @@
+你实现的 GraphQL 查询解析器模块存在一些问题，需要修复：
+
+1. schema.go 的 parseTypeReference 方法在解析 SDL 类型引用时对所有命名类型统一标记为对象类型，导致 `id: ID!` 中 ID 本是内置标量却被当作对象类型，validator.go 和 executor.go 因此在多处各自维护了"回头去 Schema 重新查真实类型"的补救逻辑，同一分类问题在两个模块重复修补。
+
+2. 提示词要求 DataLoader 在嵌套查询中批量收集键并统一加载数据避免 N+1 查询，但当前所有字段解析器如 Query.user、Post.author、User.posts 全部直接从内存 map 读取数据，从未调用过 DataLoader 的 Load 方法，DataLoader 的批量加载能力在执行器中从未被实际使用和测试覆盖。
+
+3. executor.go 的 executeObject 方法使用 Go 运行时类型名去 Schema 中查找 GraphQL 类型，当解析器返回 `map[string]interface{}` 时 Go 类型名为 `"map[string]interface {}"`，与任何 GraphQL 类型名都不匹配，这条类型查找路径实际上永远无法正确执行。
+
+4. validator.go 的 validateArguments 方法在检查必选参数时对 VariableRef 类型直接放行不做校验，当查询声明了变量但调用方未在 variables map 中提供实际值时，缺失变量的问题在执行阶段才以 nil 参数报错而非在验证阶段被提前拦截。
+
+5. 修复后运行 go test ./internal/gqlparser/ -v，需要让所有测试通过。
+
+6. 在 docs/gqlparser.md 中更新模块需求文档，说明修复后的类型分类策略、DataLoader 的实际集成方式、以及类型查找和变量验证的保证。

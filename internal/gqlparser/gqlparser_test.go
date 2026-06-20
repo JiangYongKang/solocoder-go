@@ -191,7 +191,7 @@ func TestSchema_RegisterResolver(t *testing.T) {
 	s := setupTestSchema(t)
 
 	called := false
-	resolver := func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	resolver := func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		called = true
 		return "test", nil
 	}
@@ -206,7 +206,7 @@ func TestSchema_RegisterResolver(t *testing.T) {
 		t.Fatal("expected resolver to be found")
 	}
 
-	_, _ = gotResolver(nil, nil)
+	_, _ = gotResolver(nil, nil, nil)
 	if !called {
 		t.Error("expected registered resolver to be called")
 	}
@@ -214,7 +214,7 @@ func TestSchema_RegisterResolver(t *testing.T) {
 
 func TestSchema_RegisterResolver_TypeNotFound(t *testing.T) {
 	s := NewSchema()
-	err := s.RegisterResolver("NonExistent", "field", func(p interface{}, a map[string]interface{}) (interface{}, error) {
+	err := s.RegisterResolver("NonExistent", "field", func(ctx *ExecutionContext, p interface{}, a map[string]interface{}) (interface{}, error) {
 		return nil, nil
 	})
 	if err != ErrTypeNotFound {
@@ -224,7 +224,7 @@ func TestSchema_RegisterResolver_TypeNotFound(t *testing.T) {
 
 func TestSchema_RegisterResolver_FieldNotFound(t *testing.T) {
 	s := setupTestSchema(t)
-	err := s.RegisterResolver("User", "nonExistent", func(p interface{}, a map[string]interface{}) (interface{}, error) {
+	err := s.RegisterResolver("User", "nonExistent", func(ctx *ExecutionContext, p interface{}, a map[string]interface{}) (interface{}, error) {
 		return nil, nil
 	})
 	if err != ErrFieldNotFound {
@@ -235,10 +235,10 @@ func TestSchema_RegisterResolver_FieldNotFound(t *testing.T) {
 func TestSchema_RegisterResolver_Overwrite(t *testing.T) {
 	s := setupTestSchema(t)
 
-	first := func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	first := func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		return "first", nil
 	}
-	second := func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	second := func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		return "second", nil
 	}
 
@@ -246,7 +246,7 @@ func TestSchema_RegisterResolver_Overwrite(t *testing.T) {
 	_ = s.RegisterResolver("Query", "user", second)
 
 	resolver, _ := s.GetResolver("Query", "user")
-	result, _ := resolver(nil, nil)
+	result, _ := resolver(nil, nil, nil)
 	if result != "second" {
 		t.Errorf("expected second resolver to overwrite, got %v", result)
 	}
@@ -834,12 +834,15 @@ func setupTestExecutor(t *testing.T) (*Executor, map[string]*DataLoader) {
 		"2": {"102"},
 	}
 
-	_ = s.RegisterResolver("Query", "user", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	_ = s.RegisterResolver("Query", "user", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		id := fmt.Sprintf("%v", args["id"])
+		if dl, ok := ctx.DataLoaders["user"]; ok {
+			return dl.Load(id)
+		}
 		return users[id], nil
 	})
 
-	_ = s.RegisterResolver("Query", "users", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	_ = s.RegisterResolver("Query", "users", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		result := make([]map[string]interface{}, 0, len(users))
 		for _, u := range users {
 			result = append(result, u)
@@ -847,12 +850,15 @@ func setupTestExecutor(t *testing.T) (*Executor, map[string]*DataLoader) {
 		return result, nil
 	})
 
-	_ = s.RegisterResolver("Query", "post", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	_ = s.RegisterResolver("Query", "post", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		id := fmt.Sprintf("%v", args["id"])
+		if dl, ok := ctx.DataLoaders["post"]; ok {
+			return dl.Load(id)
+		}
 		return posts[id], nil
 	})
 
-	_ = s.RegisterResolver("Query", "posts", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	_ = s.RegisterResolver("Query", "posts", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		result := make([]map[string]interface{}, 0, len(posts))
 		for _, p := range posts {
 			result = append(result, p)
@@ -860,13 +866,26 @@ func setupTestExecutor(t *testing.T) (*Executor, map[string]*DataLoader) {
 		return result, nil
 	})
 
-	_ = s.RegisterResolver("User", "posts", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	_ = s.RegisterResolver("User", "posts", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		p, ok := parent.(map[string]interface{})
 		if !ok {
 			return nil, nil
 		}
 		userId := fmt.Sprintf("%v", p["id"])
 		postIds := userPosts[userId]
+		if dl, ok := ctx.DataLoaders["post"]; ok {
+			keys := make([]interface{}, len(postIds))
+			for i, pid := range postIds {
+				keys[i] = pid
+			}
+			vals, errs := dl.LoadMany(keys)
+			for _, e := range errs {
+				if e != nil {
+					return nil, e
+				}
+			}
+			return vals, nil
+		}
 		result := make([]map[string]interface{}, 0, len(postIds))
 		for _, pid := range postIds {
 			result = append(result, posts[pid])
@@ -874,12 +893,15 @@ func setupTestExecutor(t *testing.T) (*Executor, map[string]*DataLoader) {
 		return result, nil
 	})
 
-	_ = s.RegisterResolver("Post", "author", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	_ = s.RegisterResolver("Post", "author", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		p, ok := parent.(map[string]interface{})
 		if !ok {
 			return nil, nil
 		}
 		authorId := fmt.Sprintf("%v", p["authorId"])
+		if dl, ok := ctx.DataLoaders["user"]; ok {
+			return dl.Load(authorId)
+		}
 		return users[authorId], nil
 	})
 
@@ -1208,7 +1230,7 @@ func TestNewValidationError(t *testing.T) {
 func TestExecutor_DefaultVariableValue(t *testing.T) {
 	s := setupTestSchema(t)
 
-	_ = s.RegisterResolver("Query", "search", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	_ = s.RegisterResolver("Query", "search", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		limit, _ := args["limit"].(int)
 		if limit != 10 {
 			t.Errorf("expected default limit 10, got %v", limit)
@@ -1449,7 +1471,7 @@ func TestParseQuery_FloatValues(t *testing.T) {
 func TestExecutor_ResolverReturnsError(t *testing.T) {
 	s := setupTestSchema(t)
 
-	_ = s.RegisterResolver("Query", "user", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	_ = s.RegisterResolver("Query", "user", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		return nil, fmt.Errorf("database connection failed")
 	})
 
@@ -1525,7 +1547,7 @@ func TestExecutor_ResolverReturnsStruct(t *testing.T) {
 	`
 	_ = s.ParseSDL(sdl)
 
-	_ = s.RegisterResolver("Query", "user", func(parent interface{}, args map[string]interface{}) (interface{}, error) {
+	_ = s.RegisterResolver("Query", "user", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
 		return &TestUser{
 			ID:   "1",
 			Name: "StructUser",
@@ -1551,4 +1573,277 @@ func TestExecutor_ResolverReturnsStruct(t *testing.T) {
 	if userData["age"] != 42 {
 		t.Errorf("expected 42, got %v", userData["age"])
 	}
+}
+
+func TestExecutor_DataLoaderBatchLoading(t *testing.T) {
+	s := setupTestSchema(t)
+
+	users := map[string]map[string]interface{}{
+		"1": {"id": "1", "name": "Alice", "authorId": "1"},
+		"2": {"id": "2", "name": "Bob", "authorId": "2"},
+	}
+	posts := map[string]map[string]interface{}{
+		"101": {"id": "101", "title": "Post 101", "authorId": "1"},
+		"102": {"id": "102", "title": "Post 102", "authorId": "2"},
+		"103": {"id": "103", "title": "Post 103", "authorId": "1"},
+	}
+	userPosts := map[string][]string{
+		"1": {"101", "103"},
+		"2": {"102"},
+	}
+
+	var userLoadCount int
+	var userBatchSize []int
+	var mu sync.Mutex
+
+	userDL := NewDataLoader(func(keys []interface{}) ([]interface{}, error) {
+		mu.Lock()
+		userLoadCount++
+		userBatchSize = append(userBatchSize, len(keys))
+		mu.Unlock()
+
+		results := make([]interface{}, len(keys))
+		for i, k := range keys {
+			id := fmt.Sprintf("%v", k)
+			results[i] = users[id]
+		}
+		return results, nil
+	})
+
+	var postLoadCount int
+	var postBatchSize []int
+
+	postDL := NewDataLoader(func(keys []interface{}) ([]interface{}, error) {
+		mu.Lock()
+		postLoadCount++
+		postBatchSize = append(postBatchSize, len(keys))
+		mu.Unlock()
+
+		results := make([]interface{}, len(keys))
+		for i, k := range keys {
+			id := fmt.Sprintf("%v", k)
+			results[i] = posts[id]
+		}
+		return results, nil
+	})
+
+	_ = s.RegisterResolver("Query", "users", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
+		result := make([]map[string]interface{}, 0, len(users))
+		for _, u := range users {
+			result = append(result, u)
+		}
+		return result, nil
+	})
+
+	_ = s.RegisterResolver("User", "posts", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
+		p, ok := parent.(map[string]interface{})
+		if !ok {
+			return nil, nil
+		}
+		userId := fmt.Sprintf("%v", p["id"])
+		postIds := userPosts[userId]
+		keys := make([]interface{}, len(postIds))
+		for i, pid := range postIds {
+			keys[i] = pid
+		}
+		dl := ctx.DataLoaders["post"]
+		vals, errs := dl.LoadMany(keys)
+		for _, e := range errs {
+			if e != nil {
+				return nil, e
+			}
+		}
+		return vals, nil
+	})
+
+	_ = s.RegisterResolver("Post", "author", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
+		p, ok := parent.(map[string]interface{})
+		if !ok {
+			return nil, nil
+		}
+		authorId := fmt.Sprintf("%v", p["authorId"])
+		dl := ctx.DataLoaders["user"]
+		return dl.Load(authorId)
+	})
+
+	dls := map[string]*DataLoader{
+		"user": userDL,
+		"post": postDL,
+	}
+
+	exec := NewExecutor(s)
+
+	query := `{
+		users {
+			name
+			posts {
+				title
+				author {
+					name
+				}
+			}
+		}
+	}`
+
+	result := exec.Execute(query, nil, dls)
+	if len(result.Errors) > 0 {
+		t.Fatalf("unexpected errors: %v", result.Errors)
+	}
+
+	usersData, ok := result.Data["users"].([]interface{})
+	if !ok {
+		t.Fatalf("expected users list, got %T", result.Data["users"])
+	}
+	if len(usersData) != 2 {
+		t.Errorf("expected 2 users, got %d", len(usersData))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if postLoadCount < 1 {
+		t.Error("expected at least 1 post batch load, got 0")
+	}
+	if userLoadCount < 1 {
+		t.Error("expected at least 1 user batch load, got 0")
+	}
+
+	totalPostsLoaded := 0
+	for _, size := range postBatchSize {
+		totalPostsLoaded += size
+	}
+	if totalPostsLoaded < 3 {
+		t.Errorf("expected at least 3 posts loaded, got %d", totalPostsLoaded)
+	}
+
+	totalUsersLoaded := 0
+	for _, size := range userBatchSize {
+		totalUsersLoaded += size
+	}
+	if totalUsersLoaded < 2 {
+		t.Errorf("expected at least 2 users loaded (authors), got %d", totalUsersLoaded)
+	}
+}
+
+func TestExecutor_MissingRequiredVariable(t *testing.T) {
+	s := setupTestSchema(t)
+
+	exec := NewExecutor(s)
+
+	query := `
+		query GetUser($userId: ID!) {
+			user(id: $userId) {
+				name
+			}
+		}
+	`
+
+	result := exec.Execute(query, nil, nil)
+	if len(result.Errors) == 0 {
+		t.Error("expected error for missing required variable")
+	}
+
+	found := false
+	for _, err := range result.Errors {
+		if err != nil {
+			errStr := err.Error()
+			if containsStr(errStr, "userId") && containsStr(errStr, "required") {
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected error about missing required variable $userId, got: %v", result.Errors)
+	}
+}
+
+func TestExecutor_VariableWithDefault(t *testing.T) {
+	s := setupTestSchema(t)
+
+	_ = s.RegisterResolver("Query", "search", func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error) {
+		return []map[string]interface{}{
+			{"id": "1", "title": "Test Post"},
+		}, nil
+	})
+
+	exec := NewExecutor(s)
+
+	query := `
+		query Search($q: String!, $limit: Int = 10) {
+			search(query: $q, limit: $limit) {
+				title
+			}
+		}
+	`
+
+	variables := map[string]interface{}{
+		"q": "test",
+	}
+
+	result := exec.Execute(query, variables, nil)
+	if len(result.Errors) > 0 {
+		t.Fatalf("unexpected errors: %v", result.Errors)
+	}
+}
+
+func TestSchema_TypeClassification(t *testing.T) {
+	s := setupTestSchema(t)
+
+	idType, ok := s.GetType("ID")
+	if !ok {
+		t.Fatal("expected ID type to exist")
+	}
+	if idType.Kind != TypeKindScalar {
+		t.Errorf("expected ID to be scalar kind, got %v", idType.Kind)
+	}
+
+	stringType, ok := s.GetType("String")
+	if !ok {
+		t.Fatal("expected String type to exist")
+	}
+	if stringType.Kind != TypeKindScalar {
+		t.Errorf("expected String to be scalar kind, got %v", stringType.Kind)
+	}
+
+	userType, ok := s.GetType("User")
+	if !ok {
+		t.Fatal("expected User type to exist")
+	}
+	if userType.Kind != TypeKindObject {
+		t.Errorf("expected User to be object kind, got %v", userType.Kind)
+	}
+
+	idField, ok := userType.Fields["id"]
+	if !ok {
+		t.Fatal("expected id field on User")
+	}
+	unwrapped := idField.Type.Unwrap()
+	if unwrapped.Name != "ID" {
+		t.Errorf("expected id field type name ID, got %s", unwrapped.Name)
+	}
+	if unwrapped.Kind != TypeKindScalar {
+		t.Errorf("expected id field type to be scalar kind, got %v", unwrapped.Kind)
+	}
+
+	dateTimeType, ok := s.GetType("DateTime")
+	if !ok {
+		t.Fatal("expected DateTime scalar type to exist")
+	}
+	if dateTimeType.Kind != TypeKindScalar {
+		t.Errorf("expected DateTime to be scalar kind, got %v", dateTimeType.Kind)
+	}
+}
+
+func containsStr(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsStrHelper(s, substr))
+}
+
+func containsStrHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

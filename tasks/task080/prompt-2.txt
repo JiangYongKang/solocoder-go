@@ -1,0 +1,7 @@
+你实现的结构化日志库模块存在一些问题，需要修复：
+1. structlog.go 的 log 方法输出的日志条目中系统字段 ts、level、msg 可能被用户上下文字段覆盖。当用户通过 WithFields 传入名为 "ts"、"level" 或 "msg" 的字段时，输出 JSON 中这些字段的值变成用户传入的值而非系统真实值，例如 WithFields({"level":"FAKE"}).Info("test") 输出 level 为 "FAKE" 而非 "INFO"，导致日志采集系统按级别过滤和按时间排序的功能失效。
+2. shouldSample 函数返回 true 时表示日志应被采样丢弃，但函数名 shouldSample 字面含义是"是否应该采样"，调用处 `if l.shouldSample(level) { return }` 读起来构成双重否定，增加了代码维护者的理解成本。
+3. TestNonErrorHasCaller 测试仅校验 caller 字段包含 ".go:" 模式，未验证 caller 是否实际指向调用源文件。captureCaller 中 pkgPrefix 的过滤规则导致同包的测试函数被误过滤，实际返回的 caller 指向 testing.go 而非 structlog_test.go 中的调用行，测试断言过弱未能暴露调用者定位偏差。
+4. 修复后需要为该模块补充系统字段名与用户字段名冲突场景的单元测试，并加强 caller 定位的测试断言使其能验证调用者确实指向调用源文件。
+5. 运行 go test ./internal/structlog/ -v，需要让所有测试通过。
+6. 在 docs/structlog.md 中更新模块需求文档，说明修复后的字段保护机制和 caller 定位逻辑。

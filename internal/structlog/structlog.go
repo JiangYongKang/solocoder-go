@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-const pkgPrefix = "solocoder-go/internal/structlog."
-
 type Level int
 
 const (
@@ -111,7 +109,7 @@ func (l *Logger) Error(msg string) {
 	l.log(LevelError, msg)
 }
 
-func (l *Logger) shouldSample(level Level) bool {
+func (l *Logger) isSampledOut(level Level) bool {
 	rate := l.state.samplingRates[level].Load()
 	if rate <= 0 {
 		return false
@@ -126,18 +124,18 @@ func (l *Logger) log(level Level, msg string) {
 		return
 	}
 
-	if l.shouldSample(level) {
+	if l.isSampledOut(level) {
 		return
 	}
 
 	entry := make(map[string]interface{}, len(l.fields)+5)
-	entry["ts"] = time.Now().UTC().Format(time.RFC3339Nano)
-	entry["level"] = level.String()
-	entry["msg"] = msg
-
 	for k, v := range l.fields {
 		entry[k] = v
 	}
+
+	entry["ts"] = time.Now().UTC().Format(time.RFC3339Nano)
+	entry["level"] = level.String()
+	entry["msg"] = msg
 
 	caller := captureCaller()
 	if caller != "" {
@@ -162,6 +160,14 @@ func (l *Logger) log(level Level, msg string) {
 	l.state.output.Write([]byte("\n"))
 }
 
+func isInternalFrame(frame runtime.Frame) bool {
+	if strings.HasSuffix(frame.File, "/structlog.go") ||
+		strings.HasSuffix(frame.File, "\\structlog.go") {
+		return true
+	}
+	return false
+}
+
 func captureCaller() string {
 	pcs := make([]uintptr, 32)
 	n := runtime.Callers(2, pcs)
@@ -171,7 +177,7 @@ func captureCaller() string {
 	frames := runtime.CallersFrames(pcs[:n])
 	for {
 		frame, more := frames.Next()
-		if !strings.HasPrefix(frame.Function, pkgPrefix) {
+		if !isInternalFrame(frame) {
 			return fmt.Sprintf("%s:%d", frame.File, frame.Line)
 		}
 		if !more {
@@ -191,7 +197,7 @@ func captureStack() []string {
 	var stack []string
 	for {
 		frame, more := frames.Next()
-		if !strings.HasPrefix(frame.Function, pkgPrefix) {
+		if !isInternalFrame(frame) {
 			stack = append(stack, fmt.Sprintf("%s:%d", frame.File, frame.Line))
 		}
 		if !more {

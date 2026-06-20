@@ -1,0 +1,4 @@
+你实现的 HTTP 内容协商模块存在一些问题，需要修复：
+1. contentneg.go 的 WriteNotAcceptable 方法在 json.MarshalIndent 序列化失败后走备选路径手动拼接 JSON 字符串，supported_formats 数组的元素未被双引号包裹，导致返回给客户端的 406 响应体是非法 JSON 无法被解析。
+2. contentneg_test.go 的 TestMarshalProtobuf 测试只检查了序列化结果非空，没有像 TestMarshalJSON 和 TestMarshalXML 那样对序列化结果做反序列化往返验证。当 marshalProtobuf 输出损坏数据时现有断言无法检测到错误，与提示词第 4 条"完整的单元测试"要求不符。
+3. 运行 go test ./internal/contentneg/ -v，需要让所有测试通过。

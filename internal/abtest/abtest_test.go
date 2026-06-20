@@ -409,6 +409,164 @@ func TestGetExperiment_Success(t *testing.T) {
 	}
 }
 
+func TestGetExperiment_ReturnsCopy(t *testing.T) {
+	ab := NewABTest()
+	_ = ab.AddExperiment(&Experiment{
+		ID:                  "exp-copy",
+		ExperimentGroupPct:  30,
+		ControlGroupPct:     30,
+		ExperimentGroupName: "exp_group",
+		ControlGroupName:    "ctrl_group",
+	})
+
+	exp, _ := ab.GetExperiment("exp-copy")
+	exp.ExperimentGroupPct = 100
+	exp.ControlGroupPct = 0
+	exp.ExperimentGroupName = "modified"
+	exp.ControlGroupName = "modified_ctrl"
+
+	internalExp, _ := ab.GetExperiment("exp-copy")
+	if internalExp.ExperimentGroupPct != 30 {
+		t.Errorf("internal experiment should not be modified, got ExperimentGroupPct %d", internalExp.ExperimentGroupPct)
+	}
+	if internalExp.ControlGroupPct != 30 {
+		t.Errorf("internal experiment should not be modified, got ControlGroupPct %d", internalExp.ControlGroupPct)
+	}
+	if internalExp.ExperimentGroupName != "exp_group" {
+		t.Errorf("internal experiment should not be modified, got ExperimentGroupName %s", internalExp.ExperimentGroupName)
+	}
+	if internalExp.ControlGroupName != "ctrl_group" {
+		t.Errorf("internal experiment should not be modified, got ControlGroupName %s", internalExp.ControlGroupName)
+	}
+}
+
+func TestListExperiments_ReturnsCopies(t *testing.T) {
+	ab := NewABTest()
+	_ = ab.AddExperiment(&Experiment{
+		ID:                 "exp-list-copy",
+		ExperimentGroupPct: 50,
+		ControlGroupPct:    50,
+	})
+
+	exps := ab.ListExperiments()
+	if len(exps) != 1 {
+		t.Fatalf("expected 1 experiment, got %d", len(exps))
+	}
+
+	exps[0].ExperimentGroupPct = 100
+	exps[0].ControlGroupPct = 0
+
+	internalExps := ab.ListExperiments()
+	if internalExps[0].ExperimentGroupPct != 50 {
+		t.Errorf("internal experiment should not be modified, got ExperimentGroupPct %d", internalExps[0].ExperimentGroupPct)
+	}
+	if internalExps[0].ControlGroupPct != 50 {
+		t.Errorf("internal experiment should not be modified, got ControlGroupPct %d", internalExps[0].ControlGroupPct)
+	}
+}
+
+func TestAddExperiment_StoresCopy(t *testing.T) {
+	ab := NewABTest()
+	exp := &Experiment{
+		ID:                 "exp-store-copy",
+		ExperimentGroupPct: 10,
+		ControlGroupPct:    20,
+	}
+
+	err := ab.AddExperiment(exp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exp.ExperimentGroupPct = 100
+	exp.ControlGroupPct = 0
+
+	internalExp, _ := ab.GetExperiment("exp-store-copy")
+	if internalExp.ExperimentGroupPct != 10 {
+		t.Errorf("stored experiment should not be affected by caller modification, got ExperimentGroupPct %d", internalExp.ExperimentGroupPct)
+	}
+	if internalExp.ControlGroupPct != 20 {
+		t.Errorf("stored experiment should not be affected by caller modification, got ControlGroupPct %d", internalExp.ControlGroupPct)
+	}
+}
+
+func TestConcurrent_ReadAndModifyExperimentPointer(t *testing.T) {
+	ab := NewABTest()
+	_ = ab.AddExperiment(&Experiment{
+		ID:                 "exp-race",
+		ExperimentGroupPct: 50,
+		ControlGroupPct:    50,
+	})
+
+	var wg sync.WaitGroup
+	numGoroutines := 20
+	iterations := 100
+
+	stop := make(chan struct{})
+
+	for g := 0; g < numGoroutines/2; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+					exp, _ := ab.GetExperiment("exp-race")
+					_ = exp.ExperimentGroupPct
+					_ = exp.ControlGroupPct
+				}
+			}
+		}()
+	}
+
+	for g := 0; g < numGoroutines/2; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+					exp, _ := ab.GetExperiment("exp-race")
+					exp.ExperimentGroupPct = 999
+					exp.ControlGroupPct = 999
+					_ = exp
+				}
+			}
+		}()
+	}
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+					userID := fmt.Sprintf("user-race-%d-%d", gid, i)
+					_, _ = ab.AssignGroup(userID, "exp-race")
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(stop)
+
+	internalExp, _ := ab.GetExperiment("exp-race")
+	if internalExp.ExperimentGroupPct != 50 {
+		t.Errorf("internal experiment should not be modified by concurrent readers, got %d", internalExp.ExperimentGroupPct)
+	}
+	if internalExp.ControlGroupPct != 50 {
+		t.Errorf("internal experiment should not be modified by concurrent readers, got %d", internalExp.ControlGroupPct)
+	}
+}
+
 func TestListExperiments_Empty(t *testing.T) {
 	ab := NewABTest()
 	exps := ab.ListExperiments()

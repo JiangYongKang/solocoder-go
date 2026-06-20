@@ -172,13 +172,13 @@ func computeUserBucket(userID string, seed uint64) int {
 
 ### 4.3 热更新（便捷方法）
 
-| 方法 | 说明 |
-|------|------|
-| `SetBooleanValue(key string, enabled bool) error` | 设置布尔开关值 |
-| `SetPercentage(key string, percentage int) error` | 设置百分比灰度值 |
-| `AddToWhitelist(key string, userID string) error` | 向白名单添加用户 |
-| `RemoveFromWhitelist(key string, userID string) error` | 从白名单移除用户 |
-| `ChangeFlagType(key, newType, enabled, percentage, whitelist) error` | 切换开关类型 |
+| 方法 | 说明 | 类型校验 |
+|------|------|----------|
+| `SetBooleanValue(key string, enabled bool) error` | 设置布尔开关值 | 仅允许 Boolean 类型，否则返回 `ErrInvalidFlagType` |
+| `SetPercentage(key string, percentage int) error` | 设置百分比灰度值 | 仅允许 Percentage 类型，否则返回 `ErrInvalidFlagType` |
+| `AddToWhitelist(key string, userID string) error` | 向白名单添加用户 | 仅允许 Whitelist 类型，否则返回 `ErrInvalidFlagType` |
+| `RemoveFromWhitelist(key string, userID string) error` | 从白名单移除用户 | 仅允许 Whitelist 类型，否则返回 `ErrInvalidFlagType` |
+| `ChangeFlagType(key, newType, enabled, percentage, whitelist) error` | 切换开关类型 | 无类型限制，允许从任意类型切换到任意类型 |
 
 ### 4.4 审计日志
 
@@ -350,3 +350,104 @@ Evaluator 使用 `sync.RWMutex` 实现线程安全：
 - **写操作**（CreateFlag、UpdateFlag、DeleteFlag、Set*、Add/Remove*）：使用写锁，串行执行
 
 所有返回给调用方的配置对象均为深拷贝，避免外部修改影响内部状态。
+
+## 8. 类型校验策略
+
+### 8.1 设计原则
+
+所有便捷更新方法（`SetBooleanValue`、`SetPercentage`、`AddToWhitelist`、`RemoveFromWhitelist`）均执行严格的类型校验，确保操作仅对匹配类型的开关生效。`ChangeFlagType` 和 `UpdateFlag` 不受类型校验限制，因为它们的设计目的就是允许跨类型变更。
+
+### 8.2 校验规则
+
+| 方法 | 允许的开关类型 | 拒绝时的错误 |
+|------|---------------|-------------|
+| `SetBooleanValue` | `FlagTypeBoolean` | `ErrInvalidFlagType: flag type is X, not Boolean` |
+| `SetPercentage` | `FlagTypePercentage` | `ErrInvalidFlagType: flag type is X, not Percentage` |
+| `AddToWhitelist` | `FlagTypeWhitelist` | `ErrInvalidFlagType: flag type is X, not Whitelist` |
+| `RemoveFromWhitelist` | `FlagTypeWhitelist` | `ErrInvalidFlagType: flag type is X, not Whitelist` |
+
+### 8.3 类型校验失败的副作用
+
+当类型校验失败时：
+- **不会修改开关配置**：开关的内部状态保持不变
+- **不会记录审计日志**：只有成功执行的变更才会生成审计日志条目
+- **立即返回错误**：调用方可根据返回的 `ErrInvalidFlagType` 识别类型不匹配
+
+### 8.4 示例
+
+```go
+// 创建百分比灰度开关
+_ = eval.CreateFlag(&featureflag.FlagConfig{
+    Key:        "gradual-rollout",
+    Type:       featureflag.FlagTypePercentage,
+    Percentage: 10,
+})
+
+// 错误：对百分比开关调用 SetBooleanValue
+err := eval.SetBooleanValue("gradual-rollout", true)
+// err = ErrInvalidFlagType: flag type is Percentage, not Boolean
+
+// 正确：使用 SetPercentage
+err = eval.SetPercentage("gradual-rollout", 50)
+// err = nil
+
+// 正确：使用 ChangeFlagType 切换类型后再设置布尔值
+_ = eval.ChangeFlagType("gradual-rollout", featureflag.FlagTypeBoolean, true, 0, nil)
+_ = eval.SetBooleanValue("gradual-rollout", false) // 此时类型已是 Boolean，允许操作
+```
+
+## 9. 审计日志时间范围查询
+
+### 9.1 查询接口
+
+通过 `QueryAuditLogs(query AuditLogQuery)` 方法按时间范围过滤审计日志。`AuditLogQuery` 支持三个可选维度：
+
+- **FlagKey**：按开关标识过滤（精确匹配）
+- **StartTime**：只返回时间戳 >= StartTime 的日志（含边界）
+- **EndTime**：只返回时间戳 <= EndTime 的日志（含边界）
+
+三个维度可以单独使用或任意组合，均为可选参数（nil 表示不过滤该维度）。
+
+### 9.2 时间边界行为
+
+时间范围的过滤是**闭区间**（inclusive）：
+
+- `StartTime` 和 `EndTime` 均为包含边界
+- 若某条日志的 `Timestamp` 恰好等于 `StartTime` 或 `EndTime`，该日志会被包含在结果中
+- 使用 `time.Before()` 判断是否早于 `StartTime`，使用 `time.After()` 判断是否晚于 `EndTime`
+
+### 9.3 查询组合场景
+
+| 场景 | StartTime | EndTime | FlagKey | 行为 |
+|------|-----------|---------|---------|------|
+| 全量查询 | nil | nil | "" | 返回所有日志 |
+| 按开关过滤 | nil | nil | "flag-a" | 返回 flag-a 的所有日志 |
+| 仅起始时间 | &start | nil | "" | 返回 start 之后的日志 |
+| 仅终止时间 | nil | &end | "" | 返回 end 之前的日志 |
+| 时间范围 | &start | &end | "" | 返回 [start, end] 内的日志 |
+| 开关 + 时间范围 | &start | &end | "flag-a" | 返回 flag-a 在 [start, end] 内的日志 |
+
+### 9.4 示例
+
+```go
+// 查询最近 1 小时内 flag-a 的变更
+start := time.Now().Add(-1 * time.Hour)
+end := time.Now()
+logs := eval.QueryAuditLogs(featureflag.AuditLogQuery{
+    FlagKey:   "flag-a",
+    StartTime: &start,
+    EndTime:   &end,
+})
+
+// 查询某个时间点之后的所有变更
+afterDeploy := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+recentLogs := eval.QueryAuditLogs(featureflag.AuditLogQuery{
+    StartTime: &afterDeploy,
+})
+
+// 查询某个时间点之前的所有变更（用于回溯问题）
+incidentTime := time.Date(2026, 6, 20, 14, 30, 0, 0, time.UTC)
+beforeIncident := eval.QueryAuditLogs(featureflag.AuditLogQuery{
+    EndTime: &incidentTime,
+})
+```

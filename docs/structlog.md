@@ -14,6 +14,8 @@ StructLog 是一个 Go 语言结构化日志库，位于 `internal/structlog/` �
 
 5. **调用栈信息自动附加**：Error 级别的日志自动附加产生日志的调用栈信息（文件名和行号），调用栈信息作为 JSON 输出中的独立 `stack` 字段，不包含完整的 goroutine 堆栈。其他级别的日志记录文件名和行号于 `caller` 字段，但不展开完整调用栈。
 
+6. **系统字段保护**：`ts`、`level`、`msg`、`caller`、`stack` 为系统保留字段，具有最高写入优先级。即使用户通过 `WithFields()` 传入同名上下文字段，系统字段的值也不会被覆盖，确保日志采集系统的可靠性。
+
 ---
 
 ## 核心结构体与职责
@@ -152,6 +154,35 @@ type Logger struct {
 | stack | []string | 调用栈（仅 Error 级别），每项为 `文件名:行号` 格式，不包含 structlog 内部帧 |
 | * | any | 通过 WithFields 附加的上下文字段 |
 
+### 系统字段保护机制
+
+`ts`、`level`、`msg`、`caller`、`stack` 为系统保留字段，具有最高写入优先级。即使用户通过 `WithFields()` 传入同名的上下文字段，最终输出的 JSON 中这些字段的值仍然是系统生成的真实值，不会被用户字段覆盖。
+
+**实现原理**：在 `log()` 方法中，先将用户上下文字段写入 `entry` map，再依次写入系统字段。由于 map 后写入的键值会覆盖先写入的，因此系统字段始终保留真实值，确保日志采集系统可以可靠地按级别过滤、按时间排序。
+
+---
+
+## 调用者定位逻辑
+
+### 基本原理
+
+`captureCaller()` 和 `captureStack()` 函数通过 `runtime.Callers()` 获取调用栈，跳过 `structlog.go` 源文件中的所有内部帧（包括 Logger 的方法和内部辅助函数），定位到业务代码中的实际调用位置。
+
+### 内部帧过滤规则
+
+内部帧的判定基于源文件名：文件名以 `structlog.go` 结尾的帧被视为内部帧，会被自动跳过。这种基于文件名的过滤策略相比基于包名前缀的过滤有以下优势：
+
+1. **精准性**：只跳过日志库自身的实现代码，不会误过滤同包内的其他代码（如同包的测试文件、同包的业务代码等）。
+2. **稳定性**：不受函数名、方法名、接收者类型变化的影响。
+3. **可测试性**：测试代码位于 `structlog_test.go` 中，不会被误过滤，可以精确验证调用者指向测试文件中的具体行号。
+
+### 各字段的调用信息
+
+| 字段 | 级别 | 内容 | 定位方式 |
+|------|------|------|----------|
+| caller | 所有级别 | 单个 `文件名:行号` | 跳过内部帧后的第一帧 |
+| stack | 仅 Error 级别 | `[]string`，每元素为 `文件名:行号` | 跳过内部帧后的全部剩余帧 |
+
 ---
 
 ## 使用示例
@@ -232,4 +263,23 @@ logger := structlog.New(&buf, structlog.LevelInfo)
 logger.Info("test message")
 
 // 读取 buf.Bytes() 验证输出内容
+```
+
+### 示例 6：系统字段保护（防止用户字段覆盖）
+
+```go
+logger := structlog.New(os.Stdout, structlog.LevelDebug)
+
+// 即使用户传入与系统字段同名的上下文字段
+child := logger.WithFields(map[string]interface{}{
+    "ts":     "fake-timestamp",
+    "level":  "FAKE",
+    "msg":    "fake message",
+    "caller": "fake.go:0",
+})
+
+child.Info("real message")
+
+// 输出的 ts、level、msg、caller 仍然是系统生成的真实值
+// 用户传入的同名字段会被系统字段覆盖，不会生效
 ```

@@ -1,0 +1,6 @@
+你实现的功能开关评估器模块存在一些问题，需要修复：
+1. SetBooleanValue 方法在修改开关的布尔值时没有校验目标开关的类型是否为布尔型，而 SetPercentage、AddToWhitelist 和 RemoveFromWhitelist 方法都做了类型校验。当对非布尔型开关调用 SetBooleanValue 时方法不返回任何错误，但 Evaluate 方法按开关类型分发逻辑会忽略该布尔字段的修改，改动看似成功实则无效，审计日志却仍然记录了 SET_BOOLEAN 操作，导致日志语义混乱。
+2. TestQueryAuditLogs_ByTimeRange 测试函数中构造了时间查询窗口并得到了查询结果 results，但该结果被丢弃未做任何断言验证。测试使用同一个 midTime 作为查询的起止时间，而测试日志中所有操作的时间戳集中在极短间隔内，使得构造的时间窗口不足以产生可区分的时间范围，测试对时间范围组合过滤的覆盖存在缺口。
+3. 修复后需要为该模块补充类型校验和时间范围查询场景的单元测试。
+4. 运行 go test ./internal/featureflag/ -v，需要让所有测试通过。
+5. 在 docs/featureflag.md 中更新模块需求文档，说明修复后的类型校验策略和审计日志时间范围查询的预期行为。

@@ -15,7 +15,6 @@ var (
 	ErrInvalidTrafficPercent = errors.New("abtest: invalid traffic percentage")
 	ErrTrafficExceedsLimit   = errors.New("abtest: traffic percentage exceeds 100")
 	ErrEmptyGroupName        = errors.New("abtest: empty group name")
-	ErrInvalidBucketNumber   = errors.New("abtest: invalid bucket number")
 	ErrEmptyMetricName       = errors.New("abtest: empty metric name")
 )
 
@@ -118,7 +117,13 @@ func (ab *ABTest) AddExperiment(exp *Experiment) error {
 		return ErrExperimentExists
 	}
 
-	ab.experiments[exp.ID] = exp
+	ab.experiments[exp.ID] = &Experiment{
+		ID:                  exp.ID,
+		ExperimentGroupPct:  exp.ExperimentGroupPct,
+		ControlGroupPct:     exp.ControlGroupPct,
+		ExperimentGroupName: exp.ExperimentGroupName,
+		ControlGroupName:    exp.ControlGroupName,
+	}
 	ab.metrics[exp.ID] = &ExperimentMetrics{
 		GroupMetrics: make(map[string]*GroupMetrics),
 	}
@@ -168,7 +173,13 @@ func (ab *ABTest) GetExperiment(experimentID string) (*Experiment, error) {
 	if !exists {
 		return nil, ErrExperimentNotFound
 	}
-	return exp, nil
+	return &Experiment{
+		ID:                  exp.ID,
+		ExperimentGroupPct:  exp.ExperimentGroupPct,
+		ControlGroupPct:     exp.ControlGroupPct,
+		ExperimentGroupName: exp.ExperimentGroupName,
+		ControlGroupName:    exp.ControlGroupName,
+	}, nil
 }
 
 func (ab *ABTest) ListExperiments() []*Experiment {
@@ -177,7 +188,13 @@ func (ab *ABTest) ListExperiments() []*Experiment {
 
 	result := make([]*Experiment, 0, len(ab.experiments))
 	for _, exp := range ab.experiments {
-		result = append(result, exp)
+		result = append(result, &Experiment{
+			ID:                  exp.ID,
+			ExperimentGroupPct:  exp.ExperimentGroupPct,
+			ControlGroupPct:     exp.ControlGroupPct,
+			ExperimentGroupName: exp.ExperimentGroupName,
+			ControlGroupName:    exp.ControlGroupName,
+		})
 	}
 	return result
 }

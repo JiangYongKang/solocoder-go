@@ -53,7 +53,12 @@ func (v *Validator) validateOperation(schema *Schema, op *Operation) []*Validati
 		return errs
 	}
 
-	fieldErrs := v.validateSelectionSet(schema, rootType, op.SelectionSet, "", 0)
+	variableTypes := make(map[string]*Type)
+	for _, vd := range op.VariableDefs {
+		variableTypes[vd.Name] = vd.Type
+	}
+
+	fieldErrs := v.validateSelectionSet(schema, rootType, op.SelectionSet, variableTypes, 0)
 	errs = append(errs, fieldErrs...)
 
 	return errs
@@ -63,53 +68,59 @@ func (v *Validator) validateSelectionSet(
 	schema *Schema,
 	parentType *Type,
 	selections []*Selection,
-	path string,
+	variableTypes map[string]*Type,
 	depth int,
 ) []*ValidationError {
 	var errs []*ValidationError
 
 	if depth > v.MaxDepth {
-		errs = append(errs, NewValidationError(path, "query nested too deep (max depth %d)", v.MaxDepth))
+		errs = append(errs, NewValidationError("", "query nested too deep (max depth %d)", v.MaxDepth))
 		return errs
 	}
 
-	if len(selections) == 0 {
-		if parentType != nil {
-			unwrapped := parentType.Unwrap()
-			var actualType *Type
-			if unwrapped.Name != "" {
-				if t, ok := schema.GetType(unwrapped.Name); ok {
-					actualType = t
-				} else {
-					actualType = unwrapped
-				}
-			} else {
-				actualType = unwrapped
-			}
-			if actualType.Kind == TypeKindObject || actualType.Kind == TypeKindQuery || actualType.Kind == TypeKindMutation {
-				if len(actualType.Fields) > 0 {
-					errs = append(errs, NewValidationError(path, "selection set cannot be empty for object type"))
-				}
-			}
+	unwrappedParent := parentType.Unwrap()
+	parentIsObject := unwrappedParent.Kind == TypeKindObject ||
+		unwrappedParent.Kind == TypeKindQuery ||
+		unwrappedParent.Kind == TypeKindMutation
+
+	var actualParent *Type
+	if parentIsObject && unwrappedParent.Name != "" {
+		if t, ok := schema.GetType(unwrappedParent.Name); ok {
+			actualParent = t
+		} else {
+			actualParent = unwrappedParent
 		}
+	} else {
+		actualParent = unwrappedParent
+	}
+
+	if len(selections) == 0 {
+		if parentIsObject && len(actualParent.Fields) > 0 {
+			errs = append(errs, NewValidationError("", "selection set cannot be empty for object type"))
+		}
+		return errs
+	}
+
+	if !parentIsObject {
+		errs = append(errs, NewValidationError("", "cannot select fields on scalar type %q", unwrappedParent.Name))
 		return errs
 	}
 
 	for _, sel := range selections {
 		switch s := (*sel).(type) {
 		case *FieldSelection:
-			fieldErrs := v.validateField(schema, parentType, s, path, depth)
+			fieldErrs := v.validateField(schema, actualParent, s, variableTypes, depth)
 			errs = append(errs, fieldErrs...)
 		case *InlineFragment:
 			fragType, ok := schema.GetType(s.TypeCondition)
 			if !ok {
-				errs = append(errs, NewValidationError(path, "inline fragment references unknown type %q", s.TypeCondition))
+				errs = append(errs, NewValidationError("", "inline fragment references unknown type %q", s.TypeCondition))
 				continue
 			}
-			fragErrs := v.validateSelectionSet(schema, fragType, s.SelectionSet, path, depth+1)
+			fragErrs := v.validateSelectionSet(schema, fragType, s.SelectionSet, variableTypes, depth+1)
 			errs = append(errs, fragErrs...)
 		case *FragmentSpread:
-			errs = append(errs, NewValidationError(path, "named fragments are not supported in this implementation"))
+			errs = append(errs, NewValidationError("", "named fragments are not supported in this implementation"))
 		}
 	}
 
@@ -120,66 +131,51 @@ func (v *Validator) validateField(
 	schema *Schema,
 	parentType *Type,
 	field *FieldSelection,
-	path string,
+	variableTypes map[string]*Type,
 	depth int,
 ) []*ValidationError {
 	var errs []*ValidationError
 
-	fieldPath := path
+	fieldPath := field.Name
 	if field.Alias != "" {
-		fieldPath = joinPath(fieldPath, field.Alias)
-	} else {
-		fieldPath = joinPath(fieldPath, field.Name)
-	}
-
-	if parentType == nil {
-		errs = append(errs, NewValidationError(fieldPath, "cannot validate field on nil parent type"))
-		return errs
+		fieldPath = field.Alias
 	}
 
 	unwrappedParent := parentType.Unwrap()
-	actualParent := unwrappedParent
-	if unwrappedParent.Name != "" {
-		if t, ok := schema.GetType(unwrappedParent.Name); ok {
-			actualParent = t
-		}
-	}
-
-	if actualParent.Fields == nil || len(actualParent.Fields) == 0 {
-		if field.Name != "__typename" {
-			errs = append(errs, NewValidationError(fieldPath, "type %q does not have fields", actualParent.Name))
-			return errs
-		}
-		return errs
-	}
-
-	schemaField, ok := actualParent.Fields[field.Name]
+	schemaField, ok := unwrappedParent.Fields[field.Name]
 	if !ok {
-		errs = append(errs, NewValidationError(fieldPath, "field %q does not exist on type %q", field.Name, actualParent.Name))
+		if field.Name != "__typename" {
+			errs = append(errs, NewValidationError(fieldPath, "field %q does not exist on type %q", field.Name, unwrappedParent.Name))
+		}
 		return errs
 	}
 
-	argErrs := v.validateArguments(schema, schemaField, field, fieldPath)
+	argErrs := v.validateArguments(schemaField, field, variableTypes, fieldPath)
 	errs = append(errs, argErrs...)
 
-	if len(field.SelectionSet) > 0 {
-		fieldType := schemaField.Type
-		if fieldType != nil {
-			nestedErrs := v.validateSelectionSet(schema, fieldType, field.SelectionSet, fieldPath, depth+1)
-			errs = append(errs, nestedErrs...)
+	if len(field.SelectionSet) > 0 && schemaField.Type != nil {
+		fieldType := schemaField.Type.Unwrap()
+		var actualFieldType *Type
+		if fieldType.Name != "" {
+			if t, ok := schema.GetType(fieldType.Name); ok {
+				actualFieldType = t
+			} else {
+				actualFieldType = fieldType
+			}
+		} else {
+			actualFieldType = fieldType
 		}
+		nestedErrs := v.validateSelectionSet(schema, actualFieldType, field.SelectionSet, variableTypes, depth+1)
+		errs = append(errs, nestedErrs...)
 	}
-
-	requiredErrs := v.validateRequiredFields(schema, schemaField, field, fieldPath)
-	errs = append(errs, requiredErrs...)
 
 	return errs
 }
 
 func (v *Validator) validateArguments(
-	schema *Schema,
 	schemaField *Field,
 	queryField *FieldSelection,
+	variableTypes map[string]*Type,
 	path string,
 ) []*ValidationError {
 	var errs []*ValidationError
@@ -190,8 +186,21 @@ func (v *Validator) validateArguments(
 				errs = append(errs, NewValidationError(joinPath(path, argName), "required argument %q is missing", argName))
 				continue
 			}
-			if _, ok := queryField.Args[argName]; !ok {
+			argVal, ok := queryField.Args[argName]
+			if !ok {
 				errs = append(errs, NewValidationError(joinPath(path, argName), "required argument %q is missing", argName))
+				continue
+			}
+			if vr, ok := argVal.(VariableRef); ok {
+				varType, varExists := variableTypes[vr.Name]
+				if !varExists {
+					errs = append(errs, NewValidationError(joinPath(path, argName), "variable $%s is not defined", vr.Name))
+					continue
+				}
+				if varType.IsNonNull() {
+					continue
+				}
+				errs = append(errs, NewValidationError(joinPath(path, argName), "required argument %q cannot be null (variable $%s is nullable)", argName, vr.Name))
 			}
 		}
 	}
@@ -208,7 +217,7 @@ func (v *Validator) validateArguments(
 			continue
 		}
 
-		if !v.validateArgumentValue(argDef.Type, argVal) {
+		if !v.validateArgumentValue(argDef.Type, argVal, variableTypes) {
 			errs = append(errs, NewValidationError(argPath, "invalid value type for argument %q", argName))
 		}
 	}
@@ -216,13 +225,17 @@ func (v *Validator) validateArguments(
 	return errs
 }
 
-func (v *Validator) validateArgumentValue(expectedType *Type, value interface{}) bool {
+func (v *Validator) validateArgumentValue(expectedType *Type, value interface{}, variableTypes map[string]*Type) bool {
 	if expectedType == nil {
 		return true
 	}
 
-	if _, ok := value.(VariableRef); ok {
-		return true
+	if vr, ok := value.(VariableRef); ok {
+		varType, ok := variableTypes[vr.Name]
+		if !ok {
+			return false
+		}
+		return v.isVariableTypeCompatible(expectedType, varType)
 	}
 
 	t := expectedType
@@ -244,7 +257,7 @@ func (v *Validator) validateArgumentValue(expectedType *Type, value interface{})
 			return false
 		}
 		for _, item := range list {
-			if !v.validateArgumentValue(t.OfType, item) {
+			if !v.validateArgumentValue(t.OfType, item, variableTypes) {
 				return false
 			}
 		}
@@ -254,6 +267,29 @@ func (v *Validator) validateArgumentValue(expectedType *Type, value interface{})
 	default:
 		return true
 	}
+}
+
+func (v *Validator) isVariableTypeCompatible(expectedType *Type, varType *Type) bool {
+	expected := expectedType
+	variable := varType
+
+	if variable.IsNonNull() && !expected.IsNonNull() {
+		variable = variable.OfType
+	}
+
+	if expected.IsNonNull() {
+		if !variable.IsNonNull() {
+			return false
+		}
+		expected = expected.OfType
+		variable = variable.OfType
+	}
+
+	if expected.Kind == TypeKindList && variable.Kind == TypeKindList {
+		return v.isVariableTypeCompatible(expected.OfType, variable.OfType)
+	}
+
+	return expected.Name == variable.Name
 }
 
 func (v *Validator) validateScalarValue(typeName string, value interface{}) bool {
@@ -277,43 +313,6 @@ func (v *Validator) validateScalarValue(typeName string, value interface{}) bool
 	default:
 		return true
 	}
-}
-
-func (v *Validator) validateRequiredFields(
-	schema *Schema,
-	schemaField *Field,
-	queryField *FieldSelection,
-	path string,
-) []*ValidationError {
-	var errs []*ValidationError
-
-	if schemaField.Type == nil {
-		return errs
-	}
-
-	if len(queryField.SelectionSet) > 0 {
-		unwrappedType := schemaField.Type.Unwrap()
-
-		var actualType *Type
-		if unwrappedType.Name != "" {
-			if t, ok := schema.GetType(unwrappedType.Name); ok {
-				actualType = t
-			} else {
-				actualType = unwrappedType
-			}
-		} else {
-			actualType = unwrappedType
-		}
-
-		if actualType.Kind != TypeKindObject && actualType.Kind != TypeKindQuery && actualType.Kind != TypeKindMutation {
-			errs = append(errs, NewValidationError(
-				path,
-				"field %q is a scalar type and cannot have sub-selections", queryField.Name,
-			))
-		}
-	}
-
-	return errs
 }
 
 func joinPath(base, name string) string {

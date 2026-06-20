@@ -3,6 +3,7 @@ package restclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -541,16 +542,20 @@ func TestDo_AuthProvider(t *testing.T) {
 
 func TestDo_AuthProvider_NotFound(t *testing.T) {
 	c := NewClient(WithBaseURL("http://example.com"))
-	c.RegisterTemplate(RequestTemplate{
+	err := c.RegisterTemplate(RequestTemplate{
 		Name:         "test",
 		Method:       http.MethodGet,
 		Path:         "/test",
 		AuthProvider: "nonexistent",
 	})
-
-	_, err := c.Do(context.Background(), "test", nil)
+	if !errors.Is(err, ErrTemplateInvalid) {
+		t.Errorf("expected ErrTemplateInvalid during registration, got %v", err)
+	}
 	if !errors.Is(err, ErrAuthProviderNotFound) {
-		t.Errorf("expected ErrAuthProviderNotFound, got %v", err)
+		t.Errorf("expected error to wrap ErrAuthProviderNotFound, got %v", err)
+	}
+	if !contains(err.Error(), "test") {
+		t.Errorf("expected error message to contain template name 'test', got %v", err.Error())
 	}
 }
 
@@ -634,21 +639,14 @@ func TestDo_Retry_SucceedAfterRetries(t *testing.T) {
 		count := atomic.AddInt32(&callCount, 1)
 		if count < 3 {
 			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("temporary error"))
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
-	customTransport := &retryableTransport{
-		base:      http.DefaultTransport,
-		retry5xx:  true,
-	}
-	customClient := &http.Client{
-		Transport: customTransport,
-	}
-
-	c := NewClient(WithBaseURL(server.URL), WithHTTPClient(customClient))
+	c := NewClient(WithBaseURL(server.URL))
 	c.RegisterTemplate(RequestTemplate{
 		Name:          "flaky",
 		Method:        http.MethodGet,
@@ -679,15 +677,7 @@ func TestDo_Retry_MaxRetriesExceeded(t *testing.T) {
 	}))
 	defer server.Close()
 
-	customTransport := &retryableTransport{
-		base:     http.DefaultTransport,
-		retry5xx: true,
-	}
-	customClient := &http.Client{
-		Transport: customTransport,
-	}
-
-	c := NewClient(WithBaseURL(server.URL), WithHTTPClient(customClient))
+	c := NewClient(WithBaseURL(server.URL))
 	c.RegisterTemplate(RequestTemplate{
 		Name:          "failing",
 		Method:        http.MethodGet,
@@ -696,12 +686,18 @@ func TestDo_Retry_MaxRetriesExceeded(t *testing.T) {
 		RetryInterval: 5 * time.Millisecond,
 	})
 
-	_, err := c.Do(context.Background(), "failing", nil)
+	resp, err := c.Do(context.Background(), "failing", nil)
 	if err == nil {
 		t.Error("expected error, got nil")
 	}
+	if resp != nil {
+		t.Error("expected nil response when max retries exceeded, got non-nil")
+	}
 	if !errors.Is(err, ErrMaxRetriesExceeded) {
 		t.Errorf("expected ErrMaxRetriesExceeded, got %v", err)
+	}
+	if !errors.Is(err, ErrServerError) {
+		t.Errorf("expected error to wrap ErrServerError, got %v", err)
 	}
 
 	expectedCalls := int32(3)
@@ -718,15 +714,7 @@ func TestDo_Retry_ZeroRetries(t *testing.T) {
 	}))
 	defer server.Close()
 
-	customTransport := &retryableTransport{
-		base:     http.DefaultTransport,
-		retry5xx: true,
-	}
-	customClient := &http.Client{
-		Transport: customTransport,
-	}
-
-	c := NewClient(WithBaseURL(server.URL), WithHTTPClient(customClient))
+	c := NewClient(WithBaseURL(server.URL))
 	c.RegisterTemplate(RequestTemplate{
 		Name:       "failing",
 		Method:     http.MethodGet,
@@ -734,9 +722,15 @@ func TestDo_Retry_ZeroRetries(t *testing.T) {
 		MaxRetries: 0,
 	})
 
-	_, err := c.Do(context.Background(), "failing", nil)
+	resp, err := c.Do(context.Background(), "failing", nil)
 	if err == nil {
 		t.Error("expected error, got nil")
+	}
+	if resp != nil {
+		t.Error("expected nil response, got non-nil")
+	}
+	if !errors.Is(err, ErrServerError) {
+		t.Errorf("expected ErrServerError, got %v", err)
 	}
 	if atomic.LoadInt32(&callCount) != 1 {
 		t.Errorf("expected 1 call (no retries), got %d", atomic.LoadInt32(&callCount))
@@ -751,15 +745,7 @@ func TestDo_Retry_ContextCanceled(t *testing.T) {
 	}))
 	defer server.Close()
 
-	customTransport := &retryableTransport{
-		base:     http.DefaultTransport,
-		retry5xx: true,
-	}
-	customClient := &http.Client{
-		Transport: customTransport,
-	}
-
-	c := NewClient(WithBaseURL(server.URL), WithHTTPClient(customClient))
+	c := NewClient(WithBaseURL(server.URL))
 	c.RegisterTemplate(RequestTemplate{
 		Name:          "failing",
 		Method:        http.MethodGet,
@@ -1082,19 +1068,223 @@ func TestBuildURL(t *testing.T) {
 }
 
 func TestGetTemplate_ReturnsCopy(t *testing.T) {
+	originalHeaders := make(http.Header)
+	originalHeaders.Set("X-API-Version", "1.0")
+	originalHeaders.Add("Accept", "application/json")
+
 	c := NewClient()
 	c.RegisterTemplate(RequestTemplate{
-		Name:   "test",
-		Method: http.MethodGet,
-		Path:   "/test",
+		Name:           "test",
+		Method:         http.MethodGet,
+		Path:           "/test",
+		DefaultHeaders: originalHeaders,
 	})
 
 	got1, _ := c.GetTemplate("test")
 	got1.Path = "/modified"
+	got1.DefaultHeaders.Set("X-API-Version", "2.0")
+	got1.DefaultHeaders.Add("X-Custom", "hacked")
 
 	got2, _ := c.GetTemplate("test")
 	if got2.Path != "/test" {
-		t.Error("GetTemplate should return a copy, modifications should not affect internal state")
+		t.Error("GetTemplate should return a copy, Path modifications should not affect internal state")
+	}
+	if got2.DefaultHeaders.Get("X-API-Version") != "1.0" {
+		t.Errorf("DefaultHeaders should be deep copied, expected X-API-Version '1.0', got '%s'", got2.DefaultHeaders.Get("X-API-Version"))
+	}
+	if got2.DefaultHeaders.Get("X-Custom") != "" {
+		t.Errorf("DefaultHeaders should be deep copied, X-Custom should not exist, got '%s'", got2.DefaultHeaders.Get("X-Custom"))
+	}
+
+	acceptVals := got2.DefaultHeaders.Values("Accept")
+	if len(acceptVals) != 1 {
+		t.Errorf("DefaultHeaders should be deep copied, expected 1 Accept value, got %d", len(acceptVals))
+	}
+}
+
+func TestRegisterTemplate_AuthProviderNotRegistered(t *testing.T) {
+	c := NewClient()
+	err := c.RegisterTemplate(RequestTemplate{
+		Name:         "secure",
+		Method:       http.MethodGet,
+		Path:         "/secure",
+		AuthProvider: "nonexistent",
+	})
+	if !errors.Is(err, ErrTemplateInvalid) {
+		t.Errorf("expected ErrTemplateInvalid, got %v", err)
+	}
+	if !errors.Is(err, ErrAuthProviderNotFound) {
+		t.Errorf("expected error to wrap ErrAuthProviderNotFound, got %v", err)
+	}
+	if !contains(err.Error(), "secure") {
+		t.Errorf("error message should contain template name 'secure', got: %s", err.Error())
+	}
+	if !contains(err.Error(), "nonexistent") {
+		t.Errorf("error message should contain provider name 'nonexistent', got: %s", err.Error())
+	}
+}
+
+func TestRegisterTemplate_AuthProviderRegisteredFirst(t *testing.T) {
+	c := NewClient()
+	provider := &testAuthProvider{name: "bearer", token: "token"}
+	if err := c.RegisterAuthProvider(provider); err != nil {
+		t.Fatalf("unexpected error registering auth provider: %v", err)
+	}
+
+	err := c.RegisterTemplate(RequestTemplate{
+		Name:         "secure",
+		Method:       http.MethodGet,
+		Path:         "/secure",
+		AuthProvider: "bearer",
+	})
+	if err != nil {
+		t.Errorf("expected no error when auth provider exists, got %v", err)
+	}
+}
+
+func TestRegisterTemplate_InputHeadersNotShared(t *testing.T) {
+	c := NewClient()
+	inputHeaders := make(http.Header)
+	inputHeaders.Set("X-Test", "original")
+
+	c.RegisterTemplate(RequestTemplate{
+		Name:           "test",
+		Method:         http.MethodGet,
+		Path:           "/test",
+		DefaultHeaders: inputHeaders,
+	})
+
+	inputHeaders.Set("X-Test", "modified")
+	inputHeaders.Set("X-Extra", "added")
+
+	got, _ := c.GetTemplate("test")
+	if got.DefaultHeaders.Get("X-Test") != "original" {
+		t.Errorf("RegisterTemplate should clone headers, expected X-Test 'original', got '%s'", got.DefaultHeaders.Get("X-Test"))
+	}
+	if got.DefaultHeaders.Get("X-Extra") != "" {
+		t.Errorf("RegisterTemplate should clone headers, X-Extra should not exist, got '%s'", got.DefaultHeaders.Get("X-Extra"))
+	}
+}
+
+func TestDo_Server500Error_ReturnsServerError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("database down"))
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL))
+	c.RegisterTemplate(RequestTemplate{
+		Name:       "test",
+		Method:     http.MethodGet,
+		Path:       "/test",
+		MaxRetries: 0,
+	})
+
+	resp, err := c.Do(context.Background(), "test", nil)
+	if err == nil {
+		t.Fatal("expected error for 500 response, got nil")
+	}
+	if resp != nil {
+		t.Error("expected nil response for 500 error with no retries, got non-nil")
+	}
+	if !errors.Is(err, ErrServerError) {
+		t.Errorf("expected ErrServerError, got %v", err)
+	}
+	if !contains(err.Error(), "500") {
+		t.Errorf("expected error message to contain status code '500', got: %s", err.Error())
+	}
+	if !contains(err.Error(), "database down") {
+		t.Errorf("expected error message to contain response body 'database down', got: %s", err.Error())
+	}
+}
+
+func TestDo_Server503Error_TriggersRetry(t *testing.T) {
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL))
+	c.RegisterTemplate(RequestTemplate{
+		Name:          "test",
+		Method:        http.MethodGet,
+		Path:          "/test",
+		MaxRetries:    3,
+		RetryInterval: 5 * time.Millisecond,
+	})
+
+	_, err := c.Do(context.Background(), "test", nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrMaxRetriesExceeded) {
+		t.Errorf("expected ErrMaxRetriesExceeded, got %v", err)
+	}
+	if atomic.LoadInt32(&callCount) != 4 {
+		t.Errorf("expected 4 calls (1 + 3 retries) for 503 errors, got %d", atomic.LoadInt32(&callCount))
+	}
+}
+
+func TestDo_Client4xxError_TreatedAsSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("not found"))
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL))
+	c.RegisterTemplate(RequestTemplate{
+		Name:       "test",
+		Method:     http.MethodGet,
+		Path:       "/test",
+		MaxRetries: 3,
+	})
+
+	resp, err := c.Do(context.Background(), "test", nil)
+	if err != nil {
+		t.Fatalf("expected no error for 404 response, got %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected status 404, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "not found" {
+		t.Errorf("expected body 'not found', got '%s'", string(body))
+	}
+}
+
+func TestDo_MaxRetriesExhausted_ReturnsNilResponse(t *testing.T) {
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&callCount, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(fmt.Sprintf("attempt %d", count)))
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL))
+	c.RegisterTemplate(RequestTemplate{
+		Name:          "test",
+		Method:        http.MethodGet,
+		Path:          "/test",
+		MaxRetries:    2,
+		RetryInterval: 5 * time.Millisecond,
+	})
+
+	resp, err := c.Do(context.Background(), "test", nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if resp != nil {
+		t.Error("expected nil response when retries are exhausted, got non-nil response which could be mistaken for success")
+	}
+	if !errors.Is(err, ErrMaxRetriesExceeded) {
+		t.Errorf("expected ErrMaxRetriesExceeded, got %v", err)
 	}
 }
 

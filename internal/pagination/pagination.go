@@ -234,6 +234,9 @@ func (r *PageResponse[T]) SetTotal(total int64) error {
 				}
 			}
 		}
+		if meta.CurrentPage > meta.TotalPages {
+			r.Data = []T{}
+		}
 		return nil
 	default:
 		return fmt.Errorf("pagination: unsupported meta type for SetTotal")
@@ -257,10 +260,10 @@ func BuildOffsetResponse[T any](
 
 	currentPage := req.Page
 	hasNextPage := currentPage < totalPages
-	hasPrevPage := currentPage > 1
+	hasPrevPage := currentPage > 1 && totalPages > 0
 
 	actualData := data
-	if currentPage > totalPages && totalPages > 0 {
+	if currentPage > totalPages {
 		actualData = []T{}
 	}
 
@@ -351,6 +354,13 @@ func ValidateCursorRequest(direction CursorDirection, size int) error {
 	}
 	if direction != "" && direction != CursorForward && direction != CursorBackward {
 		return fmt.Errorf("pagination: invalid cursor direction: %s", direction)
+	}
+	return nil
+}
+
+func ValidateData[T any](items []T) error {
+	if items == nil {
+		return ErrNilData
 	}
 	return nil
 }

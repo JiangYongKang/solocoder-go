@@ -41,6 +41,24 @@ type SuggestEngine struct {
 - 协调自动补全和拼写纠错，提供综合建议
 - 维护配置参数（最大编辑距离、默认返回条数等）
 - 提供词库管理、搜索提交、历史查询等对外 API
+- 通过 `mu` 引擎级读写锁保护所有公开方法，确保并发安全
+
+### 3.2 频率计数策略
+
+模块采用**两级频率计数**策略，明确区分「词库初始化」和「实际搜索」对频率的不同影响：
+
+| 操作 | 对频率的影响 | 适用场景 |
+|------|-------------|----------|
+| `AddWord(word)` | 词加入词库，频率初始化为 **0** | 初始化词库、批量导入候选词 |
+| `AddWordWithFreq(word, freq)` | 词加入词库，频率设置为 **指定值** | 初始化时设置已有热度的热门词 |
+| `SubmitSearch(userID, word)` | 词不存在则加入词库且频率 = **1**；词已存在则频率 **+1** | 用户实际提交搜索时 |
+| `RemoveWord(word)` | 词从词库移除，频率归零 | 删除不再需要的候选词 |
+
+**设计考量**:
+- `AddWord` 频率从 0 开始，确保初始化导入的词不会凭借虚假的搜索频率占据热门词榜单
+- `SubmitSearch` 是频率递增的唯一来源，真实反映用户搜索行为
+- `AddWordWithFreq` 提供灵活的初始化能力，用于从外部系统导入已有热度数据的场景
+- 热门词排序（`GetHotWords`）严格基于实际搜索频率，确保榜单可信度
 
 ### 3.2 Config
 
@@ -445,22 +463,59 @@ SuggestLimit(query, maxResults)
 
 ### 9.1 锁分层策略
 
-模块采用多层读写锁设计：
+模块采用**三层读写锁**设计，每层锁保护不同粒度的数据：
 
-| 锁 | 保护对象 | 锁类型 |
-|----|---------|--------|
-| `Trie.mu` | 前缀树节点、词库大小 | `sync.RWMutex` |
-| `SearchHistory.mu` | 历史记录 map | `sync.RWMutex` |
-| `SuggestEngine.mu` | 引擎级配置、提交操作 | `sync.RWMutex` |
+| 锁 | 保护对象 | 锁类型 | 所在层级 |
+|----|---------|--------|---------|
+| `SuggestEngine.mu` | 引擎所有公开方法的入口级保护 | `sync.RWMutex` | 引擎层（最外层） |
+| `Trie.mu` | 前缀树节点、词库大小 | `sync.RWMutex` | 组件层 |
+| `SearchHistory.mu` | 历史记录 map | `sync.RWMutex` | 组件层 |
 
-### 9.2 读写锁使用规则
+### 9.2 引擎级锁的保护范围
 
-- **读操作** (Search, StartsWith, GetHistory 等):
-  - 获取对应读锁，允许多个读操作并发执行
-- **写操作** (Insert, Delete, Add 等):
-  - 获取对应写锁，与其他读/写操作互斥
+`SuggestEngine.mu` 是引擎的**入口级读写锁**，所有公开方法都必须先获取该锁，确保：
 
-### 9.3 数据隔离保证
+- **写操作**（获取写锁 `Lock`）：
+  - `AddWord` / `AddWordWithFreq` - 添加/更新候选词
+  - `RemoveWord` - 删除候选词
+  - `SubmitSearch` - 提交搜索（同时修改词库和历史）
+  - `ClearHistory` - 清空用户历史记录
+
+- **读操作**（获取读锁 `RLock`）：
+  - `HasWord` - 检查词是否存在
+  - `WordCount` - 获取词库大小
+  - `Autocomplete` / `AutocompleteLimit` - 前缀自动补全
+  - `Correct` / `CorrectLimit` - 拼写纠错
+  - `GetHistory` - 查询搜索历史
+  - `Suggest` / `SuggestLimit` - 综合搜索建议
+  - `GetHotWords` - 获取热门搜索词
+
+**锁获取顺序**：始终先获取 `SuggestEngine.mu`，再获取内部组件的锁（`Trie.mu` / `SearchHistory.mu`），避免死锁。
+
+### 9.3 为什么需要引擎级锁
+
+虽然底层的 `Trie` 和 `SearchHistory` 组件各自都有锁保护，但引擎级锁提供了额外的重要保证：
+
+1. **组合操作的原子性**：`SubmitSearch` 同时修改词库（`trie.Insert`）和历史记录（`history.Add`），引擎级写锁确保这两个操作对外是原子的，读操作不会看到「词库已更新但历史未更新」的中间状态。
+
+2. **防止 TOCTOU 竞态**：如果没有引擎级锁，`AddWord` 可以在 `SubmitSearch` 执行期间同时修改同一 trie 节点的频率，虽然 trie 自身的锁能保证内存安全，但可能导致频率计数的语义混乱。
+
+3. **数据一致性视图**：所有读操作在持有引擎级读锁期间，看到的是一致性的引擎状态快照，不会因并发写操作而导致同一查询内的多次数据读取出现不一致。
+
+### 9.4 双重锁设计的权衡
+
+本模块采用「引擎级锁 + 组件级锁」的双重锁设计，优缺点如下：
+
+**优点**:
+- 安全性更高：两层锁提供双重保护，即使某一层被绕过也不会出现数据竞争
+- 组件可复用：`Trie` 和 `SearchHistory` 可独立使用，自带并发安全保证
+- 语义清晰：引擎锁保证 API 级别的原子性，组件锁保证数据结构的完整性
+
+**缺点**:
+- 轻微的性能开销：两次加/解锁操作
+- 需严格遵守锁顺序：必须先引擎锁、后组件锁，否则可能死锁
+
+### 9.5 数据隔离保证
 
 - 搜索历史返回结果时创建 `HistoryRecord` 的副本，避免外部修改内部数据
 - 前缀树查询返回的 `Suggestion` 是值拷贝，不直接暴露内部节点
@@ -712,12 +767,36 @@ wg.Wait()
 
 | 测试用例 | 验证目标 |
 |---------|---------|
-| `TestConcurrent_TrieInsert` | 并发插入数据完整性 |
-| `TestConcurrent_TrieInsertSameWord` | 同词并发插入的频率正确性 |
+| `TestConcurrent_TrieInsert` | Trie 并发插入数据完整性 |
+| `TestConcurrent_TrieInsertSameWord` | Trie 同词并发插入的频率正确性 |
 | `TestConcurrent_SearchHistory` | 历史记录并发安全 |
-| `TestConcurrent_SuggestEngine` | 引擎级并发读写安全 |
+| `TestConcurrent_SuggestEngine` | 引擎级基础并发读写安全 |
+| `TestConcurrent_SuggestEngine_AddWordAndSubmitSearch` | AddWord 与 SubmitSearch 并发时的频率正确性 |
+| `TestConcurrent_SuggestEngine_AutocompleteAndSubmitSearch` | Autocomplete 与 SubmitSearch 并发时无数据竞争 |
+| `TestConcurrent_SuggestEngine_CorrectAndSubmitSearch` | Correct 与 SubmitSearch 并发时无数据竞争 |
+| `TestConcurrent_SuggestEngine_GetHotWordsAndSubmit` | GetHotWords 与 SubmitSearch 并发时一致性 |
+| `TestConcurrent_SuggestEngine_HistoryAndSubmit` | GetHistory 与 SubmitSearch 并发时历史记录安全 |
 
-### 14.5 引擎集成测试覆盖
+### 14.5 引擎级并发测试设计说明
+
+针对「引擎级锁形同虚设」问题修复后，补充了多维度的引擎级并发测试：
+
+**1. AddWord 与 SubmitSearch 并发频率验证**
+- 场景：20 个 goroutine 并发执行 AddWord，30 个 goroutine 并发执行 SubmitSearch（同一词）
+- 验证：SubmitSearch 对共享词的频率累加必须精确等于并发提交次数
+- 原理：引擎级写锁保证 SubmitSearch 的读-改-写原子性，不会因 AddWord 并发干扰导致频率丢失
+
+**2. 读操作与写操作并发验证**
+- 场景：50 个 goroutine 并发执行 SubmitSearch（写），50 个 goroutine 并发执行 Autocomplete/Correct/GetHotWords（读）
+- 验证：读操作不会崩溃、不会返回异常、不会观察到中间状态
+- 原理：引擎级读写锁保证读操作看到的是一致性状态快照
+
+**3. 历史与词库操作并发验证**
+- 场景：SubmitSearch 同时修改词库和历史，与 GetHistory 并发执行
+- 验证：历史记录数量正确，不会因并发导致数据竞争
+- 原理：引擎级锁保证 SubmitSearch 的「词库+历史」组合操作原子性
+
+### 14.6 引擎集成测试覆盖
 
 | 测试用例 | 验证目标 |
 |---------|---------|
@@ -727,3 +806,7 @@ wg.Wait()
 | `TestSuggestEngine_Suggest` | 综合建议功能 |
 | `TestSuggestEngine_GetHotWords` | 热门词排序 |
 | `TestSuggestEngine_HistorySeparateFromWords` | 历史与词库隔离 |
+| `TestSuggestEngine_AddWord_FreqStartsAtZero` | AddWord 初始化频率为 0 |
+| `TestSuggestEngine_SubmitSearch_AfterAddWord_IncrementsFreq` | SubmitSearch 正确递增频率 |
+| `TestSuggestEngine_AddWordWithFreq_CustomFreq` | 自定义初始频率 |
+| `TestSuggestEngine_HotWords_InitWordsNotSearch_SortedByFreq` | 初始化词不影响真实热门排序 |

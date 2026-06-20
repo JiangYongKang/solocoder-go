@@ -1,0 +1,6 @@
+你实现的 A/B 测试流量分割器模块存在一些问题，需要修复：
+1. GetExperiment 方法在持有读锁期间直接返回了内部 map 中存储的 Experiment 指针，调用方在锁释放后可以修改该指针指向的实验配置字段。此时如果有其他 goroutine 正通过 AssignGroup 读取同一个实验的配置进行分桶判断，就会产生并发读写的数据竞争。
+2. docs/abtest.md 的"指标采集"章节只有标题没有正文内容，整个文档缺失了使用示例章节，无法向其他开发者展示模块的 API 调用流程。
+3. abtest.go 中定义了 ErrInvalidBucketNumber 错误变量但整个模块没有任何函数引用或返回该错误，外部调用方看到这个公开的 sentinel error 会预期模块在某些场景下会返回该错误，但实际上模块从未在任何校验路径中触发它。
+4. 修复后运行 go test ./internal/abtest/ -v，需要让所有测试通过，并确保用 go test -race 检测无数据竞争。
+5. 在 docs/abtest.md 中补全文档中缺失的内容。

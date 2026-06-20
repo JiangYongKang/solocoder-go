@@ -133,11 +133,63 @@ func (s *Schema) GetResolver(typeName, fieldName string) (ResolverFunc, bool) {
 }
 
 type sdlParser struct {
-	input string
-	pos   int
+	input  string
+	pos    int
+	schema *Schema
 }
 
 func (p *sdlParser) parse(s *Schema) error {
+	p.schema = s
+
+	typeDefs := make([]string, 0)
+	scalarDefs := make([]string, 0)
+
+	{
+		savedPos := p.pos
+		for p.pos < len(p.input) {
+			p.skipWhitespaceAndComments()
+			if p.matchKeyword("type") {
+				name, err := p.parseName()
+				if err == nil {
+					typeDefs = append(typeDefs, name)
+				}
+				p.skipUntilTypeEnd()
+			} else if p.matchKeyword("scalar") {
+				name, err := p.parseName()
+				if err == nil {
+					scalarDefs = append(scalarDefs, name)
+				}
+			} else if p.matchKeyword("schema") {
+				p.skipUntilTypeEnd()
+			} else {
+				if p.pos < len(p.input) {
+					return fmt.Errorf("%w: unexpected token at position %d", ErrInvalidSDL, p.pos)
+				}
+				break
+			}
+		}
+		p.pos = savedPos
+	}
+
+	for _, name := range scalarDefs {
+		if _, exists := s.types[name]; !exists {
+			s.types[name] = &Type{
+				Kind:      TypeKindScalar,
+				Name:      name,
+				IsBuiltin: false,
+			}
+		}
+	}
+	for _, name := range typeDefs {
+		if _, exists := s.types[name]; !exists {
+			s.types[name] = &Type{
+				Kind:   TypeKindObject,
+				Name:   name,
+				Fields: make(map[string]*Field),
+			}
+		}
+	}
+
 	p.skipWhitespaceAndComments()
 	for p.pos < len(p.input) {
 		if err := p.parseDefinition(s); err != nil {
@@ -145,7 +197,31 @@ func (p *sdlParser) parse(s *Schema) error {
 		}
 		p.skipWhitespaceAndComments()
 	}
+
 	return nil
+}
+
+func (p *sdlParser) skipUntilTypeEnd() {
+	depth := 0
+	inBraces := false
+	for p.pos < len(p.input) {
+		ch := p.peek()
+		if ch == '{' {
+			depth++
+			inBraces = true
+			p.pos++
+		} else if ch == '}' {
+			depth--
+			p.pos++
+			if depth == 0 && inBraces {
+				return
+			}
+		} else if ch == '\n' && !inBraces && depth == 0 {
+			return
+		} else {
+			p.pos++
+		}
+	}
 }
 
 func (p *sdlParser) parseDefinition(s *Schema) error {
@@ -354,8 +430,16 @@ func (p *sdlParser) parseTypeReference() (*Type, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		kind := TypeKindObject
+		if p.schema != nil {
+			if existing, ok := p.schema.types[name]; ok {
+				kind = existing.Kind
+			}
+		}
+
 		t = &Type{
-			Kind: TypeKindObject,
+			Kind: kind,
 			Name: name,
 		}
 	}

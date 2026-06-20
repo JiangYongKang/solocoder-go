@@ -13,6 +13,7 @@
 9. [使用示例](#9-使用示例)
 10. [错误定义](#10-错误定义)
 11. [边界条件处理](#11-边界条件处理)
+12. [修复记录](#12-修复记录)
 
 ---
 
@@ -39,13 +40,14 @@
 | 游标前向分页 | 从指定游标值之后获取数据，返回下一页游标和是否有更多页 |
 | 游标后向分页 | 从指定游标值之前获取数据，返回上一页游标和是否有更多页 |
 | 偏移量分页 | 通过页码（从 1 开始）和每页大小计算偏移量，返回对应范围数据 |
-| 总条数注入 | 提供 `SetTotal()` 接口，支持查询完成后动态注入总记录数 |
+| 总条数注入 | 提供 `SetTotal()` 接口，支持查询完成后动态注入总记录数，自动清除超范围数据 |
 | 构建响应时统计 | 在构建响应时直接传入总条数，一次性计算分页信息 |
 | 空响应构建 | 快速构建零记录的空分页响应 |
 | 参数校验 | 独立的参数校验函数，支持提前验证分页参数合法性 |
+| 数据校验 | 提供 `ValidateData()` 函数，检查数据切片是否为 nil |
 | 偏移量计算 | 提供 `Offset()`/`Limit()` 辅助方法，直接用于数据库查询 |
 | 导航信息 | 自动计算前后页/上下游标等导航字段，方便前端翻页 |
-| 边界保护 | 页码超出范围自动返回空列表，不抛异常 |
+| 边界保护 | 页码超出范围（含 total=0 时 page>1）自动返回空列表，不抛异常 |
 
 ---
 
@@ -614,6 +616,63 @@ func handler(page, size int) error {
 }
 ```
 
+### 9.6 ValidateData 严格数据校验
+
+```go
+func strictQuery(page, size int) (*pagination.PageResponse[Item], error) {
+    req, _ := pagination.NewOffsetPageRequest(page, size)
+
+    // 查询数据，可能返回 nil 切片
+    items := queryItemsFromDB(req.Offset(), req.Limit())
+
+    // 严格模式：主动校验数据是否为 nil
+    if err := pagination.ValidateData(items); err != nil {
+        // 根据业务需求处理：打日志、告警或返回错误
+        log.Printf("warning: query returned nil slice: %v", err)
+        // 也可以选择直接返回错误给调用方
+        // return nil, fmt.Errorf("data integrity check failed: %w", err)
+    }
+
+    // 即使 items 为 nil，BuildOffsetResponse 也会安全处理
+    total := int64(countItems())
+    resp := pagination.BuildOffsetResponse(items, req, total)
+
+    return resp, nil
+}
+```
+
+### 9.7 SetTotal 缩减总条数场景
+
+```go
+func dynamicTotalScenario() {
+    // 场景：先假设总条数很多，后续通过 SetTotal 修正为实际值
+    items := makeTestItems(10)
+    req, _ := pagination.NewOffsetPageRequest(5, 2)
+
+    // 初始构建：假设总条数为 100
+    resp := pagination.BuildOffsetResponse(items, req, 100)
+    meta := resp.Meta.(*pagination.OffsetPageMeta)
+    fmt.Printf("初始 - 第 %d 页，共 %d 页，数据 %d 条\n",
+        meta.CurrentPage, meta.TotalPages, len(resp.Data))
+    // 输出: 初始 - 第 5 页，共 50 页，数据 10 条
+
+    // 实际查询后发现总条数只有 3 条，修正总条数
+    err := resp.SetTotal(3)
+    if err != nil {
+        panic(err)
+    }
+
+    meta2 := resp.Meta.(*pagination.OffsetPageMeta)
+    fmt.Printf("修正后 - 第 %d 页，共 %d 页，数据 %d 条\n",
+        meta2.CurrentPage, meta2.TotalPages, len(resp.Data))
+    // 输出: 修正后 - 第 5 页，共 2 页，数据 0 条（自动清空超范围数据）
+
+    // HasPrevPage 由 CurrentPage > 1 判断，与 TotalPages 无关
+    fmt.Printf("HasPrevPage: %v\n", meta2.HasPrevPage)
+    // 输出: HasPrevPage: true（Page=5 > 1，虽然 Data 已为空，但元信息保持一致）
+}
+```
+
 ---
 
 ## 10. 错误定义
@@ -623,7 +682,20 @@ func handler(page, size int) error {
 | `ErrInvalidPageSize` | 每页条数非法 | `size <= 0` |
 | `ErrInvalidPageNumber` | 页码非法 | `page <= 0`（偏移量分页） |
 | `ErrPageSizeExceedsMax` | 每页条数超过上限 | `size > MaxPageSize`（默认 1000） |
-| `ErrNilData` | 数据切片为 nil | 保留错误，当前构建函数自动处理 nil |
+| `ErrNilData` | 数据切片为 nil | `ValidateData()` 函数检测到 nil 切片时返回 |
+
+### 10.1 ErrNilData 处理策略
+
+`ErrNilData` 错误变量的处理策略采用"**双层机制**"：
+
+1. **构建函数层（宽松）**：所有 `Build*Response` 函数在接收到 nil 切片时，**静默转换为空切片** `[]T{}`，不会返回错误，保证响应序列化时不会出现 JSON `null`。
+
+2. **主动校验层（严格）**：提供独立的 `ValidateData[T any](items []T) error` 函数，供调用方在需要严格校验时主动调用。当 `items` 为 nil 时返回 `ErrNilData`。
+
+**设计考量**：
+- 构建函数保持宽松是为了简化调用方代码，无需在每个查询后判断切片是否为 nil
+- 提供主动校验函数满足对数据完整性有严格要求的场景
+- 策略统一，避免错误定义与实际执行路径不一致的问题
 
 **参数校验规则**:
 
@@ -643,13 +715,31 @@ func handler(page, size int) error {
 | 场景 | 处理方式 |
 |------|----------|
 | 数据为空 (`total = 0`) | `Data = []`, `TotalPages = 0`, 所有导航标志为 false |
+| `total = 0` 且 `page > 1` | 返回空 `Data`，保留 `CurrentPage` 值，`HasPrevPage = false`（即使 page > 1） |
 | 请求第 1 页 | `HasPrevPage = false`, `PrevPage = nil` |
 | 请求最后一页 (`Page = TotalPages`) | `HasNextPage = false`, `NextPage = nil` |
-| `Page > TotalPages > 0` | 返回空 `Data`，保留 `CurrentPage` 值，不报错 |
+| `Page > TotalPages` | 返回空 `Data`，保留 `CurrentPage` 值，不报错（含 TotalPages=0 的情况） |
 | `Size > TotalCount > 0` | `TotalPages = 1`，所有数据在第一页 |
 | 整除情况 (`TotalCount = n * Size`) | `TotalPages = n`，最后一页 `HasNextPage = false` |
+| `TotalPages = 0` 时 `HasPrevPage` 判断 | 恒为 `false`，不因 `Page > 1` 而改变 |
 
-### 11.2 游标分页边界
+### 11.2 SetTotal 动态调整边界
+
+当调用 `SetTotal()` 方法动态更新总条数时，模块会自动处理以下边界场景：
+
+| 场景 | 处理方式 |
+|------|----------|
+| 总条数缩减导致 `CurrentPage > TotalPages` | **自动清空 `Data` 为空切片**，保证数据一致性 |
+| 总条数缩减但 `CurrentPage <= TotalPages` | 保留原有 `Data`，仅更新元信息和导航字段 |
+| 总条数缩减到 `0` | 清空 `Data`，`TotalPages = 0`，所有导航标志置为 false |
+| 总条数增加 | 正常更新元信息，保留原有 `Data` |
+| `SetTotal` 多次调用 | 每次调用都会重新计算，最后一次生效 |
+
+**示例场景**：
+- 初始构建：`Page=5, Size=2, TotalCount=100` → `TotalPages=50`，第 5 页合法
+- 调用 `SetTotal(3)` → `TotalPages=2`，第 5 页超出范围 → `Data` 被自动清空
+
+### 11.3 游标分页边界
 
 | 场景 | 处理方式 |
 |------|----------|
@@ -660,10 +750,85 @@ func handler(page, size int) error {
 | `SetTotal` 未调用 | `TotalCount = nil`, `TotalPages = nil`（合法状态） |
 | 不提供总条数 | 完全合法，`hasMore` 标志足以支持翻页 |
 
-### 11.3 构造函数返回约定
+### 11.4 构造函数返回约定
 
 - 所有 `New*Request` 构造函数：参数校验失败返回 `(nil, error)`
 - 所有 `Build*Response` 构造函数：永不返回 `nil`，`Data` 恒为非 nil 切片（输入 nil 时转为空切片）
 - `SetTotal()`：成功返回 `nil`，不支持的 Meta 类型返回错误（正常使用不会触发）
+- `ValidateData()`：`items` 为 nil 返回 `ErrNilData`，否则返回 `nil`
+
+---
+
+## 12. 修复记录
+
+### 12.1 v1.1.0 修复（2026-06-20）
+
+#### 问题 1：BuildOffsetResponse totalCount=0 时 page>1 未清空数据
+
+**问题描述**：
+`BuildOffsetResponse` 函数中页码溢出判断条件为 `currentPage > totalPages && totalPages > 0`，当 `totalCount=0` 时 `totalPages=0`，条件不成立，导致 `page>1` 的请求不会按预期返回空列表。
+
+**修复方案**：
+- 移除 `&& totalPages > 0` 限制，修改为 `if currentPage > totalPages`
+- 同时修正 `HasPrevPage` 逻辑：`hasPrevPage := currentPage > 1 && totalPages > 0`，确保 `totalPages=0` 时 `HasPrevPage` 恒为 false
+
+**代码位置**：[pagination.go#L263-L268](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/pagination/pagination.go#L263-L268)
+
+**测试覆盖**：
+- `TestBuildOffsetResponseZeroTotalCountPageGreaterThanOne`：验证 page=2/5/100 时 total=0 返回空数据
+- `TestHasPrevPageWhenTotalPagesZero`：验证 total=0 时 HasPrevPage=false
+- `TestBuildOffsetResponseHasPrevPageLogic`：表驱动测试 6 种场景的 HasPrevPage 逻辑
+
+---
+
+#### 问题 2：SetTotal 偏移量分页未校验页码超出范围
+
+**问题描述**：
+`SetTotal` 方法在偏移量分页场景下只更新了元信息字段，未校验当前页码是否因总条数缩减而超出新的有效范围。例如先以总条数 100 构建响应使第 5 页合法，再调用 `SetTotal(3)` 将总条数缩减到仅够 2 页，此时第 5 页已超出新范围但 `Data` 仍保留旧的超范围数据。
+
+**修复方案**：
+在 `SetTotal` 的偏移量分支末尾添加页码范围检查：
+```go
+if meta.CurrentPage > meta.TotalPages {
+    r.Data = []T{}
+}
+```
+
+**代码位置**：[pagination.go#L237-L239](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/pagination/pagination.go#L237-L239)
+
+**测试覆盖**：
+- `TestSetTotalShrinkTotalCountClearOutOfRangeData`：验证总条数从 100 缩减到 3 时 Data 被清空
+- `TestSetTotalShrinkTotalCountStillInRange`：验证总条数缩减但页码仍在范围内时 Data 保留
+- `TestSetTotalShrinkToExactPage`：验证页码恰好等于新 TotalPages 时 Data 保留
+- `TestSetTotalShrinkToZero`：验证总条数缩减到 0 时 Data 被清空
+
+---
+
+#### 问题 3：ErrNilData 死代码与处理策略不一致
+
+**问题描述**：
+`pagination.go` 中定义了错误变量 `ErrNilData`，语义为 "data slice cannot be nil"，但在所有构建函数中 nil 数据均被静默转换为空切片处理，从未返回该错误，导致 `ErrNilData` 成为无引用点的死代码，错误处理策略与实际执行路径不一致。
+
+**修复方案**：
+采用"**双层机制**"统一处理策略：
+1. **构建函数层（宽松）**：保持现有行为，nil 切片静默转为空切片，不返回错误
+2. **主动校验层（严格）**：新增 `ValidateData[T any](items []T) error` 函数，当 `items` 为 nil 时返回 `ErrNilData`
+
+**代码位置**：[pagination.go#L361-L365](file:///c:/Users/vince/GoletaLab/SoloCoder-3/solocoder-go/internal/pagination/pagination.go#L361-L365)
+
+**测试覆盖**：
+- `TestValidateData`：覆盖 nil/空/非空切片及多种泛型类型
+- `TestErrNilDataIsReferenceable`：验证错误变量可正常引用和比较
+- `TestBuildOffsetResponseNilDataSilentConversion`：验证构建函数 nil 转空切片
+- `TestBuildCursorResponseNilDataSilentConversion`：验证游标构建函数 nil 转空切片
+
+---
+
+### 12.2 测试覆盖统计
+
+修复后测试用例总数：**57 个**（含子测试），全部通过：
+- 原有测试：43 个
+- 新增测试：14 个
+- 测试文件行数：1544 行
 
 ---

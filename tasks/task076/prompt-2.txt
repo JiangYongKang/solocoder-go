@@ -1,0 +1,15 @@
+模板渲染引擎模块存在以下问题需要修复：
+
+1. GetTemplate 方法存在并发竞态条件，当多个 goroutine 并发调用 GetTemplate 和 RegisterTemplate 操作同一个模板时，旧版本的模板解析结果可能会覆盖新注册的模板缓存，导致后续渲染获取到过期的模板内容而非最新注册的版本。
+
+2. callFunction 方法对注册函数的双返回值做了直接的类型断言，当函数返回的第二个值不是 error 类型时（比如返回 int 和 bool），渲染过程会直接 panic 崩溃而不是返回一个可以捕获的渲染错误供调用方处理。
+
+3. errors.go 中定义了 ErrBlockNotFound、ErrInvalidRange、ErrInvalidBlockSyntax 三个错误变量，但在 templater.go 的所有 return 路径中从未被返回，属于定义但完全未使用的死代码。同时 elseIfPattern 正则表达式已在代码中声明但在解析逻辑的任何位置都未被引用，导致 `{{ else if condition }}` 分支语法无法被解析。
+
+4. docs/templater.md 第 5.2 节的完整示例中使用了 `{{ $i + 1 }}` 表达式来表示从 1 开始的序号，但引擎不支持算术表达式运算，用户复制该示例执行后会输出字面文本而非预期的序号数字。
+
+5. 测试文件 templater_test.go 缺少对关键错误路径的 FAIL 测试用例，例如模板继承循环未测试是否返回 ErrTemplateInheritanceLoop、range 目标为非切片类型未测试是否返回 ErrRangeNotIterable、未闭合的 block 标签未测试是否返回 ErrUnclosedBlock 等，这些错误变量在 errors.go 中已有定义但测试中无对应异常场景覆盖。
+
+6. 运行 go test ./internal/templater/ -v，需要让所有测试通过。
+
+7. 在 docs/templater.md 中修正文档示例，确保示例代码中的语法都在引擎支持范围内，文档描述与引擎实际行为保持一致。

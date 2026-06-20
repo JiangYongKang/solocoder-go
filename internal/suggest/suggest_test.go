@@ -749,8 +749,8 @@ func TestSuggestEngine_AddAndRemoveWord(t *testing.T) {
 	if !exists {
 		t.Error("expected 'hello' to exist")
 	}
-	if freq != 1 {
-		t.Errorf("expected freq 1, got %d", freq)
+	if freq != 0 {
+		t.Errorf("expected freq 0 for newly added word, got %d", freq)
 	}
 
 	err = eng.RemoveWord("hello")
@@ -1340,5 +1340,290 @@ func TestSuggestEngine_RemoveWord_NotAffectHistory(t *testing.T) {
 	history, _ := eng.GetHistory("user1", 10)
 	if len(history) != 2 {
 		t.Errorf("history should still have 2 records after removing word, got %d", len(history))
+	}
+}
+
+func TestSuggestEngine_AddWord_FreqStartsAtZero(t *testing.T) {
+	eng := NewSuggestEngine()
+
+	_ = eng.AddWord("hello")
+	_ = eng.AddWord("world")
+
+	_, freqHello := eng.HasWord("hello")
+	if freqHello != 0 {
+		t.Errorf("expected freq 0 for AddWord('hello'), got %d", freqHello)
+	}
+
+	_, freqWorld := eng.HasWord("world")
+	if freqWorld != 0 {
+		t.Errorf("expected freq 0 for AddWord('world'), got %d", freqWorld)
+	}
+
+	if eng.WordCount() != 2 {
+		t.Errorf("expected word count 2, got %d", eng.WordCount())
+	}
+}
+
+func TestSuggestEngine_SubmitSearch_AfterAddWord_IncrementsFreq(t *testing.T) {
+	eng := NewSuggestEngine()
+
+	_ = eng.AddWord("hello")
+
+	_, freq := eng.HasWord("hello")
+	if freq != 0 {
+		t.Fatalf("expected freq 0 after AddWord, got %d", freq)
+	}
+
+	_ = eng.SubmitSearch("user1", "hello")
+
+	_, freq = eng.HasWord("hello")
+	if freq != 1 {
+		t.Errorf("expected freq 1 after one SubmitSearch, got %d", freq)
+	}
+
+	_ = eng.SubmitSearch("user2", "hello")
+
+	_, freq = eng.HasWord("hello")
+	if freq != 2 {
+		t.Errorf("expected freq 2 after two SubmitSearch, got %d", freq)
+	}
+}
+
+func TestSuggestEngine_AddWordWithFreq_CustomFreq(t *testing.T) {
+	eng := NewSuggestEngine()
+
+	_ = eng.AddWordWithFreq("apple", 50)
+	_ = eng.AddWordWithFreq("banana", 30)
+
+	_, freqApple := eng.HasWord("apple")
+	if freqApple != 50 {
+		t.Errorf("expected freq 50 for apple, got %d", freqApple)
+	}
+
+	_, freqBanana := eng.HasWord("banana")
+	if freqBanana != 30 {
+		t.Errorf("expected freq 30 for banana, got %d", freqBanana)
+	}
+
+	hot, _ := eng.GetHotWords(2)
+	if hot[0].Word != "apple" {
+		t.Errorf("expected first hot word 'apple', got %q", hot[0].Word)
+	}
+}
+
+func TestSuggestEngine_HotWords_InitWordsNotSearch_SortedByFreq(t *testing.T) {
+	eng := NewSuggestEngine()
+
+	_ = eng.AddWordWithFreq("apple", 0)
+	_ = eng.AddWordWithFreq("banana", 0)
+	_ = eng.AddWordWithFreq("cherry", 0)
+
+	_ = eng.SubmitSearch("user1", "banana")
+	_ = eng.SubmitSearch("user1", "banana")
+	_ = eng.SubmitSearch("user1", "cherry")
+
+	hot, _ := eng.GetHotWords(3)
+
+	if len(hot) != 3 {
+		t.Fatalf("expected 3 hot words, got %d", len(hot))
+	}
+
+	if hot[0].Word != "banana" || hot[0].Frequency != 2 {
+		t.Errorf("expected first: banana(2), got %s(%d)", hot[0].Word, hot[0].Frequency)
+	}
+
+	if hot[1].Word != "cherry" || hot[1].Frequency != 1 {
+		t.Errorf("expected second: cherry(1), got %s(%d)", hot[1].Word, hot[1].Frequency)
+	}
+
+	if hot[2].Word != "apple" || hot[2].Frequency != 0 {
+		t.Errorf("expected third: apple(0), got %s(%d)", hot[2].Word, hot[2].Frequency)
+	}
+}
+
+func TestConcurrent_SuggestEngine_AddWordAndSubmitSearch(t *testing.T) {
+	eng := NewSuggestEngine()
+	var wg sync.WaitGroup
+
+	_ = eng.AddWordWithFreq("shared_word", 0)
+
+	numAddGoroutines := 20
+	numSubmitGoroutines := 30
+
+	for i := 0; i < numAddGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			_ = eng.AddWord("word_" + string(rune('a'+id%10)))
+		}(i)
+	}
+
+	for i := 0; i < numSubmitGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			_ = eng.SubmitSearch("user_"+string(rune('0'+id%5)), "shared_word")
+		}(i)
+	}
+
+	wg.Wait()
+
+	_, freq := eng.HasWord("shared_word")
+	if freq != numSubmitGoroutines {
+		t.Errorf("expected shared_word freq = %d, got %d", numSubmitGoroutines, freq)
+	}
+}
+
+func TestConcurrent_SuggestEngine_AutocompleteAndSubmitSearch(t *testing.T) {
+	eng := NewSuggestEngine()
+	var wg sync.WaitGroup
+
+	words := []string{"apple", "app", "application", "apply", "appoint", "appreciate"}
+	for _, w := range words {
+		_ = eng.AddWord(w)
+	}
+
+	numSubmit := 50
+	numQuery := 50
+
+	for i := 0; i < numSubmit; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			_ = eng.SubmitSearch("user1", "apple")
+		}(i)
+	}
+
+	for i := 0; i < numQuery; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			results, err := eng.Autocomplete("app")
+			if err != nil {
+				t.Errorf("unexpected error in Autocomplete: %v", err)
+				return
+			}
+			if len(results) == 0 {
+				t.Error("expected at least one autocomplete result")
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	_, freq := eng.HasWord("apple")
+	if freq != numSubmit {
+		t.Errorf("expected 'apple' freq = %d after concurrent submits, got %d", numSubmit, freq)
+	}
+}
+
+func TestConcurrent_SuggestEngine_CorrectAndSubmitSearch(t *testing.T) {
+	eng := NewSuggestEngine()
+	var wg sync.WaitGroup
+
+	words := []string{"apple", "apply", "apples", "banana", "bandana"}
+	for _, w := range words {
+		_ = eng.AddWord(w)
+	}
+
+	numSubmit := 30
+	numCorrect := 30
+
+	for i := 0; i < numSubmit; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			_ = eng.SubmitSearch("user1", "apple")
+		}(i)
+	}
+
+	for i := 0; i < numCorrect; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			results, err := eng.Correct("appla")
+			if err != nil {
+				t.Errorf("unexpected error in Correct: %v", err)
+				return
+			}
+			_ = results
+		}(i)
+	}
+
+	wg.Wait()
+
+	_, freq := eng.HasWord("apple")
+	if freq != numSubmit {
+		t.Errorf("expected 'apple' freq = %d, got %d", numSubmit, freq)
+	}
+}
+
+func TestConcurrent_SuggestEngine_GetHotWordsAndSubmit(t *testing.T) {
+	eng := NewSuggestEngine()
+	var wg sync.WaitGroup
+
+	_ = eng.AddWord("word1")
+	_ = eng.AddWord("word2")
+	_ = eng.AddWord("word3")
+
+	numSubmit := 40
+	numGetHot := 40
+
+	for i := 0; i < numSubmit; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			w := "word" + string(rune('1'+id%3))
+			_ = eng.SubmitSearch("user1", w)
+		}(i)
+	}
+
+	for i := 0; i < numGetHot; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			hot, err := eng.GetHotWords(3)
+			if err != nil {
+				t.Errorf("unexpected error in GetHotWords: %v", err)
+				return
+			}
+			if len(hot) != 3 {
+				t.Errorf("expected 3 hot words, got %d", len(hot))
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if eng.WordCount() != 3 {
+		t.Errorf("expected 3 words, got %d", eng.WordCount())
+	}
+}
+
+func TestConcurrent_SuggestEngine_HistoryAndSubmit(t *testing.T) {
+	eng := NewSuggestEngine()
+	var wg sync.WaitGroup
+
+	numGoroutines := 50
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(2)
+
+		go func(id int) {
+			defer wg.Done()
+			_ = eng.SubmitSearch("user1", "word_"+string(rune('a'+id%10)))
+		}(i)
+
+		go func() {
+			defer wg.Done()
+			_, _ = eng.GetHistory("user1", 10)
+		}()
+	}
+
+	wg.Wait()
+
+	count, _ := eng.GetHistory("user1", 100)
+	if len(count) == 0 {
+		t.Error("expected some history records")
 	}
 }

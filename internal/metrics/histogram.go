@@ -8,25 +8,27 @@ import (
 )
 
 type histogram struct {
-	name    string
-	labels  Labels
-	buckets []float64
-	counts  []uint64
-	sum     float64
-	count   uint64
-	mu      sync.RWMutex
+	snapshotMu *sync.RWMutex
+	mu         sync.RWMutex
+	name       string
+	labels     Labels
+	buckets    []float64
+	counts     []uint64
+	sum        float64
+	count      uint64
 }
 
-func newHistogram(name string, labels Labels, buckets []float64) *histogram {
+func newHistogram(name string, labels Labels, buckets []float64, snapshotMu *sync.RWMutex) *histogram {
 	sortedBuckets := make([]float64, len(buckets))
 	copy(sortedBuckets, buckets)
 	sort.Float64s(sortedBuckets)
 
 	h := &histogram{
-		name:    name,
-		labels:  make(Labels, len(labels)),
-		buckets: sortedBuckets,
-		counts:  make([]uint64, len(sortedBuckets)+1),
+		snapshotMu: snapshotMu,
+		name:       name,
+		labels:     make(Labels, len(labels)),
+		buckets:    sortedBuckets,
+		counts:     make([]uint64, len(sortedBuckets)+1),
 	}
 	copy(h.labels, labels)
 	return h
@@ -45,6 +47,8 @@ func (h *histogram) Labels() Labels {
 }
 
 func (h *histogram) Observe(value float64) {
+	h.snapshotMu.RLock()
+	defer h.snapshotMu.RUnlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 

@@ -481,6 +481,14 @@ func TestErrorStack(t *testing.T) {
 		t.Error("stack should not be empty")
 	}
 
+	firstFrame, ok := stackArr[0].(string)
+	if !ok {
+		t.Fatal("first stack frame should be a string")
+	}
+	if !strings.Contains(firstFrame, "structlog_test.go:") {
+		t.Errorf("first stack frame %q should point to structlog_test.go", firstFrame)
+	}
+
 	for _, frame := range stackArr {
 		frameStr, ok := frame.(string)
 		if !ok {
@@ -536,8 +544,8 @@ func TestNonErrorHasCaller(t *testing.T) {
 	if !ok {
 		t.Fatal("caller field should be a string")
 	}
-	if !strings.Contains(caller, ".go:") {
-		t.Errorf("caller %q should contain '.go:' pattern", caller)
+	if !strings.Contains(caller, "structlog_test.go:") {
+		t.Errorf("caller %q should point to structlog_test.go", caller)
 	}
 }
 
@@ -742,8 +750,11 @@ func TestStackExcludesInternalFrames(t *testing.T) {
 	stackArr := entries[0]["stack"].([]interface{})
 	for _, frame := range stackArr {
 		frameStr := frame.(string)
-		if strings.Contains(frameStr, "structlog") {
-			t.Errorf("stack should not contain structlog internal frames, got %q", frameStr)
+		if strings.Contains(frameStr, ".Logger.") {
+			t.Errorf("stack should not contain Logger internal frames, got %q", frameStr)
+		}
+		if strings.Contains(frameStr, "captureCaller") || strings.Contains(frameStr, "captureStack") {
+			t.Errorf("stack should not contain capture internal functions, got %q", frameStr)
 		}
 	}
 }
@@ -877,5 +888,161 @@ func TestLogEntryFieldTypes(t *testing.T) {
 	}
 	if entry["bool_field"] != true {
 		t.Errorf("bool_field = %v, want true", entry["bool_field"])
+	}
+}
+
+func TestSystemFieldLevelNotOverridden(t *testing.T) {
+	logger, buf := newTestLogger(LevelDebug)
+	child := logger.WithFields(map[string]interface{}{
+		"level": "FAKE",
+	})
+	child.Info("level override test")
+
+	entries := parseLogEntries(buf.Bytes())
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0]["level"] != "INFO" {
+		t.Errorf("level = %v, want 'INFO' (system field must not be overridden)", entries[0]["level"])
+	}
+}
+
+func TestSystemFieldMsgNotOverridden(t *testing.T) {
+	logger, buf := newTestLogger(LevelDebug)
+	child := logger.WithFields(map[string]interface{}{
+		"msg": "fake message",
+	})
+	child.Info("real message")
+
+	entries := parseLogEntries(buf.Bytes())
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0]["msg"] != "real message" {
+		t.Errorf("msg = %v, want 'real message' (system field must not be overridden)", entries[0]["msg"])
+	}
+}
+
+func TestSystemFieldTsNotOverridden(t *testing.T) {
+	logger, buf := newTestLogger(LevelDebug)
+	child := logger.WithFields(map[string]interface{}{
+		"ts": "fake-timestamp",
+	})
+	child.Info("ts override test")
+
+	entries := parseLogEntries(buf.Bytes())
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+
+	tsStr, ok := entries[0]["ts"].(string)
+	if !ok {
+		t.Fatal("ts field should be a string")
+	}
+	if tsStr == "fake-timestamp" {
+		t.Error("ts field was overridden by user field, should preserve system value")
+	}
+	_, err := time.Parse(time.RFC3339Nano, tsStr)
+	if err != nil {
+		t.Errorf("ts = %q is not valid RFC3339Nano format: %v", tsStr, err)
+	}
+}
+
+func TestSystemFieldCallerNotOverridden(t *testing.T) {
+	logger, buf := newTestLogger(LevelDebug)
+	child := logger.WithFields(map[string]interface{}{
+		"caller": "fake.go:999",
+	})
+	child.Info("caller override test")
+
+	entries := parseLogEntries(buf.Bytes())
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	caller, ok := entries[0]["caller"].(string)
+	if !ok {
+		t.Fatal("caller field should be a string")
+	}
+	if caller == "fake.go:999" {
+		t.Error("caller field was overridden by user field, should preserve system value")
+	}
+	if !strings.Contains(caller, "structlog_test.go:") {
+		t.Errorf("caller = %q should point to structlog_test.go", caller)
+	}
+}
+
+func TestSystemFieldStackNotOverridden(t *testing.T) {
+	logger, buf := newTestLogger(LevelDebug)
+	child := logger.WithFields(map[string]interface{}{
+		"stack": "fake stack",
+	})
+	child.Error("stack override test")
+
+	entries := parseLogEntries(buf.Bytes())
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	stack, ok := entries[0]["stack"].([]interface{})
+	if !ok {
+		t.Fatalf("stack field should be an array, got %T", entries[0]["stack"])
+	}
+	if len(stack) == 0 {
+		t.Error("stack should not be empty after Error log")
+	}
+	firstFrame, ok := stack[0].(string)
+	if !ok {
+		t.Fatal("first stack frame should be a string")
+	}
+	if !strings.Contains(firstFrame, "structlog_test.go:") {
+		t.Errorf("first stack frame %q should point to structlog_test.go", firstFrame)
+	}
+}
+
+func TestSystemFieldsAllProtected(t *testing.T) {
+	logger, buf := newTestLogger(LevelDebug)
+	child := logger.WithFields(map[string]interface{}{
+		"ts":     "bad-ts",
+		"level":  "BADLEVEL",
+		"msg":    "bad-msg",
+		"caller": "bad.go:0",
+		"stack":  "bad-stack",
+	})
+	child.Error("all fields override test")
+
+	entries := parseLogEntries(buf.Bytes())
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	entry := entries[0]
+
+	if entry["level"] != "ERROR" {
+		t.Errorf("level = %v, want ERROR", entry["level"])
+	}
+	if entry["msg"] != "all fields override test" {
+		t.Errorf("msg = %v, want 'all fields override test'", entry["msg"])
+	}
+	tsStr, ok := entry["ts"].(string)
+	if !ok {
+		t.Error("ts should be a string")
+	} else if tsStr == "bad-ts" {
+		t.Error("ts was overridden")
+	} else {
+		if _, err := time.Parse(time.RFC3339Nano, tsStr); err != nil {
+			t.Errorf("ts %q is not valid RFC3339Nano: %v", tsStr, err)
+		}
+	}
+	caller, ok := entry["caller"].(string)
+	if !ok {
+		t.Error("caller should be a string")
+	} else if caller == "bad.go:0" {
+		t.Error("caller was overridden")
+	} else if !strings.Contains(caller, "structlog_test.go:") {
+		t.Errorf("caller %q should point to structlog_test.go", caller)
+	}
+	stack, ok := entry["stack"].([]interface{})
+	if !ok {
+		t.Error("stack should be an array")
+	} else if len(stack) == 0 {
+		t.Error("stack should not be empty")
 	}
 }

@@ -6,16 +6,18 @@ import (
 )
 
 type counter struct {
-	mu     sync.RWMutex
-	name   string
-	labels Labels
-	value  float64
+	snapshotMu *sync.RWMutex
+	mu         sync.RWMutex
+	name       string
+	labels     Labels
+	value      float64
 }
 
-func newCounter(name string, labels Labels) *counter {
+func newCounter(name string, labels Labels, snapshotMu *sync.RWMutex) *counter {
 	c := &counter{
-		name:   name,
-		labels: make(Labels, len(labels)),
+		snapshotMu: snapshotMu,
+		name:       name,
+		labels:     make(Labels, len(labels)),
 	}
 	copy(c.labels, labels)
 	return c
@@ -34,6 +36,8 @@ func (c *counter) Labels() Labels {
 }
 
 func (c *counter) Inc() {
+	c.snapshotMu.RLock()
+	defer c.snapshotMu.RUnlock()
 	c.mu.Lock()
 	c.value++
 	c.mu.Unlock()
@@ -43,6 +47,8 @@ func (c *counter) Add(delta float64) {
 	if delta < 0 {
 		return
 	}
+	c.snapshotMu.RLock()
+	defer c.snapshotMu.RUnlock()
 	c.mu.Lock()
 	c.value += delta
 	c.mu.Unlock()
@@ -55,6 +61,8 @@ func (c *counter) Value() float64 {
 }
 
 func (c *counter) Reset() {
+	c.snapshotMu.RLock()
+	defer c.snapshotMu.RUnlock()
 	c.mu.Lock()
 	c.value = 0
 	c.mu.Unlock()

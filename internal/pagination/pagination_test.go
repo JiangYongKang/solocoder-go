@@ -1261,3 +1261,284 @@ func TestFullOffsetPaginationWorkflow(t *testing.T) {
 		t.Errorf("current page should still be 4, got %d", meta4.CurrentPage)
 	}
 }
+
+func TestBuildOffsetResponseZeroTotalCountPageGreaterThanOne(t *testing.T) {
+	tests := []struct {
+		name string
+		page int
+		size int
+	}{
+		{"page 2 with zero total", 2, 10},
+		{"page 5 with zero total", 5, 20},
+		{"page 100 with zero total", 100, 5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := NewOffsetPageRequest(tt.page, tt.size)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			items := makeTestItems(5)
+			resp := BuildOffsetResponse(items, req, 0)
+			if len(resp.Data) != 0 {
+				t.Errorf("expected empty data when totalCount=0 and page>1, got %d items", len(resp.Data))
+			}
+			meta := resp.Meta.(*OffsetPageMeta)
+			if meta.TotalCount != 0 {
+				t.Errorf("expected TotalCount 0, got %d", meta.TotalCount)
+			}
+			if meta.TotalPages != 0 {
+				t.Errorf("expected TotalPages 0, got %d", meta.TotalPages)
+			}
+			if meta.HasPrevPage {
+				t.Error("expected HasPrevPage false when totalPages=0")
+			}
+			if meta.HasNextPage {
+				t.Error("expected HasNextPage false when totalPages=0")
+			}
+			if meta.CurrentPage != tt.page {
+				t.Errorf("expected CurrentPage %d, got %d", tt.page, meta.CurrentPage)
+			}
+		})
+	}
+}
+
+func TestBuildOffsetResponseZeroTotalCountPageOne(t *testing.T) {
+	req, err := NewOffsetPageRequest(1, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	items := makeTestItems(0)
+	resp := BuildOffsetResponse(items, req, 0)
+	if len(resp.Data) != 0 {
+		t.Errorf("expected empty data, got %d items", len(resp.Data))
+	}
+	meta := resp.Meta.(*OffsetPageMeta)
+	if meta.CurrentPage != 1 {
+		t.Errorf("expected CurrentPage 1, got %d", meta.CurrentPage)
+	}
+	if meta.TotalPages != 0 {
+		t.Errorf("expected TotalPages 0, got %d", meta.TotalPages)
+	}
+}
+
+func TestSetTotalShrinkTotalCountClearOutOfRangeData(t *testing.T) {
+	items := makeTestItems(10)
+	req, _ := NewOffsetPageRequest(5, 2)
+	resp := BuildOffsetResponse(items, req, 100)
+	meta := resp.Meta.(*OffsetPageMeta)
+	if meta.TotalPages != 50 {
+		t.Errorf("expected 50 total pages, got %d", meta.TotalPages)
+	}
+	if len(resp.Data) != 10 {
+		t.Errorf("expected 10 items before SetTotal, got %d", len(resp.Data))
+	}
+	err := resp.SetTotal(3)
+	if err != nil {
+		t.Fatalf("SetTotal failed: %v", err)
+	}
+	meta2 := resp.Meta.(*OffsetPageMeta)
+	if meta2.TotalCount != 3 {
+		t.Errorf("expected TotalCount 3, got %d", meta2.TotalCount)
+	}
+	if meta2.TotalPages != 2 {
+		t.Errorf("expected TotalPages 2, got %d", meta2.TotalPages)
+	}
+	if len(resp.Data) != 0 {
+		t.Errorf("expected data cleared when page out of range after SetTotal, got %d items", len(resp.Data))
+	}
+	if meta2.CurrentPage != 5 {
+		t.Errorf("expected CurrentPage still 5, got %d", meta2.CurrentPage)
+	}
+}
+
+func TestSetTotalShrinkTotalCountStillInRange(t *testing.T) {
+	items := makeTestItems(10)
+	req, _ := NewOffsetPageRequest(2, 5)
+	resp := BuildOffsetResponse(items, req, 100)
+	meta := resp.Meta.(*OffsetPageMeta)
+	if meta.TotalPages != 20 {
+		t.Errorf("expected 20 total pages, got %d", meta.TotalPages)
+	}
+	err := resp.SetTotal(25)
+	if err != nil {
+		t.Fatalf("SetTotal failed: %v", err)
+	}
+	meta2 := resp.Meta.(*OffsetPageMeta)
+	if meta2.TotalCount != 25 {
+		t.Errorf("expected TotalCount 25, got %d", meta2.TotalCount)
+	}
+	if meta2.TotalPages != 5 {
+		t.Errorf("expected TotalPages 5, got %d", meta2.TotalPages)
+	}
+	if len(resp.Data) != 10 {
+		t.Errorf("expected data preserved when page still in range, got %d items", len(resp.Data))
+	}
+	if !meta2.HasNextPage {
+		t.Error("expected HasNextPage true")
+	}
+	if !meta2.HasPrevPage {
+		t.Error("expected HasPrevPage true")
+	}
+}
+
+func TestSetTotalShrinkToExactPage(t *testing.T) {
+	items := makeTestItems(5)
+	req, _ := NewOffsetPageRequest(3, 5)
+	resp := BuildOffsetResponse(items, req, 50)
+	err := resp.SetTotal(15)
+	if err != nil {
+		t.Fatalf("SetTotal failed: %v", err)
+	}
+	meta := resp.Meta.(*OffsetPageMeta)
+	if meta.TotalPages != 3 {
+		t.Errorf("expected TotalPages 3, got %d", meta.TotalPages)
+	}
+	if len(resp.Data) != 5 {
+		t.Errorf("expected data preserved when page equals TotalPages, got %d items", len(resp.Data))
+	}
+	if meta.HasNextPage {
+		t.Error("expected HasNextPage false when on last page")
+	}
+	if !meta.HasPrevPage {
+		t.Error("expected HasPrevPage true")
+	}
+}
+
+func TestSetTotalShrinkToZero(t *testing.T) {
+	items := makeTestItems(10)
+	req, _ := NewOffsetPageRequest(1, 10)
+	resp := BuildOffsetResponse(items, req, 100)
+	if len(resp.Data) != 10 {
+		t.Errorf("expected 10 items before SetTotal, got %d", len(resp.Data))
+	}
+	err := resp.SetTotal(0)
+	if err != nil {
+		t.Fatalf("SetTotal failed: %v", err)
+	}
+	meta := resp.Meta.(*OffsetPageMeta)
+	if meta.TotalCount != 0 {
+		t.Errorf("expected TotalCount 0, got %d", meta.TotalCount)
+	}
+	if meta.TotalPages != 0 {
+		t.Errorf("expected TotalPages 0, got %d", meta.TotalPages)
+	}
+	if len(resp.Data) != 0 {
+		t.Errorf("expected data cleared when SetTotal to 0, got %d items", len(resp.Data))
+	}
+}
+
+func TestValidateData(t *testing.T) {
+	t.Run("nil slice returns ErrNilData", func(t *testing.T) {
+		var items []TestItem = nil
+		err := ValidateData(items)
+		if !errors.Is(err, ErrNilData) {
+			t.Errorf("expected ErrNilData, got %v", err)
+		}
+	})
+	t.Run("empty slice returns nil", func(t *testing.T) {
+		items := []TestItem{}
+		err := ValidateData(items)
+		if err != nil {
+			t.Errorf("expected nil error for empty slice, got %v", err)
+		}
+	})
+	t.Run("non-empty slice returns nil", func(t *testing.T) {
+		items := makeTestItems(5)
+		err := ValidateData(items)
+		if err != nil {
+			t.Errorf("expected nil error for non-empty slice, got %v", err)
+		}
+	})
+	t.Run("nil string slice returns ErrNilData", func(t *testing.T) {
+		var items []string = nil
+		err := ValidateData(items)
+		if !errors.Is(err, ErrNilData) {
+			t.Errorf("expected ErrNilData for string slice, got %v", err)
+		}
+	})
+	t.Run("nil int slice returns ErrNilData", func(t *testing.T) {
+		var items []int = nil
+		err := ValidateData(items)
+		if !errors.Is(err, ErrNilData) {
+			t.Errorf("expected ErrNilData for int slice, got %v", err)
+		}
+	})
+}
+
+func TestErrNilDataIsReferenceable(t *testing.T) {
+	if ErrNilData == nil {
+		t.Fatal("ErrNilData should not be nil")
+	}
+	if ErrNilData.Error() != "pagination: data slice cannot be nil" {
+		t.Errorf("unexpected ErrNilData message: %s", ErrNilData.Error())
+	}
+	var err error = ErrNilData
+	if !errors.Is(err, ErrNilData) {
+		t.Error("errors.Is should match ErrNilData")
+	}
+}
+
+func TestBuildOffsetResponseNilDataSilentConversion(t *testing.T) {
+	req, _ := NewOffsetPageRequest(1, 10)
+	var items []TestItem = nil
+	resp := BuildOffsetResponse(items, req, 5)
+	if resp.Data == nil {
+		t.Error("expected nil data converted to empty slice, got nil")
+	}
+	if len(resp.Data) != 0 {
+		t.Errorf("expected empty slice, got %d items", len(resp.Data))
+	}
+}
+
+func TestBuildCursorResponseNilDataSilentConversion(t *testing.T) {
+	req, _ := NewCursorPageRequest("", CursorForward, 10)
+	var items []TestItem = nil
+	resp := BuildCursorResponse(items, req, itemCursor, false, false)
+	if resp.Data == nil {
+		t.Error("expected nil data converted to empty slice, got nil")
+	}
+	if len(resp.Data) != 0 {
+		t.Errorf("expected empty slice, got %d items", len(resp.Data))
+	}
+}
+
+func TestHasPrevPageWhenTotalPagesZero(t *testing.T) {
+	req, _ := NewOffsetPageRequest(5, 10)
+	resp := BuildOffsetResponse(makeTestItems(3), req, 0)
+	meta := resp.Meta.(*OffsetPageMeta)
+	if meta.HasPrevPage {
+		t.Error("HasPrevPage should be false when totalPages is 0, even if page > 1")
+	}
+	nav := resp.Nav.(*OffsetNav)
+	if nav.PrevPage != nil {
+		t.Error("PrevPage nav should be nil when totalPages is 0")
+	}
+}
+
+func TestBuildOffsetResponseHasPrevPageLogic(t *testing.T) {
+	tests := []struct {
+		name        string
+		page        int
+		size        int
+		totalCount  int64
+		wantHasPrev bool
+	}{
+		{"page 1, total 50", 1, 10, 50, false},
+		{"page 2, total 50", 2, 10, 50, true},
+		{"page 1, total 0", 1, 10, 0, false},
+		{"page 5, total 0", 5, 10, 0, false},
+		{"page 3, total 25", 3, 10, 25, true},
+		{"page 1, total 5", 1, 10, 5, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := NewOffsetPageRequest(tt.page, tt.size)
+			resp := BuildOffsetResponse(makeTestItems(tt.size), req, tt.totalCount)
+			meta := resp.Meta.(*OffsetPageMeta)
+			if meta.HasPrevPage != tt.wantHasPrev {
+				t.Errorf("expected HasPrevPage=%v, got %v", tt.wantHasPrev, meta.HasPrevPage)
+			}
+		})
+	}
+}

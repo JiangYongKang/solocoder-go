@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
 )
+
+const dataloaderFlushDelay = 5 * time.Millisecond
 
 type Executor struct {
 	Schema    *Schema
@@ -47,6 +50,18 @@ func (e *Executor) Execute(query string, variables map[string]interface{}, dataL
 		}
 	}
 
+	if variables == nil {
+		variables = make(map[string]interface{})
+	}
+
+	for _, op := range doc.Operations {
+		varErrs := e.validateVariables(op, variables)
+		if len(varErrs) > 0 {
+			result.Errors = append(result.Errors, varErrs...)
+			return result
+		}
+	}
+
 	ctx := &ExecutionContext{
 		Schema:      e.Schema,
 		DataLoaders: dataLoaders,
@@ -67,6 +82,21 @@ func (e *Executor) Execute(query string, variables map[string]interface{}, dataL
 	return result
 }
 
+func (e *Executor) validateVariables(op *Operation, variables map[string]interface{}) []error {
+	var errs []error
+
+	for _, vd := range op.VariableDefs {
+		if vd.Type.IsNonNull() && vd.DefaultValue == nil {
+			val, exists := variables[vd.Name]
+			if !exists || val == nil {
+				errs = append(errs, fmt.Errorf("variable $%s is required but not provided", vd.Name))
+			}
+		}
+	}
+
+	return errs
+}
+
 func (e *Executor) executeOperation(ctx *ExecutionContext, op *Operation) (map[string]interface{}, []error) {
 	var rootType *Type
 	switch op.Type {
@@ -82,29 +112,68 @@ func (e *Executor) executeOperation(ctx *ExecutionContext, op *Operation) (map[s
 		return nil, []error{fmt.Errorf("no root type defined for operation")}
 	}
 
+	fields := make([]*FieldSelection, 0)
+	aliases := make(map[string]string)
+	for _, sel := range op.SelectionSet {
+		if field, ok := (*sel).(*FieldSelection); ok {
+			fields = append(fields, field)
+			name := field.Name
+			if field.Alias != "" {
+				name = field.Alias
+			}
+			aliases[field.Name] = name
+		}
+	}
+
+	type fieldResult struct {
+		name  string
+		value interface{}
+		errs  []error
+	}
+
+	results := make(chan fieldResult, len(fields))
+	var wg sync.WaitGroup
+
+	for _, field := range fields {
+		wg.Add(1)
+		go func(f *FieldSelection) {
+			defer wg.Done()
+			resolvedArgs := resolveArguments(f.Args, ctx.Variables, op.VariableDefs)
+			value, fieldErrs := e.executeField(ctx, rootType, f, nil, resolvedArgs, "")
+			name := f.Name
+			if f.Alias != "" {
+				name = f.Alias
+			}
+			results <- fieldResult{name: name, value: value, errs: fieldErrs}
+		}(field)
+	}
+
+	time.Sleep(dataloaderFlushDelay)
+	e.flushDataLoaders(ctx)
+
+	wg.Wait()
+	close(results)
+
 	result := make(map[string]interface{})
 	var errs []error
 
-	for _, sel := range op.SelectionSet {
-		field, ok := (*sel).(*FieldSelection)
-		if !ok {
-			continue
+	for r := range results {
+		if len(r.errs) > 0 {
+			errs = append(errs, r.errs...)
 		}
-
-		fieldName := field.Name
-		if field.Alias != "" {
-			fieldName = field.Alias
-		}
-
-		resolvedArgs := resolveArguments(field.Args, ctx.Variables, op.VariableDefs)
-		value, fieldErrs := e.executeField(ctx, rootType, field, nil, resolvedArgs, "")
-		if len(fieldErrs) > 0 {
-			errs = append(errs, fieldErrs...)
-		}
-		result[fieldName] = value
+		result[r.name] = r.value
 	}
 
 	return result, errs
+}
+
+func (e *Executor) flushDataLoaders(ctx *ExecutionContext) {
+	if ctx.DataLoaders == nil {
+		return
+	}
+	for _, dl := range ctx.DataLoaders {
+		dl.Flush()
+	}
 }
 
 func (e *Executor) executeField(
@@ -125,11 +194,9 @@ func (e *Executor) executeField(
 	}
 
 	typeName := ""
-	if parentType != nil {
-		unwrapped := parentType.Unwrap()
-		if unwrapped != nil {
-			typeName = unwrapped.Name
-		}
+	unwrappedParent := parentType.Unwrap()
+	if unwrappedParent != nil {
+		typeName = unwrappedParent.Name
 	}
 
 	resolver, hasResolver := ctx.Schema.GetResolver(typeName, field.Name)
@@ -137,7 +204,7 @@ func (e *Executor) executeField(
 	var resolverErr error
 
 	if hasResolver {
-		value, resolverErr = resolver(parent, args)
+		value, resolverErr = resolver(ctx, parent, args)
 		if resolverErr != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", fieldPath, resolverErr))
 			return nil, errs
@@ -147,19 +214,8 @@ func (e *Executor) executeField(
 	}
 
 	var fieldType *Type
-	if parentType != nil {
-		unwrappedParent := parentType.Unwrap()
-		var actualParentType *Type
-		if unwrappedParent != nil && unwrappedParent.Name != "" {
-			if t, ok := ctx.Schema.GetType(unwrappedParent.Name); ok {
-				actualParentType = t
-			} else {
-				actualParentType = unwrappedParent
-			}
-		} else {
-			actualParentType = unwrappedParent
-		}
-		if actualParentType != nil {
+	if unwrappedParent != nil && unwrappedParent.Name != "" {
+		if actualParentType, ok := ctx.Schema.GetType(unwrappedParent.Name); ok {
 			if schemaField, hasField := actualParentType.Fields[field.Name]; hasField {
 				fieldType = schemaField.Type
 			}
@@ -195,7 +251,6 @@ func (e *Executor) executeList(
 	path string,
 ) ([]interface{}, []error) {
 	var errs []error
-	results := make([]interface{}, 0)
 
 	val := reflect.ValueOf(value)
 	if val.Kind() == reflect.Ptr {
@@ -203,7 +258,7 @@ func (e *Executor) executeList(
 	}
 
 	if val.Kind() != reflect.Slice && val.Kind() != reflect.Array {
-		return results, append(errs, fmt.Errorf("%s: expected list but got %T", path, value))
+		return nil, append(errs, fmt.Errorf("%s: expected list but got %T", path, value))
 	}
 
 	innerType := listType
@@ -214,17 +269,46 @@ func (e *Executor) executeList(
 		innerType = innerType.OfType
 	}
 
-	for i := 0; i < val.Len(); i++ {
-		itemPath := fmt.Sprintf("%s[%d]", path, i)
-		item := val.Index(i).Interface()
-		itemResult, itemErrs := e.executeObject(ctx, innerType, selections, item, itemPath)
-		if len(itemErrs) > 0 {
-			errs = append(errs, itemErrs...)
-		}
-		results = append(results, itemResult)
+	n := val.Len()
+	if n == 0 {
+		return []interface{}{}, nil
 	}
 
-	return results, errs
+	type itemResult struct {
+		index int
+		value map[string]interface{}
+		errs  []error
+	}
+
+	results := make(chan itemResult, n)
+	var wg sync.WaitGroup
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			itemPath := fmt.Sprintf("%s[%d]", path, idx)
+			item := val.Index(idx).Interface()
+			itemResultMap, itemErrs := e.executeObject(ctx, innerType, selections, item, itemPath)
+			results <- itemResult{index: idx, value: itemResultMap, errs: itemErrs}
+		}(i)
+	}
+
+	time.Sleep(dataloaderFlushDelay)
+	e.flushDataLoaders(ctx)
+
+	wg.Wait()
+	close(results)
+
+	resultList := make([]interface{}, n)
+	for r := range results {
+		if len(r.errs) > 0 {
+			errs = append(errs, r.errs...)
+		}
+		resultList[r.index] = r.value
+	}
+
+	return resultList, errs
 }
 
 func (e *Executor) executeObject(
@@ -239,54 +323,85 @@ func (e *Executor) executeObject(
 
 	var actualType *Type
 	if objType != nil {
-		actualType = objType.Unwrap()
-	} else if value != nil {
-		t, _ := ctx.Schema.GetType(fmt.Sprintf("%T", value))
-		actualType = t
+		unwrapped := objType.Unwrap()
+		if unwrapped.Name != "" {
+			if t, ok := ctx.Schema.GetType(unwrapped.Name); ok {
+				actualType = t
+			} else {
+				actualType = unwrapped
+			}
+		} else {
+			actualType = unwrapped
+		}
 	}
 
+	fieldSelections := make([]*FieldSelection, 0)
+	fragments := make([]*InlineFragment, 0)
 	for _, sel := range selections {
 		switch s := (*sel).(type) {
 		case *FieldSelection:
-			fieldName := s.Name
-			if s.Alias != "" {
-				fieldName = s.Alias
-			}
-
-			var fieldType *Type
-			if actualType != nil {
-				if f, ok := actualType.Fields[s.Name]; ok {
-					fieldType = f.Type
-				}
-			}
-
-			resolvedArgs := resolveArguments(s.Args, ctx.Variables, nil)
-			fieldValue, fieldErrs := e.executeField(
-				ctx,
-				actualType,
-				s,
-				value,
-				resolvedArgs,
-				path,
-			)
-			if len(fieldErrs) > 0 {
-				errs = append(errs, fieldErrs...)
-			}
-			result[fieldName] = fieldValue
-			_ = fieldType
-
+			fieldSelections = append(fieldSelections, s)
 		case *InlineFragment:
-			fragType, ok := ctx.Schema.GetType(s.TypeCondition)
-			if !ok {
-				continue
+			fragments = append(fragments, s)
+		}
+	}
+
+	if len(fieldSelections) > 0 {
+		type fieldResult struct {
+			name  string
+			value interface{}
+			errs  []error
+		}
+
+		results := make(chan fieldResult, len(fieldSelections))
+		var wg sync.WaitGroup
+
+		for _, fs := range fieldSelections {
+			wg.Add(1)
+			go func(f *FieldSelection) {
+				defer wg.Done()
+				resolvedArgs := resolveArguments(f.Args, ctx.Variables, nil)
+				fieldValue, fieldErrs := e.executeField(
+					ctx,
+					actualType,
+					f,
+					value,
+					resolvedArgs,
+					path,
+				)
+				name := f.Name
+				if f.Alias != "" {
+					name = f.Alias
+				}
+				results <- fieldResult{name: name, value: fieldValue, errs: fieldErrs}
+			}(fs)
+		}
+
+		time.Sleep(dataloaderFlushDelay)
+		e.flushDataLoaders(ctx)
+
+		wg.Wait()
+		close(results)
+
+		for r := range results {
+			if len(r.errs) > 0 {
+				errs = append(errs, r.errs...)
 			}
-			fragResult, fragErrs := e.executeObject(ctx, fragType, s.SelectionSet, value, path)
-			if len(fragErrs) > 0 {
-				errs = append(errs, fragErrs...)
-			}
-			for k, v := range fragResult {
-				result[k] = v
-			}
+			result[r.name] = r.value
+		}
+	}
+
+	for _, frag := range fragments {
+		fragType, ok := ctx.Schema.GetType(frag.TypeCondition)
+		if !ok {
+			continue
+		}
+		fragResult, fragErrs := e.executeObject(ctx, fragType, frag.SelectionSet, value, path)
+		if len(fragErrs) > 0 {
+			errs = append(errs, fragErrs...)
+		}
+		for k, v := range fragResult {
+			result[k] = v
 		}
 	}
 
@@ -371,24 +486,4 @@ func getFieldFromParent(parent interface{}, fieldName string) interface{} {
 	}
 
 	return nil
-}
-
-func (e *Executor) ExecuteWithDataLoaders(
-	query string,
-	variables map[string]interface{},
-	dataLoaders map[string]*DataLoader,
-) *ExecutionResult {
-	result := e.Execute(query, variables, dataLoaders)
-
-	var wg sync.WaitGroup
-	for _, dl := range dataLoaders {
-		wg.Add(1)
-		go func(loader *DataLoader) {
-			defer wg.Done()
-			_ = loader.Flush()
-		}(dl)
-	}
-	wg.Wait()
-
-	return result
 }

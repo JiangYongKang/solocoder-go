@@ -509,6 +509,8 @@ func TestEvaluate_WhitelistFlag(t *testing.T) {
 func TestSetBooleanValue(t *testing.T) {
 	e := NewEvaluator()
 	_ = e.CreateFlag(&FlagConfig{Key: "bool-setter", Type: FlagTypeBoolean, Enabled: false})
+	_ = e.CreateFlag(&FlagConfig{Key: "pct-flag", Type: FlagTypePercentage, Percentage: 50})
+	_ = e.CreateFlag(&FlagConfig{Key: "wl-flag", Type: FlagTypeWhitelist, Whitelist: []string{"alice"}})
 
 	t.Run("empty key", func(t *testing.T) {
 		err := e.SetBooleanValue("", true)
@@ -521,6 +523,35 @@ func TestSetBooleanValue(t *testing.T) {
 		err := e.SetBooleanValue("nonexistent", true)
 		if !errors.Is(err, ErrFlagNotFound) {
 			t.Errorf("expected ErrFlagNotFound, got %v", err)
+		}
+	})
+
+	t.Run("wrong type percentage", func(t *testing.T) {
+		err := e.SetBooleanValue("pct-flag", true)
+		if !errors.Is(err, ErrInvalidFlagType) {
+			t.Errorf("expected ErrInvalidFlagType for percentage flag, got %v", err)
+		}
+	})
+
+	t.Run("wrong type whitelist", func(t *testing.T) {
+		err := e.SetBooleanValue("wl-flag", true)
+		if !errors.Is(err, ErrInvalidFlagType) {
+			t.Errorf("expected ErrInvalidFlagType for whitelist flag, got %v", err)
+		}
+	})
+
+	t.Run("wrong type does not modify flag", func(t *testing.T) {
+		auditBefore := e.AuditLogCount()
+		_ = e.SetBooleanValue("pct-flag", true)
+		cfg, _ := e.GetFlag("pct-flag")
+		if cfg.Type != FlagTypePercentage {
+			t.Error("flag type should not change after failed SetBooleanValue")
+		}
+		if cfg.Percentage != 50 {
+			t.Errorf("percentage should remain 50, got %d", cfg.Percentage)
+		}
+		if e.AuditLogCount() != auditBefore {
+			t.Error("failed SetBooleanValue should not generate audit log")
 		}
 	})
 
@@ -973,33 +1004,59 @@ func TestQueryAuditLogs_ByFlagKey(t *testing.T) {
 
 func TestQueryAuditLogs_ByTimeRange(t *testing.T) {
 	e := NewEvaluator()
-	_ = e.CreateFlag(&FlagConfig{Key: "timed-flag", Type: FlagTypeBoolean})
 
-	time.Sleep(10 * time.Millisecond)
-	midTime := time.Now()
-	time.Sleep(10 * time.Millisecond)
+	_ = e.CreateFlag(&FlagConfig{Key: "early-flag", Type: FlagTypeBoolean, Enabled: false})
 
-	_ = e.SetBooleanValue("timed-flag", true)
+	time.Sleep(20 * time.Millisecond)
+	afterFirst := time.Now()
+	time.Sleep(20 * time.Millisecond)
 
-	_ = e.CreateFlag(&FlagConfig{Key: "later-flag", Type: FlagTypeBoolean})
+	_ = e.SetBooleanValue("early-flag", true)
 
-	startTime := midTime
-	endTime := midTime
-	results := e.QueryAuditLogs(AuditLogQuery{StartTime: &startTime, EndTime: &endTime})
+	time.Sleep(20 * time.Millisecond)
+	afterSecond := time.Now()
+	time.Sleep(20 * time.Millisecond)
+
+	_ = e.CreateFlag(&FlagConfig{Key: "late-flag", Type: FlagTypeBoolean})
 
 	allLogs := e.QueryAuditLogs(AuditLogQuery{})
-	for _, l := range allLogs {
-		t.Logf("log: ts=%v op=%s key=%s", l.Timestamp, l.Operation, l.FlagKey)
+	if len(allLogs) != 3 {
+		t.Fatalf("expected 3 total logs, got %d", len(allLogs))
 	}
 
-	future := time.Now().Add(1 * time.Hour)
-	past := time.Now().Add(-1 * time.Hour)
-	allRange := e.QueryAuditLogs(AuditLogQuery{StartTime: &past, EndTime: &future})
-	if len(allRange) != len(allLogs) {
-		t.Errorf("full time range should return all logs: got %d, want %d", len(allRange), len(allLogs))
+	firstOnly := e.QueryAuditLogs(AuditLogQuery{EndTime: &afterFirst})
+	if len(firstOnly) != 1 {
+		t.Errorf("expected 1 log before afterFirst, got %d", len(firstOnly))
+	}
+	if len(firstOnly) > 0 && firstOnly[0].FlagKey != "early-flag" {
+		t.Errorf("expected early-flag CREATE, got %s", firstOnly[0].FlagKey)
 	}
 
-	_ = results
+	secondOnly := e.QueryAuditLogs(AuditLogQuery{StartTime: &afterFirst, EndTime: &afterSecond})
+	if len(secondOnly) != 1 {
+		t.Errorf("expected 1 log between afterFirst and afterSecond, got %d", len(secondOnly))
+	}
+	if len(secondOnly) > 0 && secondOnly[0].Operation != "SET_BOOLEAN" {
+		t.Errorf("expected SET_BOOLEAN operation, got %s", secondOnly[0].Operation)
+	}
+
+	lateOnly := e.QueryAuditLogs(AuditLogQuery{StartTime: &afterSecond})
+	if len(lateOnly) != 1 {
+		t.Errorf("expected 1 log after afterSecond, got %d", len(lateOnly))
+	}
+	if len(lateOnly) > 0 && lateOnly[0].FlagKey != "late-flag" {
+		t.Errorf("expected late-flag CREATE, got %s", lateOnly[0].FlagKey)
+	}
+
+	firstTwo := e.QueryAuditLogs(AuditLogQuery{EndTime: &afterSecond})
+	if len(firstTwo) != 2 {
+		t.Errorf("expected 2 logs before afterSecond, got %d", len(firstTwo))
+	}
+
+	lastTwo := e.QueryAuditLogs(AuditLogQuery{StartTime: &afterFirst})
+	if len(lastTwo) != 2 {
+		t.Errorf("expected 2 logs from afterFirst onward, got %d", len(lastTwo))
+	}
 }
 
 func TestQueryAuditLogs_StartTimeOnly(t *testing.T) {
@@ -1228,5 +1285,160 @@ func TestEvaluator_DifferentSeeds_ProduceDifferentBuckets(t *testing.T) {
 	}
 	if differentCount == 0 {
 		t.Error("different seeds should produce different bucket assignments for some users")
+	}
+}
+
+func TestTypeValidation_AllSetterMethods(t *testing.T) {
+	e := NewEvaluator()
+	_ = e.CreateFlag(&FlagConfig{Key: "bool-f", Type: FlagTypeBoolean})
+	_ = e.CreateFlag(&FlagConfig{Key: "pct-f", Type: FlagTypePercentage, Percentage: 50})
+	_ = e.CreateFlag(&FlagConfig{Key: "wl-f", Type: FlagTypeWhitelist, Whitelist: nil})
+
+	t.Run("SetBooleanValue on percentage flag returns error", func(t *testing.T) {
+		err := e.SetBooleanValue("pct-f", true)
+		if !errors.Is(err, ErrInvalidFlagType) {
+			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		}
+	})
+
+	t.Run("SetBooleanValue on whitelist flag returns error", func(t *testing.T) {
+		err := e.SetBooleanValue("wl-f", true)
+		if !errors.Is(err, ErrInvalidFlagType) {
+			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		}
+	})
+
+	t.Run("SetPercentage on boolean flag returns error", func(t *testing.T) {
+		err := e.SetPercentage("bool-f", 30)
+		if !errors.Is(err, ErrInvalidFlagType) {
+			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		}
+	})
+
+	t.Run("SetPercentage on whitelist flag returns error", func(t *testing.T) {
+		err := e.SetPercentage("wl-f", 30)
+		if !errors.Is(err, ErrInvalidFlagType) {
+			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		}
+	})
+
+	t.Run("AddToWhitelist on boolean flag returns error", func(t *testing.T) {
+		err := e.AddToWhitelist("bool-f", "user1")
+		if !errors.Is(err, ErrInvalidFlagType) {
+			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		}
+	})
+
+	t.Run("AddToWhitelist on percentage flag returns error", func(t *testing.T) {
+		err := e.AddToWhitelist("pct-f", "user1")
+		if !errors.Is(err, ErrInvalidFlagType) {
+			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		}
+	})
+
+	t.Run("RemoveFromWhitelist on boolean flag returns error", func(t *testing.T) {
+		err := e.RemoveFromWhitelist("bool-f", "user1")
+		if !errors.Is(err, ErrInvalidFlagType) {
+			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		}
+	})
+
+	t.Run("RemoveFromWhitelist on percentage flag returns error", func(t *testing.T) {
+		err := e.RemoveFromWhitelist("pct-f", "user1")
+		if !errors.Is(err, ErrInvalidFlagType) {
+			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		}
+	})
+
+	t.Run("type mismatch does not generate audit logs", func(t *testing.T) {
+		auditBefore := e.AuditLogCount()
+		_ = e.SetBooleanValue("pct-f", true)
+		_ = e.SetPercentage("bool-f", 30)
+		_ = e.AddToWhitelist("bool-f", "user1")
+		_ = e.RemoveFromWhitelist("pct-f", "user1")
+		if e.AuditLogCount() != auditBefore {
+			t.Errorf("type-mismatched operations should not generate audit logs, but count changed from %d to %d", auditBefore, e.AuditLogCount())
+		}
+	})
+
+	t.Run("correct type operations succeed after failed ones", func(t *testing.T) {
+		err := e.SetBooleanValue("bool-f", true)
+		if err != nil {
+			t.Errorf("SetBooleanValue on correct type should succeed: %v", err)
+		}
+		err = e.SetPercentage("pct-f", 75)
+		if err != nil {
+			t.Errorf("SetPercentage on correct type should succeed: %v", err)
+		}
+		err = e.AddToWhitelist("wl-f", "user1")
+		if err != nil {
+			t.Errorf("AddToWhitelist on correct type should succeed: %v", err)
+		}
+	})
+}
+
+func TestQueryAuditLogs_TimeRangeWithFlagKey(t *testing.T) {
+	e := NewEvaluator()
+
+	_ = e.CreateFlag(&FlagConfig{Key: "flag-a", Type: FlagTypeBoolean})
+	_ = e.CreateFlag(&FlagConfig{Key: "flag-b", Type: FlagTypeBoolean})
+
+	time.Sleep(20 * time.Millisecond)
+	midTime := time.Now()
+	time.Sleep(20 * time.Millisecond)
+
+	_ = e.SetBooleanValue("flag-a", true)
+	_ = e.SetBooleanValue("flag-b", true)
+
+	aRecentLogs := e.QueryAuditLogs(AuditLogQuery{FlagKey: "flag-a", StartTime: &midTime})
+	if len(aRecentLogs) != 1 {
+		t.Errorf("expected 1 recent log for flag-a, got %d", len(aRecentLogs))
+	}
+	if len(aRecentLogs) > 0 && aRecentLogs[0].Operation != "SET_BOOLEAN" {
+		t.Errorf("expected SET_BOOLEAN, got %s", aRecentLogs[0].Operation)
+	}
+
+	aEarlyLogs := e.QueryAuditLogs(AuditLogQuery{FlagKey: "flag-a", EndTime: &midTime})
+	if len(aEarlyLogs) != 1 {
+		t.Errorf("expected 1 early log for flag-a, got %d", len(aEarlyLogs))
+	}
+	if len(aEarlyLogs) > 0 && aEarlyLogs[0].Operation != "CREATE" {
+		t.Errorf("expected CREATE, got %s", aEarlyLogs[0].Operation)
+	}
+
+	future := time.Now().Add(1 * time.Hour)
+	aNoResults := e.QueryAuditLogs(AuditLogQuery{FlagKey: "flag-a", StartTime: &future})
+	if len(aNoResults) != 0 {
+		t.Errorf("expected 0 logs for flag-a in future range, got %d", len(aNoResults))
+	}
+}
+
+func TestQueryAuditLogs_TimeRangeBoundaryInclusive(t *testing.T) {
+	e := NewEvaluator()
+	_ = e.CreateFlag(&FlagConfig{Key: "boundary-time", Type: FlagTypeBoolean})
+
+	logs := e.QueryAuditLogs(AuditLogQuery{})
+	if len(logs) != 1 {
+		t.Fatalf("expected 1 log, got %d", len(logs))
+	}
+
+	logTime := logs[0].Timestamp
+
+	exactStart := logTime
+	startLogs := e.QueryAuditLogs(AuditLogQuery{StartTime: &exactStart})
+	if len(startLogs) != 1 {
+		t.Errorf("StartTime equals log timestamp should include the log (inclusive), got %d", len(startLogs))
+	}
+
+	exactEnd := logTime
+	endLogs := e.QueryAuditLogs(AuditLogQuery{EndTime: &exactEnd})
+	if len(endLogs) != 1 {
+		t.Errorf("EndTime equals log timestamp should include the log (inclusive), got %d", len(endLogs))
+	}
+
+	before := logTime.Add(-1 * time.Nanosecond)
+	beforeLogs := e.QueryAuditLogs(AuditLogQuery{StartTime: &before, EndTime: &before})
+	if len(beforeLogs) != 0 {
+		t.Errorf("time range before log should return 0, got %d", len(beforeLogs))
 	}
 }

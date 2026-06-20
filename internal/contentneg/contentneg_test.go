@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"solocoder-go/internal/serialize"
 )
 
 type testUser struct {
@@ -594,6 +596,17 @@ func TestMarshalProtobuf(t *testing.T) {
 	}
 	if len(data) == 0 {
 		t.Error("expected non-empty protobuf data")
+	}
+
+	var result testUserPB
+	ser := serialize.NewProtoBufSerializer()
+	opts := serialize.DefaultOptions()
+	opts.ZeroCopy = false
+	if err := ser.Unmarshal(data, &result, opts); err != nil {
+		t.Fatalf("protobuf unmarshal failed: %v", err)
+	}
+	if result.ID != user.ID || result.Name != user.Name || result.Age != user.Age {
+		t.Errorf("protobuf round-trip mismatch: expected %+v, got %+v", user, result)
 	}
 }
 

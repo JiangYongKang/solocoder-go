@@ -2,35 +2,40 @@ package metrics
 
 import (
 	"math"
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
 )
 
-const defaultSummaryMaxSamples = 1000
+const defaultSummaryMaxSamples = 1024
 
 type summary struct {
+	snapshotMu *sync.RWMutex
+	mu         sync.RWMutex
 	name       string
 	labels     Labels
 	quantiles  []float64
-	samples    []float64
-	maxSamples int
+	reservoir  []float64
+	capacity   int
 	count      uint64
 	sum        float64
-	mu         sync.RWMutex
+	rand       *rand.Rand
 }
 
-func newSummary(name string, labels Labels, quantiles []float64) *summary {
+func newSummary(name string, labels Labels, quantiles []float64, snapshotMu *sync.RWMutex) *summary {
 	sortedQuantiles := make([]float64, len(quantiles))
 	copy(sortedQuantiles, quantiles)
 	sort.Float64s(sortedQuantiles)
 
 	s := &summary{
+		snapshotMu: snapshotMu,
 		name:       name,
 		labels:     make(Labels, len(labels)),
 		quantiles:  sortedQuantiles,
-		samples:    make([]float64, 0, defaultSummaryMaxSamples),
-		maxSamples: defaultSummaryMaxSamples,
+		reservoir:  make([]float64, 0, defaultSummaryMaxSamples),
+		capacity:   defaultSummaryMaxSamples,
+		rand:       rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	copy(s.labels, labels)
 	return s
@@ -49,18 +54,20 @@ func (s *summary) Labels() Labels {
 }
 
 func (s *summary) Observe(value float64) {
+	s.snapshotMu.RLock()
+	defer s.snapshotMu.RUnlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.count++
 	s.sum += value
 
-	if len(s.samples) < s.maxSamples {
-		s.samples = append(s.samples, value)
+	if len(s.reservoir) < s.capacity {
+		s.reservoir = append(s.reservoir, value)
 	} else {
-		idx := int(s.count-1) % s.maxSamples
-		if idx < len(s.samples) {
-			s.samples[idx] = value
+		j := s.rand.Intn(int(s.count))
+		if j < s.capacity {
+			s.reservoir[j] = value
 		}
 	}
 }
@@ -69,7 +76,7 @@ func (s *summary) Quantiles() []QuantileValue {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if len(s.samples) == 0 {
+	if len(s.reservoir) == 0 {
 		result := make([]QuantileValue, len(s.quantiles))
 		for i, q := range s.quantiles {
 			result[i] = QuantileValue{Quantile: q, Value: 0}
@@ -77,8 +84,8 @@ func (s *summary) Quantiles() []QuantileValue {
 		return result
 	}
 
-	sorted := make([]float64, len(s.samples))
-	copy(sorted, s.samples)
+	sorted := make([]float64, len(s.reservoir))
+	copy(sorted, s.reservoir)
 	sort.Float64s(sorted)
 
 	result := make([]QuantileValue, len(s.quantiles))
@@ -130,9 +137,9 @@ func (s *summary) Snapshot() MetricValue {
 	defer s.mu.RUnlock()
 
 	quantileValues := make([]QuantileValue, len(s.quantiles))
-	if len(s.samples) > 0 {
-		sorted := make([]float64, len(s.samples))
-		copy(sorted, s.samples)
+	if len(s.reservoir) > 0 {
+		sorted := make([]float64, len(s.reservoir))
+		copy(sorted, s.reservoir)
 		sort.Float64s(sorted)
 
 		for i, q := range s.quantiles {

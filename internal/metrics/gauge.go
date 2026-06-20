@@ -6,16 +6,18 @@ import (
 )
 
 type gauge struct {
-	mu     sync.RWMutex
-	name   string
-	labels Labels
-	value  float64
+	snapshotMu *sync.RWMutex
+	mu         sync.RWMutex
+	name       string
+	labels     Labels
+	value      float64
 }
 
-func newGauge(name string, labels Labels) *gauge {
+func newGauge(name string, labels Labels, snapshotMu *sync.RWMutex) *gauge {
 	g := &gauge{
-		name:   name,
-		labels: make(Labels, len(labels)),
+		snapshotMu: snapshotMu,
+		name:       name,
+		labels:     make(Labels, len(labels)),
 	}
 	copy(g.labels, labels)
 	return g
@@ -34,6 +36,8 @@ func (g *gauge) Labels() Labels {
 }
 
 func (g *gauge) Set(value float64) {
+	g.snapshotMu.RLock()
+	defer g.snapshotMu.RUnlock()
 	g.mu.Lock()
 	g.value = value
 	g.mu.Unlock()
@@ -48,12 +52,16 @@ func (g *gauge) Dec() {
 }
 
 func (g *gauge) Add(delta float64) {
+	g.snapshotMu.RLock()
+	defer g.snapshotMu.RUnlock()
 	g.mu.Lock()
 	g.value += delta
 	g.mu.Unlock()
 }
 
 func (g *gauge) Sub(delta float64) {
+	g.snapshotMu.RLock()
+	defer g.snapshotMu.RUnlock()
 	g.mu.Lock()
 	g.value -= delta
 	g.mu.Unlock()

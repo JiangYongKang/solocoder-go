@@ -7,7 +7,8 @@ import (
 )
 
 type registry struct {
-	mu       sync.RWMutex
+	mu         sync.RWMutex
+	snapshotMu sync.RWMutex
 	counters   map[string]map[string]*counter
 	gauges     map[string]map[string]*gauge
 	histograms map[string]map[string]*histogram
@@ -48,7 +49,7 @@ func (r *registry) RegisterCounter(name string, labels Labels) CounterMetric {
 		r.counters[name] = make(map[string]*counter)
 	}
 
-	c := newCounter(name, labels)
+	c := newCounter(name, labels, &r.snapshotMu)
 	r.counters[name][hash] = c
 	return c
 }
@@ -76,7 +77,7 @@ func (r *registry) RegisterGauge(name string, labels Labels) GaugeMetric {
 		r.gauges[name] = make(map[string]*gauge)
 	}
 
-	g := newGauge(name, labels)
+	g := newGauge(name, labels, &r.snapshotMu)
 	r.gauges[name][hash] = g
 	return g
 }
@@ -107,7 +108,7 @@ func (r *registry) RegisterHistogram(name string, labels Labels, buckets []float
 		r.histograms[name] = make(map[string]*histogram)
 	}
 
-	h := newHistogram(name, labels, buckets)
+	h := newHistogram(name, labels, buckets, &r.snapshotMu)
 	r.histograms[name][hash] = h
 	return h
 }
@@ -143,7 +144,7 @@ func (r *registry) RegisterSummary(name string, labels Labels, quantiles []float
 		r.summaries[name] = make(map[string]*summary)
 	}
 
-	s := newSummary(name, labels, quantiles)
+	s := newSummary(name, labels, quantiles, &r.snapshotMu)
 	r.summaries[name][hash] = s
 	return s
 }
@@ -201,6 +202,9 @@ func (r *registry) GetSummary(name string, labels Labels) (SummaryMetric, bool) 
 }
 
 func (r *registry) Snapshot() []MetricValue {
+	r.snapshotMu.Lock()
+	defer r.snapshotMu.Unlock()
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 

@@ -1,0 +1,6 @@
+产物不满意：
+1. templater.go 的 callFunction 方法在修复双返回值类型断言 panic 时新增了 Kind 白名单检查，只允许 reflect.Interface 和 reflect.Ptr 类型的第二个返回值调用 IsNil 方法，当非 nil 时再尝试类型断言为 error。这导致用户注册返回 (int, MyError) 的函数时，如果 MyError 是值类型结构体实现了 error 接口，第二个返回值的 Kind 是 Struct 而非 Interface 或 Ptr，代码跳过整个错误检查分支直接走到 return nil, ErrInvalidFunctionCall，把合法错误当非法调用丢弃。提示词第 2 条要求对非 error 类型的双返回值返回可捕获的渲染错误而非 panic，但 Kind 白名单对值类型 error 是误杀。根因是用 Kind 枚举做前置过滤而非用 comma-ok 类型断言自然分流，应去掉 Kind 判断直接把 second.Interface().(error) 放在 comma-ok 中，断言成功处理 error 分支，断言失败才是 ErrInvalidFunctionCall。
+2. templater.go 的 RenderWithVisited 方法在第 110 到 123 行新增了继承链循环检测代码，通过 for 循环遍历父模板的 extends 字段并用 GetTemplate 获取每个祖先模板。但该循环内部调用的 GetTemplate 除了做存在性校验外还会把祖先模板解析并写入 Engine 缓存，这些祖先模板并未参与后续的块合并与渲染，链遍历结束后 p 变量被丢弃，仅用于循环退出条件。这引入了不必要的模板解析和缓存的副作用，因为循环的目的仅仅是检测 extends 链中的 visited 冲突，完全可以直接对 e.templates 做存在性查询和对已解析模板的 Extends 字段做链遍历，无需调用 GetTemplate。根因是混淆了获取模板数据和检测循环的逻辑边界，应把存在性校验与缓存解析分离。
+
+过程不满意：
+1. 模型在刚收到提示词后未分析任何文件就直接调用 todo_write 创建了 6 项子任务计划，罗列了修复并发、修复 callFunction、修复 else if、添加测试、修复文档、验证测试等条目，然后才开始依次读取 errors.go、types.go、templater.go、templater_test.go、templater.md。这违反了先分析问题再规划的流程规范，后续实际执行中第 3 项"修复 else if"实际还涉及 ErrInvalidRange、ErrInvalidBlockSyntax、ErrBlockNotFound 三条错误返回路径的设计与实现，以及变量路径空段检测和 fieldNotFound 哨兵机制的引入，工作量远超 TodoList 中一行条目能概括的范围。正确做法是先完整阅读所有关联文件，理清六个缺陷之间的依赖关系和改动范围后再制定粒度匹配的执行计划。

@@ -286,6 +286,9 @@ func (e *Evaluator) SetBooleanValue(key string, enabled bool) error {
 	if !exists {
 		return ErrFlagNotFound
 	}
+	if cfg.Type != FlagTypeBoolean {
+		return fmt.Errorf("%w: flag type is %s, not Boolean", ErrInvalidFlagType, cfg.Type.String())
+	}
 
 	oldClone := cfg.Clone()
 	newCfg := cfg.Clone()

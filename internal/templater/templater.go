@@ -56,9 +56,15 @@ func (e *Engine) GetTemplate(name string) (*Template, error) {
 		return cached, nil
 	}
 
-	e.mu.RLock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	cached, ok = e.cache[name]
+	if ok {
+		return cached, nil
+	}
+
 	source, ok := e.templates[name]
-	e.mu.RUnlock()
 	if !ok {
 		return nil, ErrTemplateNotFound
 	}
@@ -68,10 +74,7 @@ func (e *Engine) GetTemplate(name string) (*Template, error) {
 		return nil, err
 	}
 
-	e.mu.Lock()
 	e.cache[name] = tmpl
-	e.mu.Unlock()
-
 	return tmpl, nil
 }
 
@@ -91,12 +94,32 @@ func (e *Engine) RenderWithVisited(name string, data interface{}, visited map[st
 	}
 
 	if tmpl.Extends != nil {
+		if visited[tmpl.Extends.ParentName] {
+			return "", ErrTemplateInheritanceLoop
+		}
 		parentTmpl, err := e.GetTemplate(tmpl.Extends.ParentName)
 		if err != nil {
 			if err == ErrTemplateNotFound {
 				return "", ErrParentTemplateNotFound
 			}
 			return "", err
+		}
+
+		visited[tmpl.Extends.ParentName] = true
+
+		for p := parentTmpl; p.Extends != nil; {
+			if visited[p.Extends.ParentName] {
+				return "", ErrTemplateInheritanceLoop
+			}
+			grandparent, err := e.GetTemplate(p.Extends.ParentName)
+			if err != nil {
+				if err == ErrTemplateNotFound {
+					return "", ErrParentTemplateNotFound
+				}
+				return "", err
+			}
+			visited[p.Extends.ParentName] = true
+			p = grandparent
 		}
 
 		parentCopy := &Template{
@@ -111,6 +134,9 @@ func (e *Engine) RenderWithVisited(name string, data interface{}, visited map[st
 		}
 
 		for blockName, childBlock := range tmpl.Blocks {
+			if _, exists := parentTmpl.Blocks[blockName]; !exists {
+				return "", ErrBlockNotFound
+			}
 			parentCopy.Blocks[blockName] = childBlock
 		}
 
@@ -214,6 +240,9 @@ func parseContent(source string) ([]Node, *ExtendsNode, map[string]*BlockNode, e
 
 		if matches := blockPattern.FindStringSubmatch("{{" + tagContent + "}}"); len(matches) > 0 {
 			blockName := matches[1]
+			if blockName == "" {
+				return nil, nil, nil, ErrInvalidBlockSyntax
+			}
 			blockEndTag, blockNodes, err := findMatchingEnd(source, endTag, "block", "endblock")
 			if err != nil {
 				return nil, nil, nil, err
@@ -223,6 +252,10 @@ func parseContent(source string) ([]Node, *ExtendsNode, map[string]*BlockNode, e
 			blocks[blockName] = blockNode
 			pos = blockEndTag
 			continue
+		}
+
+		if strings.HasPrefix(tagContent, "block ") {
+			return nil, nil, nil, ErrInvalidBlockSyntax
 		}
 
 		if matches := rangePattern.FindStringSubmatch("{{" + tagContent + "}}"); len(matches) > 0 {
@@ -260,6 +293,10 @@ func parseContent(source string) ([]Node, *ExtendsNode, map[string]*BlockNode, e
 			nodes = append(nodes, rangeNode)
 			pos = rangeEndTag
 			continue
+		}
+
+		if strings.HasPrefix(tagContent, "range ") {
+			return nil, nil, nil, ErrInvalidRange
 		}
 
 		if matches := ifPattern.FindStringSubmatch("{{" + tagContent + "}}"); len(matches) > 0 {
@@ -387,6 +424,17 @@ func parseIfBlock(source string, startPos int, initialCondition string) (int, []
 		if nextEndIf != -1 {
 			nextEndIf += pos
 		}
+		nextElseIf := strings.Index(source[pos:], "{{ else if ")
+		if nextElseIf != -1 {
+			nextElseIf += pos
+		}
+		nextAltElseIf := strings.Index(source[pos:], "{{else if ")
+		if nextAltElseIf != -1 {
+			nextAltElseIf += pos
+			if nextElseIf == -1 || nextAltElseIf < nextElseIf {
+				nextElseIf = nextAltElseIf
+			}
+		}
 		nextElse := strings.Index(source[pos:], "{{ else")
 		if nextElse != -1 {
 			nextElse += pos
@@ -419,6 +467,10 @@ func parseIfBlock(source string, startPos int, initialCondition string) (int, []
 			minPos = nextIf
 			tagType = 0
 		}
+		if nextElseIf != -1 && (minPos == -1 || nextElseIf < minPos) {
+			minPos = nextElseIf
+			tagType = 3
+		}
 		if nextElse != -1 && (minPos == -1 || nextElse < minPos) {
 			minPos = nextElse
 			tagType = 1
@@ -445,6 +497,45 @@ func parseIfBlock(source string, startPos int, initialCondition string) (int, []
 				} else {
 					falseNodes = append(falseNodes, nodes...)
 				}
+			}
+			depth++
+			endTag := strings.Index(source[minPos:], "}}")
+			pos = minPos + endTag + 2
+		case 3:
+			if depth == 1 {
+				content := source[pos:minPos]
+				nodes, _, _, err := parseContent(content)
+				if err != nil {
+					return 0, nil, nil, err
+				}
+				if currentIsTrue {
+					trueNodes = append(trueNodes, nodes...)
+				} else {
+					falseNodes = append(falseNodes, nodes...)
+				}
+
+				elseIfTag := source[minPos:]
+				matches := elseIfPattern.FindStringSubmatch(elseIfTag)
+				if len(matches) < 2 {
+					return 0, nil, nil, ErrInvalidCondition
+				}
+				condition := strings.TrimSpace(matches[1])
+
+				endTag := strings.Index(elseIfTag, "}}")
+				remainingStart := minPos + endTag + 2
+
+				nestedEndPos, nestedTrue, nestedFalse, err := parseIfBlock(source, remainingStart, condition)
+				if err != nil {
+					return 0, nil, nil, err
+				}
+
+				nestedIfNode := &IfNode{
+					Condition:  condition,
+					TrueNodes:  nestedTrue,
+					FalseNodes: nestedFalse,
+				}
+				falseNodes = append(falseNodes, nestedIfNode)
+				return nestedEndPos, trueNodes, falseNodes, nil
 			}
 			depth++
 			endTag := strings.Index(source[minPos:], "}}")
@@ -584,6 +675,8 @@ func resolveDollarVariable(name string, data interface{}) (interface{}, error) {
 	return nil, ErrVariableNotFound
 }
 
+var fieldNotFound = new(struct{})
+
 func resolveVariable(path string, data interface{}) (interface{}, error) {
 	if path == "" {
 		return nil, ErrInvalidVariablePath
@@ -591,37 +684,41 @@ func resolveVariable(path string, data interface{}) (interface{}, error) {
 	parts := strings.Split(path, ".")
 	current := data
 	for _, part := range parts {
+		if part == "" {
+			return nil, ErrInvalidVariablePath
+		}
 		if current == nil {
 			return nil, ErrVariableNotFound
 		}
-		current = getField(current, part)
-		if current == nil {
+		result := getField(current, part)
+		if result == fieldNotFound {
 			return nil, ErrVariableNotFound
 		}
+		current = result
 	}
 	return current, nil
 }
 
 func getField(data interface{}, field string) interface{} {
 	if data == nil {
-		return nil
+		return fieldNotFound
 	}
 	switch v := data.(type) {
 	case map[string]interface{}:
 		if val, ok := v[field]; ok {
 			return val
 		}
-		return nil
+		return fieldNotFound
 	case map[string]string:
 		if val, ok := v[field]; ok {
 			return val
 		}
-		return nil
+		return fieldNotFound
 	case map[string]int:
 		if val, ok := v[field]; ok {
 			return val
 		}
-		return nil
+		return fieldNotFound
 	default:
 		rv := reflect.ValueOf(data)
 		if rv.Kind() == reflect.Ptr {
@@ -633,7 +730,7 @@ func getField(data interface{}, field string) interface{} {
 				return fv.Interface()
 			}
 		}
-		return nil
+		return fieldNotFound
 	}
 }
 
@@ -891,10 +988,17 @@ func callFunction(name string, args []string, data interface{}, funcs map[string
 		return results[0].Interface(), nil
 	}
 	if len(results) == 2 {
-		if !results[1].IsNil() {
-			return nil, results[1].Interface().(error)
+		second := results[1]
+		if second.Kind() == reflect.Interface || second.Kind() == reflect.Ptr {
+			if !second.IsNil() {
+				if errVal, ok := second.Interface().(error); ok {
+					return nil, errVal
+				}
+				return nil, ErrInvalidFunctionCall
+			}
+			return results[0].Interface(), nil
 		}
-		return results[0].Interface(), nil
+		return nil, ErrInvalidFunctionCall
 	}
 	return results[0].Interface(), nil
 }

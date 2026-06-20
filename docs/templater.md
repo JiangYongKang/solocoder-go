@@ -39,11 +39,14 @@ data := map[string]interface{}{
 - 空值判断：`{{ if empty .Items }}...{{ endif }}`
 - 布尔值判断：`{{ if .Enabled }}...{{ endif }}`
 - 支持 if-else 二分支结构
+- 支持 else if 多条件分支结构
 
 **示例：**
 ```
 {{ if .Role == "admin" }}
     <p>Welcome, Administrator!</p>
+{{ else if .Role == "moderator" }}
+    <p>Welcome, Moderator!</p>
 {{ else }}
     <p>Welcome, User!</p>
 {{ endif }}
@@ -83,6 +86,7 @@ data := map[string]interface{}{
 **特性：**
 - 子模板通过声明继承某个父模板并重写其中特定块的内容实现页面布局的复用
 - 子模板中未重写的块保留父模板的默认内容
+- 子模板重写父模板中不存在的块时返回 `ErrBlockNotFound` 错误
 - 检测循环继承并返回 `ErrTemplateInheritanceLoop` 错误
 
 **示例：**
@@ -112,6 +116,8 @@ data := map[string]interface{}{
 - 模板渲染时遇到函数调用表达式如 `{{ formatTime .CreatedAt }}` 时调用注册的函数处理参数并返回结果
 - 函数参数支持变量（`.Variable`、`$Variable`）和字面量
 - 支持函数返回 `(result, error)` 类型，error 非 nil 时渲染终止并返回错误
+- 函数返回双值时，第二个值必须是 `error` 类型，否则返回 `ErrInvalidFunctionCall` 错误
+- 注册非函数类型的值会在调用时返回 `ErrInvalidFunctionCall` 错误
 
 **示例：**
 ```go
@@ -264,6 +270,9 @@ func main() {
     e.RegisterFunction("formatDate", func(t time.Time) string {
         return t.Format("2006-01-02")
     })
+    e.RegisterFunction("add", func(a, b int) int {
+        return a + b
+    })
 
     // 注册布局模板
     layout := `
@@ -292,7 +301,7 @@ func main() {
 <h3>Items:</h3>
 <ul>
 {{ range $i, $item := range .Items }}
-<li>{{ $i + 1 }}. {{ $item }}</li>
+<li>{{ add $i 1 }}. {{ $item }}</li>
 {{ endrange }}
 </ul>
 {{ if empty .Items }}

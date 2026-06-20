@@ -728,22 +728,24 @@ func TestSummary_Concurrent(t *testing.T) {
 }
 
 func TestMetricValue_Types(t *testing.T) {
-	c := newCounter("test", nil)
+	var snapshotMu sync.RWMutex
+
+	c := newCounter("test", nil, &snapshotMu)
 	if c.Type() != CounterType {
 		t.Errorf("expected counter type, got %v", c.Type())
 	}
 
-	g := newGauge("test", nil)
+	g := newGauge("test", nil, &snapshotMu)
 	if g.Type() != GaugeType {
 		t.Errorf("expected gauge type, got %v", g.Type())
 	}
 
-	h := newHistogram("test", nil, []float64{1})
+	h := newHistogram("test", nil, []float64{1}, &snapshotMu)
 	if h.Type() != HistogramType {
 		t.Errorf("expected histogram type, got %v", h.Type())
 	}
 
-	s := newSummary("test", nil, []float64{0.5})
+	s := newSummary("test", nil, []float64{0.5}, &snapshotMu)
 	if s.Type() != SummaryType {
 		t.Errorf("expected summary type, got %v", s.Type())
 	}
@@ -789,6 +791,7 @@ func TestSnapshot_Atomic(t *testing.T) {
 		}
 	}()
 
+	maxDiff := 0.0
 	for i := 0; i < 100; i++ {
 		snapshot := r.Snapshot()
 		var v1, v2 float64
@@ -801,13 +804,20 @@ func TestSnapshot_Atomic(t *testing.T) {
 			}
 		}
 		diff := math.Abs(v1 - v2)
+		if diff > maxDiff {
+			maxDiff = diff
+		}
 		if diff > 1 {
-			t.Logf("Note: snapshot values may differ by up to %v (non-atomic across metrics)", diff)
+			t.Errorf("snapshot values differ by %v, expected at most 1 (atomic snapshot)", diff)
 		}
 	}
 
 	close(stop)
 	wg.Wait()
+
+	if maxDiff > 1 {
+		t.Logf("max difference observed: %v", maxDiff)
+	}
 }
 
 func TestHistogram_BucketBoundary(t *testing.T) {
@@ -905,5 +915,118 @@ func TestPrometheusFormat_Empty(t *testing.T) {
 	output := r.PrometheusFormat()
 	if len(output) != 0 {
 		t.Errorf("expected empty output for empty registry, got %d bytes", len(output))
+	}
+}
+
+func TestSummary_ReservoirSampling_SmallSample(t *testing.T) {
+	r := NewRegistry()
+	s := r.RegisterSummary("test_small_sample", nil, []float64{0.5})
+
+	for i := 1; i <= 100; i++ {
+		s.Observe(float64(i))
+	}
+
+	if s.Count() != 100 {
+		t.Errorf("expected count 100, got %d", s.Count())
+	}
+
+	qs := s.Quantiles()
+	if len(qs) != 1 {
+		t.Fatalf("expected 1 quantile, got %d", len(qs))
+	}
+
+	if qs[0].Value < 40 || qs[0].Value > 60 {
+		t.Errorf("expected P50 around 50 (with small sample all data retained), got %v", qs[0].Value)
+	}
+}
+
+func TestSummary_ReservoirSampling_LargeSample(t *testing.T) {
+	r := NewRegistry()
+	s := r.RegisterSummary("test_large_sample", nil, []float64{0.5, 0.9, 0.99})
+
+	for i := 1; i <= 10000; i++ {
+		s.Observe(float64(i))
+	}
+
+	if s.Count() != 10000 {
+		t.Errorf("expected count 10000, got %d", s.Count())
+	}
+
+	expectedSum := float64(10000 * 10001 / 2)
+	if math.Abs(s.Sum()-expectedSum) > 0.0001 {
+		t.Errorf("expected sum %v, got %v", expectedSum, s.Sum())
+	}
+
+	qs := s.Quantiles()
+
+	if qs[0].Value < 4000 || qs[0].Value > 6000 {
+		t.Errorf("P50 out of expected range [4000, 6000], got %v", qs[0].Value)
+	}
+
+	if qs[1].Value < 8000 || qs[1].Value > 10000 {
+		t.Errorf("P90 out of expected range [8000, 10000], got %v", qs[1].Value)
+	}
+
+	if qs[2].Value < 9000 || qs[2].Value > 10000 {
+		t.Errorf("P99 out of expected range [9000, 10000], got %v", qs[2].Value)
+	}
+}
+
+func TestSummary_ReservoirSampling_UniformDistribution(t *testing.T) {
+	r := NewRegistry()
+	s := r.RegisterSummary("test_uniform", nil, []float64{0.25, 0.5, 0.75})
+
+	n := 50000
+	for i := 0; i < n; i++ {
+		s.Observe(float64(i) / float64(n))
+	}
+
+	if s.Count() != uint64(n) {
+		t.Errorf("expected count %d, got %d", n, s.Count())
+	}
+
+	qs := s.Quantiles()
+
+	expected := []float64{0.25, 0.5, 0.75}
+	tolerance := 0.05
+
+	for i, q := range qs {
+		if math.Abs(q.Value-expected[i]) > tolerance {
+			t.Errorf("P%.0f: expected ~%v, got %v (tolerance %v)",
+				q.Quantile*100, expected[i], q.Value, tolerance)
+		}
+	}
+}
+
+func TestSummary_ConcurrentReservoirSampling(t *testing.T) {
+	r := NewRegistry()
+	s := r.RegisterSummary("concurrent_reservoir", nil, []float64{0.5})
+
+	var wg sync.WaitGroup
+	numGoroutines := 10
+	iterations := 1000
+
+	var totalCount int64
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				s.Observe(float64(id*iterations + j))
+				atomic.AddInt64(&totalCount, 1)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	if s.Count() != uint64(totalCount) {
+		t.Errorf("expected count %d, got %d", totalCount, s.Count())
+	}
+
+	qs := s.Quantiles()
+	if len(qs) != 1 {
+		t.Fatalf("expected 1 quantile, got %d", len(qs))
 	}
 }

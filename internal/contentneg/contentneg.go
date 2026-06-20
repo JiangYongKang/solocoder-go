@@ -374,8 +374,12 @@ func (n *Negotiator) WriteNotAcceptable(w http.ResponseWriter) error {
 
 	body, err := json.MarshalIndent(resp, "", "  ")
 	if err != nil {
-		body = []byte(fmt.Sprintf(`{"status":"Not Acceptable","code":406,"message":"No acceptable representation found.","supported_formats":%s}`,
-			strings.Join(formats, ",")))
+		quotedFormats := make([]string, len(formats))
+		for i, f := range formats {
+			quotedFormats[i] = fmt.Sprintf(`"%s"`, f)
+		}
+		body = []byte(fmt.Sprintf(`{"status":"Not Acceptable","code":406,"message":"No acceptable representation found.","supported_formats":[%s]}`,
+			strings.Join(quotedFormats, ",")))
 	}
 
 	w.Header().Set("Content-Type", ContentTypeJSON)

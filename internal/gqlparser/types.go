@@ -47,7 +47,7 @@ type Schema struct {
 	mu         sync.RWMutex
 }
 
-type ResolverFunc func(parent interface{}, args map[string]interface{}) (interface{}, error)
+type ResolverFunc func(ctx *ExecutionContext, parent interface{}, args map[string]interface{}) (interface{}, error)
 
 type DataLoaderFunc func(keys []interface{}) ([]interface{}, error)
 

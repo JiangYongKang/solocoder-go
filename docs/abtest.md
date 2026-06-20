@@ -216,4 +216,262 @@ AssignGroup(userID, experimentID)
 - 桶号 30-59 → 对照组（30 个桶，30%）
 - 桶号 60-99 → 不参与（40 个桶，40%）
 
-### 4.4 指标采集
+### 4.4 指标采集机制
+
+**数据结构设计：**
+
+```
+ABTest.metrics
+  └─ experimentID → ExperimentMetrics
+        └─ groupName → GroupMetrics
+              ├─ EventCount["click"] = 128
+              ├─ EventCount["purchase"] = 42
+              ├─ MetricSum["click"] = 128.0
+              └─ MetricSum["revenue"] = 1536.50
+```
+
+**上报流程：**
+
+```
+RecordMetric(experimentID, groupName, metricName, value)
+   │
+   ├─ 参数校验 → 空值返回对应错误
+   │
+   ├─ 查找实验指标数据 → 不存在返回 ErrExperimentNotFound
+   │
+   ├─ 查找分组指标数据 → 不存在返回错误
+   │
+   ├─ groupMetrics.EventCount[metricName]++
+   └─ groupMetrics.MetricSum[metricName] += value
+```
+
+**统计语义：**
+- `EventCount`：指标被上报的次数，可用于计算转化率
+- `MetricSum`：指标值的总和，可用于计算平均值（如平均客单价 = 总收入 / 购买次数）
+- `GetExperimentMetrics` 返回数据的副本，防止外部修改影响内部状态
+
+### 4.5 并发安全设计
+
+所有公共方法均通过 `sync.RWMutex` 保护：
+- **写操作**（`AddExperiment`、`RemoveExperiment`、`RecordMetric`、`ResetExperimentMetrics`）：获取排他写锁
+- **读操作**（`GetExperiment`、`ListExperiments`、`AssignGroup`、`AssignAllExperiments`、`GetExperimentMetrics`、`GetGroupMetric`）：获取共享读锁
+- 单元测试中的 `TestConcurrent_*` 系列测试通过多协程并发调用验证无竞态条件
+
+### 4.6 防御性拷贝设计
+
+为防止外部调用方修改内部状态导致数据竞争，模块采用以下防御性拷贝策略：
+
+**`AddExperiment` 存储副本：**
+- 调用方传入的 `*Experiment` 指针不会被直接存储
+- 模块会创建一个新的 `Experiment` 结构体副本，复制所有字段后存入内部 map
+- 即使调用方后续修改原始指针，也不会影响模块内部状态
+
+**`GetExperiment` 返回副本：**
+- 不会直接返回内部存储的 `*Experiment` 指针
+- 会创建一个新的 `Experiment` 结构体副本返回给调用方
+- 调用方修改返回的指针不会影响模块内部状态
+
+**`ListExperiments` 返回副本切片：**
+- 切片中的每个元素都是内部实验配置的独立副本
+- 调用方修改任何返回的 `*Experiment` 指针都不会影响内部状态
+
+**`GetExperimentMetrics` 返回数据副本：**
+- 返回的 `ExperimentMetrics` 及其包含的所有 `GroupMetrics` 都是深拷贝
+- 外部修改返回的指标数据不会影响内部统计结果
+
+这些设计确保了：
+1. 即使调用方错误地修改返回的指针对象，也不会破坏模块内部状态
+2. 避免了并发场景下的读写数据竞争（一个 goroutine 修改返回的指针，另一个 goroutine 读取内部配置）
+3. 模块内部状态的一致性和安全性得到保障
+
+## 5. 使用示例
+
+### 5.1 基础使用：按钮颜色 A/B 测试
+
+```go
+package main
+
+import (
+    "errors"
+    "fmt"
+    "log"
+    "solocoder-go/internal/abtest"
+)
+
+func main() {
+    ab := abtest.NewABTest()
+
+    err := ab.AddExperiment(&abtest.Experiment{
+        ID:                  "button_color_test",
+        ExperimentGroupPct:  30,
+        ControlGroupPct:     30,
+        ExperimentGroupName: "green_button",
+        ControlGroupName:    "blue_button",
+    })
+    if err != nil {
+        log.Fatalf("创建实验失败: %v", err)
+    }
+
+    getUserButtonColor := func(userID string) string {
+        group, err := ab.AssignGroup(userID, "button_color_test")
+        if err != nil {
+            return "blue_button"
+        }
+        return group
+    }
+
+    users := []string{"user-1", "user-2", "user-3", "user-4", "user-5"}
+    for _, userID := range users {
+        color := getUserButtonColor(userID)
+        fmt.Printf("用户 %s 看到的按钮颜色: %s\n", userID, color)
+
+        err := ab.RecordMetric("button_color_test", color, "page_view", 1.0)
+        if err != nil {
+            log.Printf("记录指标失败: %v", err)
+        }
+    }
+
+    metrics, _ := ab.GetExperimentMetrics("button_color_test")
+    for group, gm := range metrics.GroupMetrics {
+        fmt.Printf("分组 %s: 页面浏览量 = %d\n", group, gm.EventCount["page_view"])
+    }
+}
+```
+
+### 5.2 多实验正交分配
+
+```go
+ab := abtest.NewABTest()
+
+_ = ab.AddExperiment(&abtest.Experiment{
+    ID:                 "ui_layout_v2",
+    ExperimentGroupPct: 50,
+    ControlGroupPct:    50,
+})
+
+_ = ab.AddExperiment(&abtest.Experiment{
+    ID:                 "search_algorithm_v3",
+    ExperimentGroupPct: 20,
+    ControlGroupPct:    20,
+})
+
+userID := "user-123"
+groups, err := ab.AssignAllExperiments(userID)
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Printf("用户 %s 的实验分配:\n", userID)
+fmt.Printf("  UI 布局实验: %s\n", groups["ui_layout_v2"])
+fmt.Printf("  搜索算法实验: %s\n", groups["search_algorithm_v3"])
+```
+
+### 5.3 指标统计与分析
+
+```go
+experimentID := "checkout_flow_v2"
+
+for i := 0; i < 1000; i++ {
+    userID := fmt.Sprintf("user-%d", i)
+    group, _ := ab.AssignGroup(userID, experimentID)
+
+    if group != abtest.GroupNoAssign {
+        _ = ab.RecordMetric(experimentID, group, "visit", 1.0)
+
+        if i%10 == 0 {
+            _ = ab.RecordMetric(experimentID, group, "purchase", 1.0)
+            _ = ab.RecordMetric(experimentID, group, "revenue", 99.9)
+        }
+    }
+}
+
+expCount, expSum, _ := ab.GetGroupMetric(experimentID, abtest.GroupExperiment, "purchase")
+ctrlCount, ctrlSum, _ := ab.GetGroupMetric(experimentID, abtest.GroupControl, "purchase")
+
+expVisits, _, _ := ab.GetGroupMetric(experimentID, abtest.GroupExperiment, "visit")
+ctrlVisits, _, _ := ab.GetGroupMetric(experimentID, abtest.GroupControl, "visit")
+
+fmt.Printf("实验组转化率: %.2f%%\n", float64(expCount)/float64(expVisits)*100)
+fmt.Printf("对照组转化率: %.2f%%\n", float64(ctrlCount)/float64(ctrlVisits)*100)
+fmt.Printf("实验组平均客单价: %.2f\n", expSum/float64(expCount))
+fmt.Printf("对照组平均客单价: %.2f\n", ctrlSum/float64(ctrlCount))
+```
+
+### 5.4 哈希分桶的直接使用
+
+```go
+userID := "user-abc-123"
+
+baseBucket, err := abtest.HashBucket(userID)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("用户 %s 的基础分桶: %d\n", userID, baseBucket)
+
+for _, expID := range []string{"exp-1", "exp-2", "exp-3"} {
+    bucket, _ := abtest.HashBucketWithExperiment(userID, expID)
+    fmt.Printf("在实验 %s 中的分桶: %d\n", expID, bucket)
+}
+
+// 输出示例:
+// 用户 user-abc-123 的基础分桶: 42
+// 在实验 exp-1 中的分桶: 17
+// 在实验 exp-2 中的分桶: 89
+// 在实验 exp-3 中的分桶: 33
+```
+
+### 5.5 灰度发布流量逐渐放量
+
+```go
+expID := "new_feature_rollout"
+
+// 初始阶段：10% 流量
+_ = ab.AddExperiment(&abtest.Experiment{
+    ID:                 expID,
+    ExperimentGroupPct: 10,
+    ControlGroupPct:    10,
+})
+
+// ... 运行一段时间，观察指标 ...
+
+// 指标正常，移除旧实验，放量到 50%
+_ = ab.RemoveExperiment(expID)
+_ = ab.AddExperiment(&abtest.Experiment{
+    ID:                 expID,
+    ExperimentGroupPct: 50,
+    ControlGroupPct:    50,
+})
+
+// 重置指标，重新开始统计
+_ = ab.ResetExperimentMetrics(expID)
+```
+
+## 6. 文件结构
+
+```
+internal/abtest/
+├── abtest.go      # A/B 测试核心实现
+└── abtest_test.go # 单元测试（覆盖正常流程、边界条件、异常分支、并发场景）
+
+docs/
+└── abtest.md      # 本文档
+```
+
+## 7. 测试覆盖说明
+
+单元测试覆盖以下场景类别：
+
+| 测试类别 | 代表性测试用例 | 覆盖目标 |
+|----------|---------------|----------|
+| **哈希分桶** | `TestHashBucket_Stability`、`TestHashBucket_Distribution`、`TestHashBucketWithExperiment_Orthogonal` | 哈希稳定性、均匀分布、正交性 |
+| **实验管理** | `TestAddExperiment_Success`、`TestAddExperiment_Duplicate`、`TestRemoveExperiment_Success` | 实验增删改查、重复/不存在处理 |
+| **配置校验** | `TestAddExperiment_NegativeExperimentPct`、`TestAddExperiment_Exceeds100`、`TestAddExperiment_ZeroTraffic` | 流量百分比校验、边界值处理 |
+| **分组分配** | `TestAssignGroup_AllExperiment`、`TestAssignGroup_5050Split`、`TestAssignGroup_3020Split` | 各种流量比例的分配正确性 |
+| **正交性验证** | `TestAssignAllExperiments_Orthogonal`、`TestHashBucketWithExperiment_Independence` | 多实验间分配独立性 |
+| **稳定性验证** | `TestAssignGroup_Stability`、`TestHashBucket_DeterministicWithDifferentIDs` | 同一用户多次调用结果一致 |
+| **指标采集** | `TestRecordMetric_Success`、`TestRecordMetric_Multiple`、`TestRecordMetric_NegativeValue` | 指标上报、累加、负值处理 |
+| **指标查询** | `TestGetExperimentMetrics_Success`、`TestGetExperimentMetrics_ReturnsCopy`、`TestGetGroupMetric_MetricNotRecorded` | 查询正确性、数据隔离、未记录指标 |
+| **指标重置** | `TestResetExperimentMetrics_Success` | 重置后数据清零 |
+| **并发安全** | `TestConcurrent_AddExperiment`、`TestConcurrent_AssignGroup`、`TestConcurrent_RecordMetric` | 并发写入无竞态 |
+| **边界条件** | `TestAddExperiment_EmptyID`、`TestRecordMetric_EmptyMetricName`、`TestGetExperiment_NotFound` | 各种空值、不存在场景处理 |
+| **完整流程** | `TestFullWorkflow` | 端到端完整使用场景 |

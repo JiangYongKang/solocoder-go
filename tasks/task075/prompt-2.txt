@@ -1,0 +1,6 @@
+你实现的搜索建议引擎模块存在一些问题，需要修复：
+1. AddWord 在初始化词库时直接调用 Trie.Insert 会导致搜索频率计数被错误递增为 1，这些从未被用户实际搜索过的词在 GetHotWords 热门词排行中会拥有虚假的搜索频率，当词库较大时热门词排序被初始化词掩盖，真正被用户高频搜索的词反而排在后面。
+2. SuggestEngine 结构体定义了 mu sync.RWMutex，但这个锁只在 SubmitSearch 方法里获取，AddWord、Autocomplete、Correct、GetHotWords 等其余所有公开方法都绕过 e.mu 直接操作底层的 trie 和 history。当 SubmitSearch 持有 e.mu 执行操作时，其他 goroutine 可以同时通过 AddWord 直接调用 e.trie.Insert 修改同一数据结构，e.mu 形同虚设。
+3. 修复后需要为 SuggestEngine 补充引擎级别的并发场景单元测试，验证多 goroutine 同时调用 AddWord 和 SubmitSearch 时词频计数的正确性，以及并发调用 Autocomplete 与 SubmitSearch 时数据竞争问题已消除。
+4. 运行 go test ./internal/suggest/ -v，需要让所有测试通过。
+5. 在 docs/suggest.md 中更新模块需求文档，说明修复后的频率计数策略（AddWord 初始化与 SubmitSearch 搜索提交对频率的不同影响）以及引擎级锁的保护范围。
