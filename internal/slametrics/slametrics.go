@@ -9,40 +9,44 @@ import (
 )
 
 type SLAMetrics struct {
-	mu             sync.RWMutex
-	records        []RequestRecord
+	mu              sync.RWMutex
+	records         []RequestRecord
 	violationEvents []ViolationEvent
-	violationSet   map[string]struct{}
+	violationSet    map[string]struct{}
+	generation      int64
 }
 
 func NewSLAMetrics() *SLAMetrics {
 	return &SLAMetrics{
-		records:        make([]RequestRecord, 0),
+		records:         make([]RequestRecord, 0),
 		violationEvents: make([]ViolationEvent, 0),
-		violationSet:   make(map[string]struct{}),
+		violationSet:    make(map[string]struct{}),
+		generation:      0,
 	}
 }
 
-func (s *SLAMetrics) RecordRequest(r RequestRecord) {
+func (s *SLAMetrics) RecordRequest(r RequestRecord) error {
+	if !r.Success && r.ErrorKey == "" {
+		return ErrEmptyErrorKey
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = append(s.records, r)
+	return nil
 }
 
-func (s *SLAMetrics) RecordRequests(records []RequestRecord) {
+func (s *SLAMetrics) RecordRequests(records []RequestRecord) error {
+	for _, r := range records {
+		if !r.Success && r.ErrorKey == "" {
+			return ErrEmptyErrorKey
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = append(s.records, records...)
-}
-
-func (s *SLAMetrics) filterRecordsLocked(start, end time.Time) []RequestRecord {
-	result := make([]RequestRecord, 0)
-	for _, r := range s.records {
-		if (r.Timestamp.Equal(start) || r.Timestamp.After(start)) && (r.Timestamp.Before(end) || r.Timestamp.Equal(end)) {
-			result = append(result, r)
-		}
-	}
-	return result
+	return nil
 }
 
 func (s *SLAMetrics) CalculateAvailability(window TimeWindow, decimalPlaces int) (AvailabilityResult, error) {
@@ -54,11 +58,14 @@ func (s *SLAMetrics) CalculateAvailability(window TimeWindow, decimalPlaces int)
 	}
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	records := s.filterRecordsLocked(window.Start, window.End)
-	total := len(records)
+	s.mu.RUnlock()
 
+	return calculateAvailability(records, decimalPlaces)
+}
+
+func calculateAvailability(records []RequestRecord, decimalPlaces int) (AvailabilityResult, error) {
+	total := len(records)
 	if total == 0 {
 		return AvailabilityResult{}, ErrNoRequests
 	}
@@ -87,16 +94,40 @@ func (s *SLAMetrics) CalculateLatencyPercentiles(window TimeWindow) (LatencyPerc
 	}
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	records := s.filterRecordsLocked(window.Start, window.End)
-	latencies := make([]float64, 0, len(records))
+	s.mu.RUnlock()
 
+	latencies := make([]float64, 0, len(records))
 	for _, r := range records {
 		latencies = append(latencies, r.Latency)
 	}
 
 	return computePercentiles(latencies)
+}
+
+func (s *SLAMetrics) CalculatePercentile(window TimeWindow, p float64) (float64, error) {
+	if !window.Start.Before(window.End) {
+		return 0, ErrInvalidTimeRange
+	}
+	if p <= 0 || p > 100 {
+		return 0, ErrInvalidPercentile
+	}
+
+	s.mu.RLock()
+	records := s.filterRecordsLocked(window.Start, window.End)
+	s.mu.RUnlock()
+
+	if len(records) == 0 {
+		return 0, ErrNoLatencyData
+	}
+
+	latencies := make([]float64, 0, len(records))
+	for _, r := range records {
+		latencies = append(latencies, r.Latency)
+	}
+	sort.Float64s(latencies)
+
+	return nearestRankPercentile(latencies, p), nil
 }
 
 func computePercentiles(latencies []float64) (LatencyPercentiles, error) {
@@ -154,11 +185,14 @@ func (s *SLAMetrics) CalculateErrorRate(window TimeWindow, decimalPlaces int) (E
 	}
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	records := s.filterRecordsLocked(window.Start, window.End)
-	total := len(records)
+	s.mu.RUnlock()
 
+	return calculateErrorRate(records, decimalPlaces)
+}
+
+func calculateErrorRate(records []RequestRecord, decimalPlaces int) (ErrorRateResult, error) {
+	total := len(records)
 	if total == 0 {
 		return ErrorRateResult{}, ErrNoRequests
 	}
@@ -183,7 +217,7 @@ func (s *SLAMetrics) CalculateErrorRate(window TimeWindow, decimalPlaces int) (E
 	for key, count := range errorCounts {
 		rate := roundToDecimal(float64(count)/float64(total)*100, decimalPlaces)
 		byErrorKey[key] = ErrorStat{
-			Count:    count,
+			Count:     count,
 			ErrorRate: rate,
 		}
 	}
@@ -207,17 +241,26 @@ func (s *SLAMetrics) EvaluateSLA(window TimeWindow, cfg *SLAConfig, decimalPlace
 		return SLAEvaluation{}, ErrInvalidDecimalPlaces
 	}
 
-	availability, err := s.CalculateAvailability(window, decimalPlaces)
+	s.mu.RLock()
+	records := s.filterRecordsLocked(window.Start, window.End)
+	generation := s.generation
+	s.mu.RUnlock()
+
+	availability, err := calculateAvailability(records, decimalPlaces)
 	if err != nil {
 		return SLAEvaluation{}, err
 	}
 
-	latencyStats, err := s.CalculateLatencyPercentiles(window)
+	latencies := make([]float64, 0, len(records))
+	for _, r := range records {
+		latencies = append(latencies, r.Latency)
+	}
+	latencyStats, err := computePercentiles(latencies)
 	if err != nil {
 		return SLAEvaluation{}, err
 	}
 
-	errorStats, err := s.CalculateErrorRate(window, decimalPlaces)
+	errorStats, err := calculateErrorRate(records, decimalPlaces)
 	if err != nil {
 		return SLAEvaluation{}, err
 	}
@@ -278,16 +321,24 @@ func (s *SLAMetrics) EvaluateSLA(window TimeWindow, cfg *SLAConfig, decimalPlace
 	}
 
 	if !evaluation.Compliant {
-		s.recordViolations(window, evaluation.Violations)
+		s.recordViolationsIfGenerationMatches(window, evaluation.Violations, generation)
 	}
 
 	return evaluation, nil
 }
 
-func (s *SLAMetrics) recordViolations(window TimeWindow, violations []ViolationDetail) {
+func (s *SLAMetrics) recordViolationsIfGenerationMatches(window TimeWindow, violations []ViolationDetail, expectedGeneration int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.generation != expectedGeneration {
+		return
+	}
+
+	s.recordViolationsLocked(window, violations)
+}
+
+func (s *SLAMetrics) recordViolationsLocked(window TimeWindow, violations []ViolationDetail) {
 	for _, v := range violations {
 		key := fmt.Sprintf("%d_%d_%s", window.Start.UnixNano(), window.End.UnixNano(), v.MetricName)
 		if _, exists := s.violationSet[key]; exists {
@@ -325,7 +376,7 @@ func (s *SLAMetrics) GetViolationEvents() []ViolationEvent {
 	return result
 }
 
-func (s *SLAMetrics) GetViolationEventsInRange(start, end time.Time) []ViolationEvent {
+func (s *SLAMetrics) GetViolationEventsByRecordedAt(start, end time.Time) []ViolationEvent {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -338,12 +389,44 @@ func (s *SLAMetrics) GetViolationEventsInRange(start, end time.Time) []Violation
 	return result
 }
 
+func (s *SLAMetrics) GetViolationEventsByWindow(window TimeWindow) []ViolationEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make([]ViolationEvent, 0)
+	for _, e := range s.violationEvents {
+		if e.WindowStart.Equal(window.Start) && e.WindowEnd.Equal(window.End) {
+			result = append(result, e)
+		}
+	}
+	return result
+}
+
+func (s *SLAMetrics) GetViolationEventsByWindowRange(windowStart, windowEnd time.Time) []ViolationEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make([]ViolationEvent, 0)
+	for _, e := range s.violationEvents {
+		windowOverlaps := !(e.WindowEnd.Before(windowStart) || e.WindowStart.After(windowEnd))
+		if windowOverlaps {
+			result = append(result, e)
+		}
+	}
+	return result
+}
+
+func (s *SLAMetrics) GetViolationEventsInRange(start, end time.Time) []ViolationEvent {
+	return s.GetViolationEventsByRecordedAt(start, end)
+}
+
 func (s *SLAMetrics) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = s.records[:0]
 	s.violationEvents = s.violationEvents[:0]
 	s.violationSet = make(map[string]struct{})
+	s.generation++
 }
 
 func (s *SLAMetrics) RecordCount() int {
@@ -356,6 +439,22 @@ func (s *SLAMetrics) ViolationCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.violationEvents)
+}
+
+func (s *SLAMetrics) Generation() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.generation
+}
+
+func (s *SLAMetrics) filterRecordsLocked(start, end time.Time) []RequestRecord {
+	result := make([]RequestRecord, 0)
+	for _, r := range s.records {
+		if (r.Timestamp.Equal(start) || r.Timestamp.After(start)) && (r.Timestamp.Before(end) || r.Timestamp.Equal(end)) {
+			result = append(result, r)
+		}
+	}
+	return result
 }
 
 func roundToDecimal(value float64, decimals int) float64 {

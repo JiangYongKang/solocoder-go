@@ -16,29 +16,54 @@ import (
 )
 
 const (
-	DefaultCorpusDir     = "corpus"
-	DefaultCrashDir      = "crashes"
-	DefaultMaxInputSize  = 1 << 16
-	DefaultMemoryThreshold  = 10 * 1024 * 1024
+	DefaultCorpusDir         = "corpus"
+	DefaultCrashDir          = "crashes"
+	DefaultMaxInputSize      = 1 << 16
+	DefaultMemoryThreshold   = 10 * 1024 * 1024
+	DefaultMemoryAllocThreshold = 1000
+	DefaultMemoryMultiplier  = 5
 	DefaultMutationsPerInput = 100
+	DefaultCoverageTraceDepth = 10
+	DefaultBaselineRuns      = 10
 )
 
 var (
-	ErrNilTargetFunction   = errors.New("fuzzdriver: target function cannot be nil")
-	ErrEmptyCorpus         = errors.New("fuzzdriver: corpus is empty")
-	ErrInvalidInput        = errors.New("fuzzdriver: invalid input")
-	ErrCorpusDirNotFound   = errors.New("fuzzdriver: corpus directory not found")
-	ErrCrashDirNotFound    = errors.New("fuzzdriver: crash directory not found")
-	ErrInvalidMaxInputSize = errors.New("fuzzdriver: max input size must be positive")
-	ErrInvalidThreshold    = errors.New("fuzzdriver: memory threshold must be positive")
-	ErrNilInput            = errors.New("fuzzdriver: input cannot be nil")
-	ErrInputTooLarge       = errors.New("fuzzdriver: input exceeds max size")
-	ErrCorpusLoadFailed    = errors.New("fuzzdriver: failed to load corpus")
-	ErrCrashSaveFailed     = errors.New("fuzzdriver: failed to save crash input")
-	ErrCorpusSaveFailed    = errors.New("fuzzdriver: failed to save corpus input")
+	ErrNilTargetFunction     = errors.New("fuzzdriver: target function cannot be nil")
+	ErrEmptyCorpus           = errors.New("fuzzdriver: corpus is empty")
+	ErrInvalidInput          = errors.New("fuzzdriver: invalid input")
+	ErrCorpusDirNotFound     = errors.New("fuzzdriver: corpus directory not found")
+	ErrCrashDirNotFound      = errors.New("fuzzdriver: crash directory not found")
+	ErrInvalidMaxInputSize   = errors.New("fuzzdriver: max input size must be positive")
+	ErrInvalidThreshold      = errors.New("fuzzdriver: memory threshold must be positive")
+	ErrNilInput              = errors.New("fuzzdriver: input cannot be nil")
+	ErrInputTooLarge         = errors.New("fuzzdriver: input exceeds max size")
+	ErrCorpusLoadFailed      = errors.New("fuzzdriver: failed to load corpus")
+	ErrCrashSaveFailed       = errors.New("fuzzdriver: failed to save crash input")
+	ErrCorpusSaveFailed      = errors.New("fuzzdriver: failed to save corpus input")
+	ErrBaselineCalibrationFailed = errors.New("fuzzdriver: baseline calibration failed")
+	ErrInvalidMultiplier     = errors.New("fuzzdriver: memory multiplier must be greater than 1")
 )
 
 type TargetFunc func(input []byte) error
+
+type CoverageHook func(input []byte) []uint64
+
+type MemoryBaseline struct {
+	AvgAllocatedBytes   float64
+	AvgNumAllocations   float64
+	MaxAllocatedBytes   uint64
+	MaxNumAllocations   uint64
+	MinAllocatedBytes   uint64
+	MinNumAllocations   uint64
+	StdDevAllocated     float64
+	StdDevAllocations   float64
+	Calibrated          bool
+}
+
+type BaselineSample struct {
+	AllocatedBytes uint64
+	NumAllocations uint64
+}
 
 type Coverage struct {
 	mu      sync.RWMutex
@@ -98,6 +123,35 @@ func (c *Coverage) Snapshot() []uint64 {
 	}
 	sort.Slice(addrs, func(i, j int) bool { return addrs[i] < addrs[j] })
 	return addrs
+}
+
+func DefaultCoverageHook(depth int) CoverageHook {
+	return func(input []byte) []uint64 {
+		pcs := make([]uintptr, depth)
+		n := runtime.Callers(2, pcs)
+		if n == 0 {
+			return nil
+		}
+		result := make([]uint64, n)
+		for i := 0; i < n; i++ {
+			result[i] = uint64(pcs[i])
+		}
+		return result
+	}
+}
+
+func InputBasedCoverageHook(input []byte) []uint64 {
+	if len(input) == 0 {
+		return nil
+	}
+	result := make([]uint64, 0, len(input)*2)
+	for i := 0; i < len(input); i++ {
+		result = append(result, uint64(input[i])*2654435761)
+	}
+	for i := 0; i < len(input)-1; i++ {
+		result = append(result, uint64(input[i])*2654435761+uint64(input[i+1]))
+	}
+	return result
 }
 
 type Mutator struct {
@@ -360,26 +414,38 @@ type CrashRecord struct {
 }
 
 type FuzzerConfig struct {
-	FunctionName       string
-	CorpusDir          string
-	CrashDir           string
-	MaxInputSize       int
-	MemoryThreshold    uint64
-	MutationsPerInput  int
-	MaxIterations      int
-	MaxDuration        time.Duration
+	FunctionName         string
+	CorpusDir            string
+	CrashDir             string
+	MaxInputSize         int
+	MemoryThreshold      uint64
+	MemoryAllocThreshold uint64
+	MemoryMultiplier     float64
+	MutationsPerInput    int
+	MaxIterations        int
+	MaxDuration          time.Duration
+	CoverageHook         CoverageHook
+	CoverageTraceDepth   int
+	BaselineRuns         int
+	EnableBaselineCalibration bool
 }
 
 func DefaultConfig(functionName string) FuzzerConfig {
 	return FuzzerConfig{
-		FunctionName:      functionName,
-		CorpusDir:         filepath.Join(DefaultCorpusDir, functionName),
-		CrashDir:          filepath.Join(DefaultCrashDir, functionName),
-		MaxInputSize:      DefaultMaxInputSize,
-		MemoryThreshold:   DefaultMemoryThreshold,
-		MutationsPerInput: DefaultMutationsPerInput,
-		MaxIterations:     0,
-		MaxDuration:       0,
+		FunctionName:              functionName,
+		CorpusDir:                 filepath.Join(DefaultCorpusDir, functionName),
+		CrashDir:                  filepath.Join(DefaultCrashDir, functionName),
+		MaxInputSize:              DefaultMaxInputSize,
+		MemoryThreshold:           DefaultMemoryThreshold,
+		MemoryAllocThreshold:      DefaultMemoryAllocThreshold,
+		MemoryMultiplier:          DefaultMemoryMultiplier,
+		MutationsPerInput:         DefaultMutationsPerInput,
+		MaxIterations:             0,
+		MaxDuration:               0,
+		CoverageHook:              nil,
+		CoverageTraceDepth:        DefaultCoverageTraceDepth,
+		BaselineRuns:              DefaultBaselineRuns,
+		EnableBaselineCalibration: true,
 	}
 }
 
@@ -394,18 +460,21 @@ type FuzzerStats struct {
 }
 
 type Fuzzer struct {
-	config           FuzzerConfig
-	target           TargetFunc
-	corpus           *Corpus
-	mutator          *Mutator
-	globalCoverage   *Coverage
-	suspiciousRecords []SuspiciousMemoryRecord
-	crashRecords     []CrashRecord
-	stats            FuzzerStats
-	statsMu          sync.Mutex
-	stopChan         chan struct{}
-	stopped          bool
-	mu               sync.Mutex
+	config              FuzzerConfig
+	target              TargetFunc
+	corpus              *Corpus
+	mutator             *Mutator
+	globalCoverage      *Coverage
+	memoryBaseline      MemoryBaseline
+	baselineSamples     []BaselineSample
+	coverageHook        CoverageHook
+	suspiciousRecords   []SuspiciousMemoryRecord
+	crashRecords        []CrashRecord
+	stats               FuzzerStats
+	statsMu             sync.Mutex
+	stopChan            chan struct{}
+	stopped             bool
+	mu                  sync.Mutex
 }
 
 func NewFuzzer(target TargetFunc, config FuzzerConfig) (*Fuzzer, error) {
@@ -417,6 +486,9 @@ func NewFuzzer(target TargetFunc, config FuzzerConfig) (*Fuzzer, error) {
 	}
 	if config.MemoryThreshold <= 0 {
 		return nil, ErrInvalidThreshold
+	}
+	if config.MemoryMultiplier <= 1 && config.EnableBaselineCalibration {
+		return nil, ErrInvalidMultiplier
 	}
 	if config.FunctionName == "" {
 		config.FunctionName = "unknown"
@@ -430,6 +502,23 @@ func NewFuzzer(target TargetFunc, config FuzzerConfig) (*Fuzzer, error) {
 	if config.MutationsPerInput <= 0 {
 		config.MutationsPerInput = DefaultMutationsPerInput
 	}
+	if config.CoverageTraceDepth <= 0 {
+		config.CoverageTraceDepth = DefaultCoverageTraceDepth
+	}
+	if config.BaselineRuns <= 0 {
+		config.BaselineRuns = DefaultBaselineRuns
+	}
+	if config.MemoryAllocThreshold <= 0 {
+		config.MemoryAllocThreshold = DefaultMemoryAllocThreshold
+	}
+
+	var coverageHook CoverageHook
+	if config.CoverageHook != nil {
+		coverageHook = config.CoverageHook
+	} else {
+		coverageHook = DefaultCoverageHook(config.CoverageTraceDepth)
+	}
+
 	corpus := NewCorpus(config.CorpusDir)
 	if err := corpus.Load(); err != nil {
 		return nil, err
@@ -440,6 +529,7 @@ func NewFuzzer(target TargetFunc, config FuzzerConfig) (*Fuzzer, error) {
 		corpus:         corpus,
 		mutator:        NewMutator(),
 		globalCoverage: NewCoverage(),
+		coverageHook:   coverageHook,
 		stopChan:       make(chan struct{}),
 		stats: FuzzerStats{
 			StartTime: time.Now(),
@@ -473,11 +563,6 @@ func (f *Fuzzer) Reproduce(input []byte) error {
 	if len(input) == 0 {
 		return ErrNilInput
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			panic(fmt.Errorf("panic during reproduction: %v", r))
-		}
-	}()
 	return f.target(input)
 }
 
@@ -507,33 +592,26 @@ func (f *Fuzzer) saveCrash(input []byte, err error) error {
 	return nil
 }
 
-func (f *Fuzzer) executeWithCoverage(input []byte) (*Coverage, error, bool) {
-	coverage := NewCoverage()
-	defer func() {
-		if r := recover(); r != nil {
-			for i := 0; i < len(input); i++ {
-				coverage.Add(uint64(input[i])*2654435761 + 2)
-			}
-			panic(r)
-		}
-	}()
-	for i := 0; i < len(input); i++ {
-		coverage.Add(uint64(input[i]) * 2654435761)
+func (f *Fuzzer) executeWithCoverage(input []byte) (coverage *Coverage, execErr error, crashed bool) {
+	coverage = NewCoverage()
+
+	preAddrs := f.coverageHook(input)
+	for _, addr := range preAddrs {
+		coverage.Add(addr)
 	}
-	for i := 0; i < len(input)-1; i++ {
-		coverage.Add(uint64(input[i])*2654435761 + uint64(input[i+1]))
+
+	execErr = f.target(input)
+
+	postAddrs := f.coverageHook(input)
+	for _, addr := range postAddrs {
+		coverage.Add(addr | 0x8000000000000000)
 	}
-	for i := 0; i < len(input) && i < 8; i++ {
-		coverage.Add(uint64(i)<<56 | uint64(input[i]))
-	}
-	err := f.target(input)
-	for i := 0; i < len(input); i++ {
-		coverage.Add(uint64(input[i])*2654435761 + 1)
-	}
-	if err != nil {
+
+	if execErr != nil {
 		coverage.Add(0xDEADBEEF)
 	}
-	return coverage, err, false
+
+	return coverage, execErr, false
 }
 
 func (f *Fuzzer) executeSafe(input []byte) (cov *Coverage, execErr error, crashed bool) {
@@ -544,18 +622,162 @@ func (f *Fuzzer) executeSafe(input []byte) (cov *Coverage, execErr error, crashe
 			if cov == nil {
 				cov = NewCoverage()
 			}
+			postAddrs := f.coverageHook(input)
+			for _, addr := range postAddrs {
+				cov.Add(addr | 0x8000000000000000)
+			}
+			cov.Add(0xDEADBEEF)
 		}
 	}()
 	cov, execErr, crashed = f.executeWithCoverage(input)
 	return cov, execErr, crashed
 }
 
-func (f *Fuzzer) checkMemory(before, after MemoryStats) bool {
+func (f *Fuzzer) CalibrateMemoryBaseline() error {
+	if f.corpus.Count() == 0 {
+		return ErrEmptyCorpus
+	}
+
+	seeds := f.corpus.GetAll()
+	numRuns := f.config.BaselineRuns
+	f.baselineSamples = make([]BaselineSample, 0, numRuns*len(seeds))
+
+	for _, seed := range seeds {
+		for i := 0; i < numRuns; i++ {
+			before := ReadMemoryStats()
+			err := func() (panicErr error) {
+				defer func() {
+					if r := recover(); r != nil {
+						panicErr = fmt.Errorf("panic: %v", r)
+					}
+				}()
+				return f.target(seed)
+			}()
+			after := ReadMemoryStats()
+
+			if err != nil {
+				continue
+			}
+
+			var allocDiff uint64
+			var allocCountDiff uint64
+			if after.AllocatedBytes > before.AllocatedBytes {
+				allocDiff = after.AllocatedBytes - before.AllocatedBytes
+			}
+			if after.NumAllocations > before.NumAllocations {
+				allocCountDiff = after.NumAllocations - before.NumAllocations
+			}
+
+			f.baselineSamples = append(f.baselineSamples, BaselineSample{
+				AllocatedBytes: allocDiff,
+				NumAllocations: allocCountDiff,
+			})
+		}
+	}
+
+	if len(f.baselineSamples) == 0 {
+		return ErrBaselineCalibrationFailed
+	}
+
+	f.computeBaselineStats()
+	f.memoryBaseline.Calibrated = true
+	return nil
+}
+
+func (f *Fuzzer) computeBaselineStats() {
+	n := len(f.baselineSamples)
+	if n == 0 {
+		return
+	}
+
+	var sumBytes, sumAllocs float64
+	minBytes := ^uint64(0)
+	minAllocs := ^uint64(0)
+	var maxBytes, maxAllocs uint64
+
+	for _, s := range f.baselineSamples {
+		sumBytes += float64(s.AllocatedBytes)
+		sumAllocs += float64(s.NumAllocations)
+		if s.AllocatedBytes < minBytes {
+			minBytes = s.AllocatedBytes
+		}
+		if s.AllocatedBytes > maxBytes {
+			maxBytes = s.AllocatedBytes
+		}
+		if s.NumAllocations < minAllocs {
+			minAllocs = s.NumAllocations
+		}
+		if s.NumAllocations > maxAllocs {
+			maxAllocs = s.NumAllocations
+		}
+	}
+
+	avgBytes := sumBytes / float64(n)
+	avgAllocs := sumAllocs / float64(n)
+
+	var varianceBytes, varianceAllocs float64
+	for _, s := range f.baselineSamples {
+		diff := float64(s.AllocatedBytes) - avgBytes
+		varianceBytes += diff * diff
+		diff = float64(s.NumAllocations) - avgAllocs
+		varianceAllocs += diff * diff
+	}
+
+	stdDevBytes := 0.0
+	stdDevAllocs := 0.0
+	if n > 1 {
+		stdDevBytes = varianceBytes / float64(n-1)
+		stdDevAllocs = varianceAllocs / float64(n-1)
+	}
+
+	f.memoryBaseline = MemoryBaseline{
+		AvgAllocatedBytes: avgBytes,
+		AvgNumAllocations: avgAllocs,
+		MaxAllocatedBytes: maxBytes,
+		MaxNumAllocations: maxAllocs,
+		MinAllocatedBytes: minBytes,
+		MinNumAllocations: minAllocs,
+		StdDevAllocated:   stdDevBytes,
+		StdDevAllocations: stdDevAllocs,
+		Calibrated:        true,
+	}
+}
+
+func (f *Fuzzer) GetMemoryBaseline() MemoryBaseline {
+	return f.memoryBaseline
+}
+
+func (f *Fuzzer) checkMemory(before, after MemoryStats) (bool, uint64, uint64) {
 	allocDiff := uint64(0)
 	if after.AllocatedBytes > before.AllocatedBytes {
 		allocDiff = after.AllocatedBytes - before.AllocatedBytes
 	}
-	return allocDiff > f.config.MemoryThreshold
+	allocCountDiff := uint64(0)
+	if after.NumAllocations > before.NumAllocations {
+		allocCountDiff = after.NumAllocations - before.NumAllocations
+	}
+
+	bytesSuspicious := false
+	allocsSuspicious := false
+
+	if f.memoryBaseline.Calibrated && f.config.EnableBaselineCalibration {
+		thresholdBytes := uint64(f.memoryBaseline.AvgAllocatedBytes * f.config.MemoryMultiplier)
+		if thresholdBytes < f.config.MemoryThreshold {
+			thresholdBytes = f.config.MemoryThreshold
+		}
+		bytesSuspicious = allocDiff > thresholdBytes
+
+		thresholdAllocs := uint64(f.memoryBaseline.AvgNumAllocations * f.config.MemoryMultiplier)
+		if thresholdAllocs < f.config.MemoryAllocThreshold {
+			thresholdAllocs = f.config.MemoryAllocThreshold
+		}
+		allocsSuspicious = allocCountDiff > thresholdAllocs
+	} else {
+		bytesSuspicious = allocDiff > f.config.MemoryThreshold
+		allocsSuspicious = allocCountDiff > f.config.MemoryAllocThreshold
+	}
+
+	return bytesSuspicious || allocsSuspicious, allocDiff, allocCountDiff
 }
 
 func (f *Fuzzer) recordSuspiciousMemory(input []byte, before, after MemoryStats) {
@@ -567,12 +789,20 @@ func (f *Fuzzer) recordSuspiciousMemory(input []byte, before, after MemoryStats)
 	if after.NumAllocations > before.NumAllocations {
 		allocCountDiff = after.NumAllocations - before.NumAllocations
 	}
+
+	var threshold uint64
+	if f.memoryBaseline.Calibrated && f.config.EnableBaselineCalibration {
+		threshold = uint64(f.memoryBaseline.AvgAllocatedBytes * f.config.MemoryMultiplier)
+	} else {
+		threshold = f.config.MemoryThreshold
+	}
+
 	record := SuspiciousMemoryRecord{
 		Input:          input,
 		Timestamp:      time.Now(),
 		AllocatedDiff:  allocDiff,
 		AllocationDiff: allocCountDiff,
-		Threshold:      f.config.MemoryThreshold,
+		Threshold:      threshold,
 	}
 	f.statsMu.Lock()
 	f.suspiciousRecords = append(f.suspiciousRecords, record)
@@ -591,7 +821,8 @@ func (f *Fuzzer) processInput(input []byte) (foundNewPath bool) {
 		f.saveCrash(input, err)
 		return false
 	}
-	if f.checkMemory(beforeMem, afterMem) {
+	suspicious, _, _ := f.checkMemory(beforeMem, afterMem)
+	if suspicious {
 		f.recordSuspiciousMemory(input, beforeMem, afterMem)
 	}
 	newPaths := f.globalCoverage.Merge(cov)
@@ -651,6 +882,15 @@ func (f *Fuzzer) Run() error {
 		defaultSeed := []byte(f.config.FunctionName)
 		f.corpus.Add(defaultSeed)
 	}
+
+	if f.config.EnableBaselineCalibration && !f.memoryBaseline.Calibrated {
+		if err := f.CalibrateMemoryBaseline(); err != nil {
+			if err != ErrBaselineCalibrationFailed {
+				return err
+			}
+		}
+	}
+
 	iterCount := int64(0)
 	startTime := time.Now()
 	for {
@@ -717,6 +957,18 @@ func ParseConfig(opts map[string]string) (FuzzerConfig, error) {
 				return config, fmt.Errorf("%w: invalid memory threshold: %v", ErrInvalidThreshold, err)
 			}
 			config.MemoryThreshold = threshold
+		case "memoryallocthreshold", "allocthreshold":
+			threshold, err := strconv.ParseUint(v, 10, 64)
+			if err != nil {
+				return config, fmt.Errorf("%w: invalid memory alloc threshold: %v", ErrInvalidThreshold, err)
+			}
+			config.MemoryAllocThreshold = threshold
+		case "memorymultiplier", "memmultiplier":
+			multiplier, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return config, fmt.Errorf("%w: invalid memory multiplier: %v", ErrInvalidMultiplier, err)
+			}
+			config.MemoryMultiplier = multiplier
 		case "mutationsperinput", "mutations":
 			muts, err := strconv.Atoi(v)
 			if err != nil {
@@ -737,6 +989,28 @@ func ParseConfig(opts map[string]string) (FuzzerConfig, error) {
 				return config, fmt.Errorf("invalid max duration: %v", err)
 			}
 			config.MaxDuration = dur
+		case "coveragetracedepth", "tracedepth":
+			depth, err := strconv.Atoi(v)
+			if err != nil {
+				return config, fmt.Errorf("invalid coverage trace depth: %v", err)
+			}
+			if depth > 0 {
+				config.CoverageTraceDepth = depth
+			}
+		case "baselineruns", "baseline":
+			runs, err := strconv.Atoi(v)
+			if err != nil {
+				return config, fmt.Errorf("invalid baseline runs: %v", err)
+			}
+			if runs > 0 {
+				config.BaselineRuns = runs
+			}
+		case "enablebaselinecalibration", "usebaseline":
+			enabled, err := strconv.ParseBool(v)
+			if err != nil {
+				return config, fmt.Errorf("invalid enable baseline calibration: %v", err)
+			}
+			config.EnableBaselineCalibration = enabled
 		}
 	}
 	return config, nil

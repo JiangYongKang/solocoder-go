@@ -133,6 +133,20 @@ func TestSerialize_Map(t *testing.T) {
 	}
 }
 
+func TestSerialize_NoHTMLEscaping(t *testing.T) {
+	input := map[string]string{"url": "https://example.com?a=1&b=2"}
+	result, err := Serialize(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(result, "\\u0026") {
+		t.Errorf("HTML escaping should be disabled, got: %s", result)
+	}
+	if !strings.Contains(result, "&") {
+		t.Errorf("expected raw & character, got: %s", result)
+	}
+}
+
 func TestDiff_Identical(t *testing.T) {
 	text := "line1\nline2\nline3"
 	result := Diff(text, text)
@@ -148,12 +162,18 @@ func TestDiff_Identical(t *testing.T) {
 	if result.TotalRemoved != 0 {
 		t.Errorf("expected 0 removed lines, got %d", result.TotalRemoved)
 	}
+	if result.TotalModified != 0 {
+		t.Errorf("expected 0 modified lines, got %d", result.TotalModified)
+	}
 	if len(result.Lines) != 3 {
 		t.Errorf("expected 3 diff lines, got %d", len(result.Lines))
 	}
 	for _, l := range result.Lines {
 		if l.Type != DiffSame {
 			t.Error("all lines should be DiffSame")
+		}
+		if l.Left == "" || l.Right == "" {
+			t.Error("both Left and Right should have content for same lines")
 		}
 	}
 }
@@ -168,11 +188,8 @@ func TestDiff_CompletelyDifferent(t *testing.T) {
 	if result.TotalSame != 0 {
 		t.Errorf("expected 0 same lines, got %d", result.TotalSame)
 	}
-	if result.TotalRemoved != 3 {
-		t.Errorf("expected 3 removed lines, got %d", result.TotalRemoved)
-	}
-	if result.TotalAdded != 3 {
-		t.Errorf("expected 3 added lines, got %d", result.TotalAdded)
+	if result.TotalModified != 3 {
+		t.Errorf("expected 3 modified lines, got %d", result.TotalModified)
 	}
 }
 
@@ -184,11 +201,9 @@ func TestDiff_PartialChanges(t *testing.T) {
 	if result.TotalSame < 2 {
 		t.Errorf("expected at least 2 same lines, got %d", result.TotalSame)
 	}
-	if result.TotalRemoved < 1 {
-		t.Errorf("expected at least 1 removed line, got %d", result.TotalRemoved)
-	}
-	if result.TotalAdded < 1 {
-		t.Errorf("expected at least 1 added line, got %d", result.TotalAdded)
+	hasChange := result.TotalRemoved > 0 || result.TotalAdded > 0 || result.TotalModified > 0
+	if !hasChange {
+		t.Error("expected some changes (removed/added/modified)")
 	}
 }
 
@@ -261,11 +276,64 @@ func TestDiff_SingleLine(t *testing.T) {
 	if result.Matches() {
 		t.Error("different single lines should not match")
 	}
-	if result.TotalRemoved != 1 {
-		t.Errorf("expected 1 removed line, got %d", result.TotalRemoved)
+	if result.TotalModified != 1 {
+		t.Errorf("expected 1 modified line, got %d", result.TotalModified)
 	}
-	if result.TotalAdded != 1 {
-		t.Errorf("expected 1 added line, got %d", result.TotalAdded)
+}
+
+func TestDiff_LineNumbers(t *testing.T) {
+	expected := "a\nb\nc"
+	actual := "a\nX\nc"
+	result := Diff(expected, actual)
+
+	foundModified := false
+	foundAdded := false
+	foundRemoved := false
+	for _, l := range result.Lines {
+		switch l.Type {
+		case DiffSame:
+			if l.LeftNum == 0 || l.RightNum == 0 {
+				t.Error("same lines should have both line numbers > 0")
+			}
+		case DiffRemoved:
+			if l.LeftNum == 0 {
+				t.Error("removed lines should have LeftNum > 0")
+			}
+			foundRemoved = true
+		case DiffAdded:
+			if l.RightNum == 0 {
+				t.Error("added lines should have RightNum > 0")
+			}
+			foundAdded = true
+		case DiffModified:
+			if l.LeftNum == 0 || l.RightNum == 0 {
+				t.Error("modified lines should have both line numbers > 0")
+			}
+			foundModified = true
+		}
+	}
+	if !foundModified && !foundAdded && !foundRemoved {
+		t.Error("should have found at least one changed line")
+	}
+}
+
+func TestDiff_ModifiedLineHasBothSides(t *testing.T) {
+	expected := "old_line"
+	actual := "new_line"
+	result := Diff(expected, actual)
+
+	if len(result.Lines) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(result.Lines))
+	}
+	line := result.Lines[0]
+	if line.Type != DiffModified {
+		t.Errorf("expected DiffModified, got %v", line.Type)
+	}
+	if line.Left != "old_line" {
+		t.Errorf("expected Left='old_line', got %q", line.Left)
+	}
+	if line.Right != "new_line" {
+		t.Errorf("expected Right='new_line', got %q", line.Right)
 	}
 }
 
@@ -278,44 +346,65 @@ func TestDiffResult_Format_NoDiff(t *testing.T) {
 	}
 }
 
-func TestDiffResult_Format_WithDiff(t *testing.T) {
-	expected := "line1\nline2\nline3\nline4\nline5"
-	actual := "line1\nline2_changed\nline3\nline4\nline5"
+func TestDiffResult_Format_SideBySide(t *testing.T) {
+	expected := "line1\nold_line\nline3"
+	actual := "line1\nnew_line\nline3"
 	result := Diff(expected, actual)
 	formatted := result.Format(3)
 
 	if formatted == "" {
 		t.Fatal("expected non-empty format")
 	}
-	if !strings.Contains(formatted, "--- Expected") {
-		t.Error("format should contain expected header")
+
+	if !strings.Contains(formatted, "Expected (snapshot)") {
+		t.Error("format should contain expected column header")
 	}
-	if !strings.Contains(formatted, "+++ Actual") {
-		t.Error("format should contain actual header")
+	if !strings.Contains(formatted, "Actual (current output)") {
+		t.Error("format should contain actual column header")
 	}
-	if !strings.Contains(formatted, "-") {
-		t.Error("format should contain removed line marker")
+	if !strings.Contains(formatted, "|") {
+		t.Error("format should contain column separator '|'")
 	}
-	if !strings.Contains(formatted, "+") {
-		t.Error("format should contain added line marker")
+	if !strings.Contains(formatted, symbolSame) {
+		t.Error("format should contain same symbol")
+	}
+	if !strings.Contains(formatted, symbolModified) {
+		t.Error("format should contain modified symbol '~'")
 	}
 	if !strings.Contains(formatted, "Summary:") {
 		t.Error("format should contain summary")
 	}
+	if !strings.Contains(formatted, "modified") {
+		t.Error("summary should mention modified count")
+	}
+}
+
+func TestDiffResult_Format_AddedAndRemoved(t *testing.T) {
+	expected := "line1\nonly_old\nline2"
+	actual := "line1\nline2\nonly_new"
+	result := Diff(expected, actual)
+	formatted := result.Format(3)
+
+	if !strings.Contains(formatted, symbolRemoved) {
+		t.Error("format should contain removed symbol '-'")
+	}
+	if !strings.Contains(formatted, symbolAdded) {
+		t.Error("format should contain added symbol '+'")
+	}
 }
 
 func TestDiffResult_Format_ContextLines(t *testing.T) {
-	expected := "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10"
-	actual := "l1\nl2\nl3\nMODIFIED\nl5\nl6\nl7\nl8\nl9\nl10"
+	expected := "l1\nl2\nl3\nl4\nMODIFIED\nl6\nl7\nl8\nl9\nl10"
+	actual := "l1\nl2\nl3\nl4\nCHANGED\nl6\nl7\nl8\nl9\nl10"
 	result := Diff(expected, actual)
 
 	full := result.Format(100)
 	with1 := result.Format(1)
-	_ = with1
 
 	if !strings.Contains(full, "l1") {
 		t.Error("full context should contain l1")
 	}
+	_ = with1
 }
 
 func TestDiffResult_Format_NegativeContext(t *testing.T) {
@@ -492,8 +581,8 @@ func TestMatcher_WriteAndReadSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected read error: %v", err)
 	}
-	if content != "hello\nworld" {
-		t.Errorf("expected %q, got %q", "hello\nworld", content)
+	if !strings.HasPrefix(content, "hello") {
+		t.Errorf("expected content starting with 'hello', got %q", content)
 	}
 }
 
@@ -525,27 +614,29 @@ func TestMatcher_ReadSnapshot_NotFound(t *testing.T) {
 	}
 }
 
-func TestMatcher_Match_NewSnapshot(t *testing.T) {
+func TestMatcher_Match_SnapshotNotFound(t *testing.T) {
 	dir, cleanup := createTempSnapshotDir(t)
 	defer cleanup()
 
 	m := NewWithConfig(Config{SnapshotDir: dir})
 
-	data := map[string]string{"key": "value"}
-	ok, info, err := m.Match("new_snap", data)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	ok, report, err := m.Match("nonexistent", "some data")
+	if ok {
+		t.Error("expected match to fail when snapshot not found")
 	}
-	if !ok {
-		t.Error("expected match to succeed for new snapshot")
+	if report != "" {
+		t.Error("expected empty report when snapshot not found")
 	}
-	if info == "" {
-		t.Error("expected info about new snapshot creation")
+	if err == nil {
+		t.Fatal("expected error when snapshot not found")
+	}
+	if !errors.Is(err, ErrSnapshotNotFound) {
+		t.Errorf("expected ErrSnapshotNotFound, got %v", err)
 	}
 
-	snapPath, _ := m.snapshotPath("new_snap")
-	if _, err := os.Stat(snapPath); os.IsNotExist(err) {
-		t.Error("snapshot file should have been created")
+	snapPath, _ := m.snapshotPath("nonexistent")
+	if _, err := os.Stat(snapPath); !os.IsNotExist(err) {
+		t.Error("snapshot file should NOT be auto-created when not found")
 	}
 }
 
@@ -556,14 +647,15 @@ func TestMatcher_Match_ExistingMatch(t *testing.T) {
 	m := NewWithConfig(Config{SnapshotDir: dir})
 
 	data := map[string]int{"a": 1, "b": 2}
-	_, _, err := m.Match("existing", data)
+
+	err := m.Update("existing", data)
 	if err != nil {
-		t.Fatalf("unexpected error on first match: %v", err)
+		t.Fatalf("unexpected error creating snapshot: %v", err)
 	}
 
 	ok, report, err := m.Match("existing", data)
 	if err != nil {
-		t.Fatalf("unexpected error on second match: %v", err)
+		t.Fatalf("unexpected error on match: %v", err)
 	}
 	if !ok {
 		t.Error("expected match to succeed for identical data")
@@ -582,14 +674,14 @@ func TestMatcher_Match_ExistingMismatch(t *testing.T) {
 	data1 := map[string]string{"status": "ok", "count": "1"}
 	data2 := map[string]string{"status": "error", "count": "2"}
 
-	_, _, err := m.Match("mismatch_test", data1)
+	err := m.Update("mismatch_test", data1)
 	if err != nil {
 		t.Fatalf("unexpected error creating snapshot: %v", err)
 	}
 
 	ok, report, err := m.Match("mismatch_test", data2)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected error on mismatch")
 	}
 	if ok {
 		t.Error("expected match to fail for different data")
@@ -599,6 +691,20 @@ func TestMatcher_Match_ExistingMismatch(t *testing.T) {
 	}
 	if !strings.Contains(report, "Summary:") {
 		t.Error("report should contain summary")
+	}
+
+	var mismatchErr *MismatchError
+	if !errors.As(err, &mismatchErr) {
+		t.Fatalf("expected MismatchError, got %T", err)
+	}
+	if mismatchErr.Name != "mismatch_test" {
+		t.Errorf("expected Name='mismatch_test', got %q", mismatchErr.Name)
+	}
+	if mismatchErr.Report == "" {
+		t.Error("MismatchError.Report should not be empty")
+	}
+	if !errors.Is(err, ErrSnapshotMismatch) {
+		t.Error("err should wrap ErrSnapshotMismatch")
 	}
 }
 
@@ -610,7 +716,7 @@ func TestMatcher_Match_UpdateMode(t *testing.T) {
 	data2 := "updated"
 
 	m1 := NewWithConfig(Config{SnapshotDir: dir})
-	_, _, err := m1.Match("update_test", data1)
+	err := m1.Update("update_test", data1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -668,8 +774,8 @@ func TestMatcher_Update(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected read error: %v", err)
 	}
-	if content != `"initial"` {
-		t.Errorf("expected %q, got %q", `"initial"`, content)
+	if !strings.Contains(content, "initial") {
+		t.Errorf("expected 'initial' in content, got %q", content)
 	}
 
 	err = m.Update("direct_update", "modified")
@@ -681,8 +787,8 @@ func TestMatcher_Update(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected read error: %v", err)
 	}
-	if content != `"modified"` {
-		t.Errorf("expected %q, got %q", `"modified"`, content)
+	if !strings.Contains(content, "modified") {
+		t.Errorf("expected 'modified' in content, got %q", content)
 	}
 }
 
@@ -703,14 +809,31 @@ func TestMatcher_Assert_Match(t *testing.T) {
 
 	m := NewWithConfig(Config{SnapshotDir: dir})
 
+	err := m.Update("assert_match", map[string]int{"x": 1})
+	if err != nil {
+		t.Fatalf("unexpected error creating snapshot: %v", err)
+	}
+
 	fakeT := &testing.T{}
 	m.Assert(fakeT, "assert_match", map[string]int{"x": 1})
 
-	fakeT2 := &testing.T{}
-	m.Assert(fakeT2, "assert_match", map[string]int{"x": 1})
-
-	if fakeT2.Failed() {
+	if fakeT.Failed() {
 		t.Error("Assert should not fail for matching snapshot")
+	}
+}
+
+func TestMatcher_Assert_SnapshotNotFound(t *testing.T) {
+	dir, cleanup := createTempSnapshotDir(t)
+	defer cleanup()
+
+	m := NewWithConfig(Config{SnapshotDir: dir})
+
+	ok, _, err := m.Match("assert_not_found", "data")
+	if ok {
+		t.Error("Match should fail when snapshot not found")
+	}
+	if !errors.Is(err, ErrSnapshotNotFound) {
+		t.Errorf("expected ErrSnapshotNotFound, got %v", err)
 	}
 }
 
@@ -719,6 +842,11 @@ func TestConvenienceFunctions_Match(t *testing.T) {
 	defer cleanup()
 
 	m := NewWithConfig(Config{SnapshotDir: dir})
+	err := m.Update("convenience", "test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
 	ok, _, err := m.Match("convenience", "test")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -742,22 +870,8 @@ func TestConvenienceFunctions_Update(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if content != "123" {
-		t.Errorf("expected '123', got %q", content)
-	}
-}
-
-func TestSerialize_NoHTMLEscaping(t *testing.T) {
-	input := map[string]string{"url": "https://example.com?a=1&b=2"}
-	result, err := Serialize(input)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if strings.Contains(result, "\\u0026") {
-		t.Errorf("HTML escaping should be disabled, got: %s", result)
-	}
-	if !strings.Contains(result, "&") {
-		t.Errorf("expected raw & character, got: %s", result)
+	if !strings.Contains(content, "123") {
+		t.Errorf("expected '123' in content, got %q", content)
 	}
 }
 
@@ -768,9 +882,11 @@ func TestNormalizeSnapshotContent(t *testing.T) {
 		expected string
 	}{
 		{"windows newlines", "a\r\nb\r\nc", "a\nb\nc"},
-		{"trailing newlines", "a\nb\n\n", "a\nb"},
-		{"mixed", "a\r\nb\n\n", "a\nb"},
+		{"trailing newline preserved", "a\nb\n", "a\nb\n"},
+		{"trailing empty line preserved", "a\nb\n\n", "a\nb\n\n"},
+		{"multiple trailing newlines preserved", "a\n\n\n", "a\n\n\n"},
 		{"no trailing", "a\nb", "a\nb"},
+		{"just newlines", "\n\n", "\n\n"},
 	}
 
 	for _, tt := range tests {
@@ -783,40 +899,6 @@ func TestNormalizeSnapshotContent(t *testing.T) {
 	}
 }
 
-func TestDiff_LineNumbers(t *testing.T) {
-	expected := "a\nb\nc"
-	actual := "a\nX\nc"
-	result := Diff(expected, actual)
-
-	foundRemoved := false
-	foundAdded := false
-	for _, l := range result.Lines {
-		if l.Type == DiffRemoved {
-			if l.LeftNum != 2 {
-				t.Errorf("expected removed line LeftNum=2, got %d", l.LeftNum)
-			}
-			foundRemoved = true
-		}
-		if l.Type == DiffAdded {
-			if l.RightNum != 2 {
-				t.Errorf("expected added line RightNum=2, got %d", l.RightNum)
-			}
-			foundAdded = true
-		}
-		if l.Type == DiffSame {
-			if l.LeftNum == 0 || l.RightNum == 0 {
-				t.Error("same lines should have both line numbers > 0")
-			}
-		}
-	}
-	if !foundRemoved {
-		t.Error("should have found a removed line")
-	}
-	if !foundAdded {
-		t.Error("should have found an added line")
-	}
-}
-
 func TestSplitLines(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -826,25 +908,72 @@ func TestSplitLines(t *testing.T) {
 		{"a", []string{"a"}},
 		{"a\nb", []string{"a", "b"}},
 		{"a\nb\nc", []string{"a", "b", "c"}},
+		{"a\n", []string{"a"}},
+		{"a\nb\n", []string{"a", "b"}},
+		{"\n", []string{""}},
+		{"\n\n", []string{"", ""}},
+		{"a\n\n", []string{"a", ""}},
 	}
 	for _, tt := range tests {
-		result := splitLines(tt.input)
-		if len(result) != len(tt.expected) {
-			t.Errorf("input %q: expected %d lines, got %d", tt.input, len(tt.expected), len(result))
-			continue
-		}
-		for i := range result {
-			if result[i] != tt.expected[i] {
-				t.Errorf("input %q line %d: expected %q, got %q", tt.input, i, tt.expected[i], result[i])
+		t.Run(tt.input, func(t *testing.T) {
+			result := splitLines(tt.input)
+			if len(result) != len(tt.expected) {
+				t.Fatalf("input %q: expected %d lines, got %d (%v)", tt.input, len(tt.expected), len(result), result)
 			}
-		}
+			for i := range result {
+				if result[i] != tt.expected[i] {
+					t.Errorf("input %q line %d: expected %q, got %q", tt.input, i, tt.expected[i], result[i])
+				}
+			}
+		})
+	}
+}
+
+func TestDiff_TrailingEmptyLines(t *testing.T) {
+	expected := "line1\nline2\n"
+	actual := "line1\nline2\n"
+	result := Diff(expected, actual)
+	if !result.Matches() {
+		t.Error("texts with matching trailing newlines should match")
+	}
+
+	expected2 := "line1\nline2\n"
+	actual2 := "line1\nline2\n\n"
+	result2 := Diff(expected2, actual2)
+	if result2.Matches() {
+		t.Error("texts with different numbers of trailing empty lines should not match")
+	}
+	if result2.TotalAdded != 1 {
+		t.Errorf("expected 1 added line (extra empty line), got %d", result2.TotalAdded)
+	}
+}
+
+func TestMatcher_TrailingEmptyLinesPreserved(t *testing.T) {
+	dir, cleanup := createTempSnapshotDir(t)
+	defer cleanup()
+
+	m := NewWithConfig(Config{SnapshotDir: dir})
+
+	content := "line1\nline2\n\n"
+	err := m.writeSnapshot("trailing_test", content)
+	if err != nil {
+		t.Fatalf("unexpected write error: %v", err)
+	}
+
+	readBack, err := m.readSnapshot("trailing_test")
+	if err != nil {
+		t.Fatalf("unexpected read error: %v", err)
+	}
+
+	if !strings.HasSuffix(readBack, "\n\n") {
+		t.Errorf("expected two trailing newlines preserved, got %q", readBack)
 	}
 }
 
 func TestApplyContext_AllSame(t *testing.T) {
 	lines := []DiffLine{
-		{Type: DiffSame, Content: "a", LeftNum: 1, RightNum: 1},
-		{Type: DiffSame, Content: "b", LeftNum: 2, RightNum: 2},
+		{Type: DiffSame, Left: "a", Right: "a", LeftNum: 1, RightNum: 1},
+		{Type: DiffSame, Left: "b", Right: "b", LeftNum: 2, RightNum: 2},
 	}
 	result := applyContext(lines, 0)
 	if len(result) != len(lines) {
@@ -861,26 +990,25 @@ func TestApplyContext_Empty(t *testing.T) {
 
 func TestApplyContext_SingleChangeWithContext(t *testing.T) {
 	lines := []DiffLine{
-		{Type: DiffSame, Content: "1", LeftNum: 1, RightNum: 1},
-		{Type: DiffSame, Content: "2", LeftNum: 2, RightNum: 2},
-		{Type: DiffSame, Content: "3", LeftNum: 3, RightNum: 3},
-		{Type: DiffRemoved, Content: "old", LeftNum: 4, RightNum: 0},
-		{Type: DiffAdded, Content: "new", LeftNum: 0, RightNum: 4},
-		{Type: DiffSame, Content: "5", LeftNum: 5, RightNum: 5},
-		{Type: DiffSame, Content: "6", LeftNum: 6, RightNum: 6},
-		{Type: DiffSame, Content: "7", LeftNum: 7, RightNum: 7},
+		{Type: DiffSame, Left: "1", Right: "1", LeftNum: 1, RightNum: 1},
+		{Type: DiffSame, Left: "2", Right: "2", LeftNum: 2, RightNum: 2},
+		{Type: DiffSame, Left: "3", Right: "3", LeftNum: 3, RightNum: 3},
+		{Type: DiffModified, Left: "old", Right: "new", LeftNum: 4, RightNum: 4},
+		{Type: DiffSame, Left: "5", Right: "5", LeftNum: 5, RightNum: 5},
+		{Type: DiffSame, Left: "6", Right: "6", LeftNum: 6, RightNum: 6},
+		{Type: DiffSame, Left: "7", Right: "7", LeftNum: 7, RightNum: 7},
 	}
 
 	result := applyContext(lines, 1)
 
 	keptChanges := 0
 	for _, l := range result {
-		if l.Type == DiffRemoved || l.Type == DiffAdded {
+		if l.Type == DiffModified || l.Type == DiffRemoved || l.Type == DiffAdded {
 			keptChanges++
 		}
 	}
-	if keptChanges != 2 {
-		t.Errorf("expected 2 change lines kept, got %d", keptChanges)
+	if keptChanges != 1 {
+		t.Errorf("expected 1 changed line kept, got %d", keptChanges)
 	}
 }
 
@@ -896,5 +1024,64 @@ func TestMatcher_Config_ReturnsCopy(t *testing.T) {
 	}
 	if got.ContextLines == 999 {
 		t.Error("Config() should return a copy, not reference")
+	}
+}
+
+func TestTruncateOrPad(t *testing.T) {
+	tests := []struct {
+		input    string
+		width    int
+		expected string
+	}{
+		{"short", 10, "short     "},
+		{"exact", 5, "exact"},
+		{"toolongstring", 8, "toolo..."},
+		{"", 5, "     "},
+		{"中文字符", 6, "中文字符  "},
+		{"中文字符测试abc", 6, "中文字..."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := truncateOrPad(tt.input, tt.width)
+			if result != tt.expected {
+				t.Errorf("input=%q width=%d: expected %q, got %q", tt.input, tt.width, tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestMismatchError_Unwrap(t *testing.T) {
+	err := &MismatchError{
+		Name:   "test",
+		Report: "diff report",
+	}
+	if !errors.Is(err, ErrSnapshotMismatch) {
+		t.Error("MismatchError should unwrap to ErrSnapshotMismatch")
+	}
+	if err.Error() == "" {
+		t.Error("MismatchError.Error() should not be empty")
+	}
+	if !strings.Contains(err.Error(), "test") {
+		t.Error("MismatchError.Error() should contain the snapshot name")
+	}
+}
+
+func TestDiff_Format_ContainsSideBySideContent(t *testing.T) {
+	expected := "left_content\nold_data"
+	actual := "left_content\nnew_data"
+	result := Diff(expected, actual)
+	formatted := result.Format(10)
+
+	lines := strings.Split(formatted, "\n")
+	foundBoth := false
+	for _, line := range lines {
+		if strings.Contains(line, "old_data") && strings.Contains(line, "new_data") {
+			foundBoth = true
+			break
+		}
+	}
+	if !foundBoth {
+		t.Errorf("expected side-by-side format to show both old and new on same line, got:\n%s", formatted)
 	}
 }

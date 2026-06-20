@@ -20,8 +20,6 @@ type GroupStatistics struct {
 	StdDevDuration  time.Duration
 	MeanAllocBytes  uint64
 	MeanAllocCount  uint64
-	AllocsPerOp     float64
-	BytesPerOp      float64
 }
 
 type ComparisonItem struct {
@@ -30,6 +28,8 @@ type ComparisonItem struct {
 	MeanAllocBytes  uint64
 	MeanAllocCount  uint64
 	VsBaselinePct   float64
+	AllocBytesPct   float64
+	AllocCountPct   float64
 }
 
 type ComparisonReport struct {

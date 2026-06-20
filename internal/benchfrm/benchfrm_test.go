@@ -1,6 +1,7 @@
 package benchfrm
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -28,6 +29,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if !cfg.CollectMemory {
 		t.Error("expected memory collection enabled")
+	}
+	if cfg.Timeout != 0 {
+		t.Errorf("expected 0 timeout, got %v", cfg.Timeout)
 	}
 }
 
@@ -106,6 +110,13 @@ func TestAddGroup(t *testing.T) {
 
 	if len(bm.groups) != 2 {
 		t.Errorf("expected 2 groups, got %d", len(bm.groups))
+	}
+
+	if bm.groups[0].config.Iterations != 100 {
+		t.Errorf("expected default 100 iterations, got %d", bm.groups[0].config.Iterations)
+	}
+	if bm.groups[1].config.Iterations != 10 {
+		t.Errorf("expected 10 iterations, got %d", bm.groups[1].config.Iterations)
 	}
 }
 
@@ -242,6 +253,58 @@ func TestRunAll_FunctionError(t *testing.T) {
 	}
 }
 
+func TestRunAll_Timeout(t *testing.T) {
+	b := NewBenchmarker()
+
+	b.AddGroup("timeout", func() error {
+		time.Sleep(100 * time.Millisecond)
+		return nil
+	}, WithIterations(3), WithWarmupIterations(0), WithTimeout(10*time.Millisecond), WithMemoryCollection(false))
+
+	_, err := b.RunAll()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context.DeadlineExceeded, got %v", err)
+	}
+}
+
+func TestRunAll_NoTimeoutWorks(t *testing.T) {
+	b := NewBenchmarker()
+
+	b.AddGroup("no-timeout", func() error {
+		time.Sleep(10 * time.Millisecond)
+		return nil
+	}, WithIterations(3), WithWarmupIterations(1), WithTimeout(0))
+
+	results, err := b.RunAll()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].Iterations != 3 {
+		t.Errorf("expected 3 iterations, got %d", results[0].Iterations)
+	}
+}
+
+func TestRunAll_ShortTimeout(t *testing.T) {
+	b := NewBenchmarker()
+
+	b.AddGroup("short-timeout", func() error {
+		return nil
+	}, WithIterations(3), WithWarmupIterations(1), WithTimeout(5*time.Second))
+
+	results, err := b.RunAll()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
 func TestMemoryCollection(t *testing.T) {
 	b := NewBenchmarker()
 
@@ -267,19 +330,14 @@ func TestMemoryCollection(t *testing.T) {
 	if stats.MeanAllocCount == 0 {
 		t.Error("expected allocation count to be counted")
 	}
-	if stats.BytesPerOp <= 0 {
-		t.Error("expected positive bytes per op")
-	}
-	if stats.AllocsPerOp <= 0 {
-		t.Error("expected positive allocs per op")
-	}
 }
 
 func TestMemoryCollectionDisabled(t *testing.T) {
 	b := NewBenchmarker()
 
 	b.AddGroup("no-mem", func() error {
-		_ = make([]byte, 1024)
+		buf := make([]byte, 1024)
+		buf[0] = 1
 		return nil
 	}, WithIterations(10), WithWarmupIterations(2), WithMemoryCollection(false))
 
@@ -417,10 +475,10 @@ func TestCompare(t *testing.T) {
 	}
 
 	if fasterItem.VsBaselinePct >= 0 {
-		t.Errorf("expected faster item to have negative pct, got %.2f", fasterItem.VsBaselinePct)
+		t.Errorf("expected faster item to have negative duration pct, got %.2f", fasterItem.VsBaselinePct)
 	}
 	if slowerItem.VsBaselinePct <= 0 {
-		t.Errorf("expected slower item to have positive pct, got %.2f", slowerItem.VsBaselinePct)
+		t.Errorf("expected slower item to have positive duration pct, got %.2f", slowerItem.VsBaselinePct)
 	}
 }
 
@@ -553,6 +611,27 @@ func TestCheckRegression_NoResults(t *testing.T) {
 	}
 }
 
+func TestCheckRegression_BaselineNotFound(t *testing.T) {
+	store := NewMemoryStore()
+	b := NewBenchmarker()
+	b.SetBaselineStore(store)
+
+	b.AddGroup("test", func() error {
+		time.Sleep(10 * time.Millisecond)
+		return nil
+	}, WithIterations(3), WithWarmupIterations(1))
+
+	_, err := b.RunAll()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	_, err = b.CheckRegression(10)
+	if !errors.Is(err, ErrBaselineNotFound) {
+		t.Errorf("expected ErrBaselineNotFound, got %v", err)
+	}
+}
+
 func TestCheckRegression_NoRegression(t *testing.T) {
 	store := NewMemoryStore()
 	b := NewBenchmarker()
@@ -592,7 +671,7 @@ func TestCheckRegression_WithRegression(t *testing.T) {
 	b.AddGroup("test", func() error {
 		time.Sleep(sleepDuration)
 		return nil
-	}, WithIterations(3), WithWarmupIterations(1))
+	}, WithIterations(3), WithWarmupIterations(1), WithMemoryCollection(false))
 
 	_, err := b.RunAll()
 	if err != nil {
@@ -612,13 +691,9 @@ func TestCheckRegression_WithRegression(t *testing.T) {
 	bm.mu.Lock()
 	for _, g := range bm.groups {
 		if g.name == "test" {
-			oldFn := g.fn
 			g.fn = func() error {
 				time.Sleep(sleepDuration * 3)
-				buf := make([]byte, 1024)
-				buf[0] = 1
-				_ = buf
-				return oldFn()
+				return nil
 			}
 		}
 	}
@@ -764,8 +839,6 @@ func TestTextReporter(t *testing.T) {
 			StdDevDuration: 25 * time.Millisecond,
 			MeanAllocBytes: 1024,
 			MeanAllocCount: 5,
-			AllocsPerOp:    5,
-			BytesPerOp:     1024,
 		},
 	}
 
@@ -779,12 +852,21 @@ func TestTextReporter(t *testing.T) {
 	if !contains(report, "100") {
 		t.Error("report should contain iterations")
 	}
+	if !contains(report, "Mean Alloc Bytes") {
+		t.Error("report should contain new memory field labels")
+	}
+	if contains(report, "Allocs/Op") {
+		t.Error("report should not contain removed Allocs/Op field")
+	}
+	if contains(report, "Bytes/Op") {
+		t.Error("report should not contain removed Bytes/Op field")
+	}
 
 	comparison := ComparisonReport{
 		Baseline: "test1",
 		Items: []ComparisonItem{
-			{Group: "test1", MeanDuration: 100 * time.Millisecond, VsBaselinePct: 0},
-			{Group: "test2", MeanDuration: 150 * time.Millisecond, VsBaselinePct: 50},
+			{Group: "test1", MeanDuration: 100 * time.Millisecond, MeanAllocBytes: 1000, MeanAllocCount: 10, VsBaselinePct: 0, AllocBytesPct: 0, AllocCountPct: 0},
+			{Group: "test2", MeanDuration: 150 * time.Millisecond, MeanAllocBytes: 1500, MeanAllocCount: 15, VsBaselinePct: 50, AllocBytesPct: 50, AllocCountPct: 50},
 		},
 		GeneratedAt: time.Now(),
 	}
@@ -795,6 +877,15 @@ func TestTextReporter(t *testing.T) {
 	}
 	if !contains(compReport, "test1") || !contains(compReport, "test2") {
 		t.Error("comparison report should contain group names")
+	}
+	if !contains(compReport, "Duration Δ%") {
+		t.Error("comparison report should contain Duration Δ% column")
+	}
+	if !contains(compReport, "Bytes Δ%") {
+		t.Error("comparison report should contain Bytes Δ% column")
+	}
+	if !contains(compReport, "Allocs Δ%") {
+		t.Error("comparison report should contain Allocs Δ% column")
 	}
 
 	regression := RegressionReport{
@@ -871,107 +962,6 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
-}
-
-func TestSaveBaseline(t *testing.T) {
-	store := NewMemoryStore()
-	b := NewBenchmarker()
-	b.SetBaselineStore(store)
-
-	b.AddGroup("test", func() error {
-		time.Sleep(10 * time.Millisecond)
-		return nil
-	}, WithIterations(3), WithWarmupIterations(1))
-
-	_, err := b.RunAll()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	err = b.SaveBaseline()
-	if err != nil {
-		t.Fatalf("unexpected error saving baseline: %v", err)
-	}
-
-	stats, found, err := store.Load("test")
-	if err != nil {
-		t.Fatalf("unexpected error loading baseline: %v", err)
-	}
-	if !found {
-		t.Fatal("expected baseline to be found")
-	}
-	if stats.Name != "test" {
-		t.Errorf("expected name 'test', got %s", stats.Name)
-	}
-}
-
-func TestSaveBaseline_NoStore(t *testing.T) {
-	b := NewBenchmarker()
-
-	b.AddGroup("test", func() error { return nil }, WithIterations(1), WithWarmupIterations(0))
-	_, err := b.RunAll()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	err = b.SaveBaseline()
-	if !errors.Is(err, ErrNoBaselineStore) {
-		t.Errorf("expected ErrNoBaselineStore, got %v", err)
-	}
-}
-
-func TestSaveBaseline_NoResults(t *testing.T) {
-	store := NewMemoryStore()
-	b := NewBenchmarker()
-	b.SetBaselineStore(store)
-
-	b.AddGroup("test", func() error { return nil }, WithIterations(1), WithWarmupIterations(0))
-
-	err := b.SaveBaseline()
-	if !errors.Is(err, ErrNoGroupsRegistered) {
-		t.Errorf("expected ErrNoGroupsRegistered, got %v", err)
-	}
-}
-
-func TestLoadBaseline(t *testing.T) {
-	store := NewMemoryStore()
-	b := NewBenchmarker()
-	b.SetBaselineStore(store)
-
-	b.AddGroup("test1", func() error { return nil }, WithIterations(1), WithWarmupIterations(0))
-	b.AddGroup("test2", func() error { return nil }, WithIterations(1), WithWarmupIterations(0))
-
-	baseline1 := GroupStatistics{Name: "test1", MeanDuration: 100 * time.Millisecond}
-	baseline2 := GroupStatistics{Name: "test2", MeanDuration: 200 * time.Millisecond}
-	_ = store.Save("test1", baseline1)
-	_ = store.Save("test2", baseline2)
-
-	baselines, err := b.LoadBaseline()
-	if err != nil {
-		t.Fatalf("unexpected error loading baselines: %v", err)
-	}
-
-	if len(baselines) != 2 {
-		t.Errorf("expected 2 baselines, got %d", len(baselines))
-	}
-
-	if b1, ok := baselines["test1"]; !ok || b1.MeanDuration != baseline1.MeanDuration {
-		t.Errorf("baseline test1 mismatch")
-	}
-	if b2, ok := baselines["test2"]; !ok || b2.MeanDuration != baseline2.MeanDuration {
-		t.Errorf("baseline test2 mismatch")
-	}
-}
-
-func TestLoadBaseline_NoStore(t *testing.T) {
-	b := NewBenchmarker()
-
-	b.AddGroup("test", func() error { return nil }, WithIterations(1), WithWarmupIterations(0))
-
-	_, err := b.LoadBaseline()
-	if !errors.Is(err, ErrNoBaselineStore) {
-		t.Errorf("expected ErrNoBaselineStore, got %v", err)
-	}
 }
 
 func TestZeroWarmupIterations(t *testing.T) {
@@ -1080,8 +1070,6 @@ func TestGroupStatistics_Fields(t *testing.T) {
 		StdDevDuration: 25 * time.Millisecond,
 		MeanAllocBytes: 1024,
 		MeanAllocCount: 5,
-		AllocsPerOp:    5.0,
-		BytesPerOp:     1024.0,
 	}
 
 	if stats.Name != "test" {
@@ -1096,8 +1084,8 @@ func TestGroupStatistics_Fields(t *testing.T) {
 	if stats.MeanAllocBytes != 1024 {
 		t.Errorf("expected MeanAllocBytes 1024, got %d", stats.MeanAllocBytes)
 	}
-	if stats.AllocsPerOp != 5.0 {
-		t.Errorf("expected AllocsPerOp 5.0, got %f", stats.AllocsPerOp)
+	if stats.MeanAllocCount != 5 {
+		t.Errorf("expected MeanAllocCount 5, got %d", stats.MeanAllocCount)
 	}
 }
 
@@ -1129,7 +1117,7 @@ func TestComparisonReport_Fields(t *testing.T) {
 		Baseline:    "base",
 		GeneratedAt: now,
 		Items: []ComparisonItem{
-			{Group: "item1", MeanDuration: 100 * time.Millisecond, MeanAllocBytes: 1000, MeanAllocCount: 10, VsBaselinePct: 0},
+			{Group: "item1", MeanDuration: 100 * time.Millisecond, MeanAllocBytes: 1000, MeanAllocCount: 10, VsBaselinePct: 0, AllocBytesPct: 0, AllocCountPct: 0},
 		},
 	}
 
@@ -1141,6 +1129,219 @@ func TestComparisonReport_Fields(t *testing.T) {
 	}
 	if len(report.Items) != 1 {
 		t.Errorf("expected 1 item, got %d", len(report.Items))
+	}
+	if report.Items[0].AllocBytesPct != 0 {
+		t.Errorf("expected AllocBytesPct 0, got %f", report.Items[0].AllocBytesPct)
+	}
+	if report.Items[0].AllocCountPct != 0 {
+		t.Errorf("expected AllocCountPct 0, got %f", report.Items[0].AllocCountPct)
+	}
+}
+
+func TestSaveBaseline(t *testing.T) {
+	store := NewMemoryStore()
+	b := NewBenchmarker()
+	b.SetBaselineStore(store)
+
+	b.AddGroup("test", func() error {
+		time.Sleep(10 * time.Millisecond)
+		return nil
+	}, WithIterations(3), WithWarmupIterations(1))
+
+	_, err := b.RunAll()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = b.SaveBaseline()
+	if err != nil {
+		t.Fatalf("unexpected error saving baseline: %v", err)
+	}
+
+	stats, found, err := store.Load("test")
+	if err != nil {
+		t.Fatalf("unexpected error loading baseline: %v", err)
+	}
+	if !found {
+		t.Fatal("expected baseline to be found")
+	}
+	if stats.Name != "test" {
+		t.Errorf("expected name 'test', got %s", stats.Name)
+	}
+}
+
+func TestSaveBaseline_NoStore(t *testing.T) {
+	b := NewBenchmarker()
+
+	b.AddGroup("test", func() error { return nil }, WithIterations(1), WithWarmupIterations(0))
+	_, err := b.RunAll()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = b.SaveBaseline()
+	if !errors.Is(err, ErrNoBaselineStore) {
+		t.Errorf("expected ErrNoBaselineStore, got %v", err)
+	}
+}
+
+func TestSaveBaseline_NoResults(t *testing.T) {
+	store := NewMemoryStore()
+	b := NewBenchmarker()
+	b.SetBaselineStore(store)
+
+	b.AddGroup("test", func() error { return nil }, WithIterations(1), WithWarmupIterations(0))
+
+	err := b.SaveBaseline()
+	if !errors.Is(err, ErrNoGroupsRegistered) {
+		t.Errorf("expected ErrNoGroupsRegistered, got %v", err)
+	}
+}
+
+func TestLoadBaseline(t *testing.T) {
+	store := NewMemoryStore()
+	b := NewBenchmarker()
+	b.SetBaselineStore(store)
+
+	b.AddGroup("test1", func() error { return nil }, WithIterations(1), WithWarmupIterations(0))
+	b.AddGroup("test2", func() error { return nil }, WithIterations(1), WithWarmupIterations(0))
+
+	baseline1 := GroupStatistics{Name: "test1", MeanDuration: 100 * time.Millisecond}
+	baseline2 := GroupStatistics{Name: "test2", MeanDuration: 200 * time.Millisecond}
+	_ = store.Save("test1", baseline1)
+	_ = store.Save("test2", baseline2)
+
+	baselines, err := b.LoadBaseline()
+	if err != nil {
+		t.Fatalf("unexpected error loading baselines: %v", err)
+	}
+
+	if len(baselines) != 2 {
+		t.Errorf("expected 2 baselines, got %d", len(baselines))
+	}
+
+	if b1, ok := baselines["test1"]; !ok || b1.MeanDuration != baseline1.MeanDuration {
+		t.Errorf("baseline test1 mismatch")
+	}
+	if b2, ok := baselines["test2"]; !ok || b2.MeanDuration != baseline2.MeanDuration {
+		t.Errorf("baseline test2 mismatch")
+	}
+}
+
+func TestLoadBaseline_NoStore(t *testing.T) {
+	b := NewBenchmarker()
+
+	b.AddGroup("test", func() error { return nil }, WithIterations(1), WithWarmupIterations(0))
+
+	_, err := b.LoadBaseline()
+	if !errors.Is(err, ErrNoBaselineStore) {
+		t.Errorf("expected ErrNoBaselineStore, got %v", err)
+	}
+}
+
+func TestErrorVariables(t *testing.T) {
+	errTests := []struct {
+		name     string
+		err      error
+		wantMsg  string
+	}{
+		{"ErrNoGroupsRegistered", ErrNoGroupsRegistered, "no benchmark groups registered"},
+		{"ErrGroupNotFound", ErrGroupNotFound, "benchmark group not found"},
+		{"ErrInvalidIterations", ErrInvalidIterations, "invalid number of iterations"},
+		{"ErrInvalidWarmup", ErrInvalidWarmup, "invalid number of warmup iterations"},
+		{"ErrInvalidThreshold", ErrInvalidThreshold, "invalid regression threshold"},
+		{"ErrNilFunction", ErrNilFunction, "benchmark function cannot be nil"},
+		{"ErrDuplicateGroupName", ErrDuplicateGroupName, "duplicate group name"},
+		{"ErrNoBaselineStore", ErrNoBaselineStore, "no baseline store configured"},
+		{"ErrBaselineNotFound", ErrBaselineNotFound, "baseline not found for group"},
+		{"ErrGroupEmptyResult", ErrGroupEmptyResult, "group has no valid results"},
+	}
+
+	for _, tt := range errTests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.err == nil {
+				t.Error("error should not be nil")
+			}
+			if !contains(tt.err.Error(), tt.wantMsg) {
+				t.Errorf("expected error message to contain %q, got %q", tt.wantMsg, tt.err.Error())
+			}
+		})
+	}
+}
+
+func TestTimeoutOptionIntegration(t *testing.T) {
+	b := NewBenchmarker()
+
+	b.AddGroup("with-timeout", func() error {
+		time.Sleep(1 * time.Millisecond)
+		return nil
+	}, WithIterations(5), WithWarmupIterations(2), WithTimeout(1*time.Second), WithMemoryCollection(false))
+
+	bm, ok := b.(*benchmarker)
+	if !ok {
+		t.Fatal("expected *benchmarker type")
+	}
+
+	if len(bm.groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(bm.groups))
+	}
+
+	if bm.groups[0].config.Timeout != 1*time.Second {
+		t.Errorf("expected 1s timeout, got %v", bm.groups[0].config.Timeout)
+	}
+	if bm.groups[0].config.Iterations != 5 {
+		t.Errorf("expected 5 iterations, got %d", bm.groups[0].config.Iterations)
+	}
+	if bm.groups[0].config.WarmupIterations != 2 {
+		t.Errorf("expected 2 warmup iterations, got %d", bm.groups[0].config.WarmupIterations)
+	}
+	if bm.groups[0].config.CollectMemory != false {
+		t.Errorf("expected CollectMemory false, got %v", bm.groups[0].config.CollectMemory)
+	}
+}
+
+func TestCompare_Percentages(t *testing.T) {
+	b := NewBenchmarker()
+
+	var sink1, sink2 []byte
+	b.AddGroup("baseline", func() error {
+		buf := make([]byte, 1000)
+		buf[0] = 1
+		sink1 = buf
+		time.Sleep(10 * time.Millisecond)
+		return nil
+	}, WithIterations(3), WithWarmupIterations(1))
+
+	b.AddGroup("compare", func() error {
+		buf := make([]byte, 1500)
+		buf[0] = 1
+		sink2 = buf
+		time.Sleep(15 * time.Millisecond)
+		return nil
+	}, WithIterations(3), WithWarmupIterations(1))
+
+	_, err := b.RunAll()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	_ = sink1
+	_ = sink2
+
+	report, err := b.Compare("baseline")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, item := range report.Items {
+		if item.Group == "compare" {
+			if item.VsBaselinePct <= 0 {
+				t.Errorf("expected positive duration pct, got %.2f", item.VsBaselinePct)
+			}
+			if item.AllocBytesPct <= 0 {
+				t.Errorf("expected positive alloc bytes pct, got %.2f", item.AllocBytesPct)
+			}
+		}
 	}
 }
 

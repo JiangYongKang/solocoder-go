@@ -402,7 +402,7 @@ func TestSpanTreeGetChildrenEmptyID(t *testing.T) {
 func TestSpanTreeGetRoots(t *testing.T) {
 	tree := NewSpanTree()
 	root1 := NewSpan("trace1", "root1", "", "root1", true)
-	root2 := NewSpan("trace2", "root2", "", "root2", true)
+	root2 := NewSpan("trace1", "root2", "", "root2", true)
 	child := NewSpan("trace1", "child1", "root1", "child1", true)
 
 	tree.AddSpan(root1)
@@ -648,6 +648,9 @@ func TestExtractTraceContext(t *testing.T) {
 	if ctx.SpanID != "0123456789abcdef" {
 		t.Errorf("unexpected SpanID: %s", ctx.SpanID)
 	}
+	if ctx.ParentSpanID != "0123456789abcdef" {
+		t.Errorf("ParentSpanID should be set to the parent-id from header, got %s", ctx.ParentSpanID)
+	}
 	if !ctx.Sampled {
 		t.Error("expected Sampled true")
 	}
@@ -753,6 +756,9 @@ func TestInjectExtractRoundTrip(t *testing.T) {
 	if extracted.SpanID != original.SpanID {
 		t.Errorf("SpanID mismatch: %s vs %s", extracted.SpanID, original.SpanID)
 	}
+	if extracted.ParentSpanID != original.SpanID {
+		t.Errorf("ParentSpanID should equal original SpanID, got %s", extracted.ParentSpanID)
+	}
 	if extracted.Sampled != original.Sampled {
 		t.Errorf("Sampled mismatch: %v vs %v", extracted.Sampled, original.Sampled)
 	}
@@ -815,18 +821,14 @@ func TestSpanTreeConcurrentAdd(t *testing.T) {
 	tree := NewSpanTree()
 	var wg sync.WaitGroup
 	numSpans := 100
+	traceID := "0123456789abcdef0123456789abcdef"
 
 	for i := 0; i < numSpans; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			span := NewSpan(
-				"0123456789abcdef0123456789abcdef",
-				generateTestSpanID(i),
-				"",
-				"test",
-				true,
-			)
+			spanID := fmt.Sprintf("span-%04d", i)
+			span := NewSpan(traceID, spanID, "", "test", true)
 			tree.AddSpan(span)
 		}(i)
 	}
@@ -937,4 +939,392 @@ func TestEdgeCases(t *testing.T) {
 			t.Errorf("expected %d spans, got %d", depth, len(subtree))
 		}
 	})
+}
+
+func TestExtractTraceContextParentSpanIDPropagation(t *testing.T) {
+	parentCtx := &TraceContext{
+		TraceID:      "0123456789abcdef0123456789abcdef",
+		SpanID:       "aaaabbbbccccdddd",
+		ParentSpanID: "1111222233334444",
+		Sampled:      true,
+	}
+
+	headers := InjectTraceContext(parentCtx)
+	extracted, err := ExtractTraceContext(headers)
+	if err != nil {
+		t.Fatalf("ExtractTraceContext failed: %v", err)
+	}
+
+	if extracted.ParentSpanID != "aaaabbbbccccdddd" {
+		t.Errorf("ParentSpanID should be set to parent-id from header, got %s", extracted.ParentSpanID)
+	}
+
+	childCtx, childSpan, err := NewChildContext(extracted, "child")
+	if err != nil {
+		t.Fatalf("NewChildContext failed: %v", err)
+	}
+	if childCtx.ParentSpanID != extracted.SpanID {
+		t.Errorf("child ParentSpanID should be extracted.SpanID, got %s", childCtx.ParentSpanID)
+	}
+	if childSpan.ParentSpanID != extracted.SpanID {
+		t.Errorf("child span ParentSpanID should be extracted.SpanID, got %s", childSpan.ParentSpanID)
+	}
+}
+
+func TestExtractTraceContextParentSpanIDNotSampled(t *testing.T) {
+	headers := map[string]string{
+		W3CTraceParentHeader: "00-0123456789abcdef0123456789abcdef-aaaabbbbccccdddd-00",
+	}
+
+	ctx, err := ExtractTraceContext(headers)
+	if err != nil {
+		t.Fatalf("ExtractTraceContext failed: %v", err)
+	}
+	if ctx.ParentSpanID != "aaaabbbbccccdddd" {
+		t.Errorf("ParentSpanID should be set even when not sampled, got %s", ctx.ParentSpanID)
+	}
+}
+
+func TestSpanTreeTraceIDMismatch(t *testing.T) {
+	tree := NewSpanTree()
+	span1 := NewSpan("trace1", "span1", "", "root", true)
+	span2 := NewSpan("trace2", "span2", "span1", "child", true)
+
+	err := tree.AddSpan(span1)
+	if err != nil {
+		t.Fatalf("first AddSpan failed: %v", err)
+	}
+
+	err = tree.AddSpan(span2)
+	if !errors.Is(err, ErrTraceIDMismatch) {
+		t.Errorf("expected ErrTraceIDMismatch, got %v", err)
+	}
+}
+
+func TestSpanTreeTraceIDConsistency(t *testing.T) {
+	tree := NewSpanTree()
+	traceID := "0123456789abcdef0123456789abcdef"
+
+	span1 := NewSpan(traceID, "span1", "", "root", true)
+	span2 := NewSpan(traceID, "span2", "span1", "child", true)
+
+	err := tree.AddSpan(span1)
+	if err != nil {
+		t.Fatalf("AddSpan span1 failed: %v", err)
+	}
+	err = tree.AddSpan(span2)
+	if err != nil {
+		t.Fatalf("AddSpan span2 failed: %v", err)
+	}
+
+	if tree.TraceID() != traceID {
+		t.Errorf("expected TraceID %s, got %s", traceID, tree.TraceID())
+	}
+}
+
+func TestSpanTreeTraceIDSetOnFirstSpan(t *testing.T) {
+	tree := NewSpanTree()
+
+	if tree.TraceID() != "" {
+		t.Errorf("expected empty TraceID on new tree, got %s", tree.TraceID())
+	}
+
+	span := NewSpan("trace1", "span1", "", "root", true)
+	tree.AddSpan(span)
+
+	if tree.TraceID() != "trace1" {
+		t.Errorf("expected TraceID trace1, got %s", tree.TraceID())
+	}
+}
+
+func TestSpanTreeTraceIDMismatchWithEmptyParent(t *testing.T) {
+	tree := NewSpanTree()
+	span1 := NewSpan("trace1", "span1", "", "root1", true)
+	span2 := NewSpan("trace2", "span2", "", "root2", true)
+
+	tree.AddSpan(span1)
+	err := tree.AddSpan(span2)
+	if !errors.Is(err, ErrTraceIDMismatch) {
+		t.Errorf("expected ErrTraceIDMismatch for second root with different TraceID, got %v", err)
+	}
+}
+
+func TestSpanTreeGetChildrenNoChildren(t *testing.T) {
+	tree := NewSpanTree()
+	root := NewSpan("trace1", "root", "", "root", true)
+	child := NewSpan("trace1", "child1", "root", "child1", true)
+	tree.AddSpan(root)
+	tree.AddSpan(child)
+
+	children, err := tree.GetChildren("child1")
+	if err != nil {
+		t.Fatalf("GetChildren failed: %v", err)
+	}
+	if len(children) != 0 {
+		t.Errorf("expected 0 children for leaf node, got %d", len(children))
+	}
+}
+
+func TestSpanTreeGetChildrenReturnsCopy(t *testing.T) {
+	tree := NewSpanTree()
+	root := NewSpan("trace1", "root", "", "root", true)
+	child := NewSpan("trace1", "child1", "root", "child1", true)
+	tree.AddSpan(root)
+	tree.AddSpan(child)
+
+	children1, _ := tree.GetChildren("root")
+	children1[0] = nil
+
+	children2, _ := tree.GetChildren("root")
+	if children2[0] == nil {
+		t.Error("GetChildren should return a copy, not a reference to internal slice")
+	}
+}
+
+func TestSpanTreeLargeScalePerformance(t *testing.T) {
+	tree := NewSpanTree()
+	traceID := "0123456789abcdef0123456789abcdef"
+	numSpans := 5000
+
+	root := NewSpan(traceID, "span-0", "", "root", true)
+	tree.AddSpan(root)
+
+	for i := 1; i < numSpans; i++ {
+		parentID := fmt.Sprintf("span-%d", (i-1)/3)
+		spanID := fmt.Sprintf("span-%d", i)
+		span := NewSpan(traceID, spanID, parentID, fmt.Sprintf("node-%d", i), true)
+		tree.AddSpan(span)
+	}
+
+	if tree.SpanCount() != numSpans {
+		t.Errorf("expected %d spans, got %d", numSpans, tree.SpanCount())
+	}
+
+	children, err := tree.GetChildren("span-0")
+	if err != nil {
+		t.Fatalf("GetChildren failed: %v", err)
+	}
+	if len(children) != 3 {
+		t.Errorf("expected 3 children for span-0, got %d", len(children))
+	}
+
+	subtree, err := tree.GetSubtree("span-1")
+	if err != nil {
+		t.Fatalf("GetSubtree failed: %v", err)
+	}
+	if len(subtree) == 0 {
+		t.Error("subtree should not be empty")
+	}
+}
+
+func TestSpanTreeSubtreeOfLeafNode(t *testing.T) {
+	tree := NewSpanTree()
+	root := NewSpan("trace1", "root", "", "root", true)
+	child := NewSpan("trace1", "child1", "root", "child1", true)
+	tree.AddSpan(root)
+	tree.AddSpan(child)
+
+	subtree, err := tree.GetSubtree("child1")
+	if err != nil {
+		t.Fatalf("GetSubtree failed: %v", err)
+	}
+	if len(subtree) != 1 {
+		t.Errorf("leaf node subtree should contain only itself, got %d", len(subtree))
+	}
+	if subtree[0].SpanID != "child1" {
+		t.Errorf("expected child1, got %s", subtree[0].SpanID)
+	}
+}
+
+func TestSpanTreeMultipleRootsSameTrace(t *testing.T) {
+	tree := NewSpanTree()
+	root1 := NewSpan("trace1", "root1", "", "root1", true)
+	root2 := NewSpan("trace1", "root2", "", "root2", true)
+	child1 := NewSpan("trace1", "child1", "root1", "child1", true)
+	child2 := NewSpan("trace1", "child2", "root2", "child2", true)
+
+	tree.AddSpan(root1)
+	tree.AddSpan(root2)
+	tree.AddSpan(child1)
+	tree.AddSpan(child2)
+
+	roots := tree.GetRoots()
+	if len(roots) != 2 {
+		t.Errorf("expected 2 roots, got %d", len(roots))
+	}
+
+	subtree1, _ := tree.GetSubtree("root1")
+	if len(subtree1) != 2 {
+		t.Errorf("expected 2 spans in root1 subtree, got %d", len(subtree1))
+	}
+
+	subtree2, _ := tree.GetSubtree("root2")
+	if len(subtree2) != 2 {
+		t.Errorf("expected 2 spans in root2 subtree, got %d", len(subtree2))
+	}
+}
+
+func TestSpanTreeConcurrentAddSameTrace(t *testing.T) {
+	tree := NewSpanTree()
+	var wg sync.WaitGroup
+	numSpans := 100
+	traceID := "0123456789abcdef0123456789abcdef"
+
+	for i := 0; i < numSpans; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			spanID := fmt.Sprintf("span-%04d", i)
+			span := NewSpan(traceID, spanID, "", "test", true)
+			tree.AddSpan(span)
+		}(i)
+	}
+
+	wg.Wait()
+
+	if tree.SpanCount() != numSpans {
+		t.Errorf("expected %d spans, got %d", numSpans, tree.SpanCount())
+	}
+	if tree.TraceID() != traceID {
+		t.Errorf("expected TraceID %s, got %s", traceID, tree.TraceID())
+	}
+}
+
+func TestSpanTreeConcurrentReadWrite(t *testing.T) {
+	tree := NewSpanTree()
+	traceID := "0123456789abcdef0123456789abcdef"
+
+	root := NewSpan(traceID, "root", "", "root", true)
+	tree.AddSpan(root)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					tree.GetChildren("root")
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					spanID := fmt.Sprintf("child-%04d", i)
+					span := NewSpan(traceID, spanID, "root", "child", true)
+					tree.AddSpan(span)
+				}
+			}
+		}(i)
+	}
+
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					tree.GetSubtree("root")
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					tree.SpanCount()
+					tree.TraceID()
+				}
+			}
+		}()
+	}
+
+	close(stop)
+	wg.Wait()
+}
+
+func TestSpanTreeConcurrentAddDifferentTrace(t *testing.T) {
+	tree := NewSpanTree()
+	span1 := NewSpan("trace1", "span1", "", "root", true)
+	tree.AddSpan(span1)
+
+	span2 := NewSpan("trace2", "span2", "", "root", true)
+	err := tree.AddSpan(span2)
+	if !errors.Is(err, ErrTraceIDMismatch) {
+		t.Errorf("expected ErrTraceIDMismatch, got %v", err)
+	}
+}
+
+func TestFullTraceWorkflowWithParentSpanID(t *testing.T) {
+	sampler := NewAlwaysSample()
+	tree := NewSpanTree()
+
+	rootCtx, rootSpan, err := NewRootContext("service-a", sampler)
+	if err != nil {
+		t.Fatalf("NewRootContext failed: %v", err)
+	}
+	tree.AddSpan(rootSpan)
+
+	childCtx, childSpan, err := NewChildContext(rootCtx, "service-b")
+	if err != nil {
+		t.Fatalf("NewChildContext failed: %v", err)
+	}
+	tree.AddSpan(childSpan)
+
+	headers := InjectTraceContext(childCtx)
+	extractedCtx, err := ExtractTraceContext(headers)
+	if err != nil {
+		t.Fatalf("ExtractTraceContext failed: %v", err)
+	}
+
+	if extractedCtx.ParentSpanID != childCtx.SpanID {
+		t.Errorf("extracted ParentSpanID should be child SpanID, got %s", extractedCtx.ParentSpanID)
+	}
+
+	grandchildCtx, grandchildSpan, err := NewChildContext(extractedCtx, "service-c")
+	if err != nil {
+		t.Fatalf("NewChildContext failed: %v", err)
+	}
+	tree.AddSpan(grandchildSpan)
+
+	if grandchildSpan.ParentSpanID != childCtx.SpanID {
+		t.Errorf("grandchild ParentSpanID should be child SpanID, got %s", grandchildSpan.ParentSpanID)
+	}
+	if grandchildSpan.TraceID != rootSpan.TraceID {
+		t.Error("all spans should have same TraceID")
+	}
+
+	subtree, err := tree.GetSubtree(rootSpan.SpanID)
+	if err != nil {
+		t.Fatalf("GetSubtree failed: %v", err)
+	}
+	if len(subtree) != 3 {
+		t.Errorf("expected 3 spans in trace, got %d", len(subtree))
+	}
+
+	_ = grandchildCtx
 }

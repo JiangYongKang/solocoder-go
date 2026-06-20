@@ -3,8 +3,10 @@ package proptest
 import (
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
+	"os"
 	"strings"
 	"time"
 )
@@ -27,6 +29,7 @@ type Config struct {
 	Seed           int64
 	UseRandomSeed  bool
 	Verbose        bool
+	Writer         io.Writer
 }
 
 func DefaultConfig() Config {
@@ -51,6 +54,7 @@ type Result[T any] struct {
 	Iterations  int
 	FailCase    *FailCase[T]
 	ShrinkSteps int
+	Err         error
 }
 
 func (r *Result[T]) String() string {
@@ -58,9 +62,13 @@ func (r *Result[T]) String() string {
 		return fmt.Sprintf("proptest: PASSED (seed=%d, iterations=%d)", r.Seed, r.Iterations)
 	}
 	fc := r.FailCase
+	errInfo := ""
+	if r.Err != nil {
+		errInfo = fmt.Sprintf("\n  error: %s", r.Err)
+	}
 	return fmt.Sprintf(
-		"proptest: FAILED (seed=%d, iteration=%d, shrinks=%d)\n  input: %v\n  reason: %s",
-		r.Seed, fc.Iteration, r.ShrinkSteps, fc.Input, fc.Message,
+		"proptest: FAILED (seed=%d, iteration=%d, shrinks=%d)\n  input: %v\n  reason: %s%s",
+		r.Seed, fc.Iteration, r.ShrinkSteps, fc.Input, fc.Message, errInfo,
 	)
 }
 
@@ -92,21 +100,22 @@ func (g *IntGenerator) Generate(r *rand.Rand) int {
 	if g.Min == g.Max {
 		return g.Min
 	}
-	min64 := int64(g.Min)
-	max64 := int64(g.Max)
-	span := max64 - min64 + 1
-	if span <= int64(math.MaxInt) && span > 0 {
-		return int(min64 + r.Int63n(span))
+	if g.Min == math.MinInt && g.Max == math.MaxInt {
+		return int(r.Uint64())
 	}
-	u := uint64(r.Int63())<<1 ^ uint64(r.Int63())
-	var spanU uint64
-	if span == math.MinInt64 {
-		spanU = uint64(1) << 63
+	spanU := uint64(g.Max) - uint64(g.Min) + 1
+	var offset uint64
+	if spanU <= uint64(math.MaxInt64) {
+		offset = uint64(r.Int63n(int64(spanU)))
 	} else {
-		spanU = uint64(span)
+		for {
+			offset = r.Uint64()
+			if offset < spanU {
+				break
+			}
+		}
 	}
-	offset := int64(u % spanU)
-	return int(min64 + offset)
+	return int(uint64(g.Min) + offset)
 }
 
 func (g *IntGenerator) Shrink(value int) []int {
@@ -596,6 +605,7 @@ type PropertyFunc[T any] func(input T) (bool, string)
 
 type Runner[T any] struct {
 	cfg Config
+	w   io.Writer
 }
 
 func NewRunner[T any](cfg Config) *Runner[T] {
@@ -608,7 +618,14 @@ func NewRunner[T any](cfg Config) *Runner[T] {
 	if cfg.UseRandomSeed && cfg.Seed == 0 {
 		cfg.Seed = time.Now().UnixNano()
 	}
-	return &Runner[T]{cfg: cfg}
+	w := cfg.Writer
+	if w == nil && cfg.Verbose {
+		w = os.Stdout
+	}
+	if w == nil {
+		w = io.Discard
+	}
+	return &Runner[T]{cfg: cfg, w: w}
 }
 
 func (r *Runner[T]) Config() Config {
@@ -617,25 +634,32 @@ func (r *Runner[T]) Config() Config {
 
 func (r *Runner[T]) Check(gen Generator[T], prop PropertyFunc[T]) *Result[T] {
 	if gen == nil {
+		r.logf("proptest: nil generator provided, returning error")
 		return &Result[T]{
 			Passed:     false,
 			Seed:       r.cfg.Seed,
 			Iterations: 0,
+			Err:        ErrGeneratorNil,
 			FailCase: &FailCase[T]{
 				Message: ErrGeneratorNil.Error(),
 			},
 		}
 	}
 	if prop == nil {
+		r.logf("proptest: nil property function provided, returning error")
 		return &Result[T]{
 			Passed:     false,
 			Seed:       r.cfg.Seed,
 			Iterations: 0,
+			Err:        ErrInvalidConfig,
 			FailCase: &FailCase[T]{
 				Message: "proptest: property function is nil",
 			},
 		}
 	}
+
+	r.logf("proptest: starting check (seed=%d, iterations=%d, maxShrinks=%d)",
+		r.cfg.Seed, r.cfg.Iterations, r.cfg.MaxShrinks)
 
 	source := rand.New(rand.NewSource(r.cfg.Seed))
 	result := &Result[T]{
@@ -660,31 +684,48 @@ func (r *Runner[T]) Check(gen Generator[T], prop PropertyFunc[T]) *Result[T] {
 			}
 			failMsg = msg
 			foundFail = true
+			r.logf("proptest: failure at iteration %d, input=%v: %s", i+1, input, msg)
 			break
+		}
+		if r.cfg.Verbose && (i+1)%100 == 0 {
+			r.logf("proptest: %d iterations passed", i+1)
 		}
 	}
 
 	if !foundFail {
+		r.logf("proptest: all %d iterations passed", result.Iterations)
 		result.Passed = true
 		return result
 	}
 
 	result.Passed = false
-	shrunkenInput, shrinkSteps := shrinkValue(gen, prop, failInput, r.cfg.MaxShrinks)
+	result.Err = ErrPropertyFailed
+	shrunkenInput, shrinkSteps, shrinkLimited := shrinkValue(gen, prop, failInput, r.cfg.MaxShrinks, r.w, r.cfg.Verbose)
 	result.ShrinkSteps = shrinkSteps
+	if shrinkLimited {
+		result.Err = fmt.Errorf("%w: reached max shrinks (%d)", ErrShrinkLimit, r.cfg.MaxShrinks)
+	}
 	result.FailCase = &FailCase[T]{
 		Input:     shrunkenInput,
 		Seed:      r.cfg.Seed,
 		Iteration: failIter,
 		Message:   failMsg,
 	}
+	r.logf("proptest: shrunk to %v in %d steps", shrunkenInput, shrinkSteps)
 	return result
 }
 
-func shrinkValue[T any](gen Generator[T], prop PropertyFunc[T], initial T, maxShrinks int) (T, int) {
+func (r *Runner[T]) logf(format string, args ...interface{}) {
+	if r.cfg.Verbose {
+		fmt.Fprintf(r.w, format+"\n", args...)
+	}
+}
+
+func shrinkValue[T any](gen Generator[T], prop PropertyFunc[T], initial T, maxShrinks int, w io.Writer, verbose bool) (T, int, bool) {
 	current := initial
 	steps := 0
 	visited := make(map[string]struct{})
+	hitLimit := false
 
 	for steps < maxShrinks {
 		candidates := gen.Shrink(current)
@@ -705,10 +746,14 @@ func shrinkValue[T any](gen Generator[T], prop PropertyFunc[T], initial T, maxSh
 			if !ok {
 				current = cand
 				improved = true
+				if verbose {
+					fmt.Fprintf(w, "proptest: shrink step %d: found simpler failing input %v\n", steps, cand)
+				}
 				break
 			}
 
 			if steps >= maxShrinks {
+				hitLimit = true
 				break
 			}
 		}
@@ -718,7 +763,11 @@ func shrinkValue[T any](gen Generator[T], prop PropertyFunc[T], initial T, maxSh
 		}
 	}
 
-	return current, steps
+	if steps >= maxShrinks {
+		hitLimit = true
+	}
+
+	return current, steps, hitLimit
 }
 
 func Check[T any](gen Generator[T], prop PropertyFunc[T], opts ...Option) *Result[T] {

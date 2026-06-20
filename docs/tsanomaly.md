@@ -26,7 +26,9 @@
 | `StdDevFactor` | float64 | 3.0 | 标准差偏离倍数阈值，非负，0表示任何偏离都算异常 |
 | `MinSamples` | int | 10 | 启动异常检测的最小样本数，必须 > 0 且 <= WindowSize |
 | `EnableSeasonal` | bool | false | 是否启用季节性模式 |
-| `PeriodLength` | int | 0 | 季节性周期长度，启用季节性时必须为正 |
+| `PeriodLength` | int | 0 | 季节性周期长度（槽位数量），启用季节性时必须为正 |
+| `PeriodSlot` | time.Duration | 0 | 每个周期槽位的时间跨度，启用季节性时必须为正。例如：1小时表示每小时一个槽位 |
+| `SeasonalEpoch` | time.Time | 零值 | 周期基准时间，用于计算时间戳对应的周期槽位索引。建议使用业务周期的起始对齐点 |
 | `Direction` | DeviationDirection | DirectionBoth | 异常检测方向 |
 | `MaxAnomalyHistory` | int | 1000 | 最大异常事件历史记录数，超限后自动淘汰最旧记录，0表示不限 |
 
@@ -220,18 +222,27 @@ sum ← sum - x_old + x_new
 
 ### 5. 季节性周期模型
 
-设周期长度为 P，第 t 个数据点对应的周期索引为：
+季节性周期索引基于**数据点时间戳**计算，而非数据点的序列序号，确保时间间隔不均匀时季节性基线学习依然有效。
+
+设周期长度（槽位数）为 P，每个槽位的时间跨度为 S（PeriodSlot），周期基准时间为 E（SeasonalEpoch）。对于任意时间戳 T，其对应的周期槽位索引计算方式为：
 
 ```
-idx = (t - 1) mod P
+totalSlots = floor( (T - E) / S )   // 计算从基准时间起经过的完整槽位数
+idx = totalSlots mod P              // 对周期长度取模得到周期位置
+if idx < 0: idx += P                // 处理时间戳早于基准时间的情况
 ```
 
-每个周期索引 idx 维护独立的 μ_idx 和 σ_idx，检测第 t 个点时使用 μ_idx 和 σ_idx 而非全局统计量，从而消除周期性波动对检测结果的干扰。
+每个周期索引 idx 维护独立的 μ_idx 和 σ_idx，检测时间戳 T 对应的数据点时使用 μ_idx 和 σ_idx 而非全局统计量，从而消除周期性波动对检测结果的干扰。
 
 典型应用场景：
-- 日周期：P=24（每小时数据），检测每日同时段的异常
-- 周周期：P=7（每日数据），检测每周同日的异常
-- 业务周期：P=自定义长度
+- 日周期（小时粒度）：P=24, S=1小时, E=某日 00:00 → 每个小时对应一个槽位（0-23）
+- 周周期（日粒度）：P=7, S=1天, E=某周一 → 周一=0, 周二=1, ..., 周日=6
+- 业务周期：P=自定义长度，S=自定义粒度
+
+注意事项：
+- PeriodSlot 的选择应与数据采集频率匹配（如每分钟采集数据建议用 1分钟作为 PeriodSlot）
+- SeasonalEpoch 建议选择周期的自然对齐点（如一天的 00:00、一周的周一）
+- 同一检测器的所有数据点必须使用一致的 PeriodSlot 和 SeasonalEpoch，配置变更时会自动执行基线迁移
 
 ## 错误定义
 
@@ -240,10 +251,41 @@ idx = (t - 1) mod P
 | `ErrInvalidWindowSize` | 窗口大小无效（<= 0） |
 | `ErrInvalidStdDevFactor` | 标准差倍数阈值无效（< 0） |
 | `ErrInvalidPeriodLength` | 季节周期长度无效（启用季节模式时 <= 0） |
+| `ErrInvalidPeriodSlot` | 周期槽位时间跨度无效（启用季节模式时 <= 0） |
 | `ErrInvalidMinSamples` | 最小样本数无效（<= 0 或 > WindowSize） |
 | `ErrNilDataPoint` | 数据点为 nil |
 | `ErrDetectorClosed` | 检测器已关闭 |
 | `ErrInvalidDirection` | 偏离方向枚举值无效 |
+
+## 配置变更基线迁移策略
+
+当调用 `UpdateConfig` 调整季节性相关配置时，检测器会根据以下策略智能迁移已积累的基线数据，尽可能避免回到冷启动状态：
+
+### 场景 1：非季节性 → 非季节性（EnableSeasonal 均为 false）
+- 行为：仅更新配置字段，全局基线数据（窗口、样本数、均值、标准差）完全保留。
+- 影响：无数据丢失，检测连续。
+
+### 场景 2：季节性 → 非季节性（EnableSeasonal 从 true 变为 false）
+- 行为：将所有周期槽位的窗口统计量（sum、sumSq、values）按顺序合并到全局基线窗口中，合并后窗口大小仍受 WindowSize 限制（超出则淘汰最旧值）。
+- 影响：全局基线获得更丰富的历史数据，季节性基线被清除。
+
+### 场景 3：非季节性 → 季节性（EnableSeasonal 从 false 变为 true）
+- 行为：将全局窗口中的历史值按索引轮询方式分配到各个新周期槽位中（第 1 个值 → 槽位 0，第 2 个 → 槽位 1，...，第 P 个 → 槽位 P-1，循环往复）。
+- 影响：每个周期槽位获得部分预热数据，加速冷启动过程；但由于分配是按顺序而非真实周期位置，初期检测准确率略低于完整学习。
+
+### 场景 4：季节性 → 季节性（PeriodLength、PeriodSlot、SeasonalEpoch 均未变化）
+- 行为：逐槽位深拷贝旧的窗口统计量（sum、sumSq、values 链表）到新结构中。
+- 影响：所有基线数据 100% 保留，检测完全连续，仅 WindowSize 等其他配置生效。
+
+### 场景 5：季节性 → 季节性（周期相关参数发生变化）
+- 行为：采用**最大公约数（GCD）映射策略**最大化保留数据。具体步骤：
+  1. 计算 g = gcd(oldPeriodLength, newPeriodLength)，即新旧周期长度的最大公约数。
+  2. 对每个旧槽位 oldIdx，计算其在新周期中的基础映射位置 newIdx = oldIdx % newPeriodLength。
+  3. 将旧槽位的统计量（sum、sumSq、values）合并到 newIdx、newIdx+g、newIdx+2g、... 等所有步长为 g 的新槽位中，使得旧数据尽可能均匀地分布到新周期结构中。
+  4. 合并时仍遵守 WindowSize 限制，超出窗口大小的值会被淘汰。
+- 影响：当新旧周期长度存在公因数时（如 4→6 的 GCD=2），历史数据能得到较好的保留；若互质（如 7→13），则数据会被均匀分散。
+
+迁移策略的设计原则：**优先保证检测连续性，其次追求数据精确映射**。任何场景下都不会简单丢弃已积累的全部基线数据。
 
 ## 并发安全设计
 
@@ -339,12 +381,15 @@ import (
 )
 
 func main() {
+    epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
     cfg := tsanomaly.Config{
-        WindowSize:        30,        // 每个时段保留30天数据
+        WindowSize:        30,               // 每个时段保留30天数据
         StdDevFactor:      2.5,
-        MinSamples:        5,         // 至少5个同周期点后才检测
+        MinSamples:        5,                // 至少5个同周期点后才检测
         EnableSeasonal:    true,
-        PeriodLength:      24,        // 24小时日周期
+        PeriodLength:      24,               // 24小时日周期（24个槽位）
+        PeriodSlot:        time.Hour,        // 每个槽位代表1小时
+        SeasonalEpoch:     epoch,            // 周期基准时间（对齐到某日零点）
         Direction:         tsanomaly.DirectionBoth,
         MaxAnomalyHistory: 500,
     }
@@ -352,7 +397,7 @@ func main() {
     detector, _ := tsanomaly.NewDetector(cfg)
 
     // 模拟10天的每小时流量数据（早高峰和晚高峰模式）
-    baseTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+    baseTime := epoch
     for day := 0; day < 10; day++ {
         for hour := 0; hour < 24; hour++ {
             var baseFlow float64
@@ -526,7 +571,9 @@ func NewServiceMonitor() *ServiceMonitor {
         MinSamples:        20,
         Direction:         tsanomaly.DirectionBoth, // QPS关注双向
         EnableSeasonal:    true,
-        PeriodLength:      24, // 小时粒度日周期
+        PeriodLength:      24,                      // 小时粒度日周期（24个槽位）
+        PeriodSlot:        time.Hour,               // 每个槽位代表1小时
+        SeasonalEpoch:     time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
         MaxAnomalyHistory: 500,
     }
 

@@ -1,0 +1,6 @@
+你实现的分布式追踪上下文传播器模块存在一些问题，需要修复：
+1. ExtractTraceContext 从请求头中提取追踪上下文时，TraceContext 结构体的 ParentSpanID 字段始终为空，丢失了该字段应有的语义信息。
+2. SpanTree 的 AddSpan 方法在添加节点时缺少跨 TraceID 的一致性校验，不同追踪链路的 Span 可能被混入同一棵树。
+3. SpanTree 的 GetChildren 和 GetSubtree 在节点数量较多时查询性能衰减严重。
+4. 修复后需要为该模块补充缺失的边界条件测试，运行 go test ./internal/tracectx/ -v 确保所有测试通过。
+5. 在 docs/tracectx.md 中更新模块需求文档，说明 SpanTree 的数据一致性约束和查询性能特性。

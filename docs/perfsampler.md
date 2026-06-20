@@ -21,7 +21,21 @@
 - `Rate() float64`: 返回采样率配置值
 
 **概率采样算法：**
-概率采样器使用请求 ID 的前 8 字节哈希值与阈值比较，确保采样决策是确定性的（同一请求 ID 始终得到相同结果），避免同一请求在不同节点采样状态不一致。阈值计算公式：`threshold = rate * math.MaxUint64`。
+概率采样器使用请求 ID 的哈希值与阈值比较，确保采样决策是确定性的（同一请求 ID 始终得到相同结果），避免同一请求在不同节点采样状态不一致。阈值计算公式：`threshold = rate * math.MaxUint64`。
+
+**采样率回退策略：**
+对于不符合标准格式的请求 ID（如短 ID、非十六进制字符等），概率采样器不会无条件采样，而是采用以下回退策略确保采样比例正确：
+
+1. **优先解析十六进制**：如果请求 ID 长度 >= 16 且前 16 个字符是有效的十六进制，则使用前 8 字节作为哈希值
+2. **FNV-1a 哈希回退**：对于短 ID 或非法十六进制 ID，使用 FNV-1a 64 位哈希算法对整个请求 ID 字符串进行哈希
+3. **比例一致性**：无论使用哪种哈希方式，采样比例始终与配置的采样率保持一致
+4. **确定性保证**：同一请求 ID 无论格式如何，始终得到相同的采样决策
+
+这种回退策略确保了：
+- 异常格式的请求 ID 不会破坏整体采样比例
+- 采样率为 0 时，任何 ID 都不会被采样
+- 采样率为 1 时，任何 ID 都会被采样
+- 边界情况（如空字符串、特殊字符、中文等）都能正确处理
 
 ### RequestProfiler（请求性能采样器）
 
@@ -345,6 +359,7 @@ RequestProfiler 所有公共方法都通过内部互斥锁保护，支持并发�
 |---------|------
 | `ErrInvalidSampleRate` | 无效的采样率，必须在 0~1 之间
 | `ErrProfilerNotStarted` | 采样器未启动
+| `ErrProfilerNotStopped` | 采样器已启动但未停止
 | `ErrProfilerAlreadyStarted` | 采样器已启动
 | `ErrEmptyRequestID` | 请求 ID 不能为空
 | `ErrEmptyLabel` | 标签不能为空
@@ -353,6 +368,34 @@ RequestProfiler 所有公共方法都通过内部互斥锁保护，支持并发�
 | `ErrNilSampler` | 采样器不能为空
 | `ErrInvalidCPUProfile` | 无效的 CPU 采样数据
 | `ErrNotSampled` | 请求未被采样
+
+## Export 方法状态行为
+
+`Export()` 方法根据 RequestProfiler 的不同状态返回不同的结果：
+
+| 状态 | 返回结果 | 说明
+|------|---------|------
+| **未启动** | 返回 `nil, ErrProfilerNotStarted` | 采样器从未调用过 `Start()` 方法
+| **已启动未停止** | 返回 `nil, ErrProfilerNotStopped` | 采样器已调用 `Start()` 但尚未调用 `Stop()`，数据不完整
+| **已启动已停止** | 返回 `ProfileResult, nil` | 采样完整，可获取完整的性能数据
+| **未被采样** | 返回 `ProfileResult, nil` | 返回基本信息（请求ID、时间等），但 CPU/内存/耗时数据为空
+
+**使用建议：**
+```go
+// 先检查是否被采样
+if profiler.IsSampled() {
+    result, err := profiler.Export()
+    if err != nil {
+        if errors.Is(err, ErrProfilerNotStarted) {
+            // 处理未启动情况
+        } else if errors.Is(err, ErrProfilerNotStopped) {
+            // 处理未停止情况
+        }
+    } else {
+        // 处理采样结果
+    }
+}
+```
 
 ## 测试
 

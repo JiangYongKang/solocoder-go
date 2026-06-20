@@ -62,9 +62,10 @@ type ThresholdCondition struct {
 }
 
 type RingbiTongbiCondition struct {
-	CompareType    CompareType
+	CompareType      CompareType
 	PercentThreshold float64
-	Period         time.Duration
+	Period           time.Duration
+	Tolerance        time.Duration
 }
 
 type DurationCondition struct {
@@ -104,18 +105,19 @@ type Notifier interface {
 }
 
 type AlertState struct {
-	RuleID        string
-	Status        AlertStatus
-	CurrentLevel  AlertLevel
-	TriggerValue  float64
-	TriggerTime   time.Time
-	LastFiredTime time.Time
-	FirstFiredTime time.Time
-	ConsecutiveHits int
-	HistoryValues   []MetricDataPoint
-	LastEvaluatedTime time.Time
-	LastNotifiedTime  time.Time
-	ResolvedTime      time.Time
+	RuleID             string
+	Status             AlertStatus
+	CurrentLevel       AlertLevel
+	TriggerValue       float64
+	TriggerTime        time.Time
+	LastFiredTime      time.Time
+	FirstFiredTime     time.Time
+	FirstTriggeredTime time.Time
+	ConsecutiveHits    int
+	HistoryValues      []MetricDataPoint
+	LastEvaluatedTime  time.Time
+	LastNotifiedTime   time.Time
+	ResolvedTime       time.Time
 }
 
 type RuleState struct {
@@ -136,6 +138,7 @@ type AlertRule struct {
 	SilentWindows     []SilentWindow
 	Escalations       []EscalationRule
 	Notifiers         []string
+	LevelNotifiers    map[AlertLevel][]string
 }
 
 type EngineConfig struct {

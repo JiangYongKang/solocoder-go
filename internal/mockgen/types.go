@@ -138,15 +138,22 @@ func (m *Mock) Verify() error {
 	defer m.mu.Unlock()
 
 	if len(m.unmatchedCalls) > 0 {
-		return fmt.Errorf("%w: %d unmatched calls", ErrNoMatchingExpectation, len(m.unmatchedCalls))
+		var details string
+		for i, call := range m.unmatchedCalls {
+			if i > 0 {
+				details += "; "
+			}
+			details += fmt.Sprintf("method=%q args=%v", call.MethodName, call.Args)
+		}
+		return fmt.Errorf("%w: %d unmatched calls [%s]",
+			ErrNoMatchingExpectation, len(m.unmatchedCalls), details)
 	}
 
-	for methodName, exps := range m.expectations {
+	for _, exps := range m.expectations {
 		for _, exp := range exps {
 			if err := exp.Verify(); err != nil {
 				return err
 			}
-			_ = methodName
 		}
 	}
 
@@ -168,7 +175,7 @@ func (m *Mock) VerifyVerbose() string {
 			if exps, ok := m.expectations[call.MethodName]; ok && len(exps) > 0 {
 				report += fmt.Sprintf("     Registered expectations for this method (%d):\n", len(exps))
 				for j, exp := range exps {
-					report += fmt.Sprintf("       %d. matchers: %d, calls: %d\n", j+1, len(exp.argMatchers), exp.callCount)
+					report += fmt.Sprintf("       %d. matchers: %d, calls: %d\n", j+1, len(exp.argMatchers), exp.CallCount())
 				}
 			} else {
 				report += "     No registered expectations for this method\n"

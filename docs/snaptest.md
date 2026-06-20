@@ -8,12 +8,13 @@
 4. [快照文件格式与存储](#4-快照文件格式与存储)
 5. [Diff 算法原理](#5-diff-算法原理)
 6. [差异展示格式说明](#6-差异展示格式说明)
-7. [快照更新机制](#7-快照更新机制)
-8. [使用示例](#8-使用示例)
-9. [错误定义](#9-错误定义)
-10. [配置说明](#10-配置说明)
-11. [安全防护](#11-安全防护)
-12. [最佳实践](#12-最佳实践)
+7. [快照创建与更新机制](#7-快照创建与更新机制)
+8. [内容归一化规则](#8-内容归一化规则)
+9. [使用示例](#9-使用示例)
+10. [错误定义](#10-错误定义)
+11. [配置说明](#11-配置说明)
+12. [安全防护](#12-安全防护)
+13. [最佳实践](#13-最佳实践)
 
 ---
 
@@ -27,8 +28,8 @@
 - 支持任意可 JSON 序列化的数据结构
 - 快照文件使用人类可读的格式化 JSON 文本存储
 - 测试运行时自动进行逐行文本比对
-- 比对不一致时输出结构化的差异报告
-- 提供显式的快照更新模式，避免意外覆盖
+- 比对不一致时输出并排格式的差异报告
+- 提供显式的快照创建与更新机制，避免意外覆盖
 - 路径遍历防护，确保快照文件仅写入指定目录
 
 ---
@@ -39,14 +40,14 @@
 |------|------|
 | 数据序列化 | 将任意数据结构序列化为格式化 JSON 文本（2 空格缩进，禁用 HTML 转义） |
 | 快照文件读写 | 按测试用例名称将快照写入 `__snapshots__/` 目录，文件扩展名为 `.snap` |
-| 自动快照创建 | 首次运行时自动创建快照文件，无需手动初始化 |
+| 快照创建 | 需显式调用 `Update()` 或启用更新模式创建快照，不会自动创建 |
 | 逐行文本比对 | 基于 LCS（最长公共子序列）算法进行行级差异计算 |
-| 差异可视化 | 以并排格式展示差异，删除行/新增行分别以 `-`/`+` 前缀标记 |
+| 差异可视化 | 以并排（side-by-side）格式展示差异，四种类别：相同、删除、新增、修改 |
 | 上下文保留 | 差异报告默认保留变更行前后各 3 行的上下文，支持自定义 |
 | 快照更新模式 | 支持通过配置或环境变量 `SNAPTEST_UPDATE` 触发快照覆写 |
 | 路径安全 | 对快照名称进行路径遍历检测，防止写入快照目录之外 |
 | 便捷断言函数 | 提供 `Assert()` 包装函数，与 Go 标准 testing 框架无缝集成 |
-| 换行符归一化 | 自动将 `\r\n` 转换为 `\n`，消除跨平台差异 |
+| 换行符归一化 | 自动将 `\r\n` 转换为 `\n`，保留尾部空行，消除跨平台差异 |
 
 ---
 
@@ -66,7 +67,7 @@ type Matcher struct {
 - 管理快照目录配置与更新模式
 - 提供 `Serialize()` 序列化入口
 - 实现 `Match()` 核心比对逻辑
-- 实现 `Update()` 显式快照更新
+- 实现 `Update()` 显式快照创建/更新
 - 实现 `Assert()` 测试断言封装
 - 内部调用 `Diff()` 算法与 `Format()` 差异格式化
 
@@ -94,23 +95,25 @@ type Config struct {
 
 ### 3.3 DiffLine
 
-表示差异比对中的单行结果。
+表示差异比对中的单行结果，采用并排结构，同时存储左右两侧内容。
 
 ```go
 type DiffLine struct {
     Type     DiffType
     LeftNum  int
     RightNum int
-    Content  string
+    Left     string
+    Right    string
 }
 ```
 
 | 字段 | 说明 |
 |------|------|
-| `Type` | 行类型：`DiffSame`（相同）、`DiffRemoved`（删除）、`DiffAdded`（新增） |
-| `LeftNum` | 在期望（快照）中的行号，仅 `DiffSame` 和 `DiffRemoved` 有效 |
-| `RightNum` | 在实际（当前输出）中的行号，仅 `DiffSame` 和 `DiffAdded` 有效 |
-| `Content` | 行的文本内容 |
+| `Type` | 行类型：`DiffSame`（相同）、`DiffRemoved`（删除）、`DiffAdded`（新增）、`DiffModified`（修改） |
+| `LeftNum` | 在期望（快照）中的行号 |
+| `RightNum` | 在实际（当前输出）中的行号 |
+| `Left` | 左侧（快照）行的文本内容 |
+| `Right` | 右侧（当前输出）行的文本内容 |
 
 ### 3.4 DiffResult
 
@@ -122,13 +125,14 @@ type DiffResult struct {
     TotalSame    int
     TotalAdded   int
     TotalRemoved int
+    TotalModified int
 }
 ```
 
 **职责**:
 - 存储逐行差异详情
 - 通过 `Matches()` 判断是否完全一致
-- 通过 `Format(contextLines int)` 生成人类可读的差异报告
+- 通过 `Format(contextLines int)` 生成人类可读的并排差异报告
 
 ### 3.5 DiffType
 
@@ -139,8 +143,29 @@ const (
     DiffSame DiffType = iota
     DiffRemoved
     DiffAdded
+    DiffModified
 )
 ```
+
+### 3.6 MismatchError
+
+快照不匹配错误，包装了详细的差异信息。
+
+```go
+type MismatchError struct {
+    Name   string
+    Diff   DiffResult
+    Report string
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `Name` | 快照名称 |
+| `Diff` | 完整的差异结果对象 |
+| `Report` | 格式化后的差异报告文本 |
+
+该错误实现了 `Unwrap()` 方法，可通过 `errors.Is(err, ErrSnapshotMismatch)` 判断错误类型。
 
 ---
 
@@ -169,20 +194,17 @@ const (
     1,
     2,
     3
-  ],
-  "Tags": [
-    "a",
-    "b"
   ]
 }
+
 ```
 
 ### 4.3 归一化规则
 
-读取和写入快照时会进行以下归一化处理：
+读取和写入快照时会进行以下归一化处理（详见 [第 8 节](#8-内容归一化规则)：
 1. 将 Windows 换行符 `\r\n` 统一转换为 `\n`
-2. 去除文件末尾多余的空行
-3. 写入时自动追加单个末尾换行符
+2. 保留所有尾部空行，不做裁剪
+3. 写入时自动确保文件以单个换行符结尾（如果原内容无末尾换行时追加）
 
 ---
 
@@ -197,7 +219,7 @@ const (
 1. 将期望文本（快照）和实际文本（当前输出）分别按行拆分为数组 `A` 和 `B`
 2. 构建动态规划表 `dp[i][j]`，表示 `A[i:]` 与 `B[j:]` 的 LCS 长度
 3. 从 `dp[0][0]` 开始回溯，提取出所有匹配的行对
-4. 在匹配行对之间填充删除行（来自 `A`）和新增行（来自 `B`）
+4. 在匹配行对之间填充删除行（来自 `A`）、新增行（来自 `B`）或修改行（两侧都有）
 
 ### 5.3 动态规划递推式
 
@@ -219,29 +241,46 @@ dp[i][j] = max(dp[i+1][j], dp[i][j+1]),   当 A[i] != B[j]
 
 ### 6.1 整体结构
 
-差异报告遵循类 unified diff 格式，由以下部分组成：
+差异报告采用**并排（side-by-side）**格式，左右两列分别展示快照内容和当前输出内容，中间以 `|` 分隔：
 
 ```
---- Expected (snapshot)
-+++ Actual (current output)
-@@ -<起始行号> +<起始行号> @@
-  <左行号> <右行号> | <相同行内容>
-- <左行号>      | <删除行内容>
-+      <右行号> | <新增行内容>
-  ...
+Expected (snapshot)                                           | Actual (current output)
+------------------------------------------------------------+------------------------------------------------------------
+    1 line1                                                  |    1 line1
+~   2 old_line                                              |    2 new_line
+    3 line3                                                 |    3 line3
+-   4 only_in_snapshot                                        |
++                                                           |    4 only_in_actual
 
-Summary: <N> same, <N> removed, <N> added
+Summary: 2 same, 1 removed, 1 added, 1 modified
 ```
 
-### 6.2 前缀标记说明
+### 6.2 行类型标记说明
 
-| 前缀 | 含义 | 行号显示 |
-|------|------|---------|
-| `  `（双空格） | 相同行，同时存在于快照和当前输出中 | 同时显示左右行号 |
-| `-` | 删除行，仅存在于快照中，当前输出中已移除 | 仅显示左侧（快照）行号，右侧以空格填充 |
-| `+` | 新增行，仅存在于当前输出中，快照中不存在 | 仅显示右侧（当前）行号，左侧以空格填充 |
+每行开头的符号表示该行的差异类型：
 
-### 6.3 示例
+| 符号 | 类型 | 含义 | 左右内容 |
+|------|------|------|---------|
+| ` `（空格） | `DiffSame` | 相同行 | 左右两侧都有，内容一致 |
+| `-` | `DiffRemoved` | 删除行 | 仅左侧（快照）有内容，右侧为空 |
+| `+` | `DiffAdded` | 新增行 | 仅右侧（当前输出）有内容，左侧为空 |
+| `~` | `DiffModified` | 修改行 | 左右两侧都有内容，但内容不同 |
+
+### 6.3 格式详解
+
+每一行的格式为：
+
+```
+<符号> <左行号> <左内容> | <右行号> <右内容>
+```
+
+- 行号占 4 个字符宽度，右对齐
+- 内容列默认宽度为 60 字符宽度，超出时显示省略号 `...`
+- 相同行和修改行左右都有行号
+- 删除行只有左行号，右行号位置为空
+- 新增行只有右行号，左行号位置为空
+
+### 6.4 完整示例
 
 假设有以下快照内容：
 
@@ -259,43 +298,67 @@ line5
 line1
 line2_modified
 line3
-line4
-line5_new
+line5
+line6_new
 ```
 
 差异报告输出：
 
 ```
---- Expected (snapshot)
-+++ Actual (current output)
-@@ -1 +1 @@
-     1    1 | line1
--    2      | line2
-+         2 | line2_modified
-     3    3 | line3
-     4    4 | line4
--    5      | line5
-+         5 | line5_new
+Expected (snapshot)                                           | Actual (current output)
+------------------------------------------------------------+------------------------------------------------------------
+    1 line1                                                  |    1 line1
+~   2 line2                                                  |    2 line2_modified
+    3 line3                                                 |    3 line3
+-   4 line4                                                  |
+    5 line5                                                 |    4 line5
++                                                           |    5 line6_new
 
-Summary: 3 same, 2 removed, 2 added
+Summary: 3 same, 1 removed, 1 added, 1 modified
 ```
 
-### 6.4 上下文折叠
+### 6.5 上下文折叠
 
 当差异较大时，默认只显示变更行前后各 3 行上下文，未变化的大段内容以 `...` 标记折叠。可通过 `Config.ContextLines` 自定义上下文行数。
 
 ---
 
-## 7. 快照更新机制
+## 7. 快照创建与更新机制
 
-### 7.1 更新模式触发方式
+### 7.1 快照创建
 
-快照更新通过以下两种方式触发（优先级从高到低）：
+快照**不会**在首次运行时自动创建。必须通过以下方式显式创建：
+
+1. **调用 `Update()` 方法**：直接创建或覆写快照文件
+2. **启用更新模式调用 `Match()`**：在更新模式下，`Match()` 会直接写入快照
+
+### 7.2 快照比对流程
+
+正常比对模式下的 `Match()` 方法的执行流程：
+
+```
+开始
+  ↓
+序列化当前输出
+  ↓
+读取快照文件 ── 不存在 ──→ 返回 ErrSnapshotNotFound 错误
+  ↓ 存在
+逐行比对快照与当前输出
+  ↓
+完全一致？ ── 是 ──→ 返回成功 (ok=true, report="", err=nil)
+  ↓ 否
+生成并排差异报告
+  ↓
+返回失败 + MismatchError 错误
+  (ok=false, report=差异报告, err=MismatchError)
+```
+
+### 7.3 更新模式
+
+更新模式通过以下两种方式触发（优先级从高到低）：
 
 1. **配置显式指定**: `NewWithConfig(Config{UpdateMode: true})`
 2. **环境变量**: 设置 `SNAPTEST_UPDATE=1`（或 `true`、`yes`，大小写不敏感）后调用 `New()`
-
-### 7.2 更新模式行为
 
 在更新模式下，`Match()` 和 `Assert()` 的行为发生变化：
 - 跳过与已有快照的比对
@@ -303,17 +366,47 @@ Summary: 3 same, 2 removed, 2 added
 - 始终返回成功（除非发生 IO 错误）
 - 不产生差异报告
 
-### 7.3 安全性说明
+### 7.4 安全性说明
 
-- 快照文件**只有**在更新模式显式启用时才会被覆写
-- 正常比对模式下，即使快照不存在也只会自动创建，不会修改已有快照
+- 快照文件**只有**在更新模式显式启用时才会被创建或覆写
+- 正常比对模式下，快照不存在时直接返回错误，不会创建或修改任何文件
 - 强烈建议将快照文件纳入版本控制，以便审查变更
 
 ---
 
-## 8. 使用示例
+## 8. 内容归一化规则
 
-### 8.1 基本使用（Assert 断言）
+### 8.1 换行符归一化
+
+所有文本在进入 Diff 算法前都会经过 `normalizeSnapshotContent()` 处理：
+
+1. **Windows 换行符转换**：将所有 `\r\n` 统一替换为 `\n`
+2. **保留尾部空行**：**不**裁剪尾部的空行，完整保留原始内容中的所有换行符
+
+### 8.2 设计原则
+
+- 跨平台兼容：消除 Windows 和 Unix 换行符差异不会导致误报
+- 数据完整性：尾部空行是内容的一部分，不应被静默丢弃
+- 可预测性：用户输出是什么，快照就保存什么，不会意外裁剪
+
+### 8.3 写入时的处理
+
+写入快照文件时：
+- 已包含换行统一为 `\n`
+- 如果内容不以换行符结尾，自动追加一个 `\n`
+- 如果内容已有换行符结尾，保持不变
+
+### 8.4 读取时的处理
+
+读取快照文件时：
+- 将 `\r\n` 转换为 `\n`
+- 保留所有原始换行符不变
+
+---
+
+## 9. 使用示例
+
+### 9.1 基本使用（Assert 断言）
 
 ```go
 package mypackage
@@ -324,14 +417,36 @@ import (
 )
 
 func TestMyFeature(t *testing.T) {
+    // 首次运行前需要先创建快照
+    // snaptest.Update("TestMyFeature/basic", ComplexFunction())
+
     result := ComplexFunction()
     snaptest.Assert(t, "TestMyFeature/basic", result)
 }
 ```
 
-首次运行时会自动创建快照文件，后续运行会自动比对。
+### 9.2 创建快照
 
-### 8.2 自定义配置
+```go
+func TestCreateSnapshots(t *testing.T) {
+    testCases := []struct{
+        name string
+        data interface{}
+    }{
+        {"case1", GenerateCase1()},
+        {"case2", GenerateCase2()},
+    }
+
+    m := snaptest.New()
+    for _, tc := range testCases {
+        if err := m.Update(tc.name, tc.data); err != nil {
+            t.Fatalf("create snapshot %s failed: %v", tc.name, err)
+        }
+    }
+}
+```
+
+### 9.3 自定义配置
 
 ```go
 func TestWithCustomDir(t *testing.T) {
@@ -345,7 +460,7 @@ func TestWithCustomDir(t *testing.T) {
 }
 ```
 
-### 8.3 使用 Match 获取详细信息
+### 9.4 使用 Match 获取详细信息
 
 ```go
 func TestManualCheck(t *testing.T) {
@@ -354,6 +469,10 @@ func TestManualCheck(t *testing.T) {
 
     ok, report, err := m.Match("manual_check", data)
     if err != nil {
+        if errors.Is(err, snaptest.ErrSnapshotNotFound) {
+            t.Skip("snapshot not found, skip test")
+            return
+        }
         t.Fatal(err)
     }
     if !ok {
@@ -363,7 +482,7 @@ func TestManualCheck(t *testing.T) {
 }
 ```
 
-### 8.4 显式更新快照
+### 9.5 显式更新快照
 
 ```go
 func TestUpdateSnapshots(t *testing.T) {
@@ -387,7 +506,7 @@ func TestUpdateSnapshots(t *testing.T) {
 }
 ```
 
-### 8.5 通过环境变量批量更新
+### 9.6 通过环境变量批量更新
 
 在命令行运行时通过环境变量触发更新：
 
@@ -399,7 +518,7 @@ $env:SNAPTEST_UPDATE="1"; go test ./... -v
 SNAPTEST_UPDATE=1 go test ./... -v
 ```
 
-### 8.6 序列化独立使用
+### 9.7 序列化独立使用
 
 ```go
 import "solocoder-go/internal/snaptest"
@@ -428,7 +547,7 @@ fmt.Println(text)
 }
 ```
 
-### 8.7 Diff 功能独立使用
+### 9.8 Diff 功能独立使用
 
 ```go
 expected := "a\nb\nc"
@@ -440,24 +559,58 @@ if !diff.Matches() {
 }
 ```
 
+### 9.9 处理不匹配错误
+
+```go
+ok, report, err := m.Match("my_snapshot", data)
+if err != nil {
+    var mismatchErr *snaptest.MismatchError
+    if errors.As(err, &mismatchErr) {
+        // 快照不匹配，访问详细信息
+        fmt.Printf("快照 %q 不匹配\n", mismatchErr.Name)
+        fmt.Printf("差异详情:\n%s", mismatchErr.Report)
+        // mismatchErr.Diff 包含结构化的差异数据
+    } else if errors.Is(err, snaptest.ErrSnapshotNotFound) {
+        fmt.Println("快照不存在")
+        // 可以选择创建快照或跳过测试
+    } else {
+        // 其他错误
+    }
+}
+```
+
 ---
 
-## 9. 错误定义
+## 10. 错误定义
 
 | 错误变量 | 含义 | 触发场景 |
 |----------|------|----------|
-| `ErrSnapshotNotFound` | 快照文件不存在 | 尝试读取不存在的快照（注意：首次 `Match()` 会自动创建，不会返回此错误） |
-| `ErrSnapshotMismatch` | 快照比对不一致 | 预留常量，实际比对失败通过 `Match()` 返回值和差异报告体现 |
+| `ErrSnapshotNotFound` | 快照文件不存在 | 尝试读取不存在的快照，`Match()` 返回此错误 |
+| `ErrSnapshotMismatch` | 快照比对不一致 | 快照存在但内容不匹配，通过 `MismatchError` 包装返回 |
 | `ErrInvalidName` | 无效的快照名称 | 名称为空、包含 `..` 路径遍历、`.` 等非法值 |
 | `ErrSerialization` | 序列化失败 | 传入不可 JSON 序列化的数据类型（如包含通道、函数、循环引用等） |
 | `ErrWriteSnapshot` | 写入快照失败 | 目录创建失败、磁盘无权限、IO 错误等 |
 | `ErrReadSnapshot` | 读取快照失败 | 文件存在但无法读取（权限问题、磁盘损坏等） |
 
+### 10.1 MismatchError
+
+`MismatchError` 是 `ErrSnapshotMismatch` 的具体实现，包含详细的差异信息：
+
+```go
+type MismatchError struct {
+    Name   string      // 快照名称
+    Diff   DiffResult // 结构化差异结果
+    Report string    // 格式化的差异报告
+}
+```
+
+使用 `errors.Is(err, ErrSnapshotMismatch)` 可判断是否为不匹配错误，使用 `errors.As(err, &mismatchErr)` 可获取详细信息。
+
 ---
 
-## 10. 配置说明
+## 11. 配置说明
 
-### 10.1 默认配置
+### 11.1 默认配置
 
 `DefaultConfig()` 返回：
 
@@ -467,22 +620,22 @@ if !diff.Matches() {
 | `UpdateMode` | `false` |
 | `ContextLines` | `3` |
 
-### 10.2 配置归一化
+### 11.2 配置归一化
 
 `NewWithConfig()` 会对传入配置做以下自动修正：
 
 | 非法值 | 修正为 |
 |--------|--------|
-| `SnapshotDir == ""` | `"__snapshots__"` |
+| `SnapshotDir == ""` | `"__snapshots__` |
 | `ContextLines <= 0` | `3` |
 
 **注意**: `UpdateMode` 不会被归一化，调用方显式传入的值会被原样保留。环境变量检查仅在 `New()` 中进行。
 
 ---
 
-## 11. 安全防护
+## 12. 安全防护
 
-### 11.1 路径遍历防护
+### 12.1 路径遍历防护
 
 模块对快照名称进行严格校验，防止通过 `../` 将快照写入或读取到配置目录之外：
 
@@ -497,15 +650,15 @@ if !diff.Matches() {
 - `".."`
 - `"."`
 
-### 11.2 自动创建目录
+### 12.2 自动创建目录
 
 写入快照时会自动调用 `os.MkdirAll()` 创建缺失的中间目录（权限 0755）。
 
 ---
 
-## 12. 最佳实践
+## 13. 最佳实践
 
-### 12.1 快照命名规范
+### 13.1 快照命名规范
 
 建议使用 `测试函数名/用例名` 的层级命名方式，便于组织：
 
@@ -525,13 +678,13 @@ __snapshots__/
     └── internal_error_500.snap
 ```
 
-### 12.2 快照版本控制
+### 13.2 快照版本控制
 
 - 将 `__snapshots__/` 目录纳入 Git 版本控制
 - 代码评审时同时审查快照变更，确保输出变化符合预期
 - 不要在 `.gitignore` 中排除 `.snap` 文件
 
-### 12.3 更新快照工作流
+### 13.3 更新快照工作流
 
 推荐的快照更新流程：
 
@@ -541,15 +694,16 @@ __snapshots__/
 4. 使用 `git diff` 审查快照变更内容
 5. 确认无误后提交代码和快照变更
 
-### 12.4 测试稳定性注意事项
+### 13.4 测试稳定性注意事项
 
 快照测试对输出变化极为敏感，以下做法可提高测试稳定性：
 
 - **避免序列化非确定性数据**: 如时间戳、随机数、自增 ID 等，测试前应 mock 或替换为固定值
 - **排除不稳定字段**: 如果某些字段不参与比对，应在序列化前从数据结构中移除
 - **Map 顺序问题**: Go 的 `encoding/json` 会按键名排序序列化 map，通常不会有问题；如需严格顺序请使用结构体替代
+- **尾部空行**: 注意尾部空行也会参与比对，确保输出一致性
 
-### 12.5 与其他测试类型配合
+### 13.5 与其他测试类型配合
 
 快照测试适合：
 - API 响应体结构验证

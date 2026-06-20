@@ -199,6 +199,23 @@ SLA 达标判定的完整返回结果。
 
 违约事件按 `RecordedAt`（记录时间）升序存储和返回，即先发生的违约排在前面。
 
+### 违约事件查询维度
+
+模块提供三种不同维度的违约事件查询方法，以适应不同的查询场景：
+
+| 方法 | 过滤维度 | 适用场景 |
+|------|----------|----------|
+| `GetViolationEventsByRecordedAt(start, end)` | 按事件记录时间 `RecordedAt` 过滤 | 查询某段时间内**被发现**的违约事件 |
+| `GetViolationEventsByWindow(window)` | 按精确窗口精确匹配（WindowStart 和 WindowEnd 完全相等 | 查询某一具体窗口的违约 |
+| `GetViolationEventsByWindowRange(windowStart, windowEnd)` | 按窗口时间范围（违约窗口与查询范围有重叠） | 查询与某段时间范围内**发生**的违约事件 |
+
+**时间过滤原则：**
+- **按记录时间查询**：基于违约事件的 `RecordedAt` 字段。适合审计"什么时候发现了问题"。
+- **按窗口时间查询**：基于违约事件的 `WindowStart` / `WindowEnd` 字段。适合审计"哪个时间段的服务不达标"。
+- **窗口范围匹配**：违约窗口的 `WindowStart ≤ queryEnd` 且 `WindowEnd ≥ queryStart`，即两个时间段有重叠即匹配。适合按业务窗口维度统计 SLA 达标率。
+
+> 注意：`GetViolationEventsInRange(start, end)` 是 `GetViolationEventsByRecordedAt` 的向后兼容别名，按记录时间过滤。
+
 ## 使用示例
 
 ### 基本使用
@@ -336,18 +353,41 @@ sla.Reset()  // 清空所有请求记录和违约事件
 | ErrNoLatencyData | 时间窗口内没有延迟数据 |
 | ErrInvalidTimeRange | 时间窗口起始时间不早于结束时间 |
 | ErrInvalidDecimalPlaces | 指定的小数位数为负数 |
-| ErrInvalidPercentile | 百分位值超出有效范围（内部使用） |
-| ErrEmptyErrorKey | 错误码为空（内部使用） |
+| ErrInvalidPercentile | 百分位值超出有效范围 (0, 100]（CalculatePercentile 方法） |
+| ErrEmptyErrorKey | 失败请求的错误码为空（RecordRequest/RecordRequests 校验） |
 | ErrNilSLAConfig | SLA 配置为 nil |
 | ErrWindowNotFound | 窗口未找到（预留） |
 
-## 并发安全
+## 并发安全与数据一致性
 
 `SLAMetrics` 的所有公共方法均支持并发安全调用：
 
 - 写入操作（RecordRequest、RecordRequests、Reset、EvaluateSLA）使用写锁
 - 读取操作（CalculateAvailability、CalculateLatencyPercentiles、CalculateErrorRate、GetViolationEvents 等）使用读锁
 - 读写锁允许多个读操作并发执行，写操作与所有其他操作互斥
+
+### SLA 评估的数据一致性保证
+
+`EvaluateSLA` 方法提供**快照一致性**保证：
+
+1. **统一数据快照**：评估开始时通过单次读锁获取所有请求记录的快照，然后释放锁。可用性、延迟百分位、错误率三项指标均基于同一份快照数据计算，避免了并发写入导致各指标基于不同时间点数据子集的不一致问题。
+
+2. **计算逻辑纯函数化**：内部计算逻辑（calculateAvailability、calculateErrorRate、computePercentiles）均为纯函数，不依赖共享状态，确保同一输入始终产生同一输出。
+
+3. **版本号（Generation）机制**：
+   - 每次调用 `Reset()` 时，内部版本号 `generation` 递增
+   - `EvaluateSLA` 在计算完成后、记录违约事件前检查版本号是否变化
+   - 如果版本号已变化（说明期间发生了 Reset），则丢弃本次违约记录，防止过期数据污染已重置的数据集
+   - 此机制有效避免了"计算完成后到记录违约之间"的竞态窗口
+
+### 并发场景下的行为保证
+
+| 并发场景 | 行为保证 |
+|----------|----------|
+| 多次 RecordRequest 并发 | 所有请求都会被记录，顺序不保证 |
+| 读操作并发 | 多个读操作可同时进行，互不阻塞 |
+| EvaluateSLA 与 Reset 并发 | 违约事件不会污染重置后的数据集 |
+| 读写混合 | 读写锁保证读操作看到一致的数据 |
 
 ## 测试
 
@@ -359,9 +399,13 @@ go test ./internal/slametrics/ -v
 
 测试覆盖范围：
 - 可用性计算：正常、100%、0%、无请求、小数位精度、时间过滤、边界校验
-- 百分位计算：最近秩算法验证、所有结果均来自数据集、空数据、单元素、边界值
+- 百分位计算：最近秩算法验证、所有结果均来自数据集、空数据、单元素、边界值、任意百分位计算
 - 错误率统计：多类型错误、无错误、空错误键处理、无请求、边界校验
 - SLA 判定：全达标、可用性违约、延迟违约、错误率违约、多指标同时违约、阈值边界（等于目标值不违约）
-- 违约事件：去重验证、排序验证、范围查询、字段完整性
-- 并发安全：多 goroutine 同时读写
+- SLA 数据一致性：快照一致性验证（三项指标基于同一数据集）
+- 违约事件：去重验证、排序验证、多维度查询（按记录时间、按窗口、按窗口范围）、字段完整性
+- 并发安全：多 goroutine 同时读写、EvaluateSLA 与 Reset 竞态保护
+- 版本号机制：Reset 递增验证、stale 违约丢弃验证
+- 输入校验：失败请求空错误码、无效百分位值
 - 数据重置：清空请求记录和违约事件
+- 纯函数验证：计算逻辑纯函数化测试

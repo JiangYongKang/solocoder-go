@@ -25,10 +25,8 @@ func (r *TextReporter) Report(stats []GroupStatistics) string {
 		sb.WriteString(fmt.Sprintf("  Min Duration:   %v\n", s.MinDuration))
 		sb.WriteString(fmt.Sprintf("  Max Duration:   %v\n", s.MaxDuration))
 		sb.WriteString(fmt.Sprintf("  Std Dev:        %v\n", s.StdDevDuration))
-		sb.WriteString(fmt.Sprintf("  Mean Allocs:    %d bytes/op\n", s.MeanAllocBytes))
-		sb.WriteString(fmt.Sprintf("  Mean Alloc Cnt: %d allocs/op\n", s.MeanAllocCount))
-		sb.WriteString(fmt.Sprintf("  Allocs/Op:      %.2f\n", s.AllocsPerOp))
-		sb.WriteString(fmt.Sprintf("  Bytes/Op:       %.2f\n\n", s.BytesPerOp))
+		sb.WriteString(fmt.Sprintf("  Mean Alloc Bytes: %d bytes/op\n", s.MeanAllocBytes))
+		sb.WriteString(fmt.Sprintf("  Mean Alloc Count: %d allocs/op\n\n", s.MeanAllocCount))
 	}
 
 	return sb.String()
@@ -41,24 +39,36 @@ func (r *TextReporter) ReportComparison(report ComparisonReport) string {
 	sb.WriteString(fmt.Sprintf("Baseline: %s\n", report.Baseline))
 	sb.WriteString(fmt.Sprintf("Generated at: %s\n\n", report.GeneratedAt.Format(time.RFC3339)))
 
-	sb.WriteString(fmt.Sprintf("%-20s %-20s %-15s %-15s %s\n",
-		"Group", "Mean Duration", "Alloc Bytes", "Alloc Count", "vs Baseline"))
-	sb.WriteString(strings.Repeat("-", 80) + "\n")
+	sb.WriteString(fmt.Sprintf("%-20s %-18s %-15s %-15s %-12s %-12s\n",
+		"Group", "Mean Duration", "Duration Δ%", "Alloc Bytes", "Bytes Δ%", "Allocs Δ%"))
+	sb.WriteString(strings.Repeat("-", 95) + "\n")
 
 	for _, item := range report.Items {
-		var marker string
+		var durMarker, bytesMarker, allocsMarker string
+
 		if item.VsBaselinePct > 0 {
-			marker = " slower"
+			durMarker = " ↑"
 		} else if item.VsBaselinePct < 0 {
-			marker = " faster"
+			durMarker = " ↓"
 		}
-		sb.WriteString(fmt.Sprintf("%-20s %-20v %-15d %-15d %+.2f%%%s\n",
+		if item.AllocBytesPct > 0 {
+			bytesMarker = " ↑"
+		} else if item.AllocBytesPct < 0 {
+			bytesMarker = " ↓"
+		}
+		if item.AllocCountPct > 0 {
+			allocsMarker = " ↑"
+		} else if item.AllocCountPct < 0 {
+			allocsMarker = " ↓"
+		}
+
+		sb.WriteString(fmt.Sprintf("%-20s %-18v %-15s %-15s %-12s %-12s\n",
 			item.Group,
 			item.MeanDuration,
-			item.MeanAllocBytes,
-			item.MeanAllocCount,
-			item.VsBaselinePct,
-			marker))
+			fmt.Sprintf("%+.2f%%%s", item.VsBaselinePct, durMarker),
+			fmt.Sprintf("%d", item.MeanAllocBytes),
+			fmt.Sprintf("%+.2f%%%s", item.AllocBytesPct, bytesMarker),
+			fmt.Sprintf("%+.2f%%%s", item.AllocCountPct, allocsMarker)))
 	}
 
 	return sb.String()

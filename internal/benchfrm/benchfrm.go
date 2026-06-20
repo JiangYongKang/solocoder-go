@@ -2,6 +2,7 @@ package benchfrm
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"runtime"
 	"sync"
@@ -84,11 +85,15 @@ func (b *benchmarker) runGroup(group *BenchmarkGroup) (GroupStatistics, error) {
 	runResults := make([]RunResult, 0, cfg.Iterations)
 
 	for i := 0; i < cfg.Iterations; i++ {
-		result := b.runSingle(group, cfg.CollectMemory)
+		result := b.runSingleWithTimeout(group, cfg.CollectMemory, cfg.Timeout)
 		if result.Error != nil {
 			return GroupStatistics{}, result.Error
 		}
 		runResults = append(runResults, result)
+	}
+
+	if len(runResults) == 0 {
+		return GroupStatistics{}, ErrGroupEmptyResult
 	}
 
 	return calculateStatistics(group.name, runResults), nil
@@ -187,8 +192,6 @@ func calculateStatistics(name string, results []RunResult) GroupStatistics {
 		StdDevDuration: stdDev,
 		MeanAllocBytes: meanAllocBytes,
 		MeanAllocCount: meanAllocCount,
-		AllocsPerOp:   float64(meanAllocCount),
-		BytesPerOp:     float64(meanAllocBytes),
 	}
 }
 
@@ -216,16 +219,26 @@ func (b *benchmarker) Compare(baseline string) (ComparisonReport, error) {
 
 	for _, stats := range b.lastResults {
 		var vsBaselinePct float64
+		var allocBytesPct, allocCountPct float64
+
 		if baselineStats.MeanDuration > 0 {
 			vsBaselinePct = float64(stats.MeanDuration-baselineStats.MeanDuration) / float64(baselineStats.MeanDuration) * 100
 		}
+		if baselineStats.MeanAllocBytes > 0 {
+			allocBytesPct = float64(stats.MeanAllocBytes-baselineStats.MeanAllocBytes) / float64(baselineStats.MeanAllocBytes) * 100
+		}
+		if baselineStats.MeanAllocCount > 0 {
+			allocCountPct = float64(stats.MeanAllocCount-baselineStats.MeanAllocCount) / float64(baselineStats.MeanAllocCount) * 100
+		}
 
 		items = append(items, ComparisonItem{
-			Group:          stats.Name,
-			MeanDuration:   stats.MeanDuration,
-			MeanAllocBytes: stats.MeanAllocBytes,
-			MeanAllocCount: stats.MeanAllocCount,
-			VsBaselinePct: vsBaselinePct,
+			Group:            stats.Name,
+			MeanDuration:     stats.MeanDuration,
+			MeanAllocBytes:   stats.MeanAllocBytes,
+			MeanAllocCount:   stats.MeanAllocCount,
+			VsBaselinePct:   vsBaselinePct,
+			AllocBytesPct:    allocBytesPct,
+			AllocCountPct:    allocCountPct,
 		})
 	}
 
@@ -261,7 +274,7 @@ func (b *benchmarker) CheckRegression(thresholdPct float64) (RegressionReport, e
 			return RegressionReport{}, err
 		}
 		if !found {
-			continue
+			return RegressionReport{}, fmt.Errorf("%w: %s", ErrBaselineNotFound, current.Name)
 		}
 
 		durationCheck := checkMetric("MeanDuration",

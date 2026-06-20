@@ -54,16 +54,17 @@ type Sampler interface {
 
 ### SpanTree
 
-Span 调用树，用于管理和遍历 Span 之间的父子关系。
+Span 调用树，用于管理和遍历 Span 之间的父子关系。同一棵 SpanTree 中只允许包含相同 TraceID 的 Span，确保追踪链路的数据一致性。
 
 **方法**：
-- `AddSpan(span *Span) error`：向树中添加 Span 节点
+- `AddSpan(span *Span) error`：向树中添加 Span 节点（含 TraceID 一致性校验）
 - `GetSpan(spanID string) (*Span, error)`：根据 SpanID 获取 Span
 - `GetChildren(parentSpanID string) ([]*Span, error)`：获取指定 Span 的直接子节点
 - `GetRoots() []*Span`：获取所有根节点
 - `GetSubtree(rootSpanID string) ([]*Span, error)`：获取以指定 Span 为根的子树（包含根节点）
 - `AllSpans() []*Span`：获取树中所有 Span
 - `SpanCount() int`：获取树中 Span 总数
+- `TraceID() string`：获取该树绑定的 TraceID
 
 ### TraceContext
 
@@ -72,17 +73,70 @@ Span 调用树，用于管理和遍历 Span 之间的父子关系。
 **字段说明**：
 - `TraceID`：全局唯一的追踪标识
 - `SpanID`：当前 Span 标识
-- `ParentSpanID`：父 Span 标识
+- `ParentSpanID`：父 Span 标识。从 W3C Trace Context 提取时，该字段被设为请求头中 `parent-id` 的值，表示上游调用方的 SpanID
 - `Sampled`：采样标志
 
 **方法**：
 - `String() string`：格式化为 W3C Trace Parent 字符串
 
+## SpanTree 的数据一致性约束
+
+### TraceID 一致性约束
+
+SpanTree 在添加 Span 时会进行 TraceID 一致性校验，确保同一棵树中的所有 Span 属于同一条追踪链路：
+
+1. **首个 Span 设置 TraceID**：当向空树添加第一个 Span 时，树的 `traceID` 字段被设置为该 Span 的 TraceID
+2. **后续 Span 必须匹配**：后续添加的 Span 的 TraceID 必须与树已有的 TraceID 一致，否则返回 `ErrTraceIDMismatch` 错误
+3. **防止链路混入**：该约束防止不同追踪链路的 Span 被错误地混入同一棵树，保证数据完整性和查询正确性
+
+```go
+tree := tracectx.NewSpanTree()
+span1 := tracectx.NewSpan("trace-aaa", "span1", "", "root", true)
+tree.AddSpan(span1)  // OK, tree.traceID = "trace-aaa"
+
+span2 := tracectx.NewSpan("trace-bbb", "span2", "", "root", true)
+err := tree.AddSpan(span2)  // 返回 ErrTraceIDMismatch
+```
+
+### SpanID 唯一性约束
+
+同一棵树中不允许存在相同 SpanID 的 Span，添加重复 SpanID 会返回 `ErrDuplicateSpanID` 错误。
+
+## SpanTree 的查询性能特性
+
+### 内部数据结构
+
+SpanTree 内部维护了三个索引结构：
+
+1. **`spans map[string]*Span`**：SpanID → Span 的哈希表，支持 O(1) 的按 SpanID 查找
+2. **`children map[string][]*Span`**：ParentSpanID → 子 Span 列表的哈希表，支持 O(1) 的直接子节点查找
+3. **`roots []*Span`**：根节点列表，存储所有 ParentSpanID 为空的 Span
+
+### 查询复杂度
+
+| 操作 | 复杂度 | 说明 |
+|------|--------|------|
+| `AddSpan` | O(1) | 哈希表插入 + children 索引更新 |
+| `GetSpan` | O(1) | 哈希表查找 |
+| `GetChildren` | O(k) | k 为该节点的子节点数量，哈希表直接定位 |
+| `GetRoots` | O(r) | r 为根节点数量，直接复制切片 |
+| `GetSubtree` | O(n) | n 为子树节点总数，递归遍历 children 索引 |
+| `SpanCount` | O(1) | 直接返回 map 长度 |
+| `TraceID` | O(1) | 直接返回字段值 |
+
+### 性能优化说明
+
+`GetChildren` 和 `GetSubtree` 通过 `children` 哈希索引实现了 O(1) 的子节点定位，避免了旧版全量遍历所有 Span 的 O(N) 扫描。在节点数量较多的场景下（数千个 Span），性能提升显著。`GetSubtree` 的递归遍历仅访问子树内的节点，不遍历树的其他部分。
+
+### 并发安全
+
+SpanTree 使用 `sync.RWMutex` 读写锁保证并发安全，支持多 goroutine 同时读取和互斥写入。`GetChildren` 返回的是子节点切片的副本，修改返回值不会影响内部数据结构。
+
 ## Span 树的结构与遍历
 
 ### 树结构
 
-SpanTree 内部使用 `map[string]*Span` 存储所有 Span，并维护一个根节点列表 `roots`。每个 Span 通过 `ParentSpanID` 字段建立父子关系。
+每个 Span 通过 `ParentSpanID` 字段建立父子关系。
 
 ```
 root (ParentSpanID = "")
@@ -98,10 +152,6 @@ root (ParentSpanID = "")
 2. **获取子树**：使用 `GetSubtree(rootSpanID)` 递归获取以指定节点为根的所有后代节点（包含根节点）
 3. **获取所有根节点**：使用 `GetRoots()` 获取所有没有父节点的 Span
 4. **获取所有节点**：使用 `AllSpans()` 获取树中的所有 Span
-
-### 并发安全
-
-SpanTree 使用 `sync.RWMutex` 读写锁保证并发安全，支持多 goroutine 同时读取和互斥写入。
 
 ## 使用示例
 
@@ -133,9 +183,12 @@ if err != nil {
 ```go
 tree := tracectx.NewSpanTree()
 
-// 添加 Span
+// 添加 Span（自动校验 TraceID 一致性）
 tree.AddSpan(rootSpan)
 tree.AddSpan(childSpan)
+
+// 查询树绑定的 TraceID
+fmt.Println(tree.TraceID())
 
 // 获取子节点
 children, err := tree.GetChildren(rootSpan.SpanID)
@@ -169,6 +222,9 @@ ctx, err := tracectx.ExtractTraceContext(headers)
 if err != nil {
     // 处理错误，可能需要创建新的根上下文
 }
+// ctx.ParentSpanID 被设为上游调用方的 SpanID
+// 后续通过 NewChildContext(ctx, name) 创建子上下文时，
+// 子 Span 的 ParentSpanID 将自动指向 ctx.SpanID（即上游 Span）
 ```
 
 ### 6. 使用概率采样
@@ -205,9 +261,11 @@ headers := tracectx.InjectTraceContext(childCtx)
 
 // 服务 B：提取上下文
 extractedCtx, _ := tracectx.ExtractTraceContext(headers)
+// extractedCtx.ParentSpanID == childCtx.SpanID (上游调用方的 SpanID)
 
 // 服务 B 调用服务 C
 grandchildCtx, grandchildSpan, _ := tracectx.NewChildContext(extractedCtx, "service-c")
+// grandchildSpan.ParentSpanID == extractedCtx.SpanID == childCtx.SpanID
 tree.AddSpan(grandchildSpan)
 ```
 
@@ -223,10 +281,27 @@ traceparent: <version>-<trace-id>-<parent-id>-<trace-flags>
 **字段说明**：
 - `version`：版本号，固定为 `00`（2 个十六进制字符）
 - `trace-id`：TraceID，16 字节（32 个十六进制字符）
-- `parent-id`：SpanID，8 字节（16 个十六进制字符）
+- `parent-id`：调用方的 SpanID，8 字节（16 个十六进制字符）。提取时该值同时设为 `TraceContext.SpanID` 和 `TraceContext.ParentSpanID`
 - `trace-flags`：标志位，1 字节（2 个十六进制字符），最低位为采样标志
+
+**ParentSpanID 传播语义**：由于 W3C `traceparent` 仅包含一个 `parent-id` 字段，提取上下文时 `ParentSpanID` 被设为 `parent-id` 的值，表示该 Span 是所有下游子 Span 的父节点。这确保了 `NewChildContext(extractedCtx, name)` 创建的子 Span 能够正确建立与上游 Span 的父子关系。
 
 **示例**：
 ```
 traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
 ```
+
+## 错误类型
+
+| 错误 | 触发场景 |
+|------|----------|
+| `ErrInvalidTraceID` | 提取时 TraceID 格式无效 |
+| `ErrInvalidSpanID` | 提取时 SpanID 格式无效 |
+| `ErrInvalidTraceParent` | traceparent 头格式错误或缺失 |
+| `ErrSpanNotFound` | 查询不存在的 Span |
+| `ErrNilSpan` | 添加 nil Span |
+| `ErrDuplicateSpanID` | 添加重复 SpanID |
+| `ErrInvalidSamplingRate` | 采样率不在 [0, 1] 范围内 |
+| `ErrEmptySpanID` | SpanID 为空 |
+| `ErrEmptyTraceID` | TraceID 为空 |
+| `ErrTraceIDMismatch` | Span 的 TraceID 与树已有的 TraceID 不一致 |

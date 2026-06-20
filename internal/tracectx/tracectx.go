@@ -33,6 +33,7 @@ var (
 	ErrInvalidSamplingRate = errors.New("tracectx: invalid sampling rate")
 	ErrEmptySpanID         = errors.New("tracectx: span id cannot be empty")
 	ErrEmptyTraceID        = errors.New("tracectx: trace id cannot be empty")
+	ErrTraceIDMismatch     = errors.New("tracectx: trace id mismatch, span belongs to a different trace")
 )
 
 type Sampler interface {
@@ -142,15 +143,18 @@ func (s *Span) IsRoot() bool {
 }
 
 type SpanTree struct {
-	mu    sync.RWMutex
-	spans map[string]*Span
-	roots []*Span
+	mu      sync.RWMutex
+	traceID string
+	spans   map[string]*Span
+	children map[string][]*Span
+	roots   []*Span
 }
 
 func NewSpanTree() *SpanTree {
 	return &SpanTree{
-		spans: make(map[string]*Span),
-		roots: make([]*Span, 0),
+		spans:   make(map[string]*Span),
+		children: make(map[string][]*Span),
+		roots:   make([]*Span, 0),
 	}
 }
 
@@ -172,13 +176,27 @@ func (t *SpanTree) AddSpan(span *Span) error {
 		return ErrDuplicateSpanID
 	}
 
+	if t.traceID == "" {
+		t.traceID = span.TraceID
+	} else if t.traceID != span.TraceID {
+		return ErrTraceIDMismatch
+	}
+
 	t.spans[span.SpanID] = span
 
 	if span.ParentSpanID == "" {
 		t.roots = append(t.roots, span)
+	} else {
+		t.children[span.ParentSpanID] = append(t.children[span.ParentSpanID], span)
 	}
 
 	return nil
+}
+
+func (t *SpanTree) TraceID() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.traceID
 }
 
 func (t *SpanTree) GetSpan(spanID string) (*Span, error) {
@@ -208,13 +226,10 @@ func (t *SpanTree) GetChildren(parentSpanID string) ([]*Span, error) {
 		return nil, ErrSpanNotFound
 	}
 
-	children := make([]*Span, 0)
-	for _, span := range t.spans {
-		if span.ParentSpanID == parentSpanID {
-			children = append(children, span)
-		}
-	}
-	return children, nil
+	children := t.children[parentSpanID]
+	result := make([]*Span, len(children))
+	copy(result, children)
+	return result, nil
 }
 
 func (t *SpanTree) GetRoots() []*Span {
@@ -247,10 +262,8 @@ func (t *SpanTree) traverseSubtree(spanID string, result *[]*Span) {
 	span := t.spans[spanID]
 	*result = append(*result, span)
 
-	for _, s := range t.spans {
-		if s.ParentSpanID == spanID {
-			t.traverseSubtree(s.SpanID, result)
-		}
+	for _, child := range t.children[spanID] {
+		t.traverseSubtree(child.SpanID, result)
 	}
 }
 
@@ -432,7 +445,7 @@ func ExtractTraceContext(headers map[string]string) (*TraceContext, error) {
 	return &TraceContext{
 		TraceID:      traceID,
 		SpanID:       parentID,
-		ParentSpanID: "",
+		ParentSpanID: parentID,
 		Sampled:      sampled,
 	}, nil
 }

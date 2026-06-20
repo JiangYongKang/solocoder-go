@@ -3,6 +3,7 @@ package perfsampler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -220,8 +221,8 @@ func TestRequestProfiler_ExportWithoutStop(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for exporting without stop")
 	}
-	if !errors.Is(err, ErrProfilerNotStarted) {
-		t.Errorf("expected ErrProfilerNotStarted, got %v", err)
+	if !errors.Is(err, ErrProfilerNotStopped) {
+		t.Errorf("expected ErrProfilerNotStopped, got %v", err)
 	}
 }
 
@@ -841,20 +842,32 @@ func TestCPUProfile_TotalTimeCalculation(t *testing.T) {
 func TestProbabilitySampler_ShortID(t *testing.T) {
 	s, _ := NewProbabilitySampler(0.5)
 
-	if !s.ShouldSample("short") {
-		t.Error("short ID with rate>0 should sample")
+	result := s.ShouldSample("short")
+	if result {
+		t.Log("short ID sampled (this is valid, depends on hash)")
+	} else {
+		t.Log("short ID not sampled (this is valid, depends on hash)")
 	}
 
 	s0, _ := NewProbabilitySampler(0.0)
 	if s0.ShouldSample("short") {
 		t.Error("short ID with rate=0 should not sample")
 	}
+
+	s1, _ := NewProbabilitySampler(1.0)
+	if !s1.ShouldSample("short") {
+		t.Error("short ID with rate=1.0 should always sample")
+	}
 }
 
 func TestProbabilitySampler_InvalidHex(t *testing.T) {
 	s, _ := NewProbabilitySampler(0.5)
-	if !s.ShouldSample("zzzzzzzzzzzzzzzz") {
-		t.Error("invalid hex with rate>0 should sample")
+
+	result := s.ShouldSample("zzzzzzzzzzzzzzzz")
+	if result {
+		t.Log("invalid hex ID sampled (this is valid, depends on hash)")
+	} else {
+		t.Log("invalid hex ID not sampled (this is valid, depends on hash)")
 	}
 }
 
@@ -1042,5 +1055,215 @@ func TestCPUProfiling_EmptyFunctionName(t *testing.T) {
 	err := p.EnterCPUFunction("")
 	if err == nil {
 		t.Error("expected error for empty function name")
+	}
+}
+
+func TestProbabilitySampler_ShortIDSampleRate(t *testing.T) {
+	s, err := NewProbabilitySampler(0.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sampledCount := 0
+	total := 20000
+
+	for i := 0; i < total; i++ {
+		shortID := fmt.Sprintf("short-%d", i)
+		if s.ShouldSample(shortID) {
+			sampledCount++
+		}
+	}
+
+	ratio := float64(sampledCount) / float64(total)
+	tolerance := 0.05
+	if ratio < 0.5-tolerance || ratio > 0.5+tolerance {
+		t.Errorf("short ID sampling ratio out of expected range [0.45, 0.55], got %v (sampled: %d/%d)",
+			ratio, sampledCount, total)
+	}
+}
+
+func TestProbabilitySampler_InvalidHexIDSampleRate(t *testing.T) {
+	s, err := NewProbabilitySampler(0.3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sampledCount := 0
+	total := 20000
+
+	for i := 0; i < total; i++ {
+		invalidHexID := fmt.Sprintf("zzzzzzzzzzzzzzzz-%d", i)
+		if s.ShouldSample(invalidHexID) {
+			sampledCount++
+		}
+	}
+
+	ratio := float64(sampledCount) / float64(total)
+	tolerance := 0.05
+	if ratio < 0.3-tolerance || ratio > 0.3+tolerance {
+		t.Errorf("invalid hex ID sampling ratio out of expected range [0.25, 0.35], got %v (sampled: %d/%d)",
+			ratio, sampledCount, total)
+	}
+}
+
+func TestProbabilitySampler_MixedIDSampleRate(t *testing.T) {
+	s, err := NewProbabilitySampler(0.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids := []string{
+		"a",
+		"short",
+		"zzzzzzzzzzzzzzzz",
+		"gggggggggggggggggggggggggggggggg",
+		"0123456789abcdef0123456789abcdef",
+		"user-request-12345",
+		"req-中文-id",
+		"!@#$%^&*()",
+	}
+
+	sampledCount := 0
+	total := len(ids) * 2000
+
+	for i := 0; i < 2000; i++ {
+		for _, baseID := range ids {
+			id := fmt.Sprintf("%s-%d", baseID, i)
+			if s.ShouldSample(id) {
+				sampledCount++
+			}
+		}
+	}
+
+	ratio := float64(sampledCount) / float64(total)
+	tolerance := 0.05
+	if ratio < 0.5-tolerance || ratio > 0.5+tolerance {
+		t.Errorf("mixed ID sampling ratio out of expected range [0.45, 0.55], got %v (sampled: %d/%d)",
+			ratio, sampledCount, total)
+	}
+}
+
+func TestProbabilitySampler_HashConsistency(t *testing.T) {
+	s, err := NewProbabilitySampler(0.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testIDs := []string{
+		"short-id",
+		"zzzzzzzzzzzzzzzz",
+		"valid-hex-id-0123456789abcdef",
+		"mixed-中文-chars",
+		"!@#$%^&*()",
+	}
+
+	for _, id := range testIDs {
+		result1 := s.ShouldSample(id)
+		result2 := s.ShouldSample(id)
+		result3 := s.ShouldSample(id)
+
+		if result1 != result2 || result2 != result3 {
+			t.Errorf("sampling decision not consistent for ID %q: got %v, %v, %v",
+				id, result1, result2, result3)
+		}
+	}
+}
+
+func TestProbabilitySampler_ShortIDRateZero(t *testing.T) {
+	s, _ := NewProbabilitySampler(0.0)
+
+	ids := []string{"a", "short", "zzzzzzzzzzzzzzzz", "any-id"}
+	for _, id := range ids {
+		if s.ShouldSample(id) {
+			t.Errorf("rate 0.0 should never sample, but sampled for ID %q", id)
+		}
+	}
+}
+
+func TestProbabilitySampler_ShortIDRateOne(t *testing.T) {
+	s, _ := NewProbabilitySampler(1.0)
+
+	ids := []string{"a", "short", "zzzzzzzzzzzzzzzz", "any-id"}
+	for _, id := range ids {
+		if !s.ShouldSample(id) {
+			t.Errorf("rate 1.0 should always sample, but not sampled for ID %q", id)
+		}
+	}
+}
+
+func TestExport_ErrorStates(t *testing.T) {
+	p, _ := NewRequestProfiler("test-export-states", NewAlwaysSample())
+
+	_, err := p.Export()
+	if !errors.Is(err, ErrProfilerNotStarted) {
+		t.Errorf("expected ErrProfilerNotStarted for never started, got %v", err)
+	}
+
+	_ = p.Start()
+
+	_, err = p.Export()
+	if !errors.Is(err, ErrProfilerNotStopped) {
+		t.Errorf("expected ErrProfilerNotStopped for started but not stopped, got %v", err)
+	}
+
+	_ = p.Stop()
+
+	_, err = p.Export()
+	if err != nil {
+		t.Errorf("expected no error for started and stopped, got %v", err)
+	}
+}
+
+func TestExport_ErrorMessagesDistinct(t *testing.T) {
+	if errors.Is(ErrProfilerNotStarted, ErrProfilerNotStopped) {
+		t.Error("ErrProfilerNotStarted and ErrProfilerNotStopped should be distinct errors")
+	}
+
+	if ErrProfilerNotStarted.Error() == ErrProfilerNotStopped.Error() {
+		t.Error("error messages should be distinct")
+	}
+
+	if !strings.Contains(ErrProfilerNotStarted.Error(), "not started") {
+		t.Errorf("ErrProfilerNotStarted message should contain 'not started', got %q",
+			ErrProfilerNotStarted.Error())
+	}
+
+	if !strings.Contains(ErrProfilerNotStopped.Error(), "not stopped") {
+		t.Errorf("ErrProfilerNotStopped message should contain 'not stopped', got %q",
+			ErrProfilerNotStopped.Error())
+	}
+}
+
+func TestProbabilitySampler_AnomalousIDNotAlwaysSampled(t *testing.T) {
+	s, err := NewProbabilitySampler(0.01)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	anomalousIDs := []string{
+		"",
+		"x",
+		"zz",
+		"zzzzzzzzzzzzzzzz",
+		"gggggggggggggggg",
+		"not-hex-at-all",
+		"request-id-with-spaces",
+	}
+
+	for _, id := range anomalousIDs {
+		if id == "" {
+			continue
+		}
+		alwaysSampled := true
+		for i := 0; i < 100; i++ {
+			testID := fmt.Sprintf("%s-%d", id, i)
+			if !s.ShouldSample(testID) {
+				alwaysSampled = false
+				break
+			}
+		}
+		if alwaysSampled {
+			t.Errorf("anomalous ID prefix %q appears to be always sampled with rate 0.01, which breaks sampling ratio", id)
+		}
 	}
 }

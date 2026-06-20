@@ -5,6 +5,7 @@ import "errors"
 var (
 	ErrInvalidSampleRate       = errors.New("perfsampler: invalid sample rate, must be between 0 and 1")
 	ErrProfilerNotStarted      = errors.New("perfsampler: profiler not started")
+	ErrProfilerNotStopped      = errors.New("perfsampler: profiler not stopped")
 	ErrProfilerAlreadyStarted  = errors.New("perfsampler: profiler already started")
 	ErrEmptyRequestID          = errors.New("perfsampler: request ID cannot be empty")
 	ErrEmptyLabel              = errors.New("perfsampler: timing label cannot be empty")

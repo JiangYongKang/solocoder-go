@@ -54,6 +54,14 @@
 
 通知内容包含：告警名称、触发值、触发时间、当前等级、标签等信息。
 
+#### 按等级配置通知渠道
+每个告警规则支持为不同告警等级配置独立的通知渠道列表。当告警升级或降级时，通知渠道会自动切换到对应等级的配置。
+
+**优先级规则：**
+1. 如果当前等级在 `LevelNotifiers` 中有配置且非空，则使用该等级对应的通知渠道
+2. 否则降级使用通用的 `Notifiers` 列表
+3. 如果两者都未配置，则使用引擎中注册的所有通知渠道
+
 ## 核心结构体职责
 
 ### Engine (告警引擎)
@@ -83,15 +91,16 @@
 - `Name`: 告警名称
 - `MetricName`: 关联的指标名称
 - `Labels`: 规则标签，用于维度过滤
-- `Tags`: 规则标签列表
+- `Tags`: 规则标签列表，用于静默窗口匹配
 - `InitialLevel`: 初始告警等级
 - `Threshold`: 阈值告警条件（与 RingbiTongbi 二选一）
 - `RingbiTongbi`: 同环比告警条件（与 Threshold 二选一）
 - `Duration`: 持续时长要求
-- `InhibitDuration`: 告警抑制窗口
+- `InhibitDuration`: 告警抑制窗口，0 表示不抑制，负值使用默认值
 - `SilentWindows`: 静默时段配置列表
 - `Escalations`: 告警升级规则列表
-- `Notifiers`: 通知渠道名称列表
+- `Notifiers`: 通用通知渠道名称列表
+- `LevelNotifiers`: 按告警等级划分的通知渠道，优先级高于 Notifiers
 
 ### AlertState (告警状态)
 维护告警规则的运行时状态，记录告警的生命周期信息。
@@ -103,7 +112,8 @@
 - `TriggerValue`: 最近一次触发值
 - `TriggerTime`: 最近一次触发时间
 - `LastFiredTime`: 条件最近一次满足的时间
-- `FirstFiredTime`: 条件首次满足的时间（用于持续时长和升级判断）
+- `FirstFiredTime`: 条件首次满足的时间（用于持续时长判断）
+- `FirstTriggeredTime`: 告警实际触发时间（告警升级的计时起点）
 - `ConsecutiveHits`: 连续满足条件的次数
 - `HistoryValues`: 历史指标数据点（用于同环比计算）
 - `LastEvaluatedTime`: 最近一次评估时间
@@ -124,6 +134,20 @@
 - `CompareType`: 比较类型 (ringbi/tongbi)
 - `PercentThreshold`: 变化百分比阈值（绝对值）
 - `Period`: 环比周期时长（同比固定为一年）
+- `Tolerance`: 历史数据匹配容差，未配置时使用默认值
+
+#### 历史数据匹配容差 (Tolerance)
+
+在进行同环比比较时，需要从历史数据中找到与目标时间点匹配的数据点。由于数据上报可能存在时间偏差，需要设置匹配容差。
+
+**默认容差规则：**
+- **同比 (Tongbi)**: 默认容差为 24 小时。因为同比数据跨越一整年，数据采集时间点可能有较大偏移，较大的容差能确保找到匹配的历史数据。
+- **环比 (Ringbi)**: 默认容差为周期的一半。例如周期为 1 小时，则容差为 30 分钟。
+
+**配置建议：**
+- 对于数据上报规律性强、时间精度高的场景，可以适当减小容差
+- 对于数据上报不规律或需要宽松匹配的场景，可以增大容差
+- 同比场景建议至少保留数小时的容差，避免因节假日、周末等因素导致数据无法匹配
 
 ### DurationCondition (持续时长条件)
 定义告警持续时长要求。
@@ -140,7 +164,16 @@
 - `Type`: 静默类型 (daily/range)
 - `StartTime/EndTime`: 按天静默的起止时间，格式 "HH:MM"
 - `StartDate/EndDate`: 按日期范围静默的起止时间
-- `Tags`: 关联的标签
+- `Tags`: 标签列表，用于按标签维度匹配静默规则
+
+#### 按标签维度静默
+
+静默窗口支持通过 `Tags` 字段实现按标签维度的静默匹配。当静默窗口配置了标签时，只有规则标签与静默窗口标签存在交集时，该静默窗口才会生效。
+
+**匹配规则：**
+- 如果静默窗口未配置 Tags（空或 nil），则该静默窗口对所有规则生效
+- 如果静默窗口配置了 Tags，则只有当规则的 Tags 中至少包含一个静默窗口的标签时，静默才生效
+- 标签匹配是"或"逻辑，只要有一个标签匹配即可
 
 ### EscalationRule (升级规则)
 定义告警升级策略。
@@ -207,10 +240,31 @@ type Notifier interface {
 
 3. **告警触发 (Firing)**:
    - 条件满足且达到持续时长要求后，告警状态变为 `Firing`
+   - 设置 `FirstTriggeredTime`（告警实际触发时间），作为告警升级的计时起点
    - 检查是否在抑制窗口内（自上次通知起的抑制时间）
    - 检查是否在静默时段内
    - 如果不在抑制期且不在静默时段，则发送通知
-   - 发送通知时检查是否需要告警升级（持续未恢复超过指定时间）
+   - 每次评估时检查是否需要告警升级（自首次触发起持续未恢复超过指定时间）
+
+#### 告警升级时钟规则
+
+告警升级的计时起点是 **告警实际触发时间** (`FirstTriggeredTime`)，而非基础条件首次命中时间 (`FirstFiredTime`)。
+
+**设计原因：**
+- 在持续时长告警场景中，基础条件可能很早就命中了，但需要满足持续时长要求后告警才真正触发
+- 如果从基础条件首次命中就开始计时升级，可能导致告警在刚触发时就被直接升级，跳过初始等级
+- 从告警实际触发时间开始计时，确保每个等级都有完整的升级等待周期
+
+**时间线示例（持续 3 次检查后触发，持续 5 分钟后升级）：**
+```
+时间点:    T0      T1      T2      T3      T4      T5      T6
+条件:      ✓       ✓       ✓       ✓       ✓       ✓       ✓
+状态:   Pending Pending Pending  Firing  Firing  Firing  升级
+升级计时:  0       0       0       0s     1min    4min    5min→升级
+```
+- T0-T2：条件满足但未达到持续要求，不触发告警，升级计时不启动
+- T3：满足持续时长要求，告警触发，`FirstTriggeredTime` 设置，升级计时开始
+- T3 后 5 分钟：告警升级到下一等级
 
 4. **通知发送**:
    - 根据规则配置的通知渠道列表选择渠道
@@ -388,6 +442,40 @@ rule := &alertengine.AlertRule{
 }
 ```
 
+### 按等级配置通知渠道 + 告警升级
+
+```go
+rule := &alertengine.AlertRule{
+    ID:           "level-notify",
+    Name:         "数据库连接池告警",
+    InitialLevel: alertengine.LevelWarning,
+    Threshold: &alertengine.ThresholdCondition{
+        Operator:  alertengine.OpGreaterThan,
+        Threshold: 80,
+    },
+    Escalations: []alertengine.EscalationRule{
+        // 持续 5 分钟未恢复，升级为告警
+        {
+            AfterDuration: 5 * time.Minute,
+            FromLevel:     alertengine.LevelWarning,
+            ToLevel:       alertengine.LevelAlert,
+        },
+        // 再持续 10 分钟，升级为严重告警
+        {
+            AfterDuration: 15 * time.Minute,
+            FromLevel:     alertengine.LevelAlert,
+            ToLevel:       alertengine.LevelCritical,
+        },
+    },
+    // 按等级配置不同的通知渠道
+    LevelNotifiers: map[alertengine.AlertLevel][]string{
+        alertengine.LevelWarning:  {"console"},           // 警告只发控制台
+        alertengine.LevelAlert:    {"console", "email"},  // 告警发控制台+邮件
+        alertengine.LevelCritical: {"console", "email", "sms"}, // 严重告警发所有渠道
+    },
+}
+```
+
 ### 自定义回调通知
 
 ```go
@@ -417,12 +505,49 @@ engine.AddRule(rule)
 
 ## 并发安全
 
-引擎内部使用互斥锁（`sync.RWMutex`）保护规则和状态数据，支持并发安全地进行：
-- 规则的添加、删除和查询
-- 告警状态的查询
-- 多协程并发调用 `Evaluate()` 进行规则评估
+### 并发安全策略
 
-`ConsoleNotifier` 和 `CallbackNotifier` 内部也使用互斥锁保护通知记录，支持并发安全访问。
+引擎采用 **全局互斥锁** (`sync.RWMutex`) 保护所有共享状态，确保并发场景下的数据一致性。
+
+#### 读写锁使用策略
+
+| 操作 | 锁类型 | 说明 |
+|------|--------|------|
+| 规则查询 (`GetRule`) | 读锁 (`RLock`) | 只读操作，支持并发读 |
+| 告警状态查询 (`GetAlertState`) | 读锁 (`RLock`) | 只读操作，支持并发读 |
+| 添加规则 (`AddRule`) | 写锁 (`Lock`) | 修改规则映射，需独占访问 |
+| 移除规则 (`RemoveRule`) | 写锁 (`Lock`) | 修改规则映射，需独占访问 |
+| 注册通知器 (`RegisterNotifier`) | 写锁 (`Lock`) | 修改通知器映射，需独占访问 |
+| 规则评估 (`Evaluate`) | 写锁 (`Lock`) | 修改告警状态，全程锁保护 |
+
+#### Evaluate 方法的并发安全
+
+`Evaluate` 方法是最核心的写操作，**整个评估过程全程在写锁保护下执行**，包括：
+- 读取规则配置
+- 读取和修改告警状态
+- 更新历史数据
+- 检查持续时长、抑制期、静默期
+- 触发告警升级
+- 发送通知
+
+**设计考量：**
+- 虽然全程加锁会降低并发度，但保证了状态修改的原子性和一致性
+- 避免了"先检查后执行"的竞态条件
+- 避免了状态在评估过程中被其他 goroutine 中途修改
+- 通知发送在锁内执行（通知器内部有自己的锁），确保状态与通知的时序一致性
+
+### 通知器的并发安全
+
+- `ConsoleNotifier`: 内部使用互斥锁保护通知记录列表
+- `CallbackNotifier`: 内部使用互斥锁保护通知记录列表和回调函数
+- 所有通知器方法都是并发安全的
+
+### 并发场景最佳实践
+
+1. **避免长时间持有锁**: 自定义 `Notifier` 的 `Send` 方法应尽快返回，避免阻塞
+2. **单一规则评估**: 同一规则的多次评估是串行执行的，不同规则的评估也串行（全局锁）
+3. **读多写少场景**: 对于高频查询场景，读操作使用 RLock 可提高并发度
+4. **数据一致性**: 由于使用全局锁，状态查询总是能看到一致的快照
 
 ## 测试
 
@@ -439,14 +564,23 @@ go test ./internal/alertengine/ -v
 - 持续时长中断后的重置逻辑
 - 环比和同比告警的正确触发
 - 同环比缺少历史数据或比较值为 0 的边界情况
+- 同比告警历史数据匹配容差（默认容差和自定义容差）
 - 告警抑制窗口的生效和失效
 - 每日静默时段（含跨天时段）的判断
 - 日期范围静默时段的判断
+- 静默窗口按标签维度匹配
 - 告警升级的正确触发
+- 告警升级从告警实际触发时间开始计时
+- 按告警等级切换通知渠道
+- 等级通知渠道的 fallback 机制
 - 控制台通知器和回调通知器的功能
 - 多渠道和默认渠道通知分发
 - 通知内容的完整性校验
 - 无效规则、无效操作符、无效静默窗口等错误处理
+- AddRule 配置校验门禁（等级、操作符、比较类型、阈值、时长、静默窗口、升级规则）
+- RegisterNotifier 配置校验
+- 无效指标数据校验
 - 默认等级和默认抑制时长等默认值设置
 - 并发场景下的评估安全性
+- 并发场景下的状态一致性
 - 历史数据点的自动裁剪

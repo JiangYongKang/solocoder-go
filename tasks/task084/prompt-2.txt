@@ -1,0 +1,6 @@
+你实现的请求级性能采样器模块存在一些问题，需要修复：
+1. ProbabilitySampler 在处理短 ID 或非法十六进制 ID 时的回退逻辑导致这些请求被无条件采样，破坏了按比例配置的采样率。
+2. Export 方法在 profiler 未停止时返回的错误信息与实际状态不符，会误导调用方。
+3. RequestProfiler 结构体中存在一个从未被使用的字段，增加了不必要的内存开销。
+4. 修复后需要为该模块补充异常 ID 场景和状态错误信息的单元测试，运行 go test ./internal/perfsampler/ -v 确保所有测试通过。
+5. 在 docs/perfsampler.md 中更新模块需求文档，说明采样率回退策略和各状态下 Export 的预期行为。

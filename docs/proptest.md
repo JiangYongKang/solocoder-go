@@ -10,6 +10,8 @@
 2. **不变量断言验证**：自动执行大量随机输入验证不变量条件
 3. **失败用例最小化收缩**：自动将失败用例简化为最小可复现形式
 4. **可复现的随机种子**：记录种子值以精确复现测试结果
+5. **Verbose 详细输出**：开启后输出测试执行过程和收缩步骤的详细信息
+6. **结构化错误返回**：通过 `Result.Err` 字段返回可判别的错误类型，便于程序化处理
 
 ---
 
@@ -32,13 +34,14 @@ type Generator[T any] interface {
 #### `Config`
 测试运行配置：
 
-| 字段          | 类型     | 默认值   | 说明                                   |
-|--------------|----------|----------|----------------------------------------|
-| `Iterations` | `int`    | 100      | 随机输入迭代验证次数                   |
-| `MaxShrinks` | `int`    | 1000     | 收缩阶段最大尝试次数                   |
-| `Seed`       | `int64`  | 0        | 随机种子（`UseRandomSeed=false` 时生效）|
-| `UseRandomSeed` | `bool` | `true`   | 是否使用基于时间戳的随机种子           |
-| `Verbose`    | `bool`   | `false`  | 是否输出详细信息                       |
+| 字段          | 类型        | 默认值       | 说明                                               |
+|--------------|-------------|-------------|----------------------------------------------------|
+| `Iterations` | `int`       | 100          | 随机输入迭代验证次数                               |
+| `MaxShrinks` | `int`       | 1000         | 收缩阶段最大尝试次数                               |
+| `Seed`       | `int64`     | 0            | 随机种子（`UseRandomSeed=false` 时生效）           |
+| `UseRandomSeed` | `bool`   | `true`       | 是否使用基于时间戳的随机种子                       |
+| `Verbose`    | `bool`      | `false`      | 是否输出详细信息                                   |
+| `Writer`     | `io.Writer` | `nil`        | Verbose 输出目标；`nil` 时 Verbose=true 写入 os.Stdout |
 
 #### `Result[T any]`
 测试执行结果：
@@ -50,6 +53,7 @@ type Generator[T any] interface {
 | `Iterations` | `int`             | 实际执行的迭代次数                           |
 | `FailCase`   | `*FailCase[T]`    | 失败用例详情（通过时为 `nil`）               |
 | `ShrinkSteps`| `int`             | 收缩阶段实际执行的步数                       |
+| `Err`        | `error`           | 失败时的结构化错误（通过时为 `nil`）          |
 
 #### `FailCase[T any]`
 失败用例详情：
@@ -73,6 +77,8 @@ type Generator[T any] interface {
 | `IntRange(min, max int)`    | 自定义范围 `[min, max]`（自动处理 min>max）      |
 | `IntNonNegative()`          | 非负整数 `[0, math.MaxInt]`                      |
 | `IntPositive()`             | 正整数 `[1, math.MaxInt]`                        |
+
+整数生成器使用 `uint64` 算术计算跨度，避免大范围场景下的整数溢出。对于 `[MinInt, MaxInt]` 的全范围使用 `r.Uint64()` 生成；其他大跨度范围使用拒绝采样法确保均匀性。
 
 **示例**：
 ```go
@@ -239,29 +245,122 @@ gen := Const(42)    // 永远生成 42
 
 ---
 
-## 6. 使用方式
+## 6. Verbose 模式
 
-### 6.1 方式一：便捷函数 `Check`
+### 6.1 启用方式
+
+通过 `Config.Verbose = true` 或 `WithVerbose(true)` 选项启用：
+
+```go
+// 方式一：通过 Config
+cfg := proptest.Config{
+    Iterations: 200,
+    Seed:       42,
+    Verbose:    true,
+}
+runner := proptest.NewRunner[int](cfg)
+
+// 方式二：通过 Check 便捷函数
+result := proptest.Check(gen, prop, proptest.WithVerbose(true))
+
+// 方式三：指定自定义 Writer（用于测试捕获输出）
+var buf bytes.Buffer
+cfg := proptest.Config{
+    Verbose: true,
+    Writer:  &buf,    // Verbose 输出写入 buf 而非 os.Stdout
+}
+```
+
+### 6.2 输出内容
+
+当 Verbose 启用时，框架会在以下关键节点输出信息：
+
+| 阶段             | 输出内容                                              |
+|-----------------|------------------------------------------------------|
+| 测试开始         | `proptest: starting check (seed=..., iterations=..., maxShrinks=...)` |
+| 每 100 次迭代    | `proptest: N iterations passed`                       |
+| 发现失败         | `proptest: failure at iteration N, input=...: message` |
+| 收缩每步进展     | `proptest: shrink step N: found simpler failing input ...` |
+| 收缩完成         | `proptest: shrunk to ... in N steps`                  |
+| 全部通过         | `proptest: all N iterations passed`                   |
+
+### 6.3 Writer 配置
+
+- `Config.Writer` 为 `nil` 且 `Verbose=true` → 默认写入 `os.Stdout`
+- `Config.Writer` 为 `nil` 且 `Verbose=false` → 使用 `io.Discard`，不产生任何输出
+- `Config.Writer` 非 `nil` → Verbose 输出写入指定 Writer（常用于测试中捕获输出）
+
+---
+
+## 7. 错误变量与使用场景
+
+### 7.1 错误变量定义
+
+| 错误变量              | 触发场景                                                    |
+|----------------------|-------------------------------------------------------------|
+| `ErrPropertyFailed`  | 属性验证失败（不变量被违反）                                 |
+| `ErrInvalidConfig`   | 配置非法（如传入 nil 属性函数）                               |
+| `ErrShrinkLimit`     | 收缩达到最大迭代限制（`MaxShrinks` 用尽）                    |
+| `ErrGeneratorNil`    | 传入 nil 生成器（Runner.Check 返回时设置，生成器构造时 panic）|
+
+### 7.2 错误在 Result.Err 中的设置规则
+
+| 场景                     | `Result.Err` 值                                           |
+|-------------------------|-----------------------------------------------------------|
+| 属性验证通过             | `nil`                                                     |
+| 传入 nil 生成器          | `ErrGeneratorNil`                                         |
+| 传入 nil 属性函数        | `ErrInvalidConfig`                                        |
+| 属性验证失败（收缩未受限）| `ErrPropertyFailed`                                       |
+| 属性验证失败（收缩达上限）| `fmt.Errorf("%w: reached max shrinks (%d)", ErrShrinkLimit, maxShrinks)` |
+
+### 7.3 使用 errors.Is 判断错误类型
+
+```go
+result := proptest.Check(gen, prop, proptest.WithSeed(42))
+
+if !result.Passed {
+    switch {
+    case errors.Is(result.Err, proptest.ErrGeneratorNil):
+        // 生成器为空，需检查生成器构造
+    case errors.Is(result.Err, proptest.ErrInvalidConfig):
+        // 配置非法，需检查属性函数
+    case errors.Is(result.Err, proptest.ErrShrinkLimit):
+        // 收缩受限，可考虑增大 MaxShrinks
+    case errors.Is(result.Err, proptest.ErrPropertyFailed):
+        // 正常的属性失败，检查 FailCase 获取详情
+    }
+}
+```
+
+`ErrShrinkLimit` 使用 `%w` 动词包装，因此 `errors.Is` 可以正确解包。当收缩达到上限时，`Result.Err` 同时匹配 `ErrShrinkLimit` 和 `ErrPropertyFailed`（因为 `ErrShrinkLimit` 场景是 `ErrPropertyFailed` 的子集），建议先检查 `ErrShrinkLimit`。
+
+---
+
+## 8. 使用方式
+
+### 8.1 方式一：便捷函数 `Check`
 
 ```go
 result := proptest.Check(
     IntNonNegative(),                                     // 生成器
     func(x int) (bool, string) {                          // 属性函数
-        // 验证：x + 0 == x 恒成立
         return x + 0 == x, "x + 0 should equal x"
     },
-    proptest.WithIterations(1000),                        // 配置选项
+    proptest.WithIterations(1000),
     proptest.WithSeed(12345),
 )
 
 if result.Passed {
     fmt.Println("Passed!")
 } else {
-    fmt.Println(result.String())  // 输出完整失败信息
+    fmt.Println(result.String())
+    if errors.Is(result.Err, proptest.ErrShrinkLimit) {
+        fmt.Println("Hint: consider increasing MaxShrinks")
+    }
 }
 ```
 
-### 6.2 方式二：显式 Runner
+### 8.2 方式二：显式 Runner
 
 ```go
 cfg := proptest.Config{
@@ -279,37 +378,49 @@ result := runner.Check(IntRange(0, 100), func(x int) (bool, string) {
 })
 ```
 
-### 6.3 使用种子复现失败
+### 8.3 使用种子复现失败
 
 当测试失败时，`Result.Seed` 会记录导致失败的种子。下次运行时使用相同种子即可精确复现：
 
 ```go
-// 第一次运行，假设失败，记录种子
-seed := result.Seed  // 比如 12345
+seed := result.Seed
 
-// 调试时复现
 result2 := proptest.Check(gen, prop, proptest.WithSeed(seed))
 // result2 会生成完全相同的输入序列
 ```
 
-### 6.4 复合示例：验证排序算法
+### 8.4 启用 Verbose 调试
 
 ```go
-// 验证：对任意切片排序后，结果应为非降序
+var buf bytes.Buffer
+result := proptest.Check(
+    IntRange(0, 100),
+    func(x int) (bool, string) {
+        if x > 50 { return false, "too large" }
+        return true, ""
+    },
+    proptest.WithIterations(200),
+    proptest.WithSeed(42),
+    proptest.WithVerbose(true),
+    // proptest.WithWriter(&buf),  // 可选：捕获到 buffer
+)
+// Verbose 输出已写入 os.Stdout（或指定 Writer）
+```
+
+### 8.5 复合示例：验证排序算法
+
+```go
 gen := SliceLen(IntRange(-100, 100), 0, 50)
 prop := func(nums []int) (bool, string) {
-    // 复制并排
     sorted := make([]int, len(nums))
     copy(sorted, nums)
     sort.Ints(sorted)
-    
-    // 验证有序
+
     for i := 1; i < len(sorted); i++ {
         if sorted[i] < sorted[i-1] {
             return false, fmt.Sprintf("not sorted at index %d: %v", i, sorted)
         }
     }
-    // 验证元素一致（多重集相等）
     if len(sorted) != len(nums) {
         return false, "length changed"
     }
@@ -321,29 +432,18 @@ result := proptest.Check(gen, prop, proptest.WithIterations(1000))
 
 ---
 
-## 7. 配置选项（Option 模式）
+## 9. 配置选项（Option 模式）
 
 | 选项函数                      | 说明                                      |
 |------------------------------|-------------------------------------------|
 | `WithIterations(n int)`      | 设置迭代次数（仅 n>0 时生效）             |
 | `WithMaxShrinks(n int)`      | 设置最大收缩尝试次数                      |
 | `WithSeed(seed int64)`       | 指定固定随机种子（同时禁用 UseRandomSeed）|
-| `WithVerbose(v bool)`        | 设置详细输出标志                          |
+| `WithVerbose(v bool)`        | 启用/禁用详细输出                         |
 
 ---
 
-## 8. 错误定义
-
-| 错误变量              | 触发场景                               |
-|----------------------|----------------------------------------|
-| `ErrPropertyFailed`  | 属性验证失败（通用错误）               |
-| `ErrInvalidConfig`   | 配置参数非法                           |
-| `ErrShrinkLimit`     | 收缩达到最大迭代限制                   |
-| `ErrGeneratorNil`    | 向生成器组合函数传入 `nil` 生成器时 panic |
-
----
-
-## 9. 包路径
+## 10. 包路径
 
 - 实现：`internal/proptest/proptest.go`
 - 测试：`internal/proptest/proptest_test.go`

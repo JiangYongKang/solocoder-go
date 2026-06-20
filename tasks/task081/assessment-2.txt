@@ -1,0 +1,6 @@
+产物不满意：
+1. 在修复 TestSpanTreeConcurrentAdd 时将 span ID 生成方式从 generateTestSpanID 换为 fmt.Sprintf，原辅助函数 generateTestSpanID 已无任何调用方却未被删除，成为测试文件中的死代码。触发节点是修改并发添加测试后未检查旧代码的引用关系，导致测试文件残留无用函数。后果是污染测试代码可读性，增加了后续维护和标注人员的阅读负担，容易误以为该函数仍被使用。根因是重构完成后只关注新增代码而忽略了关联废弃代码的清理步骤。正确做法是每次替换代码逻辑后应扫描原函数的全部调用方，确认无引用后立即删除。
+2. TestSpanTreeConcurrentReadWrite 中 3 个写 goroutine 各用一个固定 span ID 在无限循环中重复插入，首轮之后的所有 AddSpan 调用都因 SpanID 重复而静默返回 ErrDuplicateSpanID，返回值未被检查。触发条件是在 stop channel 生效前这些固定 ID 已各自成功写入一次。影响是测试实际覆盖的路径主要是重复键错误处理分支，而非持续多次插入不同 Span 的并发写入正确性，如果 AddSpan 在插入新节点的并发窗口中有数据覆盖 bug 可能未被暴露。根因是写 goroutine 的 span ID 硬编码固定值，未在每次迭代生成唯一标识。正确做法是按迭代轮次生成唯一 SpanID，让写路径始终执行有效插入而非提前进入重复校验分支。
+过程不满意：
+1. 模型在修改 tracectx_test.go 的 TestSpanTreeConcurrentAdd 后用 fmt.Sprintf 替换了原有的 generateTestSpanID 调用，但未回头检查 generateTestSpanID 是否还有其他引用就继续向前推进后续测试编写，最终该废弃函数未从文件中移除。从思考轨迹看模型只聚焦于当前编辑的目标代码块，缺乏对单个文件整体引用一致性的回溯校验。正确做法是在每次替换函数调用后做一次局部引用检查，确认旧辅助函数已无调用方立即删除，避免死代码遗留在最终产物中。
+2. 模型在总结阶段声称新增了 14 个边界条件测试，但实际在测试文件末尾新增了 15 个测试函数，从 TestExtractTraceContextParentSpanIDPropagation 到 TestFullTraceWorkflowWithParentSpanID 共计 15 个。这属于任务收尾环节的计数核对失误，模型在编写完测试后未逐个数点清就给出了一个大概数字。这表明模型在总结阶段缺少对产出物的精确校验，把估算值当作准确数据上报，可能误导后续标注人员对任务完成度的判断。正确做法是在写总结前逐一统计新增测试函数数量，确保上报数字与实际代码一致。

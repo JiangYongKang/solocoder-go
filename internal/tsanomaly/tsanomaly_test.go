@@ -77,6 +77,7 @@ func TestValidateConfig(t *testing.T) {
 				MinSamples:     2,
 				EnableSeasonal: true,
 				PeriodLength:   0,
+				PeriodSlot:     time.Hour,
 			},
 			wantErr: ErrInvalidPeriodLength,
 		},
@@ -88,8 +89,33 @@ func TestValidateConfig(t *testing.T) {
 				MinSamples:     2,
 				EnableSeasonal: true,
 				PeriodLength:   -1,
+				PeriodSlot:     time.Hour,
 			},
 			wantErr: ErrInvalidPeriodLength,
+		},
+		{
+			name: "seasonal mode without period slot",
+			cfg: Config{
+				WindowSize:     10,
+				StdDevFactor:   3.0,
+				MinSamples:     2,
+				EnableSeasonal: true,
+				PeriodLength:   24,
+				PeriodSlot:     0,
+			},
+			wantErr: ErrInvalidPeriodSlot,
+		},
+		{
+			name: "seasonal mode with negative period slot",
+			cfg: Config{
+				WindowSize:     10,
+				StdDevFactor:   3.0,
+				MinSamples:     2,
+				EnableSeasonal: true,
+				PeriodLength:   24,
+				PeriodSlot:     -time.Hour,
+			},
+			wantErr: ErrInvalidPeriodSlot,
 		},
 		{
 			name: "valid seasonal config",
@@ -99,6 +125,8 @@ func TestValidateConfig(t *testing.T) {
 				MinSamples:     10,
 				EnableSeasonal: true,
 				PeriodLength:   24,
+				PeriodSlot:     time.Hour,
+				SeasonalEpoch:  time.Unix(0, 0).UTC(),
 				Direction:      DirectionBoth,
 			},
 		},
@@ -492,12 +520,15 @@ func TestDetector_WindowEviction(t *testing.T) {
 }
 
 func TestDetector_SeasonalMode(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	cfg := Config{
 		WindowSize:        100,
 		StdDevFactor:      2.0,
 		MinSamples:        3,
 		EnableSeasonal:    true,
 		PeriodLength:      4,
+		PeriodSlot:        time.Second,
+		SeasonalEpoch:     epoch,
 		Direction:         DirectionBoth,
 		MaxAnomalyHistory: 100,
 	}
@@ -506,12 +537,12 @@ func TestDetector_SeasonalMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	baseTime := time.Now()
 	pattern := []float64{10, 20, 30, 40}
 	for cycle := 0; cycle < 3; cycle++ {
 		for i, v := range pattern {
+			offsetSec := cycle*4 + i
 			p := &DataPoint{
-				Timestamp: baseTime.Add(time.Duration(cycle*4+i) * time.Second),
+				Timestamp: epoch.Add(time.Duration(offsetSec) * time.Second),
 				Value:     v,
 			}
 			_, err := d.Add(p)
@@ -541,7 +572,7 @@ func TestDetector_SeasonalMode(t *testing.T) {
 	}
 
 	anomalyPoint := &DataPoint{
-		Timestamp: baseTime.Add(12 * time.Second),
+		Timestamp: epoch.Add(12 * time.Second),
 		Value:     100.0,
 	}
 	event, err := d.Add(anomalyPoint)
@@ -556,6 +587,153 @@ func TestDetector_SeasonalMode(t *testing.T) {
 	}
 	if event.BaselineValue != 10.0 {
 		t.Errorf("Expected BaselineValue=10 (seasonal), got %v", event.BaselineValue)
+	}
+}
+
+func TestDetector_Seasonal_UnevenTimestamps(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{
+		WindowSize:        100,
+		StdDevFactor:      2.0,
+		MinSamples:        3,
+		EnableSeasonal:    true,
+		PeriodLength:      4,
+		PeriodSlot:        time.Second,
+		SeasonalEpoch:     epoch,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	d, err := NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := []float64{10, 20, 30, 40}
+	for cycle := 0; cycle < 3; cycle++ {
+		for i := range pattern {
+			baseOffset := cycle * 4
+			var irregularOffsets = []int{0, 3, 7, 12, 15, 22, 28, 31, 33, 37, 42, 48}
+			idx := baseOffset + i
+			offsetSec := irregularOffsets[idx]
+			expectedSeasonalIdx := offsetSec % 4
+
+			p := &DataPoint{
+				Timestamp: epoch.Add(time.Duration(offsetSec) * time.Second),
+				Value:     pattern[expectedSeasonalIdx],
+			}
+			_, err := d.Add(p)
+			if err != nil {
+				t.Fatalf("cycle=%d i=%d offset=%d err=%v", cycle, i, offsetSec, err)
+			}
+		}
+	}
+
+	mean0, _, count0, err := d.GetSeasonalBaseline(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count0 < 1 {
+		t.Errorf("Seasonal index 0: expected at least 1 sample, got %d", count0)
+	}
+	if count0 >= 1 && !floatApproxEqual(mean0, 10.0) {
+		t.Errorf("Seasonal index 0: expected mean=10, got %v (count=%d)", mean0, count0)
+	}
+
+	mean1, _, count1, _ := d.GetSeasonalBaseline(1)
+	if count1 >= 1 && !floatApproxEqual(mean1, 20.0) {
+		t.Errorf("Seasonal index 1: expected mean=20, got %v (count=%d)", mean1, count1)
+	}
+
+	anomalyTs := epoch.Add(100 * time.Second)
+	expectedIdx := 100 % 4
+	anomalyVal := pattern[expectedIdx] * 10
+	anomalyPoint := &DataPoint{
+		Timestamp: anomalyTs,
+		Value:     anomalyVal,
+	}
+	event, err := d.Add(anomalyPoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event == nil {
+		t.Fatalf("Expected seasonal anomaly at index %d, got nil (expectedIdx baseline may not have enough samples)", expectedIdx)
+	}
+	if event != nil && event.SeasonalIndex != expectedIdx {
+		t.Errorf("Expected SeasonalIndex=%d (from timestamp 100%%4), got %d", expectedIdx, event.SeasonalIndex)
+	}
+}
+
+func TestDetector_Seasonal_DailyHourCycle(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{
+		WindowSize:        50,
+		StdDevFactor:      2.0,
+		MinSamples:        3,
+		EnableSeasonal:    true,
+		PeriodLength:      24,
+		PeriodSlot:        time.Hour,
+		SeasonalEpoch:     epoch,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	d, err := NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for day := 0; day < 4; day++ {
+		for hour := 0; hour < 24; hour++ {
+			var val float64
+			switch {
+			case hour >= 8 && hour <= 10:
+				val = 5000
+			case hour >= 18 && hour <= 20:
+				val = 6000
+			case hour >= 0 && hour <= 5:
+				val = 500
+			default:
+				val = 2000
+			}
+			p := &DataPoint{
+				Timestamp: epoch.Add(time.Duration(day*24+hour) * time.Hour),
+				Value:     val,
+			}
+			_, err := d.Add(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	mean8, _, count8, _ := d.GetSeasonalBaseline(8)
+	if count8 != 4 {
+		t.Errorf("8 hour slot: expected count=4, got %d", count8)
+	}
+	if !floatApproxEqual(mean8, 5000) {
+		t.Errorf("8 hour slot: expected mean=5000, got %v", mean8)
+	}
+
+	mean3, _, count3, _ := d.GetSeasonalBaseline(3)
+	if count3 != 4 {
+		t.Errorf("3 hour slot: expected count=4, got %d", count3)
+	}
+	if !floatApproxEqual(mean3, 500) {
+		t.Errorf("3 hour slot: expected mean=500, got %v", mean3)
+	}
+
+	crashPoint := &DataPoint{
+		Timestamp: epoch.Add(4*24*time.Hour + 9*time.Hour),
+		Value:     100.0,
+	}
+	event, _ := d.Add(crashPoint)
+	if event == nil {
+		t.Fatal("Expected anomaly during morning peak crash")
+	}
+	if event.SeasonalIndex != 9 {
+		t.Errorf("Expected SeasonalIndex=9 (9th hour), got %d", event.SeasonalIndex)
+	}
+	if event.BaselineValue != 5000 {
+		t.Errorf("Expected BaselineValue=5000 (peak hour), got %v", event.BaselineValue)
 	}
 }
 
@@ -583,6 +761,8 @@ func TestDetector_SeasonalBaselineErrors(t *testing.T) {
 		MinSamples:        2,
 		EnableSeasonal:    true,
 		PeriodLength:      4,
+		PeriodSlot:        time.Second,
+		SeasonalEpoch:     time.Unix(0, 0).UTC(),
 		Direction:         DirectionBoth,
 		MaxAnomalyHistory: 100,
 	}
@@ -795,6 +975,52 @@ func TestDetector_BatchAdd(t *testing.T) {
 	}
 }
 
+func TestDetector_BatchAdd_NoRaceWithClose(t *testing.T) {
+	cfg := Config{
+		WindowSize:        50,
+		StdDevFactor:      2.0,
+		MinSamples:        5,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	d, err := NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseTime := time.Now()
+	batch := make([]*DataPoint, 100)
+	for i := 0; i < 100; i++ {
+		batch[i] = &DataPoint{
+			Timestamp: baseTime.Add(time.Duration(i) * time.Millisecond),
+			Value:     float64(i%10) + 1.0,
+		}
+	}
+
+	var wg sync.WaitGroup
+	var batchErr error
+	var closeErr error
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_, batchErr = d.BatchAdd(batch)
+	}()
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(10 * time.Microsecond)
+		d.Close()
+	}()
+
+	wg.Wait()
+
+	if batchErr != nil && !errors.Is(batchErr, ErrDetectorClosed) {
+		t.Errorf("BatchAdd expected success or ErrDetectorClosed, got %v", batchErr)
+	}
+	_ = closeErr
+}
+
 func TestDetector_Reset(t *testing.T) {
 	cfg := Config{
 		WindowSize:        50,
@@ -845,6 +1071,8 @@ func TestDetector_UpdateConfig(t *testing.T) {
 		MinSamples:        50,
 		EnableSeasonal:    true,
 		PeriodLength:      7,
+		PeriodSlot:        time.Hour * 24,
+		SeasonalEpoch:     time.Unix(0, 0).UTC(),
 		Direction:         DirectionUp,
 		MaxAnomalyHistory: 500,
 	}
@@ -865,6 +1093,316 @@ func TestDetector_UpdateConfig(t *testing.T) {
 	err = d.UpdateConfig(invalidCfg)
 	if err == nil {
 		t.Error("UpdateConfig() expected error for invalid config")
+	}
+}
+
+func TestDetector_UpdateConfig_PreservesGlobalBaseline(t *testing.T) {
+	cfg := Config{
+		WindowSize:        20,
+		StdDevFactor:      3.0,
+		MinSamples:        5,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	d, err := NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseTime := time.Now()
+	for i := 0; i < 15; i++ {
+		p := &DataPoint{
+			Timestamp: baseTime.Add(time.Duration(i) * time.Second),
+			Value:     100.0,
+		}
+		_, _ = d.Add(p)
+	}
+
+	meanBefore, stdBefore, countBefore := d.GetBaseline()
+	if countBefore != 15 {
+		t.Fatalf("Setup failed: baseline count=%d", countBefore)
+	}
+
+	newCfg := Config{
+		WindowSize:        30,
+		StdDevFactor:      2.5,
+		MinSamples:        8,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 200,
+	}
+	err = d.UpdateConfig(newCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	meanAfter, stdAfter, countAfter := d.GetBaseline()
+	if countAfter != countBefore {
+		t.Errorf("Baseline count changed after non-seasonal UpdateConfig: got %d, want %d", countAfter, countBefore)
+	}
+	if !floatApproxEqual(meanAfter, meanBefore) {
+		t.Errorf("Baseline mean changed after non-seasonal UpdateConfig: got %v, want %v", meanAfter, meanBefore)
+	}
+	if !floatApproxEqual(stdAfter, stdBefore) {
+		t.Errorf("Baseline std changed after non-seasonal UpdateConfig: got %v, want %v", stdAfter, stdBefore)
+	}
+}
+
+func TestDetector_UpdateConfig_NonSeasonalToSeasonal(t *testing.T) {
+	cfg := Config{
+		WindowSize:        20,
+		StdDevFactor:      3.0,
+		MinSamples:        2,
+		EnableSeasonal:    false,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	d, err := NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseTime := time.Now()
+	for i := 0; i < 12; i++ {
+		p := &DataPoint{
+			Timestamp: baseTime.Add(time.Duration(i) * time.Second),
+			Value:     float64(10 + i),
+		}
+		_, _ = d.Add(p)
+	}
+
+	_, _, globalCountBefore := d.GetBaseline()
+	if globalCountBefore != 12 {
+		t.Fatalf("Setup failed: global count=%d", globalCountBefore)
+	}
+
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	seasonalCfg := Config{
+		WindowSize:        20,
+		StdDevFactor:      3.0,
+		MinSamples:        2,
+		EnableSeasonal:    true,
+		PeriodLength:      4,
+		PeriodSlot:        time.Second,
+		SeasonalEpoch:     epoch,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	err = d.UpdateConfig(seasonalCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	totalSeasonalCount := 0
+	for i := 0; i < 4; i++ {
+		_, _, cnt, _ := d.GetSeasonalBaseline(i)
+		totalSeasonalCount += cnt
+	}
+	if totalSeasonalCount != globalCountBefore {
+		t.Errorf("Total seasonal samples=%d, want %d (migrated from global)", totalSeasonalCount, globalCountBefore)
+	}
+
+	meanAfter, _, globalCountAfter := d.GetBaseline()
+	if globalCountAfter != globalCountBefore {
+		t.Errorf("Global count changed: got %d, want %d", globalCountAfter, globalCountBefore)
+	}
+	_ = meanAfter
+}
+
+func TestDetector_UpdateConfig_SeasonalToNonSeasonal(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{
+		WindowSize:        50,
+		StdDevFactor:      3.0,
+		MinSamples:        2,
+		EnableSeasonal:    true,
+		PeriodLength:      4,
+		PeriodSlot:        time.Second,
+		SeasonalEpoch:     epoch,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	d, err := NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := []float64{10, 20, 30, 40}
+	totalSamplesSeasonal := 0
+	for cycle := 0; cycle < 3; cycle++ {
+		for i, v := range pattern {
+			offsetSec := cycle*4 + i
+			p := &DataPoint{
+				Timestamp: epoch.Add(time.Duration(offsetSec) * time.Second),
+				Value:     v,
+			}
+			_, _ = d.Add(p)
+			totalSamplesSeasonal++
+		}
+	}
+
+	for i := 0; i < 4; i++ {
+		_, _, cnt, _ := d.GetSeasonalBaseline(i)
+		if cnt != 3 {
+			t.Fatalf("Setup failed: seasonal[%d] count=%d, want 3", i, cnt)
+		}
+	}
+
+	nonSeasonalCfg := Config{
+		WindowSize:        50,
+		StdDevFactor:      3.0,
+		MinSamples:        5,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	err = d.UpdateConfig(nonSeasonalCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, globalCount := d.GetBaseline()
+	if globalCount < totalSamplesSeasonal {
+		t.Errorf("Global count=%d after migration, want at least %d", globalCount, totalSamplesSeasonal)
+	}
+
+	gotCfg := d.Config()
+	if gotCfg.EnableSeasonal {
+		t.Error("Seasonal mode should be disabled after UpdateConfig")
+	}
+}
+
+func TestDetector_UpdateConfig_SamePeriodLength_PreservesData(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{
+		WindowSize:        50,
+		StdDevFactor:      2.0,
+		MinSamples:        2,
+		EnableSeasonal:    true,
+		PeriodLength:      4,
+		PeriodSlot:        time.Second,
+		SeasonalEpoch:     epoch,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	d, err := NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := []float64{10, 20, 30, 40}
+	for cycle := 0; cycle < 3; cycle++ {
+		for i, v := range pattern {
+			offsetSec := cycle*4 + i
+			p := &DataPoint{
+				Timestamp: epoch.Add(time.Duration(offsetSec) * time.Second),
+				Value:     v,
+			}
+			_, _ = d.Add(p)
+		}
+	}
+
+	beforeMeans := make([]float64, 4)
+	beforeCounts := make([]int, 4)
+	for i := 0; i < 4; i++ {
+		m, _, c, _ := d.GetSeasonalBaseline(i)
+		beforeMeans[i] = m
+		beforeCounts[i] = c
+	}
+
+	newCfg := Config{
+		WindowSize:        60,
+		StdDevFactor:      3.0,
+		MinSamples:        3,
+		EnableSeasonal:    true,
+		PeriodLength:      4,
+		PeriodSlot:        time.Second,
+		SeasonalEpoch:     epoch,
+		Direction:         DirectionUp,
+		MaxAnomalyHistory: 200,
+	}
+	err = d.UpdateConfig(newCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 4; i++ {
+		afterMean, _, afterCount, _ := d.GetSeasonalBaseline(i)
+		if afterCount != beforeCounts[i] {
+			t.Errorf("Seasonal[%d] count changed: got %d, want %d", i, afterCount, beforeCounts[i])
+		}
+		if !floatApproxEqual(afterMean, beforeMeans[i]) {
+			t.Errorf("Seasonal[%d] mean changed: got %v, want %v", i, afterMean, beforeMeans[i])
+		}
+	}
+}
+
+func TestDetector_UpdateConfig_ChangePeriodLength(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	cfg := Config{
+		WindowSize:        100,
+		StdDevFactor:      2.0,
+		MinSamples:        1,
+		EnableSeasonal:    true,
+		PeriodLength:      4,
+		PeriodSlot:        time.Second,
+		SeasonalEpoch:     epoch,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	d, err := NewDetector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for cycle := 0; cycle < 3; cycle++ {
+		for i := 0; i < 4; i++ {
+			offsetSec := cycle*4 + i
+			p := &DataPoint{
+				Timestamp: epoch.Add(time.Duration(offsetSec) * time.Second),
+				Value:     float64(10 + i*10),
+			}
+			_, _ = d.Add(p)
+		}
+	}
+
+	totalBefore := 0
+	for i := 0; i < 4; i++ {
+		_, _, cnt, _ := d.GetSeasonalBaseline(i)
+		totalBefore += cnt
+	}
+	if totalBefore != 12 {
+		t.Fatalf("Setup: total seasonal samples=%d, want 12", totalBefore)
+	}
+
+	newCfg := Config{
+		WindowSize:        100,
+		StdDevFactor:      2.0,
+		MinSamples:        1,
+		EnableSeasonal:    true,
+		PeriodLength:      6,
+		PeriodSlot:        time.Second,
+		SeasonalEpoch:     epoch,
+		Direction:         DirectionBoth,
+		MaxAnomalyHistory: 100,
+	}
+	err = d.UpdateConfig(newCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	totalAfter := 0
+	anyNonZero := false
+	for i := 0; i < 6; i++ {
+		_, _, cnt, _ := d.GetSeasonalBaseline(i)
+		totalAfter += cnt
+		if cnt > 0 {
+			anyNonZero = true
+		}
+	}
+	if !anyNonZero {
+		t.Error("No seasonal baseline data after period length change (migration failed)")
+	}
+	if totalAfter < totalBefore {
+		t.Errorf("Total seasonal samples after migration=%d, expected at least as many as before=%d", totalAfter, totalBefore)
 	}
 }
 
@@ -1086,12 +1624,15 @@ func TestDetector_PointCount(t *testing.T) {
 }
 
 func TestDetector_SeasonalReset(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	cfg := Config{
 		WindowSize:        10,
 		StdDevFactor:      2.0,
 		MinSamples:        2,
 		EnableSeasonal:    true,
 		PeriodLength:      3,
+		PeriodSlot:        time.Second,
+		SeasonalEpoch:     epoch,
 		Direction:         DirectionBoth,
 		MaxAnomalyHistory: 100,
 	}
@@ -1100,11 +1641,11 @@ func TestDetector_SeasonalReset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	baseTime := time.Now()
 	for cycle := 0; cycle < 2; cycle++ {
 		for i := 0; i < 3; i++ {
+			offsetSec := cycle*3 + i
 			p := &DataPoint{
-				Timestamp: baseTime.Add(time.Duration(cycle*3+i) * time.Second),
+				Timestamp: epoch.Add(time.Duration(offsetSec) * time.Second),
 				Value:     float64(i*10 + 10),
 			}
 			_, _ = d.Add(p)
@@ -1121,5 +1662,26 @@ func TestDetector_SeasonalReset(t *testing.T) {
 	_, _, countAfter, _ := d.GetSeasonalBaseline(0)
 	if countAfter != 0 {
 		t.Errorf("Seasonal baseline count after reset: got %d, want 0", countAfter)
+	}
+}
+
+func TestGcdHelper(t *testing.T) {
+	tests := []struct {
+		a, b int
+		want int
+	}{
+		{4, 6, 2},
+		{6, 4, 2},
+		{12, 8, 4},
+		{7, 13, 1},
+		{0, 5, 5},
+		{5, 0, 5},
+		{-4, 6, 2},
+	}
+	for _, tt := range tests {
+		got := gcd(tt.a, tt.b)
+		if got != tt.want {
+			t.Errorf("gcd(%d,%d) = %d, want %d", tt.a, tt.b, got, tt.want)
+		}
 	}
 }

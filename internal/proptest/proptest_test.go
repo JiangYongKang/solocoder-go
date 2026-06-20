@@ -1,6 +1,8 @@
 package proptest
 
 import (
+	"bytes"
+	"errors"
 	"math"
 	"math/rand"
 	"strings"
@@ -1025,7 +1027,6 @@ func TestRunner_Check_AllIterations(t *testing.T) {
 	gen := IntRange(1, 10)
 	failCount := 0
 	prop := func(x int) (bool, string) {
-		// Always fail so we can see which iteration triggers
 		failCount++
 		return false, "always fail"
 	}
@@ -1035,5 +1036,367 @@ func TestRunner_Check_AllIterations(t *testing.T) {
 	}
 	if result.FailCase.Iteration != 1 {
 		t.Errorf("expected failure at iteration 1, got %d", result.FailCase.Iteration)
+	}
+}
+
+func TestResult_Err_NilGenerator(t *testing.T) {
+	cfg := Config{Iterations: 10, Seed: 1, UseRandomSeed: false}
+	r := NewRunner[int](cfg)
+	result := r.Check(nil, func(x int) (bool, string) { return true, "" })
+	if !errors.Is(result.Err, ErrGeneratorNil) {
+		t.Errorf("expected Err to be ErrGeneratorNil, got %v", result.Err)
+	}
+}
+
+func TestResult_Err_NilProperty(t *testing.T) {
+	cfg := Config{Iterations: 10, Seed: 1, UseRandomSeed: false}
+	r := NewRunner[int](cfg)
+	result := r.Check(Int(), nil)
+	if !errors.Is(result.Err, ErrInvalidConfig) {
+		t.Errorf("expected Err to be ErrInvalidConfig, got %v", result.Err)
+	}
+}
+
+func TestResult_Err_PropertyFailed(t *testing.T) {
+	gen := IntRange(0, 100)
+	prop := func(x int) (bool, string) {
+		if x >= 50 {
+			return false, "x too large"
+		}
+		return true, ""
+	}
+	cfg := Config{Iterations: 1000, Seed: 42, UseRandomSeed: false, MaxShrinks: 100}
+	r := NewRunner[int](cfg)
+	result := r.Check(gen, prop)
+	if result.Passed {
+		t.Fatal("expected property to fail")
+	}
+	if !errors.Is(result.Err, ErrPropertyFailed) {
+		t.Errorf("expected Err to wrap ErrPropertyFailed, got %v", result.Err)
+	}
+}
+
+func TestResult_Err_ShrinkLimit(t *testing.T) {
+	gen := IntRange(0, 1000000)
+	prop := func(x int) (bool, string) {
+		if x > 0 {
+			return false, "must be 0"
+		}
+		return true, ""
+	}
+	cfg := Config{
+		Iterations:    100,
+		MaxShrinks:    2,
+		Seed:          987654,
+		UseRandomSeed: false,
+	}
+	r := NewRunner[int](cfg)
+	result := r.Check(gen, prop)
+	if result.Passed {
+		t.Fatal("expected failure")
+	}
+	if !errors.Is(result.Err, ErrShrinkLimit) {
+		t.Errorf("expected Err to wrap ErrShrinkLimit, got %v", result.Err)
+	}
+	if !strings.Contains(result.Err.Error(), "max shrinks") {
+		t.Errorf("expected shrink limit detail in error, got %v", result.Err)
+	}
+}
+
+func TestResult_Err_PassingProperty(t *testing.T) {
+	gen := IntRange(0, 10)
+	prop := func(x int) (bool, string) { return x >= 0 && x <= 10, "" }
+	cfg := Config{Iterations: 10, Seed: 1, UseRandomSeed: false}
+	r := NewRunner[int](cfg)
+	result := r.Check(gen, prop)
+	if !result.Passed {
+		t.Fatal("expected passing property")
+	}
+	if result.Err != nil {
+		t.Errorf("expected nil Err for passing property, got %v", result.Err)
+	}
+}
+
+func TestResult_StringIncludesError(t *testing.T) {
+	r := &Result[int]{
+		Passed:      false,
+		Seed:        456,
+		Iterations:  20,
+		ShrinkSteps: 5,
+		Err:         ErrPropertyFailed,
+		FailCase: &FailCase[int]{
+			Input:     42,
+			Iteration: 10,
+			Message:   "test error",
+			Seed:      456,
+		},
+	}
+	s := r.String()
+	if !strings.Contains(s, ErrPropertyFailed.Error()) {
+		t.Errorf("expected error message in result string, got: %s", s)
+	}
+}
+
+func TestVerbose_OutputToWriter(t *testing.T) {
+	var buf bytes.Buffer
+	cfg := Config{
+		Iterations:    5,
+		Seed:          42,
+		UseRandomSeed: false,
+		Verbose:       true,
+		Writer:        &buf,
+	}
+	r := NewRunner[int](cfg)
+	result := r.Check(IntRange(0, 10), func(x int) (bool, string) {
+		return true, ""
+	})
+	if !result.Passed {
+		t.Fatal("expected passing property")
+	}
+	output := buf.String()
+	if !strings.Contains(output, "starting check") {
+		t.Errorf("expected 'starting check' in verbose output, got: %s", output)
+	}
+	if !strings.Contains(output, "iterations passed") {
+		t.Errorf("expected 'iterations passed' in verbose output, got: %s", output)
+	}
+}
+
+func TestVerbose_OutputOnFailure(t *testing.T) {
+	var buf bytes.Buffer
+	cfg := Config{
+		Iterations:    100,
+		Seed:          42,
+		UseRandomSeed: false,
+		Verbose:       true,
+		Writer:        &buf,
+		MaxShrinks:    50,
+	}
+	r := NewRunner[int](cfg)
+	result := r.Check(IntRange(0, 100), func(x int) (bool, string) {
+		if x >= 50 {
+			return false, "too large"
+		}
+		return true, ""
+	})
+	if result.Passed {
+		t.Fatal("expected failure")
+	}
+	output := buf.String()
+	if !strings.Contains(output, "failure at iteration") {
+		t.Errorf("expected 'failure at iteration' in verbose output, got: %s", output)
+	}
+	if !strings.Contains(output, "shrunk to") {
+		t.Errorf("expected 'shrunk to' in verbose output, got: %s", output)
+	}
+}
+
+func TestVerbose_OutputWithShrinkSteps(t *testing.T) {
+	var buf bytes.Buffer
+	cfg := Config{
+		Iterations:    200,
+		Seed:          7,
+		UseRandomSeed: false,
+		Verbose:       true,
+		Writer:        &buf,
+		MaxShrinks:    500,
+	}
+	r := NewRunner[string](cfg)
+	result := r.Check(StringLen(0, 100), func(s string) (bool, string) {
+		if len(s) > 5 {
+			return false, "too long"
+		}
+		return true, ""
+	})
+	if result.Passed {
+		t.Fatal("expected failure")
+	}
+	output := buf.String()
+	if !strings.Contains(output, "shrink step") {
+		t.Errorf("expected 'shrink step' in verbose output, got: %s", output)
+	}
+}
+
+func TestVerbose_DefaultWriterStdout(t *testing.T) {
+	cfg := Config{
+		Iterations:    2,
+		Seed:          1,
+		UseRandomSeed: false,
+		Verbose:       true,
+	}
+	r := NewRunner[int](cfg)
+	if r.w == nil {
+		t.Error("expected non-nil writer when Verbose=true and no Writer set")
+	}
+}
+
+func TestVerbose_Off_NoOutput(t *testing.T) {
+	var buf bytes.Buffer
+	cfg := Config{
+		Iterations:    5,
+		Seed:          42,
+		UseRandomSeed: false,
+		Verbose:       false,
+		Writer:        &buf,
+	}
+	r := NewRunner[int](cfg)
+	result := r.Check(IntRange(0, 10), func(x int) (bool, string) {
+		return true, ""
+	})
+	if !result.Passed {
+		t.Fatal("expected passing property")
+	}
+	output := buf.String()
+	if output != "" {
+		t.Errorf("expected no output when Verbose=false, got: %s", output)
+	}
+}
+
+func TestIntGenerator_FullRangeBounds(t *testing.T) {
+	gen := Int()
+	r := rand.New(rand.NewSource(42))
+	minSeen := math.MaxInt
+	maxSeen := math.MinInt
+	for i := 0; i < 100000; i++ {
+		v := gen.Generate(r)
+		if v < minSeen {
+			minSeen = v
+		}
+		if v > maxSeen {
+			maxSeen = v
+		}
+	}
+	if minSeen > math.MinInt+100000 {
+		t.Logf("Warning: minSeen=%d, may not be covering full negative range well", minSeen)
+	}
+	if maxSeen < math.MaxInt-100000 {
+		t.Logf("Warning: maxSeen=%d, may not be covering full positive range well", maxSeen)
+	}
+}
+
+func TestIntGenerator_NonNegativeOverflow(t *testing.T) {
+	gen := IntNonNegative()
+	r := rand.New(rand.NewSource(1))
+	for i := 0; i < 10000; i++ {
+		v := gen.Generate(r)
+		if v < 0 {
+			t.Fatalf("sample %d: expected non-negative, got %d (overflow bug)", i, v)
+		}
+	}
+}
+
+func TestIntGenerator_PositiveOverflow(t *testing.T) {
+	gen := IntPositive()
+	r := rand.New(rand.NewSource(1))
+	for i := 0; i < 10000; i++ {
+		v := gen.Generate(r)
+		if v < 1 {
+			t.Fatalf("sample %d: expected >= 1, got %d (overflow bug)", i, v)
+		}
+	}
+}
+
+func TestIntGenerator_LargeNegativeRange(t *testing.T) {
+	gen := IntRange(math.MinInt, 0)
+	r := rand.New(rand.NewSource(1))
+	for i := 0; i < 10000; i++ {
+		v := gen.Generate(r)
+		if v > 0 || v < math.MinInt {
+			t.Fatalf("sample %d: value %d out of range [MinInt, 0]", i, v)
+		}
+	}
+}
+
+func TestIntGenerator_LargeMixedRange(t *testing.T) {
+	gen := IntRange(math.MinInt, math.MaxInt)
+	r := rand.New(rand.NewSource(1))
+	hasNeg := false
+	hasPos := false
+	for i := 0; i < 10000; i++ {
+		v := gen.Generate(r)
+		if v < 0 {
+			hasNeg = true
+		}
+		if v > 0 {
+			hasPos = true
+		}
+		if v < math.MinInt || v > math.MaxInt {
+			t.Fatalf("sample %d: value %d out of full range", i, v)
+		}
+	}
+	if !hasNeg {
+		t.Error("expected negative values in full range")
+	}
+	if !hasPos {
+		t.Error("expected positive values in full range")
+	}
+}
+
+func TestCheck_WithVerboseOption(t *testing.T) {
+	var buf bytes.Buffer
+	result := Check(
+		IntRange(1, 10),
+		func(x int) (bool, string) {
+			return x >= 1 && x <= 10, ""
+		},
+		WithIterations(5),
+		WithSeed(42),
+		WithVerbose(true),
+	)
+	if !result.Passed {
+		t.Errorf("expected passing property, got: %s", result.String())
+	}
+	_ = buf
+}
+
+func TestRunner_Check_ShrinkNotLimited(t *testing.T) {
+	gen := IntRange(0, 100)
+	prop := func(x int) (bool, string) {
+		if x > 50 {
+			return false, "too large"
+		}
+		return true, ""
+	}
+	cfg := Config{Iterations: 1000, Seed: 42, UseRandomSeed: false, MaxShrinks: 1000}
+	r := NewRunner[int](cfg)
+	result := r.Check(gen, prop)
+	if result.Passed {
+		t.Fatal("expected failure")
+	}
+	if errors.Is(result.Err, ErrShrinkLimit) {
+		t.Errorf("did not expect ErrShrinkLimit when sufficient shrinks available, got %v", result.Err)
+	}
+	if !errors.Is(result.Err, ErrPropertyFailed) {
+		t.Errorf("expected ErrPropertyFailed, got %v", result.Err)
+	}
+}
+
+func TestConfig_WriterField(t *testing.T) {
+	var buf bytes.Buffer
+	cfg := Config{
+		Iterations:    3,
+		Seed:          1,
+		UseRandomSeed: false,
+		Verbose:       true,
+		Writer:        &buf,
+	}
+	r := NewRunner[int](cfg)
+	if r.w != &buf {
+		t.Error("expected Runner to use the provided Writer")
+	}
+}
+
+func TestConfig_WriterNilVerboseFalse(t *testing.T) {
+	cfg := Config{
+		Iterations:    3,
+		Seed:          1,
+		UseRandomSeed: false,
+		Verbose:       false,
+		Writer:        nil,
+	}
+	r := NewRunner[int](cfg)
+	result := r.Check(IntRange(0, 5), func(x int) (bool, string) { return true, "" })
+	if !result.Passed {
+		t.Error("expected passing")
 	}
 }

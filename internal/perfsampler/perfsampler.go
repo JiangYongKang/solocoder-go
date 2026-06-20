@@ -3,6 +3,7 @@ package perfsampler
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"hash/fnv"
 	"math"
 	"sync"
 	"time"
@@ -59,18 +60,26 @@ func (s *ProbabilitySampler) ShouldSample(requestID string) bool {
 	if s.rate <= 0 {
 		return false
 	}
-	if len(requestID) < 16 {
-		return s.rate > 0
-	}
-	b, err := hex.DecodeString(requestID[:16])
-	if err != nil {
-		return s.rate > 0
-	}
+
 	var val uint64
-	for i := 0; i < 8; i++ {
-		val = (val << 8) | uint64(b[i])
+	if len(requestID) >= 16 {
+		b, err := hex.DecodeString(requestID[:16])
+		if err == nil {
+			for i := 0; i < 8; i++ {
+				val = (val << 8) | uint64(b[i])
+			}
+			return val < s.threshold
+		}
 	}
+
+	val = hashRequestID(requestID)
 	return val < s.threshold
+}
+
+func hashRequestID(requestID string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(requestID))
+	return h.Sum64()
 }
 
 func (s *ProbabilitySampler) Rate() float64 {
@@ -90,7 +99,6 @@ type RequestProfiler struct {
 
 	cpuRoot      *CPUStackNode
 	cpuStack     []*CPUStackNode
-	cpuNodeMap   map[string]*CPUStackNode
 
 	memoryStats  map[string]*MemoryFuncStat
 
@@ -113,7 +121,6 @@ func NewRequestProfiler(requestID string, sampler Sampler) (*RequestProfiler, er
 		sampler:     sampler,
 		sampled:     sampled,
 		sampleRate:  sampler.Rate(),
-		cpuNodeMap:  make(map[string]*CPUStackNode),
 		memoryStats: make(map[string]*MemoryFuncStat),
 	}, nil
 }
@@ -467,7 +474,7 @@ func (p *RequestProfiler) Export() (*ProfileResult, error) {
 		return nil, ErrProfilerNotStarted
 	}
 	if !p.stopped {
-		return nil, ErrProfilerNotStarted
+		return nil, ErrProfilerNotStopped
 	}
 
 	result := &ProfileResult{

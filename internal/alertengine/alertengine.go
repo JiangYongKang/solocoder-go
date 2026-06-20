@@ -8,11 +8,40 @@ import (
 
 const maxHistorySize = 1000
 
+var validLevels = map[AlertLevel]bool{
+	LevelInfo:     true,
+	LevelWarning:  true,
+	LevelAlert:    true,
+	LevelCritical: true,
+}
+
+var validOperators = map[ComparisonOperator]bool{
+	OpGreaterThan:        true,
+	OpLessThan:           true,
+	OpGreaterThanOrEqual: true,
+	OpLessThanOrEqual:    true,
+}
+
+var validCompareTypes = map[CompareType]bool{
+	CompareRingbi: true,
+	CompareTongbi: true,
+}
+
+var validDurationTypes = map[DurationType]bool{
+	DurationByCount: true,
+	DurationByTime:  true,
+}
+
+var validSilentTypes = map[SilentType]bool{
+	SilentDaily: true,
+	SilentRange: true,
+}
+
 type Engine struct {
-	mu       sync.RWMutex
-	cfg      EngineConfig
-	rules    map[string]*AlertRule
-	states   map[string]*RuleState
+	mu        sync.RWMutex
+	cfg       EngineConfig
+	rules     map[string]*AlertRule
+	states    map[string]*RuleState
 	notifiers map[string]Notifier
 }
 
@@ -31,24 +60,100 @@ func NewEngine(cfg EngineConfig) *Engine {
 	}
 }
 
-func (e *Engine) RegisterNotifier(notifier Notifier) {
+func (e *Engine) RegisterNotifier(notifier Notifier) error {
+	if notifier == nil {
+		return ErrInvalidCondition
+	}
+	if notifier.Name() == "" {
+		return ErrInvalidRule
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.notifiers[notifier.Name()] = notifier
+	return nil
 }
 
 func (e *Engine) AddRule(rule *AlertRule) error {
 	if rule == nil || rule.ID == "" {
 		return ErrInvalidRule
 	}
+	if rule.Name == "" {
+		return ErrInvalidRule
+	}
 	if rule.Threshold == nil && rule.RingbiTongbi == nil {
 		return ErrNoConditionDefined
 	}
+
 	if rule.InitialLevel == "" {
 		rule.InitialLevel = LevelAlert
 	}
-	if rule.InhibitDuration <= 0 {
+	if rule.InhibitDuration < 0 {
 		rule.InhibitDuration = e.cfg.DefaultInhibitDuration
+	}
+
+	if !validLevels[rule.InitialLevel] {
+		return ErrInvalidLevel
+	}
+
+	if rule.Threshold != nil {
+		if !validOperators[rule.Threshold.Operator] {
+			return ErrInvalidOperator
+		}
+	}
+
+	if rule.RingbiTongbi != nil {
+		if !validCompareTypes[rule.RingbiTongbi.CompareType] {
+			return ErrInvalidCondition
+		}
+		if rule.RingbiTongbi.PercentThreshold < 0 {
+			return ErrInvalidThreshold
+		}
+		if rule.RingbiTongbi.Period <= 0 {
+			return ErrInvalidDuration
+		}
+	}
+
+	if rule.Duration != nil {
+		if !validDurationTypes[rule.Duration.Type] {
+			return ErrInvalidDuration
+		}
+		if rule.Duration.Type == DurationByCount && rule.Duration.CheckCount <= 0 {
+			return ErrInvalidDuration
+		}
+		if rule.Duration.Type == DurationByTime && rule.Duration.TimeWindow <= 0 {
+			return ErrInvalidDuration
+		}
+	}
+
+	for _, sw := range rule.SilentWindows {
+		if !validSilentTypes[sw.Type] {
+			return ErrInvalidSilentWindow
+		}
+		if sw.Type == SilentDaily {
+			if _, _, err := parseTimeStr(sw.StartTime); err != nil {
+				return ErrInvalidSilentWindow
+			}
+			if _, _, err := parseTimeStr(sw.EndTime); err != nil {
+				return ErrInvalidSilentWindow
+			}
+		}
+		if sw.Type == SilentRange {
+			if sw.StartDate.IsZero() || sw.EndDate.IsZero() {
+				return ErrInvalidSilentWindow
+			}
+			if !sw.EndDate.After(sw.StartDate) {
+				return ErrInvalidSilentWindow
+			}
+		}
+	}
+
+	for _, esc := range rule.Escalations {
+		if !validLevels[esc.FromLevel] || !validLevels[esc.ToLevel] {
+			return ErrInvalidLevel
+		}
+		if esc.AfterDuration <= 0 {
+			return ErrInvalidDuration
+		}
 	}
 
 	e.mu.Lock()
@@ -99,16 +204,20 @@ func (e *Engine) GetAlertState(ruleID string) (*AlertState, error) {
 }
 
 func (e *Engine) Evaluate(ruleID string, dataPoint MetricDataPoint) error {
+	if dataPoint.Timestamp.IsZero() {
+		return ErrInvalidMetricData
+	}
+
 	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	rule, exists := e.rules[ruleID]
 	if !exists {
-		e.mu.Unlock()
 		return ErrRuleNotFound
 	}
 	state := e.states[ruleID]
-	e.mu.Unlock()
-
 	alert := state.Alert
+
 	alert.LastEvaluatedTime = time.Now()
 	alert.HistoryValues = append(alert.HistoryValues, dataPoint)
 	if len(alert.HistoryValues) > maxHistorySize {
@@ -156,9 +265,11 @@ func (e *Engine) Evaluate(ruleID string, dataPoint MetricDataPoint) error {
 		alert.TriggerValue = triggerValue
 		alert.TriggerTime = now
 
-		if alert.Status != StatusFiring && alert.Status != StatusSuppressed {
+		wasTriggered := alert.Status == StatusFiring || alert.Status == StatusSuppressed
+		if !wasTriggered {
 			alert.Status = StatusFiring
 			alert.CurrentLevel = rule.InitialLevel
+			alert.FirstTriggeredTime = now
 		}
 
 		escalated, newLevel := checkEscalation(rule.Escalations, alert, now)
@@ -166,14 +277,15 @@ func (e *Engine) Evaluate(ruleID string, dataPoint MetricDataPoint) error {
 			alert.CurrentLevel = newLevel
 		}
 
-		if !isInhibitPeriod(rule, alert, now) && !isInSilentPeriod(rule, now) {
-			e.sendNotifications(rule, alert, triggerValue, now)
+		if !isInhibitPeriod(rule, alert, now) && !isInSilentPeriod(rule, alert, now) {
+			e.sendNotificationsLocked(rule, alert, triggerValue, now)
 			alert.LastNotifiedTime = now
 		}
 	} else {
 		if alert.Status == StatusFiring || alert.Status == StatusSuppressed {
 			alert.Status = StatusResolved
 			alert.ResolvedTime = now
+			alert.FirstTriggeredTime = time.Time{}
 		}
 	}
 
@@ -214,6 +326,15 @@ func evaluateRingbiTongbi(cond *RingbiTongbiCondition, current MetricDataPoint, 
 		targetOffset = 365 * 24 * time.Hour
 	}
 
+	tolerance := cond.Tolerance
+	if tolerance <= 0 {
+		if cond.CompareType == CompareTongbi {
+			tolerance = 24 * time.Hour
+		} else {
+			tolerance = cond.Period / 2
+		}
+	}
+
 	targetTime := current.Timestamp.Add(-targetOffset)
 
 	for i := len(history) - 1; i >= 0; i-- {
@@ -222,7 +343,7 @@ func evaluateRingbiTongbi(cond *RingbiTongbiCondition, current MetricDataPoint, 
 		if diff < 0 {
 			diff = -diff
 		}
-		if diff <= cond.Period/2 {
+		if diff <= tolerance {
 			compareValue = dp.Value
 			found = true
 			break
@@ -270,11 +391,11 @@ func checkEscalation(escalations []EscalationRule, alert *AlertState, now time.T
 		return false, alert.CurrentLevel
 	}
 
-	if alert.FirstFiredTime.IsZero() {
+	if alert.FirstTriggeredTime.IsZero() {
 		return false, alert.CurrentLevel
 	}
 
-	duration := now.Sub(alert.FirstFiredTime)
+	duration := now.Sub(alert.FirstTriggeredTime)
 
 	for _, esc := range escalations {
 		if alert.CurrentLevel == esc.FromLevel && duration >= esc.AfterDuration {
@@ -294,8 +415,25 @@ func isInhibitPeriod(rule *AlertRule, alert *AlertState, now time.Time) bool {
 	return now.Sub(alert.LastNotifiedTime) < rule.InhibitDuration
 }
 
-func isInSilentPeriod(rule *AlertRule, now time.Time) bool {
+func isInSilentPeriod(rule *AlertRule, alert *AlertState, now time.Time) bool {
 	for _, sw := range rule.SilentWindows {
+		if len(sw.Tags) > 0 {
+			ruleTagSet := make(map[string]bool)
+			for _, tag := range rule.Tags {
+				ruleTagSet[tag] = true
+			}
+			tagMatched := false
+			for _, tag := range sw.Tags {
+				if ruleTagSet[tag] {
+					tagMatched = true
+					break
+				}
+			}
+			if !tagMatched {
+				continue
+			}
+		}
+
 		switch sw.Type {
 		case SilentDaily:
 			if isInDailySilent(sw, now) {
@@ -351,7 +489,7 @@ func parseTimeStr(s string) (int, int, error) {
 	return hour, minute, nil
 }
 
-func (e *Engine) sendNotifications(rule *AlertRule, alert *AlertState, triggerValue float64, now time.Time) {
+func (e *Engine) sendNotificationsLocked(rule *AlertRule, alert *AlertState, triggerValue float64, now time.Time) {
 	notification := Notification{
 		RuleID:       rule.ID,
 		AlertName:    rule.Name,
@@ -362,20 +500,16 @@ func (e *Engine) sendNotifications(rule *AlertRule, alert *AlertState, triggerVa
 		Message:      fmt.Sprintf("Alert %s triggered with value %.2f at %s, level: %s", rule.Name, triggerValue, now.Format(time.RFC3339), alert.CurrentLevel),
 	}
 
-	notifierNames := rule.Notifiers
+	notifierNames := e.getNotifiersForLevel(rule, alert.CurrentLevel)
 	if len(notifierNames) == 0 {
-		e.mu.RLock()
 		notifierNames = make([]string, 0, len(e.notifiers))
 		for name := range e.notifiers {
 			notifierNames = append(notifierNames, name)
 		}
-		e.mu.RUnlock()
 	}
 
 	for _, name := range notifierNames {
-		e.mu.RLock()
 		notifier, exists := e.notifiers[name]
-		e.mu.RUnlock()
 		if exists {
 			func() {
 				defer func() { recover() }()
@@ -383,6 +517,15 @@ func (e *Engine) sendNotifications(rule *AlertRule, alert *AlertState, triggerVa
 			}()
 		}
 	}
+}
+
+func (e *Engine) getNotifiersForLevel(rule *AlertRule, level AlertLevel) []string {
+	if rule.LevelNotifiers != nil {
+		if names, ok := rule.LevelNotifiers[level]; ok && len(names) > 0 {
+			return names
+		}
+	}
+	return rule.Notifiers
 }
 
 type ConsoleNotifier struct {

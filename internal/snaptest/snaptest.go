@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 var (
@@ -21,9 +22,10 @@ var (
 )
 
 const (
-	defaultSnapshotDir = "__snapshots__"
+	defaultSnapshotDir  = "__snapshots__"
 	defaultContextLines = 3
-	updateEnvVar       = "SNAPTEST_UPDATE"
+	updateEnvVar        = "SNAPTEST_UPDATE"
+	defaultColumnWidth  = 60
 )
 
 type DiffType int
@@ -32,20 +34,23 @@ const (
 	DiffSame DiffType = iota
 	DiffRemoved
 	DiffAdded
+	DiffModified
 )
 
 type DiffLine struct {
 	Type     DiffType
 	LeftNum  int
 	RightNum int
-	Content  string
+	Left     string
+	Right    string
 }
 
 type DiffResult struct {
-	Lines      []DiffLine
-	TotalSame  int
-	TotalAdded int
+	Lines        []DiffLine
+	TotalSame    int
+	TotalAdded   int
 	TotalRemoved int
+	TotalModified int
 }
 
 type Config struct {
@@ -108,7 +113,6 @@ func Serialize(v interface{}) (string, error) {
 
 func normalizeSnapshotContent(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
-	s = strings.TrimRight(s, "\n")
 	return s
 }
 
@@ -147,7 +151,10 @@ func (m *Matcher) writeSnapshot(name string, content string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("%w: cannot create dir %q: %v", ErrWriteSnapshot, dir, err)
 	}
-	normalized := normalizeSnapshotContent(content) + "\n"
+	normalized := normalizeSnapshotContent(content)
+	if !strings.HasSuffix(normalized, "\n") {
+		normalized += "\n"
+	}
 	if err := os.WriteFile(path, []byte(normalized), 0o644); err != nil {
 		return fmt.Errorf("%w: %v", ErrWriteSnapshot, err)
 	}
@@ -164,12 +171,25 @@ func Diff(expected, actual string) DiffResult {
 	i, j := 0, 0
 
 	for _, pair := range lcs {
+		for i < pair.Left && j < pair.Right {
+			result.Lines = append(result.Lines, DiffLine{
+				Type:     DiffModified,
+				LeftNum:  i + 1,
+				RightNum: j + 1,
+				Left:     expLines[i],
+				Right:    actLines[j],
+			})
+			result.TotalModified++
+			i++
+			j++
+		}
 		for i < pair.Left {
 			result.Lines = append(result.Lines, DiffLine{
 				Type:     DiffRemoved,
 				LeftNum:  i + 1,
 				RightNum: 0,
-				Content:  expLines[i],
+				Left:     expLines[i],
+				Right:    "",
 			})
 			result.TotalRemoved++
 			i++
@@ -179,7 +199,8 @@ func Diff(expected, actual string) DiffResult {
 				Type:     DiffAdded,
 				LeftNum:  0,
 				RightNum: j + 1,
-				Content:  actLines[j],
+				Left:     "",
+				Right:    actLines[j],
 			})
 			result.TotalAdded++
 			j++
@@ -188,19 +209,33 @@ func Diff(expected, actual string) DiffResult {
 			Type:     DiffSame,
 			LeftNum:  i + 1,
 			RightNum: j + 1,
-			Content:  expLines[i],
+			Left:     expLines[i],
+			Right:    actLines[j],
 		})
 		result.TotalSame++
 		i++
 		j++
 	}
 
+	for i < len(expLines) && j < len(actLines) {
+		result.Lines = append(result.Lines, DiffLine{
+			Type:     DiffModified,
+			LeftNum:  i + 1,
+			RightNum: j + 1,
+			Left:     expLines[i],
+			Right:    actLines[j],
+		})
+		result.TotalModified++
+		i++
+		j++
+	}
 	for i < len(expLines) {
 		result.Lines = append(result.Lines, DiffLine{
 			Type:     DiffRemoved,
 			LeftNum:  i + 1,
 			RightNum: 0,
-			Content:  expLines[i],
+			Left:     expLines[i],
+			Right:    "",
 		})
 		result.TotalRemoved++
 		i++
@@ -210,7 +245,8 @@ func Diff(expected, actual string) DiffResult {
 			Type:     DiffAdded,
 			LeftNum:  0,
 			RightNum: j + 1,
-			Content:  actLines[j],
+			Left:     "",
+			Right:    actLines[j],
 		})
 		result.TotalAdded++
 		j++
@@ -270,12 +306,23 @@ func splitLines(s string) []string {
 	if s == "" {
 		return []string{}
 	}
+	if strings.HasSuffix(s, "\n") {
+		s = s[:len(s)-1]
+		return strings.Split(s, "\n")
+	}
 	return strings.Split(s, "\n")
 }
 
 func (d DiffResult) Matches() bool {
-	return d.TotalAdded == 0 && d.TotalRemoved == 0
+	return d.TotalAdded == 0 && d.TotalRemoved == 0 && d.TotalModified == 0
 }
+
+const (
+	symbolSame     = " "
+	symbolRemoved  = "-"
+	symbolAdded    = "+"
+	symbolModified = "~"
+)
 
 func (d DiffResult) Format(contextLines int) string {
 	if d.Matches() {
@@ -287,44 +334,58 @@ func (d DiffResult) Format(contextLines int) string {
 
 	filtered := applyContext(d.Lines, contextLines)
 
+	colWidth := defaultColumnWidth
+
 	var buf bytes.Buffer
-	buf.WriteString("--- Expected (snapshot)\n")
-	buf.WriteString("+++ Actual (current output)\n")
-	buf.WriteString(fmt.Sprintf("@@ -%d +%d @@\n", firstLeftNum(filtered), firstRightNum(filtered)))
+
+	header := fmt.Sprintf("%-*s | %s", colWidth, "Expected (snapshot)", "Actual (current output)")
+	buf.WriteString(header + "\n")
+	buf.WriteString(strings.Repeat("-", colWidth) + "-+-" + strings.Repeat("-", colWidth) + "\n")
 
 	for _, line := range filtered {
 		switch line.Type {
 		case DiffSame:
-			fmt.Fprintf(&buf, "  %4d %4d | %s\n", line.LeftNum, line.RightNum, line.Content)
+			left := truncateOrPad(line.Left, colWidth)
+			right := truncateOrPad(line.Right, colWidth)
+			fmt.Fprintf(&buf, "%s %4d %s | %4d %s\n",
+				symbolSame, line.LeftNum, left, line.RightNum, right)
 		case DiffRemoved:
-			fmt.Fprintf(&buf, "- %4d      | %s\n", line.LeftNum, line.Content)
+			left := truncateOrPad(line.Left, colWidth)
+			right := truncateOrPad("", colWidth)
+			fmt.Fprintf(&buf, "%s %4d %s | %4s %s\n",
+				symbolRemoved, line.LeftNum, left, "", right)
 		case DiffAdded:
-			fmt.Fprintf(&buf, "+      %4d | %s\n", line.RightNum, line.Content)
+			left := truncateOrPad("", colWidth)
+			right := truncateOrPad(line.Right, colWidth)
+			fmt.Fprintf(&buf, "%s %4s %s | %4d %s\n",
+				symbolAdded, "", left, line.RightNum, right)
+		case DiffModified:
+			left := truncateOrPad(line.Left, colWidth)
+			right := truncateOrPad(line.Right, colWidth)
+			fmt.Fprintf(&buf, "%s %4d %s | %4d %s\n",
+				symbolModified, line.LeftNum, left, line.RightNum, right)
 		}
 	}
 
-	fmt.Fprintf(&buf, "\nSummary: %d same, %d removed, %d added\n",
-		d.TotalSame, d.TotalRemoved, d.TotalAdded)
+	fmt.Fprintf(&buf, "\nSummary: %d same, %d removed, %d added, %d modified\n",
+		d.TotalSame, d.TotalRemoved, d.TotalAdded, d.TotalModified)
 
 	return buf.String()
 }
 
-func firstLeftNum(lines []DiffLine) int {
-	for _, l := range lines {
-		if l.LeftNum > 0 {
-			return l.LeftNum
-		}
+func truncateOrPad(s string, width int) string {
+	runeCount := utf8.RuneCountInString(s)
+	if runeCount == width {
+		return s
 	}
-	return 1
-}
-
-func firstRightNum(lines []DiffLine) int {
-	for _, l := range lines {
-		if l.RightNum > 0 {
-			return l.RightNum
+	if runeCount > width {
+		runes := []rune(s)
+		if width <= 3 {
+			return string(runes[:width])
 		}
+		return string(runes[:width-3]) + "..."
 	}
-	return 1
+	return s + strings.Repeat(" ", width-runeCount)
 }
 
 func applyContext(lines []DiffLine, contextLines int) []DiffLine {
@@ -368,8 +429,9 @@ func applyContext(lines []DiffLine, contextLines int) []DiffLine {
 		if kept[i] {
 			if i > 0 && !prevKept {
 				result = append(result, DiffLine{
-					Type:    DiffSame,
-					Content: "...",
+					Type:  DiffSame,
+					Left:  "...",
+					Right: "...",
 				})
 			}
 			result = append(result, l)
@@ -381,12 +443,27 @@ func applyContext(lines []DiffLine, contextLines int) []DiffLine {
 
 	if len(lines) > 0 && !kept[len(lines)-1] {
 		result = append(result, DiffLine{
-			Type:    DiffSame,
-			Content: "...",
+			Type:  DiffSame,
+			Left:  "...",
+			Right: "...",
 		})
 	}
 
 	return result
+}
+
+type MismatchError struct {
+	Name   string
+	Diff   DiffResult
+	Report string
+}
+
+func (e *MismatchError) Error() string {
+	return fmt.Sprintf("%s: %q\n%s", ErrSnapshotMismatch.Error(), e.Name, e.Report)
+}
+
+func (e *MismatchError) Unwrap() error {
+	return ErrSnapshotMismatch
 }
 
 func (m *Matcher) Match(name string, v interface{}) (bool, string, error) {
@@ -404,12 +481,6 @@ func (m *Matcher) Match(name string, v interface{}) (bool, string, error) {
 
 	expected, err := m.readSnapshot(name)
 	if err != nil {
-		if errors.Is(err, ErrSnapshotNotFound) {
-			if err := m.writeSnapshot(name, actual); err != nil {
-				return false, "", err
-			}
-			return true, "created new snapshot", nil
-		}
 		return false, "", err
 	}
 
@@ -419,7 +490,12 @@ func (m *Matcher) Match(name string, v interface{}) (bool, string, error) {
 	}
 
 	report := diff.Format(m.cfg.ContextLines)
-	return false, report, nil
+	mismatchErr := &MismatchError{
+		Name:   name,
+		Diff:   diff,
+		Report: report,
+	}
+	return false, report, mismatchErr
 }
 
 func (m *Matcher) Update(name string, v interface{}) error {
@@ -434,6 +510,9 @@ func (m *Matcher) Assert(t *testing.T, name string, v interface{}) {
 	t.Helper()
 	ok, report, err := m.Match(name, v)
 	if err != nil {
+		if errors.Is(err, ErrSnapshotNotFound) {
+			t.Fatalf("snaptest: snapshot %q not found, use Update() or set SNAPTEST_UPDATE=1 to create it: %v", name, err)
+		}
 		t.Fatalf("snaptest: error matching snapshot %q: %v", name, err)
 	}
 	if !ok {

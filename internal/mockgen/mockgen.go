@@ -164,13 +164,14 @@ type MockProxy struct {
 	targetType reflect.Type
 }
 
-func CreateMock(iface interface{}) *MockProxy {
+func CreateMock(iface interface{}) (*MockProxy, error) {
 	ifaceType := reflect.TypeOf(iface)
 	if ifaceType.Kind() == reflect.Ptr {
 		ifaceType = ifaceType.Elem()
 	}
 	if ifaceType.Kind() != reflect.Interface {
-		panic(fmt.Sprintf("mockgen: CreateMock requires an interface type, got %s", ifaceType.Kind()))
+		return nil, fmt.Errorf("%w: expected interface type, got %s",
+			ErrInvalidInterface, ifaceType.Kind())
 	}
 
 	controller := NewMockController()
@@ -178,7 +179,15 @@ func CreateMock(iface interface{}) *MockProxy {
 	return &MockProxy{
 		controller: controller,
 		targetType: ifaceType,
+	}, nil
+}
+
+func MustCreateMock(iface interface{}) *MockProxy {
+	mp, err := CreateMock(iface)
+	if err != nil {
+		panic(err)
 	}
+	return mp
 }
 
 func (mp *MockProxy) Controller() *MockController {
@@ -202,9 +211,18 @@ func (mp *MockProxy) Call(methodName string, args ...interface{}) []interface{} 
 }
 
 func (mp *MockProxy) Method(methodName string) interface{} {
+	fn, err := mp.TryMethod(methodName)
+	if err != nil {
+		panic(err)
+	}
+	return fn
+}
+
+func (mp *MockProxy) TryMethod(methodName string) (interface{}, error) {
 	method, ok := mp.targetType.MethodByName(methodName)
 	if !ok {
-		panic(fmt.Sprintf("mockgen: method %q not found on interface %s", methodName, mp.targetType.Name()))
+		return nil, fmt.Errorf("%w: method %q not found on interface %s",
+			ErrMethodNotFound, methodName, mp.targetType.Name())
 	}
 
 	methodType := method.Type
@@ -229,7 +247,77 @@ func (mp *MockProxy) Method(methodName string) interface{} {
 		return out
 	})
 
-	return fn.Interface()
+	return fn.Interface(), nil
+}
+
+func (mp *MockProxy) Instance() interface{} {
+	return createInterfaceInstance(mp)
+}
+
+type mockInterfaceWrapper struct {
+	mockProxy *MockProxy
+}
+
+func createInterfaceInstance(mp *MockProxy) interface{} {
+	ifaceType := mp.targetType
+	numMethods := ifaceType.NumMethod()
+
+	fields := make([]reflect.StructField, numMethods)
+	for i := 0; i < numMethods; i++ {
+		method := ifaceType.Method(i)
+		fields[i] = reflect.StructField{
+			Name: method.Name,
+			Type: method.Type,
+		}
+	}
+
+	structType := reflect.StructOf(fields)
+	structPtr := reflect.New(structType)
+	structVal := structPtr.Elem()
+
+	for i := 0; i < numMethods; i++ {
+		method := ifaceType.Method(i)
+		methodName := method.Name
+		methodType := method.Type
+		mpCapture := mp
+
+		fn := reflect.MakeFunc(methodType, func(args []reflect.Value) []reflect.Value {
+			in := make([]interface{}, len(args))
+			for j, arg := range args {
+				in[j] = arg.Interface()
+			}
+
+			results := mpCapture.controller.CallMethod(methodName, in)
+
+			out := make([]reflect.Value, methodType.NumOut())
+			for j := 0; j < methodType.NumOut(); j++ {
+				if j < len(results) && results[j] != nil {
+					out[j] = reflect.ValueOf(results[j])
+				} else {
+					out[j] = reflect.Zero(methodType.Out(j))
+				}
+			}
+
+			return out
+		})
+
+		structVal.Field(i).Set(fn)
+	}
+
+	wrapperType := reflect.StructOf([]reflect.StructField{
+		{
+			Name: "Data", Type: structType,
+		},
+	})
+	wrapperPtr := reflect.New(wrapperType)
+	wrapperVal := wrapperPtr.Elem()
+	wrapperVal.Field(0).Set(structVal)
+
+	return wrapperPtr.Interface()
+}
+
+func (m mockInterfaceWrapper) GetMockProxy() *MockProxy {
+	return m.mockProxy
 }
 
 func zeroValue(t reflect.Type) reflect.Value {

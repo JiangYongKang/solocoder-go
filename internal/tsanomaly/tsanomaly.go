@@ -10,13 +10,14 @@ import (
 )
 
 var (
-	ErrInvalidWindowSize    = errors.New("tsanomaly: invalid window size, must be positive")
-	ErrInvalidStdDevFactor  = errors.New("tsanomaly: invalid standard deviation factor, must be non-negative")
-	ErrInvalidPeriodLength  = errors.New("tsanomaly: invalid period length, must be positive when seasonal mode is enabled")
-	ErrInvalidMinSamples    = errors.New("tsanomaly: invalid min samples, must be positive and <= window size")
-	ErrNilDataPoint         = errors.New("tsanomaly: nil data point")
-	ErrDetectorClosed       = errors.New("tsanomaly: detector is closed")
-	ErrInvalidDirection     = errors.New("tsanomaly: invalid deviation direction")
+	ErrInvalidWindowSize      = errors.New("tsanomaly: invalid window size, must be positive")
+	ErrInvalidStdDevFactor    = errors.New("tsanomaly: invalid standard deviation factor, must be non-negative")
+	ErrInvalidPeriodLength    = errors.New("tsanomaly: invalid period length, must be positive when seasonal mode is enabled")
+	ErrInvalidPeriodSlot      = errors.New("tsanomaly: invalid period slot, must be positive duration when seasonal mode is enabled")
+	ErrInvalidMinSamples      = errors.New("tsanomaly: invalid min samples, must be positive and <= window size")
+	ErrNilDataPoint           = errors.New("tsanomaly: nil data point")
+	ErrDetectorClosed         = errors.New("tsanomaly: detector is closed")
+	ErrInvalidDirection       = errors.New("tsanomaly: invalid deviation direction")
 )
 
 type DeviationDirection int
@@ -41,13 +42,15 @@ func (d DeviationDirection) String() string {
 }
 
 type Config struct {
-	WindowSize          int
-	StdDevFactor        float64
-	MinSamples          int
-	EnableSeasonal      bool
-	PeriodLength        int
-	Direction           DeviationDirection
-	MaxAnomalyHistory   int
+	WindowSize        int
+	StdDevFactor      float64
+	MinSamples        int
+	EnableSeasonal    bool
+	PeriodLength      int
+	PeriodSlot        time.Duration
+	SeasonalEpoch     time.Time
+	Direction         DeviationDirection
+	MaxAnomalyHistory int
 }
 
 func DefaultConfig() Config {
@@ -57,6 +60,8 @@ func DefaultConfig() Config {
 		MinSamples:        10,
 		EnableSeasonal:    false,
 		PeriodLength:      0,
+		PeriodSlot:        0,
+		SeasonalEpoch:     time.Unix(0, 0).UTC(),
 		Direction:         DirectionBoth,
 		MaxAnomalyHistory: 1000,
 	}
@@ -76,6 +81,9 @@ func ValidateConfig(cfg Config) error {
 		if cfg.PeriodLength <= 0 {
 			return ErrInvalidPeriodLength
 		}
+		if cfg.PeriodSlot <= 0 {
+			return ErrInvalidPeriodSlot
+		}
 	}
 	switch cfg.Direction {
 	case DirectionBoth, DirectionUp, DirectionDown:
@@ -93,7 +101,7 @@ type DataPoint struct {
 type AnomalySeverity string
 
 const (
-	SeverityWarning AnomalySeverity = "warning"
+	SeverityWarning  AnomalySeverity = "warning"
 	SeverityCritical AnomalySeverity = "critical"
 )
 
@@ -120,6 +128,16 @@ func newWindowStats() *windowStats {
 	return &windowStats{
 		values: list.New(),
 	}
+}
+
+func cloneWindowStats(src *windowStats) *windowStats {
+	dst := newWindowStats()
+	dst.sum = src.sum
+	dst.sumSq = src.sumSq
+	for e := src.values.Front(); e != nil; e = e.Next() {
+		dst.values.PushBack(e.Value.(float64))
+	}
+	return dst
 }
 
 func (ws *windowStats) count() int {
@@ -166,13 +184,13 @@ func (ws *windowStats) reset() {
 }
 
 type Detector struct {
-	mu                sync.RWMutex
-	cfg               Config
-	globalStats       *windowStats
-	seasonalStats     []*windowStats
-	anomalies         []*AnomalyEvent
-	pointCount        int64
-	closed            bool
+	mu            sync.RWMutex
+	cfg           Config
+	globalStats   *windowStats
+	seasonalStats []*windowStats
+	anomalies     []*AnomalyEvent
+	pointCount    int64
+	closed        bool
 }
 
 func NewDetector(cfg Config) (*Detector, error) {
@@ -207,32 +225,141 @@ func (d *Detector) Config() Config {
 	return d.cfg
 }
 
+func (d *Detector) computeSeasonalIndex(timestamp time.Time) int {
+	slotCount := int64(timestamp.Sub(d.cfg.SeasonalEpoch) / d.cfg.PeriodSlot)
+	idx := int(slotCount % int64(d.cfg.PeriodLength))
+	if idx < 0 {
+		idx += d.cfg.PeriodLength
+	}
+	return idx
+}
+
+func mergeWindowStats(dst *windowStats, src *windowStats, maxSize int) {
+	var srcVals []float64
+	for e := src.values.Front(); e != nil; e = e.Next() {
+		srcVals = append(srcVals, e.Value.(float64))
+	}
+	sort.Slice(srcVals, func(i, j int) bool {
+		return i < j
+	})
+	for _, v := range srcVals {
+		dst.add(v, maxSize)
+	}
+}
+
 func (d *Detector) UpdateConfig(cfg Config) error {
 	if err := ValidateConfig(cfg); err != nil {
 		return err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	oldCfg := d.cfg
+	oldSeasonal := d.seasonalStats
+	oldEnable := oldCfg.EnableSeasonal
+	newEnable := cfg.EnableSeasonal
+
 	d.cfg = cfg
-	if cfg.EnableSeasonal {
-		if len(d.seasonalStats) != cfg.PeriodLength {
-			d.seasonalStats = make([]*windowStats, cfg.PeriodLength)
-			for i := 0; i < cfg.PeriodLength; i++ {
-				d.seasonalStats[i] = newWindowStats()
+
+	newSeasonalLen := 0
+	if newEnable {
+		newSeasonalLen = cfg.PeriodLength
+	}
+
+	if !oldEnable && !newEnable {
+		d.seasonalStats = nil
+		return nil
+	}
+
+	if oldEnable && !newEnable {
+		if oldCfg.PeriodLength > 0 && len(oldSeasonal) > 0 {
+			merged := newWindowStats()
+			for _, s := range oldSeasonal {
+				mergeWindowStats(merged, s, cfg.WindowSize)
+			}
+			for e := merged.values.Front(); e != nil; e = e.Next() {
+				d.globalStats.add(e.Value.(float64), cfg.WindowSize)
 			}
 		}
-	} else {
 		d.seasonalStats = nil
+		return nil
 	}
+
+	if !oldEnable && newEnable {
+		newSeasonal := make([]*windowStats, newSeasonalLen)
+		for i := 0; i < newSeasonalLen; i++ {
+			newSeasonal[i] = newWindowStats()
+		}
+		if d.globalStats.count() > 0 {
+			globalClone := cloneWindowStats(d.globalStats)
+			idx := 0
+			for e := globalClone.values.Front(); e != nil; e = e.Next() {
+				newSeasonal[idx%newSeasonalLen].add(e.Value.(float64), cfg.WindowSize)
+				idx++
+			}
+		}
+		d.seasonalStats = newSeasonal
+		return nil
+	}
+
+	oldLen := oldCfg.PeriodLength
+	newLen := cfg.PeriodLength
+	newSeasonal := make([]*windowStats, newLen)
+	for i := 0; i < newLen; i++ {
+		newSeasonal[i] = newWindowStats()
+	}
+
+	if oldLen > 0 && len(oldSeasonal) > 0 {
+		if oldLen == newLen && oldCfg.PeriodSlot == cfg.PeriodSlot && oldCfg.SeasonalEpoch.Equal(cfg.SeasonalEpoch) {
+			for i := 0; i < newLen; i++ {
+				if i < len(oldSeasonal) && oldSeasonal[i] != nil {
+					newSeasonal[i] = cloneWindowStats(oldSeasonal[i])
+					for newSeasonal[i].count() > cfg.WindowSize {
+						e := newSeasonal[i].values.Front()
+						oldVal := e.Value.(float64)
+						newSeasonal[i].sum -= oldVal
+						newSeasonal[i].sumSq -= oldVal * oldVal
+						newSeasonal[i].values.Remove(e)
+					}
+				}
+			}
+		} else {
+			gcdVal := gcd(oldLen, newLen)
+			for oldIdx := 0; oldIdx < oldLen && oldIdx < len(oldSeasonal); oldIdx++ {
+				if oldSeasonal[oldIdx] == nil {
+					continue
+				}
+				newIdx := oldIdx % newLen
+				if gcdVal > 0 {
+					for k := 0; k < newLen/gcdVal; k++ {
+						mappedIdx := (newIdx + k*gcdVal) % newLen
+						mergeWindowStats(newSeasonal[mappedIdx], oldSeasonal[oldIdx], cfg.WindowSize)
+					}
+				} else {
+					mergeWindowStats(newSeasonal[newIdx], oldSeasonal[oldIdx], cfg.WindowSize)
+				}
+			}
+		}
+	}
+
+	d.seasonalStats = newSeasonal
 	return nil
 }
 
-func (d *Detector) Add(point *DataPoint) (*AnomalyEvent, error) {
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	if a < 0 {
+		return -a
+	}
+	return a
+}
+
+func (d *Detector) addLocked(point *DataPoint) (*AnomalyEvent, error) {
 	if point == nil {
 		return nil, ErrNilDataPoint
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.closed {
 		return nil, ErrDetectorClosed
 	}
@@ -242,7 +369,7 @@ func (d *Detector) Add(point *DataPoint) (*AnomalyEvent, error) {
 	var seasonalIdx int
 	var stats *windowStats
 	if d.cfg.EnableSeasonal {
-		seasonalIdx = int((d.pointCount - 1) % int64(d.cfg.PeriodLength))
+		seasonalIdx = d.computeSeasonalIndex(point.Timestamp)
 		stats = d.seasonalStats[seasonalIdx]
 	} else {
 		stats = d.globalStats
@@ -324,6 +451,15 @@ func (d *Detector) Add(point *DataPoint) (*AnomalyEvent, error) {
 	return event, nil
 }
 
+func (d *Detector) Add(point *DataPoint) (*AnomalyEvent, error) {
+	if point == nil {
+		return nil, ErrNilDataPoint
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.addLocked(point)
+}
+
 func (d *Detector) BatchAdd(points []*DataPoint) ([]*AnomalyEvent, error) {
 	if len(points) == 0 {
 		return nil, nil
@@ -333,16 +469,17 @@ func (d *Detector) BatchAdd(points []*DataPoint) ([]*AnomalyEvent, error) {
 			return nil, ErrNilDataPoint
 		}
 	}
+
 	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	if d.closed {
-		d.mu.Unlock()
 		return nil, ErrDetectorClosed
 	}
-	d.mu.Unlock()
 
-	events := make([]*AnomalyEvent, 0)
+	events := make([]*AnomalyEvent, 0, len(points))
 	for _, p := range points {
-		event, err := d.Add(p)
+		event, err := d.addLocked(p)
 		if err != nil {
 			return events, err
 		}

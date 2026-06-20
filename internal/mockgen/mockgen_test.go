@@ -271,6 +271,47 @@ func TestVerify_UnmatchedCalls(t *testing.T) {
 	}
 }
 
+func TestVerify_UnmatchedCalls_ContainsMethodNameAndArgs(t *testing.T) {
+	mc := NewMockController()
+	mc.On("GetUser", 1).Return("user1", nil)
+
+	mc.Call("GetUser", 999)
+
+	err := mc.Verify()
+	if err == nil {
+		t.Fatal("expected error for unmatched calls")
+	}
+
+	errStr := err.Error()
+	if !strings.Contains(errStr, "GetUser") {
+		t.Errorf("expected error to contain method name 'GetUser', got: %s", errStr)
+	}
+	if !strings.Contains(errStr, "999") {
+		t.Errorf("expected error to contain arg value '999', got: %s", errStr)
+	}
+}
+
+func TestVerify_MultipleUnmatchedCalls(t *testing.T) {
+	mc := NewMockController()
+	mc.On("GetUser", 1).Return("user1", nil)
+
+	mc.Call("GetUser", 999)
+	mc.Call("Greet", "World")
+
+	err := mc.Verify()
+	if err == nil {
+		t.Fatal("expected error for unmatched calls")
+	}
+
+	errStr := err.Error()
+	if !strings.Contains(errStr, "GetUser") {
+		t.Errorf("expected error to contain 'GetUser', got: %s", errStr)
+	}
+	if !strings.Contains(errStr, "Greet") {
+		t.Errorf("expected error to contain 'Greet', got: %s", errStr)
+	}
+}
+
 func TestVerifyVerbose_UnmatchedCalls(t *testing.T) {
 	mc := NewMockController()
 	mc.On("GetUser", 1).Return("user1", nil)
@@ -392,8 +433,11 @@ func TestMultiReturn(t *testing.T) {
 func TestCreateMock(t *testing.T) {
 	var svc TestService
 	_ = svc
-	mock := CreateMock((*TestService)(nil))
+	mock, err := CreateMock((*TestService)(nil))
 
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if mock == nil {
 		t.Fatal("expected non-nil MockProxy")
 	}
@@ -402,17 +446,41 @@ func TestCreateMock(t *testing.T) {
 	}
 }
 
-func TestCreateMock_NonInterfacePanics(t *testing.T) {
+func TestCreateMock_NonInterface_ReturnsError(t *testing.T) {
+	mock, err := CreateMock("not an interface")
+
+	if err == nil {
+		t.Error("expected error for non-interface type")
+	}
+	if mock != nil {
+		t.Error("expected nil mock for non-interface type")
+	}
+	if !errors.Is(err, ErrInvalidInterface) {
+		t.Errorf("expected ErrInvalidInterface, got %v", err)
+	}
+}
+
+func TestMustCreateMock_NonInterface_Panics(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
 			t.Error("expected panic for non-interface type")
 		}
 	}()
-	CreateMock("not an interface")
+	MustCreateMock("not an interface")
+}
+
+func TestMustCreateMock_Success(t *testing.T) {
+	mock := MustCreateMock((*TestService)(nil))
+	if mock == nil {
+		t.Fatal("expected non-nil MockProxy")
+	}
 }
 
 func TestMockProxy_On(t *testing.T) {
-	mock := CreateMock((*TestService)(nil))
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	mock.On("GetUser", 1).Return("user1", nil)
 
 	results := mock.Call("GetUser", 1)
@@ -422,19 +490,25 @@ func TestMockProxy_On(t *testing.T) {
 }
 
 func TestMockProxy_Verify(t *testing.T) {
-	mock := CreateMock((*TestService)(nil))
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	mock.On("Greet", "World").Return("hello").Once()
 
 	mock.Call("Greet", "World")
 
-	err := mock.Verify()
+	err = mock.Verify()
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
 }
 
 func TestMockProxy_VerifyVerbose(t *testing.T) {
-	mock := CreateMock((*TestService)(nil))
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	mock.Call("UnknownMethod", 123)
 
@@ -445,7 +519,10 @@ func TestMockProxy_VerifyVerbose(t *testing.T) {
 }
 
 func TestMockProxy_Method(t *testing.T) {
-	mock := CreateMock((*TestService)(nil))
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	mock.On("Greet", "World").Return("Hello, World!")
 
 	greetFunc := mock.Method("Greet")
@@ -464,6 +541,39 @@ func TestMockProxy_Method(t *testing.T) {
 	}
 }
 
+func TestMockProxy_TryMethod_Success(t *testing.T) {
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	fn, err := mock.TryMethod("Greet")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if fn == nil {
+		t.Error("expected non-nil method function")
+	}
+}
+
+func TestMockProxy_TryMethod_NotFound(t *testing.T) {
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	fn, err := mock.TryMethod("NonExistentMethod")
+	if err == nil {
+		t.Error("expected error for non-existent method")
+	}
+	if fn != nil {
+		t.Error("expected nil function for non-existent method")
+	}
+	if !errors.Is(err, ErrMethodNotFound) {
+		t.Errorf("expected ErrMethodNotFound, got %v", err)
+	}
+}
+
 func TestMockProxy_MethodNotFound(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
@@ -471,12 +581,18 @@ func TestMockProxy_MethodNotFound(t *testing.T) {
 		}
 	}()
 
-	mock := CreateMock((*TestService)(nil))
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	mock.Method("NonExistentMethod")
 }
 
 func TestMockProxy_MethodWithMultipleReturns(t *testing.T) {
-	mock := CreateMock((*TestService)(nil))
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	mock.On("GetUser", 1).Return("user1", nil)
 
 	getUserFunc := mock.Method("GetUser")
@@ -495,7 +611,10 @@ func TestMockProxy_MethodWithMultipleReturns(t *testing.T) {
 }
 
 func TestMockProxy_MethodZeroValues(t *testing.T) {
-	mock := CreateMock((*TestService)(nil))
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	getUserFunc := mock.Method("GetUser")
 	fn, ok := getUserFunc.(func(int) (string, error))
@@ -509,6 +628,19 @@ func TestMockProxy_MethodZeroValues(t *testing.T) {
 	}
 	if err != nil {
 		t.Errorf("expected nil error (zero value), got %v", err)
+	}
+}
+
+func TestMockProxy_Instance(t *testing.T) {
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	mock.On("Greet", "World").Return("Hello, World!")
+
+	instance := mock.Instance()
+	if instance == nil {
+		t.Fatal("expected non-nil instance")
 	}
 }
 
@@ -535,6 +667,74 @@ func TestConcurrentCalls(t *testing.T) {
 	if exps[0].CallCount() < 10 {
 		t.Errorf("expected at least 10 calls, got %d", exps[0].CallCount())
 	}
+}
+
+func TestConcurrent_VerifyAndCalls(t *testing.T) {
+	mc := NewMockController()
+	mc.On("Greet", Any()).Return("hello").MinTimes(10).MaxTimes(100)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(2)
+		go func(a int) {
+			defer wg.Done()
+			mc.Call("Greet", fmt.Sprintf("name%d", a))
+		}(i)
+		go func() {
+			defer wg.Done()
+			_ = mc.Mock().Expectations()
+			_ = mc.Mock().UnmatchedCalls()
+		}()
+	}
+	wg.Wait()
+
+	err := mc.Verify()
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+}
+
+func TestConcurrent_VerifyVerbose_NoRace(t *testing.T) {
+	mc := NewMockController()
+	mc.On("Greet", "World").Return("hello").Once()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			mc.Call("Greet", "World")
+		}()
+		go func() {
+			defer wg.Done()
+			_ = mc.VerifyVerbose()
+		}()
+	}
+	wg.Wait()
+}
+
+func TestConcurrent_CallCountAccess_NoRace(t *testing.T) {
+	mc := NewMockController()
+	mc.On("Add", Any(), Any()).Return(0)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 30; i++ {
+		wg.Add(2)
+		go func(a, b int) {
+			defer wg.Done()
+			mc.Call("Add", a, b)
+		}(i, i+1)
+		go func() {
+			defer wg.Done()
+			expectations := mc.Mock().Expectations()
+			for _, exps := range expectations {
+				for _, exp := range exps {
+					_ = exp.CallCount()
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestMatcher_Any(t *testing.T) {
@@ -691,5 +891,37 @@ func TestCallReturnFunc_NilArgs(t *testing.T) {
 	results := mc.Call("Greet", "")
 	if results[0] != "empty" {
 		t.Errorf("expected 'empty', got %v", results[0])
+	}
+}
+
+func TestErrInvalidInterface_Used(t *testing.T) {
+	_, err := CreateMock("invalid")
+	if !errors.Is(err, ErrInvalidInterface) {
+		t.Errorf("expected ErrInvalidInterface to be used, got %v", err)
+	}
+}
+
+func TestErrMethodNotFound_Used(t *testing.T) {
+	mock, _ := CreateMock((*TestService)(nil))
+	_, err := mock.TryMethod("NonExistent")
+	if !errors.Is(err, ErrMethodNotFound) {
+		t.Errorf("expected ErrMethodNotFound to be used, got %v", err)
+	}
+}
+
+func TestVerify_ErrorContainsArgsInDetail(t *testing.T) {
+	mc := NewMockController()
+	mc.On("Add", 1, 2).Return(3)
+
+	mc.Call("Add", 10, 20)
+
+	err := mc.Verify()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	errStr := err.Error()
+	if !strings.Contains(errStr, "[10 20]") && !strings.Contains(errStr, "10") && !strings.Contains(errStr, "20") {
+		t.Errorf("expected error to contain args [10 20], got: %s", errStr)
 	}
 }

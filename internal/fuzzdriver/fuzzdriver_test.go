@@ -729,6 +729,8 @@ func TestFuzzerProcessInputNewPath(t *testing.T) {
 	config := DefaultConfig("testProcessFunc")
 	config.CorpusDir = t.TempDir()
 	config.CrashDir = t.TempDir()
+	config.EnableBaselineCalibration = false
+	config.CoverageHook = InputBasedCoverageHook
 	f, _ := NewFuzzer(target, config)
 	input := []byte("test input for new path")
 	found := f.processInput(input)
@@ -795,15 +797,376 @@ func TestFuzzerCheckMemory(t *testing.T) {
 	config.CorpusDir = t.TempDir()
 	config.CrashDir = t.TempDir()
 	config.MemoryThreshold = 100
+	config.EnableBaselineCalibration = false
 	f, _ := NewFuzzer(target, config)
 	before := MemoryStats{AllocatedBytes: 1000, NumAllocations: 10}
 	after := MemoryStats{AllocatedBytes: 2000, NumAllocations: 20}
-	if !f.checkMemory(before, after) {
+	suspicious, allocDiff, allocCountDiff := f.checkMemory(before, after)
+	if !suspicious {
 		t.Error("expected memory check to fail")
 	}
+	if allocDiff != 1000 {
+		t.Errorf("expected allocDiff 1000, got %d", allocDiff)
+	}
+	if allocCountDiff != 10 {
+		t.Errorf("expected allocCountDiff 10, got %d", allocCountDiff)
+	}
 	after2 := MemoryStats{AllocatedBytes: 1050, NumAllocations: 15}
-	if f.checkMemory(before, after2) {
+	suspicious2, _, _ := f.checkMemory(before, after2)
+	if suspicious2 {
 		t.Error("expected memory check to pass")
+	}
+}
+
+func TestFuzzerCheckMemoryAllocationCount(t *testing.T) {
+	target := func(input []byte) error { return nil }
+	config := DefaultConfig("testCheckAllocFunc")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.MemoryThreshold = 10000
+	config.MemoryAllocThreshold = 5
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+	before := MemoryStats{AllocatedBytes: 1000, NumAllocations: 10}
+	after := MemoryStats{AllocatedBytes: 1050, NumAllocations: 100}
+	suspicious, _, allocCountDiff := f.checkMemory(before, after)
+	if !suspicious {
+		t.Error("expected memory check to fail due to high allocation count")
+	}
+	if allocCountDiff != 90 {
+		t.Errorf("expected allocCountDiff 90, got %d", allocCountDiff)
+	}
+}
+
+func TestDefaultCoverageHook(t *testing.T) {
+	hook := DefaultCoverageHook(10)
+	if hook == nil {
+		t.Fatal("DefaultCoverageHook returned nil")
+	}
+	addrs := hook([]byte("test"))
+	if len(addrs) == 0 {
+		t.Error("expected non-empty coverage addresses")
+	}
+	for i, addr := range addrs {
+		if addr == 0 {
+			t.Errorf("expected non-zero address at index %d", i)
+		}
+	}
+}
+
+func TestInputBasedCoverageHook(t *testing.T) {
+	input1 := []byte("test input 1")
+	input2 := []byte("test input 2")
+	addrs1 := InputBasedCoverageHook(input1)
+	addrs2 := InputBasedCoverageHook(input2)
+	if len(addrs1) == 0 {
+		t.Error("expected non-empty addresses for input1")
+	}
+	if len(addrs2) == 0 {
+		t.Error("expected non-empty addresses for input2")
+	}
+	sameCount := 0
+	for _, a1 := range addrs1 {
+		for _, a2 := range addrs2 {
+			if a1 == a2 {
+				sameCount++
+			}
+		}
+	}
+	if sameCount == len(addrs1) && sameCount == len(addrs2) {
+		t.Error("expected different addresses for different inputs")
+	}
+	emptyAddrs := InputBasedCoverageHook([]byte{})
+	if len(emptyAddrs) != 0 {
+		t.Errorf("expected empty addresses for empty input, got %d", len(emptyAddrs))
+	}
+}
+
+func TestCustomCoverageHook(t *testing.T) {
+	customHook := func(input []byte) []uint64 {
+		return []uint64{uint64(len(input)), uint64(input[0])}
+	}
+	target := func(input []byte) error { return nil }
+	config := DefaultConfig("testCustomHook")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.CoverageHook = customHook
+	config.EnableBaselineCalibration = false
+	f, err := NewFuzzer(target, config)
+	if err != nil {
+		t.Fatalf("NewFuzzer failed: %v", err)
+	}
+	input := []byte{0x41, 0x42, 0x43}
+	cov, _, _ := f.executeWithCoverage(input)
+	if cov.Count() == 0 {
+		t.Error("expected coverage to be collected")
+	}
+	if !cov.Has(3) {
+		t.Error("expected custom coverage address 3 (len=3)")
+	}
+	if !cov.Has(0x41) {
+		t.Error("expected custom coverage address 0x41 (first byte)")
+	}
+}
+
+func TestCalibrateMemoryBaseline(t *testing.T) {
+	target := func(input []byte) error {
+		_ = make([]byte, len(input)*10)
+		return nil
+	}
+	config := DefaultConfig("testBaseline")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.BaselineRuns = 5
+	config.EnableBaselineCalibration = false
+	f, err := NewFuzzer(target, config)
+	if err != nil {
+		t.Fatalf("NewFuzzer failed: %v", err)
+	}
+	f.AddSeed([]byte("seed1"))
+	f.AddSeed([]byte("seed2"))
+	err = f.CalibrateMemoryBaseline()
+	if err != nil {
+		t.Fatalf("CalibrateMemoryBaseline failed: %v", err)
+	}
+	baseline := f.GetMemoryBaseline()
+	if !baseline.Calibrated {
+		t.Error("expected baseline to be calibrated")
+	}
+	if baseline.AvgAllocatedBytes <= 0 {
+		t.Error("expected positive AvgAllocatedBytes")
+	}
+	if baseline.AvgNumAllocations <= 0 {
+		t.Error("expected positive AvgNumAllocations")
+	}
+}
+
+func TestCalibrateMemoryBaselineEmptyCorpus(t *testing.T) {
+	target := func(input []byte) error { return nil }
+	config := DefaultConfig("testEmptyBaseline")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+	err := f.CalibrateMemoryBaseline()
+	if !errors.Is(err, ErrEmptyCorpus) {
+		t.Errorf("expected ErrEmptyCorpus, got %v", err)
+	}
+}
+
+func TestCheckMemoryWithBaseline(t *testing.T) {
+	target := func(input []byte) error {
+		return nil
+	}
+	config := DefaultConfig("testBaselineCheck")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.MemoryMultiplier = 2.0
+	config.MemoryThreshold = 100
+	config.MemoryAllocThreshold = 10
+	config.EnableBaselineCalibration = true
+	f, _ := NewFuzzer(target, config)
+	f.baselineSamples = []BaselineSample{
+		{AllocatedBytes: 1000, NumAllocations: 100},
+		{AllocatedBytes: 1200, NumAllocations: 120},
+		{AllocatedBytes: 800, NumAllocations: 80},
+	}
+	f.computeBaselineStats()
+	baseline := f.GetMemoryBaseline()
+	if !baseline.Calibrated {
+		t.Fatal("expected baseline to be calibrated")
+	}
+	if baseline.AvgAllocatedBytes != 1000 {
+		t.Fatalf("expected AvgAllocatedBytes 1000, got %f", baseline.AvgAllocatedBytes)
+	}
+	before := MemoryStats{AllocatedBytes: 0, NumAllocations: 0}
+	afterNormal := MemoryStats{
+		AllocatedBytes: 1500,
+		NumAllocations: 150,
+	}
+	suspicious, _, _ := f.checkMemory(before, afterNormal)
+	if suspicious {
+		t.Error("expected normal memory usage to pass (1.5x baseline)")
+	}
+	afterAbnormal := MemoryStats{
+		AllocatedBytes: 2500,
+		NumAllocations: 250,
+	}
+	suspicious, _, _ = f.checkMemory(before, afterAbnormal)
+	if !suspicious {
+		t.Error("expected abnormal memory usage to fail (2.5x baseline)")
+	}
+}
+
+func TestNewFuzzerInvalidMultiplier(t *testing.T) {
+	target := func(input []byte) error { return nil }
+	config := DefaultConfig("testInvalidMult")
+	config.MemoryMultiplier = 1.0
+	config.EnableBaselineCalibration = true
+	_, err := NewFuzzer(target, config)
+	if !errors.Is(err, ErrInvalidMultiplier) {
+		t.Errorf("expected ErrInvalidMultiplier, got %v", err)
+	}
+}
+
+func TestReproducePreservesPanicType(t *testing.T) {
+	type customPanic struct {
+		msg string
+	}
+	target := func(input []byte) error {
+		if len(input) > 0 && input[0] == 'P' {
+			panic(customPanic{msg: "custom panic"})
+		}
+		return nil
+	}
+	config := DefaultConfig("testPanicType")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic")
+		}
+		cp, ok := r.(customPanic)
+		if !ok {
+			t.Errorf("expected customPanic type, got %T", r)
+		}
+		if cp.msg != "custom panic" {
+			t.Errorf("expected msg 'custom panic', got '%s'", cp.msg)
+		}
+	}()
+	f.Reproduce([]byte("Panic!"))
+}
+
+func TestFuzzerCoverageHookSwitch(t *testing.T) {
+	target := func(input []byte) error { return nil }
+	config1 := DefaultConfig("testHook1")
+	config1.CorpusDir = t.TempDir()
+	config1.CrashDir = t.TempDir()
+	config1.EnableBaselineCalibration = false
+	f1, _ := NewFuzzer(target, config1)
+	input := []byte("test input")
+	cov1, _, _ := f1.executeWithCoverage(input)
+	if cov1.Count() == 0 {
+		t.Error("expected default hook to collect coverage")
+	}
+	customAddrs := []uint64{0xAAAA, 0xBBBB}
+	customHook := func(input []byte) []uint64 {
+		return customAddrs
+	}
+	config2 := DefaultConfig("testHook2")
+	config2.CorpusDir = t.TempDir()
+	config2.CrashDir = t.TempDir()
+	config2.CoverageHook = customHook
+	config2.EnableBaselineCalibration = false
+	f2, _ := NewFuzzer(target, config2)
+	cov2, _, _ := f2.executeWithCoverage(input)
+	for _, addr := range customAddrs {
+		if !cov2.Has(addr) {
+			t.Errorf("expected custom hook address 0x%X", addr)
+		}
+		if !cov2.Has(addr|0x8000000000000000) {
+			t.Errorf("expected post-execution address for 0x%X", addr)
+		}
+	}
+}
+
+func TestPanicCoveragePreservation(t *testing.T) {
+	target := func(input []byte) error {
+		if len(input) > 0 && input[0] == 'P' {
+			panic("test panic")
+		}
+		return nil
+	}
+	hookCalled := false
+	customHook := func(input []byte) []uint64 {
+		hookCalled = true
+		return []uint64{0x1234, 0x5678}
+	}
+	config := DefaultConfig("testPanicCov")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.CoverageHook = customHook
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+	cov, _, crashed := f.executeSafe([]byte("Panic!"))
+	if !crashed {
+		t.Fatal("expected crash")
+	}
+	if !hookCalled {
+		t.Error("expected coverage hook to be called")
+	}
+	if cov == nil {
+		t.Fatal("expected coverage to be preserved, got nil")
+	}
+	if cov.Count() == 0 {
+		t.Error("expected coverage to contain addresses")
+	}
+	if !cov.Has(0xDEADBEEF) {
+		t.Error("expected coverage to contain panic marker")
+	}
+}
+
+func TestParseConfigNewOptions(t *testing.T) {
+	opts := map[string]string{
+		"functionname":             "newOpts",
+		"memoryallocthreshold":     "2000",
+		"memorymultiplier":         "3.5",
+		"coveragetracedepth":       "20",
+		"baselineruns":             "15",
+		"enablebaselinecalibration": "false",
+	}
+	config, err := ParseConfig(opts)
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+	if config.MemoryAllocThreshold != 2000 {
+		t.Errorf("expected MemoryAllocThreshold 2000, got %d", config.MemoryAllocThreshold)
+	}
+	if config.MemoryMultiplier != 3.5 {
+		t.Errorf("expected MemoryMultiplier 3.5, got %f", config.MemoryMultiplier)
+	}
+	if config.CoverageTraceDepth != 20 {
+		t.Errorf("expected CoverageTraceDepth 20, got %d", config.CoverageTraceDepth)
+	}
+	if config.BaselineRuns != 15 {
+		t.Errorf("expected BaselineRuns 15, got %d", config.BaselineRuns)
+	}
+	if config.EnableBaselineCalibration {
+		t.Error("expected EnableBaselineCalibration to be false")
+	}
+}
+
+func TestComputeBaselineStats(t *testing.T) {
+	target := func(input []byte) error { return nil }
+	config := DefaultConfig("testComputeStats")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+	f.baselineSamples = []BaselineSample{
+		{AllocatedBytes: 100, NumAllocations: 10},
+		{AllocatedBytes: 200, NumAllocations: 20},
+		{AllocatedBytes: 300, NumAllocations: 30},
+	}
+	f.computeBaselineStats()
+	baseline := f.GetMemoryBaseline()
+	if baseline.AvgAllocatedBytes != 200 {
+		t.Errorf("expected AvgAllocatedBytes 200, got %f", baseline.AvgAllocatedBytes)
+	}
+	if baseline.AvgNumAllocations != 20 {
+		t.Errorf("expected AvgNumAllocations 20, got %f", baseline.AvgNumAllocations)
+	}
+	if baseline.MinAllocatedBytes != 100 {
+		t.Errorf("expected MinAllocatedBytes 100, got %d", baseline.MinAllocatedBytes)
+	}
+	if baseline.MaxAllocatedBytes != 300 {
+		t.Errorf("expected MaxAllocatedBytes 300, got %d", baseline.MaxAllocatedBytes)
+	}
+	if !baseline.Calibrated {
+		t.Error("expected Calibrated to be true")
 	}
 }
 

@@ -9,7 +9,8 @@
 - **覆盖率引导的输入变异**：通过位翻转、字节插入、字节删除和字节替换等操作生成变异输入，基于覆盖率反馈优化变异策略
 - **语料库管理**：自动维护和扩展测试语料库，持久化存储到磁盘，支持从外部加载初始种子
 - **Crash 输入保存与复现**：自动捕获并保存导致崩溃或错误的输入，支持后续复现和验证
-- **内存安全检测**：监控内存分配行为，识别异常内存使用模式
+- **内存安全检测**：基于基线校准的内存监控，识别异常内存使用模式
+- **可扩展的覆盖率收集**：支持自定义覆盖率 Hook，默认基于 PC (程序计数器) 的真实执行路径追踪
 
 ---
 
@@ -79,18 +80,21 @@ type Corpus struct {
 
 ```go
 type Fuzzer struct {
-    config            FuzzerConfig
-    target            TargetFunc
-    corpus            *Corpus
-    mutator           *Mutator
-    globalCoverage    *Coverage
-    suspiciousRecords []SuspiciousMemoryRecord
-    crashRecords      []CrashRecord
-    stats             FuzzerStats
-    statsMu           sync.Mutex
-    stopChan          chan struct{}
-    stopped           bool
-    mu                sync.Mutex
+    config              FuzzerConfig
+    target              TargetFunc
+    corpus              *Corpus
+    mutator             *Mutator
+    globalCoverage      *Coverage
+    memoryBaseline      MemoryBaseline
+    baselineSamples     []BaselineSample
+    coverageHook        CoverageHook
+    suspiciousRecords   []SuspiciousMemoryRecord
+    crashRecords        []CrashRecord
+    stats               FuzzerStats
+    statsMu             sync.Mutex
+    stopChan            chan struct{}
+    stopped             bool
+    mu                  sync.Mutex
 }
 ```
 
@@ -103,22 +107,70 @@ type Fuzzer struct {
 - `CrashRecords() []CrashRecord`：获取所有崩溃记录
 - `SuspiciousRecords() []SuspiciousMemoryRecord`：获取所有可疑内存记录
 - `LoadCrashInput(path string) ([]byte, error)`：从磁盘加载崩溃输入
-- `Reproduce(input []byte) error`：使用保存的输入复现问题
+- `Reproduce(input []byte) error`：使用保存的输入复现问题（会直接抛出原始 panic）
+- `CalibrateMemoryBaseline() error`：执行内存基线校准
+- `GetMemoryBaseline() MemoryBaseline`：获取当前内存基线数据
 
-### 2.5 配置与数据结构
+### 2.5 `CoverageHook` - 覆盖率收集钩子
+
+**职责**：定义覆盖率收集的扩展点，允许用户注入自定义的覆盖率收集逻辑。
+
+```go
+type CoverageHook func(input []byte) []uint64
+```
+
+**内置实现**：
+- `DefaultCoverageHook(depth int) CoverageHook`：基于 `runtime.Callers` 获取真实程序计数器 (PC) 的执行路径
+- `InputBasedCoverageHook(input []byte) []uint64`：基于输入内容生成确定性覆盖标记（用于测试和调试）
+
+### 2.6 `MemoryBaseline` - 内存基线数据
+
+**职责**：存储被测函数正常内存使用的统计数据，用于异常检测的基准。
+
+```go
+type MemoryBaseline struct {
+    AvgAllocatedBytes   float64 // 平均分配字节数
+    AvgNumAllocations   float64 // 平均分配次数
+    MaxAllocatedBytes   uint64  // 最大分配字节数
+    MaxNumAllocations   uint64  // 最大分配次数
+    MinAllocatedBytes   uint64  // 最小分配字节数
+    MinNumAllocations   uint64  // 最小分配次数
+    StdDevAllocated     float64 // 分配字节数标准差
+    StdDevAllocations   float64 // 分配次数标准差
+    Calibrated          bool    // 是否已完成校准
+}
+```
+
+### 2.7 `BaselineSample` - 基线样本
+
+**职责**：存储单次基线采样的内存数据。
+
+```go
+type BaselineSample struct {
+    AllocatedBytes uint64 // 分配字节数增量
+    NumAllocations uint64 // 分配次数增量
+}
+
+### 2.8 配置与数据结构
 
 #### `FuzzerConfig` - 模糊测试配置
 
 ```go
 type FuzzerConfig struct {
-    FunctionName      string        // 被测函数名称
-    CorpusDir         string        // 语料库目录
-    CrashDir          string        // 崩溃输入保存目录
-    MaxInputSize      int           // 最大输入大小 (默认 64KB)
-    MemoryThreshold   uint64        // 内存异常阈值 (默认 10MB)
-    MutationsPerInput int           // 每个种子的变异次数 (默认 100)
-    MaxIterations     int           // 最大迭代次数 (0 表示无限制)
-    MaxDuration       time.Duration // 最大运行时长 (0 表示无限制)
+    FunctionName              string        // 被测函数名称
+    CorpusDir                 string        // 语料库目录
+    CrashDir                  string        // 崩溃输入保存目录
+    MaxInputSize              int           // 最大输入大小 (默认 64KB)
+    MemoryThreshold           uint64        // 内存分配字节阈值 (默认 10MB)
+    MemoryAllocThreshold      uint64        // 内存分配次数阈值 (默认 1000)
+    MemoryMultiplier          float64       // 基线相对阈值倍数 (默认 5x)
+    MutationsPerInput         int           // 每个种子的变异次数 (默认 100)
+    MaxIterations             int           // 最大迭代次数 (0 表示无限制)
+    MaxDuration               time.Duration // 最大运行时长 (0 表示无限制)
+    CoverageHook              CoverageHook  // 自定义覆盖率收集 Hook
+    CoverageTraceDepth        int           // 覆盖率追踪栈深度 (默认 10)
+    BaselineRuns              int           // 每个种子的基线运行次数 (默认 10)
+    EnableBaselineCalibration bool          // 是否启用基线校准 (默认 true)
 }
 ```
 
@@ -170,6 +222,8 @@ type SuspiciousMemoryRecord struct {
     ↓
 验证目标函数和配置参数
     ↓
+初始化覆盖率 Hook (默认使用 PC 追踪)
+    ↓
 创建语料库管理器并从磁盘加载现有语料
     ↓
 创建变异器、覆盖率统计器
@@ -185,13 +239,23 @@ type SuspiciousMemoryRecord struct {
 种子输入被添加到语料库
 ```
 
-### 3.3 主测试循环
+### 3.3 基线校准阶段 (可选)
 
 ```
 调用 Run() 启动测试
     ↓
 如果语料库为空，自动添加默认种子
     ↓
+如果启用基线校准:
+    ├─ 对每个种子运行 N 次 (BaselineRuns)
+    ├─ 记录每次运行的内存分配增量
+    ├─ 计算平均值、最大值、最小值、标准差
+    └─ 标记基线校准完成
+```
+
+### 3.4 主测试循环
+
+```
 ┌─────────────────────────────────────────────────┐
 │  循环直到满足停止条件 (迭代数/时长/手动停止)   │
 │    ↓                                            │
@@ -201,15 +265,44 @@ type SuspiciousMemoryRecord struct {
 │    ↓                                            │
 │  对每个变异输入执行 processInput():              │
 │    ├─ 执行前记录内存统计                        │
+│    ├─ 执行前调用 CoverageHook 收集 PC           │
 │    ├─ 安全执行被测函数 (捕获 panic)             │
+│    ├─ 执行后调用 CoverageHook 收集 PC           │
 │    ├─ 执行后记录内存统计                        │
 │    ├─ 检查是否崩溃或返回错误 → 保存 Crash       │
-│    ├─ 检查内存使用是否异常 → 记录可疑行为       │
+│    ├─ 检查内存使用是否异常 (双维度检测)         │
+│    │   ├─ 分配字节量 vs 阈值                    │
+│    │   └─ 分配次数 vs 阈值                      │
 │    ├─ 检查覆盖率是否有新增 → 加入语料库        │
 │    └─ 更新统计信息                              │
 └─────────────────────────────────────────────────┘
     ↓
 测试结束，返回 nil
+```
+
+### 3.5 Crash 复现行为约定
+
+`Reproduce()` 方法的行为约定：
+
+1. **不做任何包装**：直接调用目标函数，不添加任何 panic 捕获或错误包装
+2. **保留原始类型**：如果目标函数发生 panic，原始 panic 值会被直接抛出，类型信息完整保留
+3. **错误原样返回**：如果目标函数返回错误，错误会被原样返回
+4. **调用方负责处理**：使用 `Reproduce()` 时，调用方必须自行使用 `recover()` 来捕获可能的 panic
+
+```go
+// 正确的复现方式
+defer func() {
+    if r := recover(); r != nil {
+        // r 是原始 panic 值，保持完整类型信息
+        switch v := r.(type) {
+        case MyCustomError:
+            // 处理自定义错误类型
+        default:
+            // 其他类型
+        }
+    }
+}()
+err := fuzzer.Reproduce(crashInput)
 ```
 
 ### 3.4 结果处理阶段
@@ -354,9 +447,122 @@ fuzzer.AddSeed(seed)
 
 ---
 
-## 5. 变异操作详解
+## 5. 覆盖率统计实现方式
 
-### 5.1 位翻转 (Flip Bit)
+### 5.1 基于 PC (程序计数器) 的真实执行路径追踪
+
+默认的覆盖率收集机制使用 `runtime.Callers` 获取调用栈的程序计数器 (PC) 值，真实反映代码执行路径。
+
+**实现原理**：
+
+```go
+func DefaultCoverageHook(depth int) CoverageHook {
+    return func(input []byte) []uint64 {
+        pcs := make([]uintptr, depth)
+        n := runtime.Callers(2, pcs)  // 跳过 runtime.Callers 和 Hook 本身
+        result := make([]uint64, n)
+        for i := 0; i < n; i++ {
+            result[i] = uint64(pcs[i])
+        }
+        return result
+    }
+}
+```
+
+**执行流程**：
+
+1. **执行前追踪**：调用目标函数前调用 `CoverageHook`，记录当前执行路径
+2. **执行后追踪**：调用目标函数后再次调用 `CoverageHook`，记录执行后的路径（地址最高位设为 1 以区分）
+3. **覆盖率标记**：
+   - 错误返回时添加 `0xDEADBEEF` 标记
+   - panic 时在 `recover` 中补充执行后的覆盖率数据，确保不丢失
+
+### 5.2 自定义覆盖率 Hook
+
+用户可以注入自定义的覆盖率收集逻辑，例如集成 Go 原生的覆盖测试工具或其他插桩框架。
+
+**示例**：
+
+```go
+// 使用基于输入的确定性覆盖率 (适用于测试)
+config.CoverageHook = fuzzdriver.InputBasedCoverageHook
+
+// 自定义覆盖率收集
+config.CoverageHook = func(input []byte) []uint64 {
+    // 集成自定义的覆盖率工具
+    return myCoverageCollector.GetCoveragePoints()
+}
+```
+
+### 5.3 Panic 场景的覆盖率数据传递
+
+为确保 panic 场景下覆盖率数据不丢失，采用两层 defer/recover 机制：
+
+```
+executeWithCoverage()
+    ↓
+    defer 函数 (第一层)
+        ↓ 目标函数发生 panic
+        执行目标函数
+        ↓ panic 向上传播
+    executeSafe()
+        ↓
+        defer 函数 (第二层，捕获 panic)
+            ↓
+            保存已收集的覆盖率数据
+            补充执行后的覆盖率标记
+            添加 panic 标记 0xDEADBEEF
+            返回覆盖率、错误信息和 crashed=true
+```
+
+---
+
+## 6. 内存检测的基线校准机制
+
+### 6.1 基线校准流程
+
+内存基线校准通过采集正常输入下的内存使用模式，建立检测基准，减少误报。
+
+**校准步骤**：
+
+1. **采样阶段**：对每个种子输入运行 N 次（默认 10 次）
+2. **数据采集**：记录每次运行的内存分配增量（字节数和次数）
+3. **统计计算**：计算平均值、最大值、最小值、标准差
+4. **阈值计算**：使用 `平均值 × 倍率` 作为异常检测阈值
+
+### 6.2 双维度异常检测
+
+同时检测两个维度的内存使用异常：
+
+| 维度 | 说明 | 阈值来源 |
+|------|------|---------|
+| **分配字节量** | 单次执行分配的内存字节数增量 | 已校准：`AvgAllocatedBytes × MemoryMultiplier` <br> 未校准：`MemoryThreshold` |
+| **分配次数** | 单次执行的内存分配次数增量 | 已校准：`AvgNumAllocations × MemoryMultiplier` <br> 未校准：`MemoryAllocThreshold` |
+
+**最小阈值保护**：即使已校准，阈值也不会低于配置的绝对阈值，避免基线异常导致漏检。
+
+### 6.3 阈值计算示例
+
+假设基线校准结果：
+- 平均分配字节：1000 bytes
+- 平均分配次数：50 次
+- MemoryMultiplier：3.0
+- MemoryThreshold：500 bytes
+- MemoryAllocThreshold：20 次
+
+计算阈值：
+- 字节阈值 = max(1000 × 3.0, 500) = 3000 bytes
+- 次数阈值 = max(50 × 3.0, 20) = 150 次
+
+任何一次执行满足以下任一条件即被标记为可疑：
+- 分配字节增量 > 3000 bytes
+- 分配次数增量 > 150 次
+
+---
+
+## 7. 变异操作详解
+
+### 7.1 位翻转 (Flip Bit)
 
 随机选择输入中的某一位，将其取反（0 变 1，1 变 0）。
 
@@ -367,7 +573,7 @@ fuzzer.AddSeed(seed)
 输出:  11110111 00000000 (0xF7, 0x00)
 ```
 
-### 5.2 字节插入 (Insert Byte)
+### 7.2 字节插入 (Insert Byte)
 
 在随机位置插入一个随机字节值。
 
@@ -378,7 +584,7 @@ fuzzer.AddSeed(seed)
 输出:  [0x01, 0xAB, 0x02, 0x03]
 ```
 
-### 5.3 字节删除 (Delete Byte)
+### 7.3 字节删除 (Delete Byte)
 
 随机删除一个字节。
 
@@ -389,7 +595,7 @@ fuzzer.AddSeed(seed)
 输出:  [0x01, 0x03]
 ```
 
-### 5.4 字节替换 (Replace Byte)
+### 7.4 字节替换 (Replace Byte)
 
 将随机位置的字节替换为新的随机值。
 
@@ -402,7 +608,7 @@ fuzzer.AddSeed(seed)
 
 ---
 
-## 6. 错误码列表
+## 8. 错误码列表
 
 | 错误变量 | 说明 |
 |---------|------|
@@ -418,22 +624,28 @@ fuzzer.AddSeed(seed)
 | `ErrCorpusLoadFailed` | 加载语料库失败 |
 | `ErrCrashSaveFailed` | 保存 Crash 输入失败 |
 | `ErrCorpusSaveFailed` | 保存语料库输入失败 |
+| `ErrBaselineCalibrationFailed` | 内存基线校准失败 |
+| `ErrInvalidMultiplier` | 内存倍率无效 (必须大于 1) |
 
 ---
 
-## 7. 常量配置
+## 9. 常量配置
 
 | 常量 | 默认值 | 说明 |
 |------|--------|------|
 | `DefaultCorpusDir` | `"corpus"` | 默认语料库根目录 |
 | `DefaultCrashDir` | `"crashes"` | 默认 Crash 根目录 |
 | `DefaultMaxInputSize` | `1 << 16` (64KB) | 默认最大输入大小 |
-| `DefaultMemoryThreshold` | `10 * 1024 * 1024` (10MB) | 默认内存分配阈值 |
+| `DefaultMemoryThreshold` | `10 * 1024 * 1024` (10MB) | 默认内存分配字节阈值 |
+| `DefaultMemoryAllocThreshold` | `1000` | 默认内存分配次数阈值 |
+| `DefaultMemoryMultiplier` | `5` | 默认基线相对阈值倍数 |
 | `DefaultMutationsPerInput` | `100` | 每个种子的默认变异次数 |
+| `DefaultCoverageTraceDepth` | `10` | 默认覆盖率追踪栈深度 |
+| `DefaultBaselineRuns` | `10` | 每个种子的默认基线运行次数 |
 
 ---
 
-## 8. 并发安全
+## 10. 并发安全
 
 本模块的所有公共方法都是并发安全的：
 - `Coverage` 使用 `sync.RWMutex` 保护内部 map
@@ -446,10 +658,55 @@ fuzzer.AddSeed(seed)
 
 ---
 
-## 9. 最佳实践
+## 11. 最佳实践
 
 1. **提供高质量种子**：好的初始种子可以显著提高模糊测试效率
-2. **合理设置内存阈值**：根据被测函数的正常内存使用情况调整阈值
-3. **定期持久化语料库**：框架会自动保存新增语料，无需手动干预
-4. **监控测试进度**：定期调用 `Stats()` 了解测试进展
-5. **及时复现和修复 Crash**：发现 Crash 后尽快使用 `Reproduce()` 复现问题
+2. **启用基线校准**：使用 `EnableBaselineCalibration=true` 减少内存检测误报
+3. **合理设置内存倍率**：`MemoryMultiplier` 建议设置在 2-5 倍之间
+4. **定期持久化语料库**：框架会自动保存新增语料，无需手动干预
+5. **监控测试进度**：定期调用 `Stats()` 了解测试进展
+6. **及时复现和修复 Crash**：发现 Crash 后尽快使用 `Reproduce()` 复现问题
+7. **根据需要选择覆盖率 Hook**：
+   - 默认 PC 追踪适合大多数场景
+   - `InputBasedCoverageHook` 适合需要确定性的测试场景
+   - 自定义 Hook 适合集成专业覆盖率工具
+
+---
+
+## 12. 使用示例补充
+
+### 12.1 使用自定义覆盖率 Hook
+
+```go
+// 使用基于输入的确定性覆盖率（适用于自动化测试）
+config := fuzzdriver.DefaultConfig("myFunction")
+config.CoverageHook = fuzzdriver.InputBasedCoverageHook
+```
+
+### 12.2 显式执行基线校准
+
+```go
+fuzzer, _ := fuzzdriver.NewFuzzer(myFunction, config)
+fuzzer.AddSeed([]byte("seed1"))
+fuzzer.AddSeed([]byte("seed2"))
+
+// 手动执行基线校准
+if err := fuzzer.CalibrateMemoryBaseline(); err != nil {
+    log.Printf("Warning: baseline calibration failed: %v", err)
+}
+
+// 获取基线数据
+baseline := fuzzer.GetMemoryBaseline()
+log.Printf("Baseline: avg=%f bytes, avg=%f allocs", 
+    baseline.AvgAllocatedBytes, baseline.AvgNumAllocations)
+```
+
+### 12.3 调整内存检测参数
+
+```go
+config := fuzzdriver.DefaultConfig("memoryIntensiveFunc")
+config.EnableBaselineCalibration = true
+config.MemoryMultiplier = 3.0      // 3 倍于平均水平
+config.MemoryThreshold = 10 * 1024 * 1024  // 至少 10MB
+config.MemoryAllocThreshold = 5000  // 至少 5000 次分配
+```
