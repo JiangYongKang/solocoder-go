@@ -7,8 +7,9 @@ import (
 )
 
 type registry struct {
-	mu         sync.RWMutex
+	mu       sync.RWMutex
 	snapshotMu sync.RWMutex
+	guard      snapshotGuard
 	counters   map[string]map[string]*counter
 	gauges     map[string]map[string]*gauge
 	histograms map[string]map[string]*histogram
@@ -16,12 +17,14 @@ type registry struct {
 }
 
 func NewRegistry() Registry {
-	return &registry{
+	r := &registry{
 		counters:   make(map[string]map[string]*counter),
 		gauges:     make(map[string]map[string]*gauge),
 		histograms: make(map[string]map[string]*histogram),
 		summaries:  make(map[string]map[string]*summary),
 	}
+	r.guard = newSnapshotGuard(&r.snapshotMu)
+	return r
 }
 
 var DefaultRegistry = NewRegistry()
@@ -49,7 +52,7 @@ func (r *registry) RegisterCounter(name string, labels Labels) CounterMetric {
 		r.counters[name] = make(map[string]*counter)
 	}
 
-	c := newCounter(name, labels, &r.snapshotMu)
+	c := newCounter(name, labels, r.guard)
 	r.counters[name][hash] = c
 	return c
 }
@@ -77,7 +80,7 @@ func (r *registry) RegisterGauge(name string, labels Labels) GaugeMetric {
 		r.gauges[name] = make(map[string]*gauge)
 	}
 
-	g := newGauge(name, labels, &r.snapshotMu)
+	g := newGauge(name, labels, r.guard)
 	r.gauges[name][hash] = g
 	return g
 }
@@ -108,7 +111,7 @@ func (r *registry) RegisterHistogram(name string, labels Labels, buckets []float
 		r.histograms[name] = make(map[string]*histogram)
 	}
 
-	h := newHistogram(name, labels, buckets, &r.snapshotMu)
+	h := newHistogram(name, labels, buckets, r.guard)
 	r.histograms[name][hash] = h
 	return h
 }
@@ -144,7 +147,7 @@ func (r *registry) RegisterSummary(name string, labels Labels, quantiles []float
 		r.summaries[name] = make(map[string]*summary)
 	}
 
-	s := newSummary(name, labels, quantiles, &r.snapshotMu)
+	s := newSummary(name, labels, quantiles, r.guard)
 	r.summaries[name][hash] = s
 	return s
 }

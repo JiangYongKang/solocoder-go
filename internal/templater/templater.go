@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+var errorType = reflect.TypeOf((*error)(nil)).Elem()
+
 func (e *Engine) RegisterFunction(name string, fn interface{}) error {
 	if name == "" {
 		return ErrFunctionNotFound
@@ -46,6 +48,20 @@ func (e *Engine) ClearCache() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cache = make(map[string]*Template)
+}
+
+func (e *Engine) getExtendsParent(name string) (string, bool, error) {
+	e.mu.RLock()
+	source, ok := e.templates[name]
+	e.mu.RUnlock()
+	if !ok {
+		return "", false, ErrTemplateNotFound
+	}
+	matches := extendsPattern.FindStringSubmatch(source)
+	if len(matches) < 2 {
+		return "", false, nil
+	}
+	return matches[1], true, nil
 }
 
 func (e *Engine) GetTemplate(name string) (*Template, error) {
@@ -107,19 +123,23 @@ func (e *Engine) RenderWithVisited(name string, data interface{}, visited map[st
 
 		visited[tmpl.Extends.ParentName] = true
 
-		for p := parentTmpl; p.Extends != nil; {
-			if visited[p.Extends.ParentName] {
-				return "", ErrTemplateInheritanceLoop
-			}
-			grandparent, err := e.GetTemplate(p.Extends.ParentName)
+		currentParent := tmpl.Extends.ParentName
+		for {
+			grandparent, hasExtends, err := e.getExtendsParent(currentParent)
 			if err != nil {
 				if err == ErrTemplateNotFound {
 					return "", ErrParentTemplateNotFound
 				}
 				return "", err
 			}
-			visited[p.Extends.ParentName] = true
-			p = grandparent
+			if !hasExtends {
+				break
+			}
+			if visited[grandparent] {
+				return "", ErrTemplateInheritanceLoop
+			}
+			visited[grandparent] = true
+			currentParent = grandparent
 		}
 
 		parentCopy := &Template{
@@ -858,6 +878,14 @@ func valuesEqual(a, b interface{}) bool {
 	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
 }
 
+func canBeNil(k reflect.Kind) bool {
+	switch k {
+	case reflect.Interface, reflect.Ptr, reflect.Slice, reflect.Map, reflect.Chan, reflect.Func:
+		return true
+	}
+	return false
+}
+
 func isTruthy(v interface{}) bool {
 	if v == nil {
 		return false
@@ -989,14 +1017,15 @@ func callFunction(name string, args []string, data interface{}, funcs map[string
 	}
 	if len(results) == 2 {
 		second := results[1]
-		if second.Kind() == reflect.Interface || second.Kind() == reflect.Ptr {
-			if !second.IsNil() {
-				if errVal, ok := second.Interface().(error); ok {
-					return nil, errVal
-				}
-				return nil, ErrInvalidFunctionCall
-			}
+		secondType := second.Type()
+		if !secondType.Implements(errorType) {
+			return nil, ErrInvalidFunctionCall
+		}
+		if canBeNil(second.Kind()) && second.IsNil() {
 			return results[0].Interface(), nil
+		}
+		if errVal, ok := second.Interface().(error); ok {
+			return nil, errVal
 		}
 		return nil, ErrInvalidFunctionCall
 	}

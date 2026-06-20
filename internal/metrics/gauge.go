@@ -6,18 +6,22 @@ import (
 )
 
 type gauge struct {
-	snapshotMu *sync.RWMutex
-	mu         sync.RWMutex
-	name       string
-	labels     Labels
-	value      float64
+	guard  snapshotGuard
+	mu     sync.RWMutex
+	name   string
+	labels Labels
+	value  float64
 }
 
-func newGauge(name string, labels Labels, snapshotMu *sync.RWMutex) *gauge {
+var _ snapshotProtected = (*gauge)(nil)
+
+func (g *gauge) snapshotGuardPtr() *snapshotGuard { return &g.guard }
+
+func newGauge(name string, labels Labels, guard snapshotGuard) *gauge {
 	g := &gauge{
-		snapshotMu: snapshotMu,
-		name:       name,
-		labels:     make(Labels, len(labels)),
+		guard:  guard,
+		name:   name,
+		labels: make(Labels, len(labels)),
 	}
 	copy(g.labels, labels)
 	return g
@@ -36,11 +40,11 @@ func (g *gauge) Labels() Labels {
 }
 
 func (g *gauge) Set(value float64) {
-	g.snapshotMu.RLock()
-	defer g.snapshotMu.RUnlock()
-	g.mu.Lock()
-	g.value = value
-	g.mu.Unlock()
+	g.guard.write(func() {
+		g.mu.Lock()
+		g.value = value
+		g.mu.Unlock()
+	})
 }
 
 func (g *gauge) Inc() {
@@ -52,19 +56,19 @@ func (g *gauge) Dec() {
 }
 
 func (g *gauge) Add(delta float64) {
-	g.snapshotMu.RLock()
-	defer g.snapshotMu.RUnlock()
-	g.mu.Lock()
-	g.value += delta
-	g.mu.Unlock()
+	g.guard.write(func() {
+		g.mu.Lock()
+		g.value += delta
+		g.mu.Unlock()
+	})
 }
 
 func (g *gauge) Sub(delta float64) {
-	g.snapshotMu.RLock()
-	defer g.snapshotMu.RUnlock()
-	g.mu.Lock()
-	g.value -= delta
-	g.mu.Unlock()
+	g.guard.write(func() {
+		g.mu.Lock()
+		g.value -= delta
+		g.mu.Unlock()
+	})
 }
 
 func (g *gauge) Value() float64 {

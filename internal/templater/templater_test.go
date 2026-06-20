@@ -1073,6 +1073,42 @@ func TestFunctionNonErrorSecondReturn(t *testing.T) {
 	}
 }
 
+type ValueError struct {
+	Code    int
+	Message string
+}
+
+func (e ValueError) Error() string {
+	return fmt.Sprintf("error %d: %s", e.Code, e.Message)
+}
+
+func TestFunctionValueTypeError(t *testing.T) {
+	e := NewEngine(Config{StrictVariables: true})
+
+	fnWithValueError := func(trigger bool) (string, ValueError) {
+		if trigger {
+			return "", ValueError{Code: 100, Message: "value type error"}
+		}
+		return "ok", ValueError{}
+	}
+	e.RegisterFunction("valerr", fnWithValueError)
+
+	e.RegisterTemplate("valerr1", "{{ valerr .Flag }}")
+
+	_, err := e.Render("valerr1", map[string]interface{}{"Flag": true})
+	if err == nil {
+		t.Error("expected error for value type error return, got nil")
+	}
+	if err.Error() != "error 100: value type error" {
+		t.Errorf("unexpected error message: %v", err)
+	}
+
+	_, err = e.Render("valerr1", map[string]interface{}{"Flag": false})
+	if err == nil {
+		t.Error("expected error for zero value type error (value types cannot be nil), got nil")
+	}
+}
+
 func TestFunctionNonFuncRegistration(t *testing.T) {
 	e := NewEngine(Config{StrictVariables: true})
 

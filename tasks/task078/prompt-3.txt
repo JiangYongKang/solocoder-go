@@ -1,0 +1,5 @@
+你实现的 A/B 测试流量分割器模块存在以下问题，需要修复：
+
+1. TestConcurrent_ReadAndModifyExperimentPointer 测试中定义了 stop channel 并在每个 goroutine 的循环内用 select 检查该 channel 是否关闭。但 close(stop) 调用放在 wg.Wait 之后，此时所有 goroutine 已执行完 wg.Done，select 的 <-stop 分支永远不会被触发，stop channel 成为无实际作用的死代码。
+
+修复后需要确保所有测试通过。运行 go test ./internal/abtest/ -v 验证。

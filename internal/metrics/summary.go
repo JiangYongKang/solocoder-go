@@ -11,31 +11,35 @@ import (
 const defaultSummaryMaxSamples = 1024
 
 type summary struct {
-	snapshotMu *sync.RWMutex
-	mu         sync.RWMutex
-	name       string
-	labels     Labels
-	quantiles  []float64
-	reservoir  []float64
-	capacity   int
-	count      uint64
-	sum        float64
-	rand       *rand.Rand
+	guard     snapshotGuard
+	mu        sync.RWMutex
+	name      string
+	labels    Labels
+	quantiles []float64
+	reservoir []float64
+	capacity  int
+	count     uint64
+	sum       float64
+	rand      *rand.Rand
 }
 
-func newSummary(name string, labels Labels, quantiles []float64, snapshotMu *sync.RWMutex) *summary {
+var _ snapshotProtected = (*summary)(nil)
+
+func (s *summary) snapshotGuardPtr() *snapshotGuard { return &s.guard }
+
+func newSummary(name string, labels Labels, quantiles []float64, guard snapshotGuard) *summary {
 	sortedQuantiles := make([]float64, len(quantiles))
 	copy(sortedQuantiles, quantiles)
 	sort.Float64s(sortedQuantiles)
 
 	s := &summary{
-		snapshotMu: snapshotMu,
-		name:       name,
-		labels:     make(Labels, len(labels)),
-		quantiles:  sortedQuantiles,
-		reservoir:  make([]float64, 0, defaultSummaryMaxSamples),
-		capacity:   defaultSummaryMaxSamples,
-		rand:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		guard:     guard,
+		name:      name,
+		labels:    make(Labels, len(labels)),
+		quantiles: sortedQuantiles,
+		reservoir: make([]float64, 0, defaultSummaryMaxSamples),
+		capacity:  defaultSummaryMaxSamples,
+		rand:      rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	copy(s.labels, labels)
 	return s
@@ -54,22 +58,22 @@ func (s *summary) Labels() Labels {
 }
 
 func (s *summary) Observe(value float64) {
-	s.snapshotMu.RLock()
-	defer s.snapshotMu.RUnlock()
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.guard.write(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	s.count++
-	s.sum += value
+		s.count++
+		s.sum += value
 
-	if len(s.reservoir) < s.capacity {
-		s.reservoir = append(s.reservoir, value)
-	} else {
-		j := s.rand.Intn(int(s.count))
-		if j < s.capacity {
-			s.reservoir[j] = value
+		if len(s.reservoir) < s.capacity {
+			s.reservoir = append(s.reservoir, value)
+		} else {
+			j := s.rand.Intn(int(s.count))
+			if j < s.capacity {
+				s.reservoir[j] = value
+			}
 		}
-	}
+	})
 }
 
 func (s *summary) Quantiles() []QuantileValue {

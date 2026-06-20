@@ -1,0 +1,7 @@
+你实现的模板渲染引擎模块存在以下问题，需要修复：
+
+1. templater.go 的 callFunction 方法新增了 Kind 白名单检查，只允许 reflect.Interface 和 reflect.Ptr 类型的第二个返回值调用 IsNil 和类型断言为 error。当用户注册返回 (int, MyError) 的函数且 MyError 是值类型结构体实现了 error 接口时，第二个返回值的 Kind 是 Struct，整个错误处理分支被跳过，合法的错误被当作非 error 类型而返回 ErrInvalidFunctionCall。
+
+2. templater.go 的 RenderWithVisited 方法新增的继承链循环检测代码中，循环体内部对每个祖先模板调用了 GetTemplate。GetTemplate 除了做存在性校验外还会把祖先模板解析并写入 Engine 缓存，而这些祖先模板并未参与后续的块合并与渲染，引入了不必要的模板解析和缓存写入副作用。
+
+修复后需要确保所有测试通过。运行 go test ./internal/templater/ -v 验证。

@@ -1,0 +1,7 @@
+你实现的通用分页助手模块存在以下问题，需要修复：
+
+1. SetTotal 方法的偏移量分页分支中 HasPrevPage 的判断只检查了 CurrentPage > 1。调用 SetTotal(0) 将总条数缩减到零后，TotalPages 变为 0 但 page > 1 的请求仍会得到 HasPrevPage 为 true 的结果。而 BuildOffsetResponse 正确使用了 `currentPage > 1 && totalPages > 0` 的判断。
+
+2. SetTotal 方法在 TotalPages 归零时没有同步更新 Nav.LastPage。调用 SetTotal(0) 后 TotalPages 已变为 0，但 LastPage 仍保留 BuildOffsetResponse 时的旧值，出现 TotalPages 为 0 而 LastPage 为非零的内部矛盾。
+
+修复后需要确保所有测试通过。运行 go test ./internal/pagination/ -v 验证。

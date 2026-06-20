@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const dataloaderFlushDelay = 5 * time.Millisecond
+const dataloaderFlushInterval = 500 * time.Microsecond
 
 type Executor struct {
 	Schema    *Schema
@@ -134,24 +134,22 @@ func (e *Executor) executeOperation(ctx *ExecutionContext, op *Operation) (map[s
 	results := make(chan fieldResult, len(fields))
 	var wg sync.WaitGroup
 
-	for _, field := range fields {
-		wg.Add(1)
-		go func(f *FieldSelection) {
-			defer wg.Done()
-			resolvedArgs := resolveArguments(f.Args, ctx.Variables, op.VariableDefs)
-			value, fieldErrs := e.executeField(ctx, rootType, f, nil, resolvedArgs, "")
-			name := f.Name
-			if f.Alias != "" {
-				name = f.Alias
-			}
-			results <- fieldResult{name: name, value: value, errs: fieldErrs}
-		}(field)
-	}
+	e.runConcurrentlyWithFlush(ctx, &wg, func() {
+		for _, field := range fields {
+			wg.Add(1)
+			go func(f *FieldSelection) {
+				defer wg.Done()
+				resolvedArgs := resolveArguments(f.Args, ctx.Variables, op.VariableDefs)
+				value, fieldErrs := e.executeField(ctx, rootType, f, nil, resolvedArgs, "")
+				name := f.Name
+				if f.Alias != "" {
+					name = f.Alias
+				}
+				results <- fieldResult{name: name, value: value, errs: fieldErrs}
+			}(field)
+		}
+	})
 
-	time.Sleep(dataloaderFlushDelay)
-	e.flushDataLoaders(ctx)
-
-	wg.Wait()
 	close(results)
 
 	result := make(map[string]interface{})
@@ -174,6 +172,35 @@ func (e *Executor) flushDataLoaders(ctx *ExecutionContext) {
 	for _, dl := range ctx.DataLoaders {
 		dl.Flush()
 	}
+}
+
+func (e *Executor) runConcurrentlyWithFlush(
+	ctx *ExecutionContext,
+	wg *sync.WaitGroup,
+	spawnGoroutines func(),
+) {
+	spawnGoroutines()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	ticker := time.NewTicker(dataloaderFlushInterval)
+	defer ticker.Stop()
+
+loop:
+	for {
+		select {
+		case <-done:
+			break loop
+		case <-ticker.C:
+			e.flushDataLoaders(ctx)
+		}
+	}
+
+	e.flushDataLoaders(ctx)
 }
 
 func (e *Executor) executeField(
@@ -283,21 +310,19 @@ func (e *Executor) executeList(
 	results := make(chan itemResult, n)
 	var wg sync.WaitGroup
 
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			itemPath := fmt.Sprintf("%s[%d]", path, idx)
-			item := val.Index(idx).Interface()
-			itemResultMap, itemErrs := e.executeObject(ctx, innerType, selections, item, itemPath)
-			results <- itemResult{index: idx, value: itemResultMap, errs: itemErrs}
-		}(i)
-	}
+	e.runConcurrentlyWithFlush(ctx, &wg, func() {
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				itemPath := fmt.Sprintf("%s[%d]", path, idx)
+				item := val.Index(idx).Interface()
+				itemResultMap, itemErrs := e.executeObject(ctx, innerType, selections, item, itemPath)
+				results <- itemResult{index: idx, value: itemResultMap, errs: itemErrs}
+			}(i)
+		}
+	})
 
-	time.Sleep(dataloaderFlushDelay)
-	e.flushDataLoaders(ctx)
-
-	wg.Wait()
 	close(results)
 
 	resultList := make([]interface{}, n)
@@ -356,31 +381,29 @@ func (e *Executor) executeObject(
 		results := make(chan fieldResult, len(fieldSelections))
 		var wg sync.WaitGroup
 
-		for _, fs := range fieldSelections {
-			wg.Add(1)
-			go func(f *FieldSelection) {
-				defer wg.Done()
-				resolvedArgs := resolveArguments(f.Args, ctx.Variables, nil)
-				fieldValue, fieldErrs := e.executeField(
-					ctx,
-					actualType,
-					f,
-					value,
-					resolvedArgs,
-					path,
-				)
-				name := f.Name
-				if f.Alias != "" {
-					name = f.Alias
-				}
-				results <- fieldResult{name: name, value: fieldValue, errs: fieldErrs}
-			}(fs)
-		}
+		e.runConcurrentlyWithFlush(ctx, &wg, func() {
+			for _, fs := range fieldSelections {
+				wg.Add(1)
+				go func(f *FieldSelection) {
+					defer wg.Done()
+					resolvedArgs := resolveArguments(f.Args, ctx.Variables, nil)
+					fieldValue, fieldErrs := e.executeField(
+						ctx,
+						actualType,
+						f,
+						value,
+						resolvedArgs,
+						path,
+					)
+					name := f.Name
+					if f.Alias != "" {
+						name = f.Alias
+					}
+					results <- fieldResult{name: name, value: fieldValue, errs: fieldErrs}
+				}(fs)
+			}
+		})
 
-		time.Sleep(dataloaderFlushDelay)
-		e.flushDataLoaders(ctx)
-
-		wg.Wait()
 		close(results)
 
 		for r := range results {

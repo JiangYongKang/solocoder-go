@@ -15,6 +15,7 @@ var (
 	ErrFlagNotFound          = errors.New("feature flag not found")
 	ErrFlagAlreadyExists     = errors.New("feature flag already exists")
 	ErrInvalidFlagType       = errors.New("invalid feature flag type")
+	ErrFlagTypeMismatch      = errors.New("feature flag type mismatch")
 	ErrInvalidPercentage     = errors.New("percentage must be between 0 and 100")
 	ErrNilUserID             = errors.New("user ID cannot be empty for percentage/whitelist evaluation")
 	ErrInvalidConfig         = errors.New("invalid feature flag configuration")
@@ -22,6 +23,23 @@ var (
 	ErrNilFlagKey            = errors.New("feature flag key cannot be empty")
 	ErrPercentageTypeNoValue = errors.New("percentage type flag must have percentage value")
 )
+
+type flagTypeMismatchError struct {
+	actual   FlagType
+	expected FlagType
+}
+
+func (e *flagTypeMismatchError) Error() string {
+	return fmt.Sprintf("%s: flag type is %s, not %s", ErrFlagTypeMismatch.Error(), e.actual.String(), e.expected.String())
+}
+
+func (e *flagTypeMismatchError) Is(target error) bool {
+	return target == ErrFlagTypeMismatch
+}
+
+func newFlagTypeMismatchError(actual, expected FlagType) error {
+	return &flagTypeMismatchError{actual: actual, expected: expected}
+}
 
 type FlagType int
 
@@ -287,7 +305,7 @@ func (e *Evaluator) SetBooleanValue(key string, enabled bool) error {
 		return ErrFlagNotFound
 	}
 	if cfg.Type != FlagTypeBoolean {
-		return fmt.Errorf("%w: flag type is %s, not Boolean", ErrInvalidFlagType, cfg.Type.String())
+		return newFlagTypeMismatchError(cfg.Type, FlagTypeBoolean)
 	}
 
 	oldClone := cfg.Clone()
@@ -315,7 +333,7 @@ func (e *Evaluator) SetPercentage(key string, percentage int) error {
 		return ErrFlagNotFound
 	}
 	if cfg.Type != FlagTypePercentage {
-		return fmt.Errorf("%w: flag type is %s, not Percentage", ErrInvalidFlagType, cfg.Type.String())
+		return newFlagTypeMismatchError(cfg.Type, FlagTypePercentage)
 	}
 
 	oldClone := cfg.Clone()
@@ -343,7 +361,7 @@ func (e *Evaluator) AddToWhitelist(key string, userID string) error {
 		return ErrFlagNotFound
 	}
 	if cfg.Type != FlagTypeWhitelist {
-		return fmt.Errorf("%w: flag type is %s, not Whitelist", ErrInvalidFlagType, cfg.Type.String())
+		return newFlagTypeMismatchError(cfg.Type, FlagTypeWhitelist)
 	}
 
 	if isInWhitelist(cfg.Whitelist, userID) {
@@ -375,7 +393,7 @@ func (e *Evaluator) RemoveFromWhitelist(key string, userID string) error {
 		return ErrFlagNotFound
 	}
 	if cfg.Type != FlagTypeWhitelist {
-		return fmt.Errorf("%w: flag type is %s, not Whitelist", ErrInvalidFlagType, cfg.Type.String())
+		return newFlagTypeMismatchError(cfg.Type, FlagTypeWhitelist)
 	}
 
 	if !isInWhitelist(cfg.Whitelist, userID) {

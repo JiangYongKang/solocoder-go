@@ -18,6 +18,7 @@ var (
 	ErrInvalidArgValue      = errors.New("gqlparser: invalid argument value")
 	ErrUnknownOperation     = errors.New("gqlparser: unknown operation type")
 	ErrDataLoaderNotReady   = errors.New("gqlparser: dataloader not ready")
+	ErrDataLoaderCleared    = errors.New("gqlparser: dataloader request cleared")
 )
 
 func NewValidationError(path, format string, args ...interface{}) *ValidationError {

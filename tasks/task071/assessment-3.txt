@@ -1,0 +1,6 @@
+产物不满意：
+1. executor.go 的 runConcurrentlyWithFlush 方法使用 500μs 定时器周期性触发 Flush，仍属基于时间的轮询而非事件驱动。当 goroutine 在两次 tick 之间调用 dl.Load 收集键后，必须等到下一个 tick 才触发批量加载，最长延迟 500μs。这导致同层级内 Load 请求可能跨越 tick 边界被分割为多次小批量 Flush，削弱了 DataLoader 合并批次以减少查询次数的效果。根因是模型只把 time.Sleep 替换为定时器周期轮询，未从时间触发改为事件触发，正确做法应在 WaitGroup 释放后立即 Flush 而非依赖固定间隔。
+2. query_parser.go 的 parseTypeReference 新增了 builtinScalarNames 映射表仅识别五个内置标量，但测试 SDL 中定义的 DateTime 等自定义标量类型仍被标记为 TypeKindObject。schema.go 的同名方法可通过 p.schema.types 查找模式表中任意已注册类型的真实 Kind，而 query_parser.go 因无 schema 引用只能依赖硬编码名称表，两个 parseTypeReference 对自定义标量的类型分类行为仍然不一致。根因是模型仅完成了内置标量的名称比对修复，未考虑两个解析器应共享统一的类型分类策略，若未来 validator 开始依赖查询解析阶段的 Kind 做类型校验，自定义标量将全部误判。
+过程不满意：
+1. 模型在收到提示词后的第一步操作是调用 todo_write 创建 4 项子任务计划，然后才开始逐一查看 executor.go、dataloader.go、query_parser.go 和 types.go 的源码。此时模型对三个 BUG 的代码位置和修改范围毫无了解，创建的计划仅是提示词文本的字面转述而非基于代码分析的规划。这种先计划后分析的顺序违反了标注规范要求的先分析问题再规划的原则，模型后续多次通过 todo_write 更新任务状态也说明初始计划流于形式。正确做法是先通读所有相关源文件，理解缺陷的触发条件和涉及代码后再制定修改计划。
+2. 模型对 executor.go 进行了五次独立编辑，在第一步编辑后又新增 runConcurrentlyWithFlush 辅助方法，然后逐个修改 executeOperation、executeList、executeObject 三个方法调用新辅助函数。这种先局部修改再补充架构设计的顺序说明模型在动手前未对 executor.go 的修复方案做通盘设计，应先构思好辅助方法的接口签名和调用方式，再一次性删除旧同步代码并替换为新方法调用，而非分五步增量修改同一文件增加遗漏或冲突风险。

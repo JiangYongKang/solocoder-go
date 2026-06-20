@@ -1,0 +1,7 @@
+你实现的指标采集器模块存在以下问题，需要修复：
+
+1. summary.go 的 Observe 方法实现了蓄水池采样算法，但新增的并发采样测试 TestSummary_ConcurrentReservoirSampling 只验证了 Count 一致性，未对分位值准确性做任何断言。在十个 goroutine 各自写入一千个不同范围观测值的并发场景下，P50 是否落在合理区间完全没有验证，无法证明蓄水池算法在并发竞争条件下的统计无偏性。
+
+2. 快照原子性修复将 snapshotMu 以指针形式注入到 counter.go、gauge.go、histogram.go、summary.go 四个指标类型中，要求每个写入方法先获取 snapshotMu.RLock 再获取自身 mu.Lock，这一锁顺序约定仅靠代码惯例维持。未来新增指标类型或写入方法时如果遗漏 snapshotMu 保护，快照非原子性问题会沉默地重新出现。
+
+修复后需要确保所有测试通过。运行 go test ./internal/metrics/ -v 验证。

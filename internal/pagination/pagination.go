@@ -210,16 +210,14 @@ func (r *PageResponse[T]) SetTotal(total int64) error {
 		} else {
 			meta.HasNextPage = false
 		}
-		if meta.CurrentPage > 1 {
+		if meta.CurrentPage > 1 && meta.TotalPages > 0 {
 			meta.HasPrevPage = true
 		} else {
 			meta.HasPrevPage = false
 		}
 		if r.Nav != nil {
 			if nav, ok := r.Nav.(*OffsetNav); ok {
-				if meta.TotalPages > 0 {
-					nav.LastPage = meta.TotalPages
-				}
+				nav.LastPage = meta.TotalPages
 				if meta.HasPrevPage {
 					prev := meta.CurrentPage - 1
 					nav.PrevPage = &prev

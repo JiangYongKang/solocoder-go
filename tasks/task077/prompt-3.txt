@@ -1,0 +1,9 @@
+你实现的功能开关评估器模块存在以下问题，需要修复：
+
+1. SetBooleanValue 添加了类型校验并返回 ErrInvalidFlagType 错误，但校验失败时的错误信息直接拼接 FlagType 的英文名称，与 ErrInvalidFlagType 自身的英文 Error() 输出风格不统一，缺少统一的前缀或结构化错误包装来区分"类型参数本身非法"和"类型不匹配"两种语义。
+
+2. TestQueryAuditLogs_ByTimeRange 测试完全依赖系统时钟排序，使用 time.Sleep(20ms) 在操作之间插入间隔并监控两个时间锚点。在 Windows 环境下系统时钟精度约为 15ms，极端高负载场景下可能出现时间锚点捕获的时间晚于操作产生的审计日志时间戳，导致测试断言不稳定。
+
+3. 新增的 TestQueryAuditLogs_TimeRangeWithFlagKey 测试了 FlagKey+StartTime 和 FlagKey+EndTime 组合，但未覆盖 docs/featureflag.md 第 9.3 节明确列出的 FlagKey+StartTime+EndTime 三参数同时使用的场景。
+
+修复后需要确保所有测试通过。运行 go test ./internal/featureflag/ -v 验证。

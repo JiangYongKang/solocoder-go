@@ -92,6 +92,8 @@ func (dl *DataLoader) Clear(key interface{}) {
 	for _, req := range dl.pending {
 		if req.key != key {
 			newPending = append(newPending, req)
+		} else {
+			req.result <- loaderResult{nil, ErrDataLoaderCleared}
 		}
 	}
 	dl.pending = newPending
@@ -100,5 +102,9 @@ func (dl *DataLoader) Clear(key interface{}) {
 func (dl *DataLoader) ClearAll() {
 	dl.mu.Lock()
 	defer dl.mu.Unlock()
+
+	for _, req := range dl.pending {
+		req.result <- loaderResult{nil, ErrDataLoaderCleared}
+	}
 	dl.pending = make([]*loaderRequest, 0)
 }

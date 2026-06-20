@@ -1,0 +1,5 @@
+产物不满意：
+1. doRequest 方法在 5xx 分支中通过 io.LimitReader(resp.Body, maxErrorBodySize) 限制读取大小并调用 io.ReadAll 获取截断后的响应体，但 io.ReadAll 返回的 readErr 在 readErr == nil && len(body) > 0 的判断中被静默丢弃。当上游连接在 body 传输过程中异常中断时，readErr 记录了真实的网络错误信息却被完全忽略，错误最终表现为 `500 Internal Server Error` 无 body 内容，调试人员无法区分"上游返回了空 body"还是"网络传输过程中 body 读取失败"，两种场景的根因定位路径截然不同。正确做法是在 readErr 不为 nil 时将读取失败信息拼接到 serverError 的 status 字段中或输出 log，保留异常路径的诊断线索。
+
+过程不满意：
+1. 模型在收到 prompt-3 后用 view_files 查看了 restclient.go 的 doRequest 实现，确认两个 bug 后直接通过 edit_file_search_replace 对同一文件连续执行了两次编辑操作，全程没有运行 go test 建立基线。Bug Fix 流程的标准前置步骤是在修改代码前先执行一次完整测试，确认当前代码的编译状态和现有测试通过情况，以此为后续改动提供对比基准。模型跳过这一步直接进入编辑，虽然在最终运行测试时 51 个用例全部通过，但如果任何一次编辑引入了语法错误或破坏性变更，在缺少基线对比的情况下排查效率会显著降低，正确的做法是在两次编辑之间至少执行一次 go build 或 go vet 做增量校验。

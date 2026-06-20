@@ -1,0 +1,7 @@
+你实现的 REST HTTP 客户端模块存在以下问题，需要修复：
+
+1. doRequest 方法在检测到 5xx 状态码后，先把响应体读完再关闭 Body，然后同时返回这个 Body 已关闭的响应对象和一个 serverError 错误。这导致 Do 方法上层又对已关闭的 Body 二次调用 Close。
+
+2. doRequest 在每次遇到 5xx 时都用 io.ReadAll 把完整响应体读入内存拼接到错误信息中。当上游返回大体积错误页面时会造成不必要的内存分配，如果重试最终成功则这些内存被白白消耗。
+
+修复后需要确保所有测试通过。运行 go test ./internal/restclient/ -v 验证。

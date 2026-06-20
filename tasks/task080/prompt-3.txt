@@ -1,0 +1,5 @@
+你实现的结构化日志库模块存在以下问题，需要修复：
+
+1. isInternalFrame 函数改用文件名后缀判定后仅过滤了 structlog.go 这一个文件。若包内后续新增同包的内部辅助文件（如 encoder.go 或 formatter.go），那些文件中的栈帧不会被过滤，会泄漏到 caller 和 stack 输出中。原来的 pkgPrefix 方案虽过滤范围过宽导致误伤测试文件，但至少能自动覆盖包内所有源文件，而新方案把通用过滤退化成了单文件白名单，缺乏自动扩展能力。
+
+修复后需要确保所有测试通过。运行 go test ./internal/structlog/ -v 验证。

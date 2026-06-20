@@ -1,0 +1,9 @@
+你实现的 GraphQL 查询解析器模块存在以下问题，需要修复：
+
+1. executor.go 的 executeOperation、executeList 和 executeObject 方法使用 time.Sleep 与 DataLoader Flush 做同步。当 goroutine 因调度延迟未能在 sleep 窗口内完成键收集时，请求会被当前层级 Flush 遗漏，导致批量加载效果不确定。在真实 I/O 场景下 N+1 查询保证会被打破。
+
+2. query_parser.go 的 parseTypeReference 方法对所有命名类型硬编码 Kind 为 TypeKindObject。当查询中包含 `$value: ID!` 这类标量类型变量时，该变量类型会被错误标记为 Object 而非 Scalar，与 schema.go 已修复的同名方法行为不一致。
+
+3. dataloader.go 的 Clear 和 ClearAll 方法从 pending 队列移除请求后，不向被移除请求的 result channel 发送任何值。调用 dl.Load 的 goroutine 会永久阻塞在 channel 接收上，导致 goroutine 泄漏。
+
+修复后需要确保所有测试通过。运行 go test ./internal/gqlparser/ -v 验证。

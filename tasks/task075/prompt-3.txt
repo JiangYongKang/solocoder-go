@@ -1,0 +1,7 @@
+你实现的搜索建议引擎模块存在以下问题，需要修复：
+
+1. suggest.go 的 AddWord 方法通过 InsertWithFreq(word, 0) 将频率初始化为 0，但 InsertWithFreq 方法无条件将 node.freq 设为了指定值。当 AddWord 作用在已通过 SubmitSearch 积累了搜索频率的已有词上时，该词的真实搜索频率会被擦除为 0，导致 GetHotWords 中原本的高频词排名跌至末尾。
+
+2. suggest.go 中 CorrectLimit 方法与 correctNoLock 方法存在超过 50 行完全重复的纠错逻辑，correctNoLock 本质上是 CorrectLimit 去掉锁获取后的逐行复制。当纠错排序规则或编辑距离阈值需要变更时，两处代码必须同步修改，遗漏一处会导致 SuggestLimit 方法的纠错结果与 Correct 方法不一致。
+
+修复后需要确保所有测试通过。运行 go test ./internal/suggest/ -v 验证。

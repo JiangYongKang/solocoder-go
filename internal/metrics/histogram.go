@@ -8,27 +8,31 @@ import (
 )
 
 type histogram struct {
-	snapshotMu *sync.RWMutex
-	mu         sync.RWMutex
-	name       string
-	labels     Labels
-	buckets    []float64
-	counts     []uint64
-	sum        float64
-	count      uint64
+	guard   snapshotGuard
+	mu      sync.RWMutex
+	name    string
+	labels  Labels
+	buckets []float64
+	counts  []uint64
+	sum     float64
+	count   uint64
 }
 
-func newHistogram(name string, labels Labels, buckets []float64, snapshotMu *sync.RWMutex) *histogram {
+var _ snapshotProtected = (*histogram)(nil)
+
+func (h *histogram) snapshotGuardPtr() *snapshotGuard { return &h.guard }
+
+func newHistogram(name string, labels Labels, buckets []float64, guard snapshotGuard) *histogram {
 	sortedBuckets := make([]float64, len(buckets))
 	copy(sortedBuckets, buckets)
 	sort.Float64s(sortedBuckets)
 
 	h := &histogram{
-		snapshotMu: snapshotMu,
-		name:       name,
-		labels:     make(Labels, len(labels)),
-		buckets:    sortedBuckets,
-		counts:     make([]uint64, len(sortedBuckets)+1),
+		guard:   guard,
+		name:    name,
+		labels:  make(Labels, len(labels)),
+		buckets: sortedBuckets,
+		counts:  make([]uint64, len(sortedBuckets)+1),
 	}
 	copy(h.labels, labels)
 	return h
@@ -47,19 +51,19 @@ func (h *histogram) Labels() Labels {
 }
 
 func (h *histogram) Observe(value float64) {
-	h.snapshotMu.RLock()
-	defer h.snapshotMu.RUnlock()
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.guard.write(func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
 
-	idx := sort.SearchFloat64s(h.buckets, value)
-	if idx < len(h.buckets) {
-		h.counts[idx]++
-	} else {
-		h.counts[len(h.buckets)]++
-	}
-	h.count++
-	h.sum += value
+		idx := sort.SearchFloat64s(h.buckets, value)
+		if idx < len(h.buckets) {
+			h.counts[idx]++
+		} else {
+			h.counts[len(h.buckets)]++
+		}
+		h.count++
+		h.sum += value
+	})
 }
 
 func (h *histogram) Buckets() []BucketValue {

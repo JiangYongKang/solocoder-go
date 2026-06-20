@@ -1,0 +1,5 @@
+你实现的 HTTP 内容协商模块存在以下问题，需要修复：
+
+1. WriteNotAcceptable 方法的备选 JSON 拼接路径中，message 字段为 `No acceptable representation found.`，而主路径和 docs/contentneg.md 第 6.2 节定义的消息是 `No acceptable representation found for the requested resource.`。当主路径序列化失败触发备选路径时，客户端收到的错误消息缺少了 `for the requested resource` 部分。
+
+修复后需要确保所有测试通过。运行 go test ./internal/contentneg/ -v 验证。

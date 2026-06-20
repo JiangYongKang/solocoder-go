@@ -1428,6 +1428,138 @@ func TestSetTotalShrinkToZero(t *testing.T) {
 	}
 }
 
+func TestSetTotalShrinkToZeroHasPrevPage(t *testing.T) {
+	tests := []struct {
+		name string
+		page int
+	}{
+		{"page 5 shrink to zero", 5},
+		{"page 10 shrink to zero", 10},
+		{"page 2 shrink to zero", 2},
+		{"page 1 shrink to zero", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			items := makeTestItems(tt.page * 10)
+			req, _ := NewOffsetPageRequest(tt.page, 10)
+			resp := BuildOffsetResponse(items, req, 1000)
+			metaBefore := resp.Meta.(*OffsetPageMeta)
+			if metaBefore.TotalPages != 100 {
+				t.Fatalf("expected 100 pages before SetTotal, got %d", metaBefore.TotalPages)
+			}
+			err := resp.SetTotal(0)
+			if err != nil {
+				t.Fatalf("SetTotal failed: %v", err)
+			}
+			meta := resp.Meta.(*OffsetPageMeta)
+			if meta.TotalPages != 0 {
+				t.Errorf("expected TotalPages 0, got %d", meta.TotalPages)
+			}
+			if meta.HasPrevPage {
+				t.Errorf("HasPrevPage should be false when TotalPages=0, got true (page=%d)", tt.page)
+			}
+			if meta.HasNextPage {
+				t.Errorf("HasNextPage should be false when TotalPages=0, got true")
+			}
+			nav := resp.Nav.(*OffsetNav)
+			if nav.PrevPage != nil {
+				t.Errorf("PrevPage nav should be nil when TotalPages=0, got %d", *nav.PrevPage)
+			}
+			if nav.NextPage != nil {
+				t.Errorf("NextPage nav should be nil when TotalPages=0, got %d", *nav.NextPage)
+			}
+		})
+	}
+}
+
+func TestSetTotalShrinkToZeroNavLastPage(t *testing.T) {
+	items := makeTestItems(10)
+	req, _ := NewOffsetPageRequest(5, 10)
+	resp := BuildOffsetResponse(items, req, 500)
+	metaBefore := resp.Meta.(*OffsetPageMeta)
+	if metaBefore.TotalPages != 50 {
+		t.Fatalf("expected 50 pages before SetTotal, got %d", metaBefore.TotalPages)
+	}
+	navBefore := resp.Nav.(*OffsetNav)
+	if navBefore.LastPage != 50 {
+		t.Fatalf("expected LastPage 50 before SetTotal, got %d", navBefore.LastPage)
+	}
+	err := resp.SetTotal(0)
+	if err != nil {
+		t.Fatalf("SetTotal failed: %v", err)
+	}
+	meta := resp.Meta.(*OffsetPageMeta)
+	if meta.TotalPages != 0 {
+		t.Errorf("expected TotalPages 0, got %d", meta.TotalPages)
+	}
+	nav := resp.Nav.(*OffsetNav)
+	if nav.LastPage != 0 {
+		t.Errorf("expected LastPage 0 after SetTotal(0), got %d", nav.LastPage)
+	}
+}
+
+func TestSetTotalShrinkZeroNavLastPageConsistency(t *testing.T) {
+	req, _ := NewOffsetPageRequest(3, 5)
+	resp := BuildOffsetResponse(makeTestItems(5), req, 100)
+	nav := resp.Nav.(*OffsetNav)
+	if nav.LastPage != 20 {
+		t.Fatalf("expected LastPage 20, got %d", nav.LastPage)
+	}
+	_ = resp.SetTotal(3)
+	meta := resp.Meta.(*OffsetPageMeta)
+	nav2 := resp.Nav.(*OffsetNav)
+	if nav2.LastPage != meta.TotalPages {
+		t.Errorf("LastPage (%d) should equal TotalPages (%d)", nav2.LastPage, meta.TotalPages)
+	}
+	_ = resp.SetTotal(0)
+	meta2 := resp.Meta.(*OffsetPageMeta)
+	nav3 := resp.Nav.(*OffsetNav)
+	if nav3.LastPage != meta2.TotalPages {
+		t.Errorf("After SetTotal(0): LastPage (%d) should equal TotalPages (%d)", nav3.LastPage, meta2.TotalPages)
+	}
+}
+
+func TestSetTotalOffsetHasPrevPageLogic(t *testing.T) {
+	tests := []struct {
+		name         string
+		initialTotal int64
+		page         int
+		size         int
+		setTotal     int64
+		wantHasPrev  bool
+	}{
+		{"page 5, shrink from 100 to 100", 100, 5, 10, 100, true},
+		{"page 5, shrink from 100 to 50", 100, 5, 10, 50, true},
+		{"page 5, shrink from 100 to 5", 100, 5, 10, 5, true},
+		{"page 5, shrink from 100 to 0", 100, 5, 10, 0, false},
+		{"page 1, shrink from 100 to 0", 100, 1, 10, 0, false},
+		{"page 1, shrink from 100 to 5", 100, 1, 10, 5, false},
+		{"page 2, shrink from 100 to 20", 100, 2, 10, 20, true},
+		{"page 2, shrink from 100 to 15", 100, 2, 10, 15, true},
+		{"page 2, shrink from 100 to 10", 100, 2, 10, 10, true},
+		{"page 2, shrink from 100 to 0", 100, 2, 10, 0, false},
+		{"page 10, shrink from 1000 to 95", 1000, 10, 10, 95, true},
+		{"page 10, shrink from 1000 to 100", 1000, 10, 10, 100, true},
+		{"page 10, shrink from 1000 to 5", 1000, 10, 10, 5, true},
+		{"page 10, shrink from 1000 to 0", 1000, 10, 10, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := NewOffsetPageRequest(tt.page, tt.size)
+			resp := BuildOffsetResponse(makeTestItems(tt.size), req, tt.initialTotal)
+			err := resp.SetTotal(tt.setTotal)
+			if err != nil {
+				t.Fatalf("SetTotal failed: %v", err)
+			}
+			meta := resp.Meta.(*OffsetPageMeta)
+			if meta.HasPrevPage != tt.wantHasPrev {
+				t.Errorf("expected HasPrevPage=%v, got %v (page=%d, totalAfter=%d, totalPages=%d)",
+					tt.wantHasPrev, meta.HasPrevPage, tt.page, tt.setTotal, meta.TotalPages)
+			}
+		})
+	}
+}
+
 func TestValidateData(t *testing.T) {
 	t.Run("nil slice returns ErrNilData", func(t *testing.T) {
 		var items []TestItem = nil

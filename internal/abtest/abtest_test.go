@@ -502,21 +502,14 @@ func TestConcurrent_ReadAndModifyExperimentPointer(t *testing.T) {
 	numGoroutines := 20
 	iterations := 100
 
-	stop := make(chan struct{})
-
 	for g := 0; g < numGoroutines/2; g++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
-				select {
-				case <-stop:
-					return
-				default:
-					exp, _ := ab.GetExperiment("exp-race")
-					_ = exp.ExperimentGroupPct
-					_ = exp.ControlGroupPct
-				}
+				exp, _ := ab.GetExperiment("exp-race")
+				_ = exp.ExperimentGroupPct
+				_ = exp.ControlGroupPct
 			}
 		}()
 	}
@@ -526,15 +519,10 @@ func TestConcurrent_ReadAndModifyExperimentPointer(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
-				select {
-				case <-stop:
-					return
-				default:
-					exp, _ := ab.GetExperiment("exp-race")
-					exp.ExperimentGroupPct = 999
-					exp.ControlGroupPct = 999
-					_ = exp
-				}
+				exp, _ := ab.GetExperiment("exp-race")
+				exp.ExperimentGroupPct = 999
+				exp.ControlGroupPct = 999
+				_ = exp
 			}
 		}()
 	}
@@ -544,19 +532,13 @@ func TestConcurrent_ReadAndModifyExperimentPointer(t *testing.T) {
 		go func(gid int) {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
-				select {
-				case <-stop:
-					return
-				default:
-					userID := fmt.Sprintf("user-race-%d-%d", gid, i)
-					_, _ = ab.AssignGroup(userID, "exp-race")
-				}
+				userID := fmt.Sprintf("user-race-%d-%d", gid, i)
+				_, _ = ab.AssignGroup(userID, "exp-race")
 			}
 		}(g)
 	}
 
 	wg.Wait()
-	close(stop)
 
 	internalExp, _ := ab.GetExperiment("exp-race")
 	if internalExp.ExperimentGroupPct != 50 {

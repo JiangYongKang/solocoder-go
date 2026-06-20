@@ -106,6 +106,31 @@ func (t *Trie) InsertWithFreq(word string, freq int) error {
 	return nil
 }
 
+func (t *Trie) EnsureWord(word string) error {
+	if word == "" {
+		return ErrEmptyWord
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	node := t.root
+	for _, ch := range word {
+		if node.children[ch] == nil {
+			node.children[ch] = newTrieNode()
+		}
+		node = node.children[ch]
+	}
+
+	if !node.isEnd {
+		node.isEnd = true
+		node.freq = 0
+		t.size++
+	}
+
+	return nil
+}
+
 func (t *Trie) Delete(word string) error {
 	if word == "" {
 		return ErrEmptyWord
@@ -478,7 +503,7 @@ func (e *SuggestEngine) AddWord(word string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return e.trie.InsertWithFreq(word, 0)
+	return e.trie.EnsureWord(word)
 }
 
 func (e *SuggestEngine) AddWordWithFreq(word string, freq int) error {
@@ -528,57 +553,7 @@ func (e *SuggestEngine) CorrectLimit(query string, maxResults int) ([]Suggestion
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	if query == "" {
-		return nil, ErrEmptyQuery
-	}
-	if maxResults <= 0 {
-		return nil, ErrInvalidMaxResult
-	}
-
-	exists, _ := e.trie.Search(query)
-	if exists {
-		return []Suggestion{}, nil
-	}
-
-	allWords := e.trie.GetAllWords()
-	if len(allWords) == 0 {
-		return []Suggestion{}, nil
-	}
-
-	type candidate struct {
-		word Suggestion
-		dist int
-	}
-
-	var candidates []candidate
-	for _, w := range allWords {
-		dist := EditDistance(query, w.Word)
-		if dist <= e.maxEditDist {
-			candidates = append(candidates, candidate{word: w, dist: dist})
-		}
-	}
-
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].dist != candidates[j].dist {
-			return candidates[i].dist < candidates[j].dist
-		}
-		if candidates[i].word.Frequency != candidates[j].word.Frequency {
-			return candidates[i].word.Frequency > candidates[j].word.Frequency
-		}
-		return candidates[i].word.Word < candidates[j].word.Word
-	})
-
-	resultCount := len(candidates)
-	if resultCount > maxResults {
-		resultCount = maxResults
-	}
-
-	results := make([]Suggestion, resultCount)
-	for i := 0; i < resultCount; i++ {
-		results[i] = candidates[i].word
-	}
-
-	return results, nil
+	return e.correctNoLock(query, maxResults)
 }
 
 func (e *SuggestEngine) SubmitSearch(userID, word string) error {

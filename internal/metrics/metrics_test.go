@@ -729,23 +729,24 @@ func TestSummary_Concurrent(t *testing.T) {
 
 func TestMetricValue_Types(t *testing.T) {
 	var snapshotMu sync.RWMutex
+	guard := newSnapshotGuard(&snapshotMu)
 
-	c := newCounter("test", nil, &snapshotMu)
+	c := newCounter("test", nil, guard)
 	if c.Type() != CounterType {
 		t.Errorf("expected counter type, got %v", c.Type())
 	}
 
-	g := newGauge("test", nil, &snapshotMu)
+	g := newGauge("test", nil, guard)
 	if g.Type() != GaugeType {
 		t.Errorf("expected gauge type, got %v", g.Type())
 	}
 
-	h := newHistogram("test", nil, []float64{1}, &snapshotMu)
+	h := newHistogram("test", nil, []float64{1}, guard)
 	if h.Type() != HistogramType {
 		t.Errorf("expected histogram type, got %v", h.Type())
 	}
 
-	s := newSummary("test", nil, []float64{0.5}, &snapshotMu)
+	s := newSummary("test", nil, []float64{0.5}, guard)
 	if s.Type() != SummaryType {
 		t.Errorf("expected summary type, got %v", s.Type())
 	}
@@ -1000,7 +1001,7 @@ func TestSummary_ReservoirSampling_UniformDistribution(t *testing.T) {
 
 func TestSummary_ConcurrentReservoirSampling(t *testing.T) {
 	r := NewRegistry()
-	s := r.RegisterSummary("concurrent_reservoir", nil, []float64{0.5})
+	s := r.RegisterSummary("concurrent_reservoir", nil, []float64{0.5, 0.9, 0.99})
 
 	var wg sync.WaitGroup
 	numGoroutines := 10
@@ -1026,7 +1027,38 @@ func TestSummary_ConcurrentReservoirSampling(t *testing.T) {
 	}
 
 	qs := s.Quantiles()
-	if len(qs) != 1 {
-		t.Fatalf("expected 1 quantile, got %d", len(qs))
+	if len(qs) != 3 {
+		t.Fatalf("expected 3 quantiles, got %d", len(qs))
+	}
+
+	expectedSum := float64(numGoroutines*iterations) * float64(numGoroutines*iterations-1) / 2
+	if math.Abs(s.Sum()-expectedSum) > 0.0001 {
+		t.Errorf("expected sum %v, got %v", expectedSum, s.Sum())
+	}
+
+	tolerance := 1500.0
+
+	if qs[0].Quantile != 0.5 {
+		t.Errorf("expected quantile 0.5, got %v", qs[0].Quantile)
+	}
+	expectedP50 := float64(numGoroutines*iterations-1) / 2
+	if math.Abs(qs[0].Value-expectedP50) > tolerance {
+		t.Errorf("P50: expected ~%v, got %v (tolerance %v)", expectedP50, qs[0].Value, tolerance)
+	}
+
+	if qs[1].Quantile != 0.9 {
+		t.Errorf("expected quantile 0.9, got %v", qs[1].Quantile)
+	}
+	expectedP90 := float64(numGoroutines*iterations-1) * 0.9
+	if math.Abs(qs[1].Value-expectedP90) > tolerance {
+		t.Errorf("P90: expected ~%v, got %v (tolerance %v)", expectedP90, qs[1].Value, tolerance)
+	}
+
+	if qs[2].Quantile != 0.99 {
+		t.Errorf("expected quantile 0.99, got %v", qs[2].Quantile)
+	}
+	expectedP99 := float64(numGoroutines*iterations-1) * 0.99
+	if math.Abs(qs[2].Value-expectedP99) > tolerance {
+		t.Errorf("P99: expected ~%v, got %v (tolerance %v)", expectedP99, qs[2].Value, tolerance)
 	}
 }

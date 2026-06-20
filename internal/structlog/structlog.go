@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -161,11 +162,16 @@ func (l *Logger) log(level Level, msg string) {
 }
 
 func isInternalFrame(frame runtime.Frame) bool {
-	if strings.HasSuffix(frame.File, "/structlog.go") ||
-		strings.HasSuffix(frame.File, "\\structlog.go") {
-		return true
+	hasStructlogDir := strings.Contains(frame.File, "/internal/structlog/") ||
+		strings.Contains(frame.File, "\\internal\\structlog\\")
+	if !hasStructlogDir {
+		return false
 	}
-	return false
+	base := filepath.Base(frame.File)
+	if strings.HasSuffix(base, "_test.go") {
+		return false
+	}
+	return true
 }
 
 func captureCaller() string {

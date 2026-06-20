@@ -380,6 +380,14 @@ type VariableRef struct {
 	Name string
 }
 
+var builtinScalarNames = map[string]bool{
+	"Int":     true,
+	"Float":   true,
+	"String":  true,
+	"Boolean": true,
+	"ID":      true,
+}
+
 func (p *queryParser) parseTypeReference() (*Type, error) {
 	var t *Type
 
@@ -402,8 +410,12 @@ func (p *queryParser) parseTypeReference() (*Type, error) {
 		if err != nil {
 			return nil, err
 		}
+		kind := TypeKindObject
+		if builtinScalarNames[name] {
+			kind = TypeKindScalar
+		}
 		t = &Type{
-			Kind: TypeKindObject,
+			Kind: kind,
 			Name: name,
 		}
 	}

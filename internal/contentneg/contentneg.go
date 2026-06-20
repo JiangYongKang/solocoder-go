@@ -378,7 +378,7 @@ func (n *Negotiator) WriteNotAcceptable(w http.ResponseWriter) error {
 		for i, f := range formats {
 			quotedFormats[i] = fmt.Sprintf(`"%s"`, f)
 		}
-		body = []byte(fmt.Sprintf(`{"status":"Not Acceptable","code":406,"message":"No acceptable representation found.","supported_formats":[%s]}`,
+		body = []byte(fmt.Sprintf(`{"status":"Not Acceptable","code":406,"message":"No acceptable representation found for the requested resource.","supported_formats":[%s]}`,
 			strings.Join(quotedFormats, ",")))
 	}
 

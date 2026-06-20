@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const maxErrorBodySize = 1024
+
 var (
 	ErrTemplateNotFound      = errors.New("restclient: template not found")
 	ErrTemplateNameEmpty    = errors.New("restclient: template name is empty")
@@ -353,15 +355,21 @@ func (c *Client) doRequest(ctx context.Context, tmpl *RequestTemplate, opts *Req
 		return nil, err
 	}
 	if resp.StatusCode >= http.StatusInternalServerError {
-		body, readErr := io.ReadAll(resp.Body)
+		statusCode := resp.StatusCode
+		status := resp.Status
+		limitedReader := io.LimitReader(resp.Body, maxErrorBodySize)
+		body, readErr := io.ReadAll(limitedReader)
 		resp.Body.Close()
-		statusText := resp.Status
 		if readErr == nil && len(body) > 0 {
-			statusText = fmt.Sprintf("%s: %s", resp.Status, string(body))
+			bodyStr := string(body)
+			if len(body) == maxErrorBodySize {
+				bodyStr += "..."
+			}
+			status = fmt.Sprintf("%s: %s", status, bodyStr)
 		}
-		return resp, &serverError{
-			statusCode: resp.StatusCode,
-			status:     statusText,
+		return nil, &serverError{
+			statusCode: statusCode,
+			status:     status,
 		}
 	}
 	return resp, nil

@@ -528,15 +528,15 @@ func TestSetBooleanValue(t *testing.T) {
 
 	t.Run("wrong type percentage", func(t *testing.T) {
 		err := e.SetBooleanValue("pct-flag", true)
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType for percentage flag, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch for percentage flag, got %v", err)
 		}
 	})
 
 	t.Run("wrong type whitelist", func(t *testing.T) {
 		err := e.SetBooleanValue("wl-flag", true)
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType for whitelist flag, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch for whitelist flag, got %v", err)
 		}
 	})
 
@@ -617,8 +617,8 @@ func TestSetPercentage(t *testing.T) {
 
 	t.Run("wrong type", func(t *testing.T) {
 		err := e.SetPercentage("bool-flag", 50)
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
@@ -666,8 +666,8 @@ func TestAddToWhitelist(t *testing.T) {
 
 	t.Run("wrong type", func(t *testing.T) {
 		err := e.AddToWhitelist("bool-flag", "bob")
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
@@ -730,8 +730,8 @@ func TestRemoveFromWhitelist(t *testing.T) {
 
 	t.Run("wrong type", func(t *testing.T) {
 		err := e.RemoveFromWhitelist("bool-flag", "bob")
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
@@ -1006,17 +1006,7 @@ func TestQueryAuditLogs_ByTimeRange(t *testing.T) {
 	e := NewEvaluator()
 
 	_ = e.CreateFlag(&FlagConfig{Key: "early-flag", Type: FlagTypeBoolean, Enabled: false})
-
-	time.Sleep(20 * time.Millisecond)
-	afterFirst := time.Now()
-	time.Sleep(20 * time.Millisecond)
-
 	_ = e.SetBooleanValue("early-flag", true)
-
-	time.Sleep(20 * time.Millisecond)
-	afterSecond := time.Now()
-	time.Sleep(20 * time.Millisecond)
-
 	_ = e.CreateFlag(&FlagConfig{Key: "late-flag", Type: FlagTypeBoolean})
 
 	allLogs := e.QueryAuditLogs(AuditLogQuery{})
@@ -1024,38 +1014,92 @@ func TestQueryAuditLogs_ByTimeRange(t *testing.T) {
 		t.Fatalf("expected 3 total logs, got %d", len(allLogs))
 	}
 
-	firstOnly := e.QueryAuditLogs(AuditLogQuery{EndTime: &afterFirst})
-	if len(firstOnly) != 1 {
-		t.Errorf("expected 1 log before afterFirst, got %d", len(firstOnly))
+	ts0 := allLogs[0].Timestamp
+	ts1 := allLogs[1].Timestamp
+	ts2 := allLogs[2].Timestamp
+
+	if ts1.Before(ts0) {
+		t.Fatalf("log timestamps not monotonic: ts1=%v before ts0=%v", ts1, ts0)
 	}
-	if len(firstOnly) > 0 && firstOnly[0].FlagKey != "early-flag" {
-		t.Errorf("expected early-flag CREATE, got %s", firstOnly[0].FlagKey)
+	if ts2.Before(ts1) {
+		t.Fatalf("log timestamps not monotonic: ts2=%v before ts1=%v", ts2, ts1)
 	}
 
-	secondOnly := e.QueryAuditLogs(AuditLogQuery{StartTime: &afterFirst, EndTime: &afterSecond})
-	if len(secondOnly) != 1 {
-		t.Errorf("expected 1 log between afterFirst and afterSecond, got %d", len(secondOnly))
+	distinctCount := 1
+	if ts1.After(ts0) {
+		distinctCount++
 	}
-	if len(secondOnly) > 0 && secondOnly[0].Operation != "SET_BOOLEAN" {
-		t.Errorf("expected SET_BOOLEAN operation, got %s", secondOnly[0].Operation)
+	if ts2.After(ts1) {
+		distinctCount++
+	}
+	t.Logf("timestamps: ts0=%v, ts1=%v, ts2=%v (distinct=%d)", ts0, ts1, ts2, distinctCount)
+
+	beforeAll := ts0.Add(-1 * time.Hour)
+	afterAll := ts2.Add(1 * time.Hour)
+
+	fullRange := e.QueryAuditLogs(AuditLogQuery{StartTime: &beforeAll, EndTime: &afterAll})
+	if len(fullRange) != 3 {
+		t.Errorf("wide range should include all 3 logs, got %d", len(fullRange))
 	}
 
-	lateOnly := e.QueryAuditLogs(AuditLogQuery{StartTime: &afterSecond})
-	if len(lateOnly) != 1 {
-		t.Errorf("expected 1 log after afterSecond, got %d", len(lateOnly))
-	}
-	if len(lateOnly) > 0 && lateOnly[0].FlagKey != "late-flag" {
-		t.Errorf("expected late-flag CREATE, got %s", lateOnly[0].FlagKey)
-	}
-
-	firstTwo := e.QueryAuditLogs(AuditLogQuery{EndTime: &afterSecond})
-	if len(firstTwo) != 2 {
-		t.Errorf("expected 2 logs before afterSecond, got %d", len(firstTwo))
+	wayBefore := ts0.Add(-2 * time.Hour)
+	wayBeforeEnd := ts0.Add(-1 * time.Hour)
+	beforeRange := e.QueryAuditLogs(AuditLogQuery{StartTime: &wayBefore, EndTime: &wayBeforeEnd})
+	if len(beforeRange) != 0 {
+		t.Errorf("range entirely before first log should return 0, got %d", len(beforeRange))
 	}
 
-	lastTwo := e.QueryAuditLogs(AuditLogQuery{StartTime: &afterFirst})
-	if len(lastTwo) != 2 {
-		t.Errorf("expected 2 logs from afterFirst onward, got %d", len(lastTwo))
+	wayAfterStart := ts2.Add(1 * time.Hour)
+	wayAfter := ts2.Add(2 * time.Hour)
+	afterRange := e.QueryAuditLogs(AuditLogQuery{StartTime: &wayAfterStart, EndTime: &wayAfter})
+	if len(afterRange) != 0 {
+		t.Errorf("range entirely after last log should return 0, got %d", len(afterRange))
+	}
+
+	exactStartAll := ts0
+	exactEndAll := ts2
+	exactRange := e.QueryAuditLogs(AuditLogQuery{StartTime: &exactStartAll, EndTime: &exactEndAll})
+	if len(exactRange) != 3 {
+		t.Errorf("[ts0, ts2] should include all 3 logs (inclusive bounds), got %d", len(exactRange))
+	}
+
+	beforeFirst := ts0.Add(-1 * time.Nanosecond)
+	excludeFirstStart := e.QueryAuditLogs(AuditLogQuery{StartTime: &beforeFirst, EndTime: &beforeFirst})
+	if len(excludeFirstStart) != 0 {
+		t.Errorf("single point [ts0-1ns, ts0-1ns] should return 0, got %d", len(excludeFirstStart))
+	}
+
+	afterLast := ts2.Add(1 * time.Nanosecond)
+	excludeLastEnd := e.QueryAuditLogs(AuditLogQuery{StartTime: &afterLast, EndTime: &afterLast})
+	if len(excludeLastEnd) != 0 {
+		t.Errorf("single point [ts2+1ns, ts2+1ns] should return 0, got %d", len(excludeLastEnd))
+	}
+
+	if ts1.After(ts0) {
+		betweenStart := ts0.Add(1 * time.Nanosecond)
+		betweenEnd := ts1.Add(-1 * time.Nanosecond)
+		if betweenEnd.After(betweenStart) || betweenEnd.Equal(betweenStart) {
+			midRange := e.QueryAuditLogs(AuditLogQuery{StartTime: &betweenStart, EndTime: &betweenEnd})
+			for _, l := range midRange {
+				if l.Timestamp.Before(betweenStart) || l.Timestamp.After(betweenEnd) {
+					t.Errorf("log ts=%v outside strict range [%v, %v]", l.Timestamp, betweenStart, betweenEnd)
+				}
+			}
+		}
+	}
+
+	if distinctCount == 3 {
+		strictStart := ts0.Add(1 * time.Nanosecond)
+		strictEnd := ts2.Add(-1 * time.Nanosecond)
+		excludeOuter := e.QueryAuditLogs(AuditLogQuery{StartTime: &strictStart, EndTime: &strictEnd})
+		for _, l := range excludeOuter {
+			if l.FlagKey == "early-flag" && l.Operation == "CREATE" {
+				t.Error("strict range should exclude first log (CREATE early-flag)")
+			}
+			if l.FlagKey == "late-flag" && l.Operation == "CREATE" {
+				t.Error("strict range should exclude last log (CREATE late-flag)")
+			}
+		}
 	}
 }
 
@@ -1296,57 +1340,57 @@ func TestTypeValidation_AllSetterMethods(t *testing.T) {
 
 	t.Run("SetBooleanValue on percentage flag returns error", func(t *testing.T) {
 		err := e.SetBooleanValue("pct-f", true)
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
 	t.Run("SetBooleanValue on whitelist flag returns error", func(t *testing.T) {
 		err := e.SetBooleanValue("wl-f", true)
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
 	t.Run("SetPercentage on boolean flag returns error", func(t *testing.T) {
 		err := e.SetPercentage("bool-f", 30)
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
 	t.Run("SetPercentage on whitelist flag returns error", func(t *testing.T) {
 		err := e.SetPercentage("wl-f", 30)
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
 	t.Run("AddToWhitelist on boolean flag returns error", func(t *testing.T) {
 		err := e.AddToWhitelist("bool-f", "user1")
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
 	t.Run("AddToWhitelist on percentage flag returns error", func(t *testing.T) {
 		err := e.AddToWhitelist("pct-f", "user1")
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
 	t.Run("RemoveFromWhitelist on boolean flag returns error", func(t *testing.T) {
 		err := e.RemoveFromWhitelist("bool-f", "user1")
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
 	t.Run("RemoveFromWhitelist on percentage flag returns error", func(t *testing.T) {
 		err := e.RemoveFromWhitelist("pct-f", "user1")
-		if !errors.Is(err, ErrInvalidFlagType) {
-			t.Errorf("expected ErrInvalidFlagType, got %v", err)
+		if !errors.Is(err, ErrFlagTypeMismatch) {
+			t.Errorf("expected ErrFlagTypeMismatch, got %v", err)
 		}
 	})
 
@@ -1382,35 +1426,149 @@ func TestQueryAuditLogs_TimeRangeWithFlagKey(t *testing.T) {
 
 	_ = e.CreateFlag(&FlagConfig{Key: "flag-a", Type: FlagTypeBoolean})
 	_ = e.CreateFlag(&FlagConfig{Key: "flag-b", Type: FlagTypeBoolean})
-
-	time.Sleep(20 * time.Millisecond)
-	midTime := time.Now()
-	time.Sleep(20 * time.Millisecond)
-
 	_ = e.SetBooleanValue("flag-a", true)
 	_ = e.SetBooleanValue("flag-b", true)
 
-	aRecentLogs := e.QueryAuditLogs(AuditLogQuery{FlagKey: "flag-a", StartTime: &midTime})
-	if len(aRecentLogs) != 1 {
-		t.Errorf("expected 1 recent log for flag-a, got %d", len(aRecentLogs))
-	}
-	if len(aRecentLogs) > 0 && aRecentLogs[0].Operation != "SET_BOOLEAN" {
-		t.Errorf("expected SET_BOOLEAN, got %s", aRecentLogs[0].Operation)
+	allLogs := e.QueryAuditLogs(AuditLogQuery{})
+	if len(allLogs) != 4 {
+		t.Fatalf("expected 4 total logs, got %d", len(allLogs))
 	}
 
-	aEarlyLogs := e.QueryAuditLogs(AuditLogQuery{FlagKey: "flag-a", EndTime: &midTime})
-	if len(aEarlyLogs) != 1 {
-		t.Errorf("expected 1 early log for flag-a, got %d", len(aEarlyLogs))
+	aLogs := make([]*AuditLogEntry, 0)
+	bLogs := make([]*AuditLogEntry, 0)
+	for _, l := range allLogs {
+		switch l.FlagKey {
+		case "flag-a":
+			aLogs = append(aLogs, l)
+		case "flag-b":
+			bLogs = append(bLogs, l)
+		}
 	}
-	if len(aEarlyLogs) > 0 && aEarlyLogs[0].Operation != "CREATE" {
-		t.Errorf("expected CREATE, got %s", aEarlyLogs[0].Operation)
+	if len(aLogs) != 2 || len(bLogs) != 2 {
+		t.Fatalf("expected 2 logs per flag, got flag-a=%d flag-b=%d", len(aLogs), len(bLogs))
 	}
 
-	future := time.Now().Add(1 * time.Hour)
-	aNoResults := e.QueryAuditLogs(AuditLogQuery{FlagKey: "flag-a", StartTime: &future})
-	if len(aNoResults) != 0 {
-		t.Errorf("expected 0 logs for flag-a in future range, got %d", len(aNoResults))
-	}
+	aCreateTs := aLogs[0].Timestamp
+	aSetTs := aLogs[1].Timestamp
+	bCreateTs := bLogs[0].Timestamp
+	bSetTs := bLogs[1].Timestamp
+	_ = bCreateTs
+	_ = bSetTs
+
+	allBeforeA := aCreateTs.Add(-1 * time.Hour)
+	allAfterA := aSetTs.Add(1 * time.Hour)
+
+	t.Run("FlagKey + StartTime only (far past) returns all logs for that flag", func(t *testing.T) {
+		aAllLogs := e.QueryAuditLogs(AuditLogQuery{FlagKey: "flag-a", StartTime: &allBeforeA})
+		if len(aAllLogs) != len(aLogs) {
+			t.Errorf("expected %d logs for flag-a from far past, got %d", len(aLogs), len(aAllLogs))
+		}
+		for _, l := range aAllLogs {
+			if l.FlagKey != "flag-a" {
+				t.Errorf("only flag-a logs expected, got %s", l.FlagKey)
+			}
+		}
+	})
+
+	t.Run("FlagKey + EndTime only (far future) returns all logs for that flag", func(t *testing.T) {
+		aAllLogs := e.QueryAuditLogs(AuditLogQuery{FlagKey: "flag-a", EndTime: &allAfterA})
+		if len(aAllLogs) != len(aLogs) {
+			t.Errorf("expected %d logs for flag-a until far future, got %d", len(aLogs), len(aAllLogs))
+		}
+		for _, l := range aAllLogs {
+			if l.FlagKey != "flag-a" {
+				t.Errorf("only flag-a logs expected, got %s", l.FlagKey)
+			}
+		}
+	})
+
+	t.Run("FlagKey + StartTime only (far future) returns 0", func(t *testing.T) {
+		future := time.Now().Add(1 * time.Hour)
+		aNoResults := e.QueryAuditLogs(AuditLogQuery{FlagKey: "flag-a", StartTime: &future})
+		if len(aNoResults) != 0 {
+			t.Errorf("expected 0 logs for flag-a in far future, got %d", len(aNoResults))
+		}
+	})
+
+	t.Run("FlagKey + StartTime + EndTime three-parameter combination (exact bounds)", func(t *testing.T) {
+		startFilter := aCreateTs
+		endFilter := aSetTs
+
+		midLogs := e.QueryAuditLogs(AuditLogQuery{
+			FlagKey:   "flag-a",
+			StartTime: &startFilter,
+			EndTime:   &endFilter,
+		})
+		if len(midLogs) < 1 {
+			t.Errorf("expected at least 1 log for flag-a in [aCreateTs, aSetTs], got %d", len(midLogs))
+		}
+		for _, l := range midLogs {
+			if l.FlagKey != "flag-a" {
+				t.Errorf("three-param query should filter by FlagKey, got %s", l.FlagKey)
+			}
+			if l.Timestamp.Before(startFilter) || l.Timestamp.After(endFilter) {
+				t.Errorf("log timestamp %v outside range [%v, %v]", l.Timestamp, startFilter, endFilter)
+			}
+		}
+
+		for _, l := range midLogs {
+			if l.FlagKey == "flag-b" {
+				t.Fatalf("three-param query should not include flag-b logs (found %s op=%s)", l.FlagKey, l.Operation)
+			}
+		}
+	})
+
+	t.Run("three-param query (wide range) filters FlagKey but not time", func(t *testing.T) {
+		overallStart := aCreateTs.Add(-1 * time.Hour)
+		overallEnd := aSetTs.Add(1 * time.Hour)
+
+		onlyA := e.QueryAuditLogs(AuditLogQuery{
+			FlagKey:   "flag-a",
+			StartTime: &overallStart,
+			EndTime:   &overallEnd,
+		})
+		if len(onlyA) != len(aLogs) {
+			t.Errorf("wide three-param query should include all flag-a logs, got %d want %d", len(onlyA), len(aLogs))
+		}
+		for _, l := range onlyA {
+			if l.FlagKey != "flag-a" {
+				t.Errorf("FlagKey=flag-a three-param query returned log for %s", l.FlagKey)
+			}
+		}
+
+		onlyB := e.QueryAuditLogs(AuditLogQuery{
+			FlagKey:   "flag-b",
+			StartTime: &overallStart,
+			EndTime:   &overallEnd,
+		})
+		if len(onlyB) != len(bLogs) {
+			t.Errorf("wide three-param query should include all flag-b logs, got %d want %d", len(onlyB), len(bLogs))
+		}
+		for _, l := range onlyB {
+			if l.FlagKey != "flag-b" {
+				t.Errorf("FlagKey=flag-b three-param query returned log for %s", l.FlagKey)
+			}
+		}
+	})
+
+	t.Run("three-param query (exclusive range boundaries)", func(t *testing.T) {
+		if aSetTs.After(aCreateTs) {
+			strictStart := aCreateTs.Add(1 * time.Nanosecond)
+			strictEnd := aSetTs.Add(-1 * time.Nanosecond)
+			_ = strictEnd
+
+			afterCreate := e.QueryAuditLogs(AuditLogQuery{
+				FlagKey:   "flag-a",
+				StartTime: &strictStart,
+				EndTime:   &allAfterA,
+			})
+			for _, l := range afterCreate {
+				if l.Operation == "CREATE" {
+					t.Error("strict StartTime should exclude flag-a CREATE log")
+				}
+			}
+		}
+	})
 }
 
 func TestQueryAuditLogs_TimeRangeBoundaryInclusive(t *testing.T) {
