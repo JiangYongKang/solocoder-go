@@ -1,0 +1,8 @@
+在当前项目中实现一个分布式追踪上下文传播器功能模块。
+1. 实现 TraceID/SpanID/ParentSpanID 的生成与传播：TraceID 应全局唯一标识一次分布式请求链路，SpanID 标识链路中的一个操作单元，ParentSpanID 记录父操作的 SpanID 形成父子关系，三者均为字符串格式可在进程间传递。
+2. 实现 Span 树构建：根据各个 Span 的 ParentSpanID 关系构建出完整的 Span 调用树，支持向树中添加新的 Span 节点和查询某个 Span 的子树结构。
+3. 实现采样策略配置：支持全量采样和按概率采样两种策略，采样决策应在根 Span 创建时确定并沿调用链向下传播，采样标志随上下文一起传递，下游 Span 发现未采样时可跳过自身记录但仍需传播上下文。
+4. 实现跨进程上下文注入：支持将 TraceID/SpanID/ParentSpanID 和采样标志序列化为键值对注入到请求头中，以及从请求头中提取这些信息恢复追踪上下文，注入和提取使用兼容 W3C Trace Context 格式的键名。
+5. 代码实现和单测需要放在 internal/tracectx/ 包下，然后为该模块编写完整的单元测试，覆盖正常流程、边界条件和异常分支。
+6. 运行 go test ./internal/tracectx/ -v，需要让所有测试通过。
+7. 在 docs/tracectx.md 中编写模块需求文档，说明模块功能、核心结构体的职责、Span 树的结构与遍历方式以及使用示例。

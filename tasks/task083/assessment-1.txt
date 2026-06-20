@@ -1,0 +1,9 @@
+产物不满意：
+1. tsanomaly.go 的 Add 方法中季节性周期位置索引 seasonalIdx 通过 `(pointCount-1) % PeriodLength` 的纯序列计数器计算，完全忽略了 DataPoint.Timestamp 时间戳字段。提示词要求支持"每天或每周的周期规律"，隐含了基于实际时间戳确定周期位置的语义。若数据点时间间隔不均匀（如遗漏某些时段的数据或数据密度变化），序列索引与实际时间位置将产生错位，同一时刻的数据被映射到不同周期位置，季节性基线学习完全失效。测试用例 TestDetector_SeasonalMode 数据以均匀间隔添加掩盖了此缺陷。应基于 DataPoint.Timestamp 计算周期位置。
+2. tsanomaly.go 的 UpdateConfig 方法在检测到 PeriodLength 变化或 EnableSeasonal 状态切换时，直接 `make([]*windowStats, cfg.PeriodLength)` 重建 seasonalStats 数组，旧有的所有周期位置基线数据（均值、标准差、样本计数）全部被静默丢弃。在生产监控场景中，运维人员可能仅调整周期长度参数以适配业务变化，但这一操作会瞬间清空全部季节性学习成果，导致后续检测回到冷启动状态，期间低于 MinSamples 的分位均无法触发异常检测。应在配置更新时对相同周期索引位置保留已累积的统计信息。
+3. tsanomaly.go 的 BatchAdd 方法中 closed 状态检查在第 336 行持锁后立即在第 341 行释放，后续循环调用 Add 方法每一次独立加解锁。从检查到首次 Add 调用之间存在时间窗口，其他 goroutine 可在此期间调用 Close 关闭检测器，构成 TOCTOU 竞态条件。若前几个 Add 已成功记录异常事件后 Close 被调用，BatchAdd 返回时同时携带部分有效事件和 ErrDetectorClosed 错误，调用方无法区分哪些数据已处理、哪些未处理。应使用单次持锁覆盖整个批量添加过程。
+
+过程不满意：
+1. 模型在第 3 步用 file_search 搜索 `**/*.go` 后，又用 view_files 阅读了 `internal/windowagg/windowagg.go` 和 `internal/tsdb/engine.go` 两个与当前 tsanomaly 任务完全无关的模块代码。tsanomaly 是一个全新的独立模块，任务明确要求代码集中在 `internal/tsanomaly/` 包下，不需要参考其他包的实现风格。阅读无关模块浪费了推理资源和上下文窗口长度。正确做法是直接分析提示词中对 tsanomaly 的四个核心功能需求，先理清移动平均、标准差偏离、季节性建模、异常事件标记各自的数据结构关系。
+2. 模型在第 7 步就通过 todo_write 创建了 6 项子任务计划，此时仅阅读了 go.mod 和两个无关模块文件，尚未对提示词中的四个核心需求做结构化分析，也未梳理 tsanomaly 应包含哪些核心结构体和它们的职责边界。结果后续所有生产代码通过一次 Write 写入整个 tsanomaly.go 文件，缺乏先设计接口和数据结构、再逐功能模块实现的渐进式开发过程，也不利于在遇到被忽略的边界条件时做局部调整。正确做法是先分析功能点，理清 Detector、windowStats、AnomalyEvent 等核心结构体的职责和数据流再制定分步计划。
+3. 模型在第一次实现时直接将 Add 方法中基线更新放在检测之前（新点先入窗口再检测），导致新点污染基线使季节性子测试失败，经测试暴露后才做了顺序调换修复。更关键的是季节性周期索引的计算方案（基于 pointCount 序列计数器）自始至终未经推敲和评估，模型既没有对比过基于 DataPoint.Timestamp 的时间戳映射方案，也未意识到 Timestamp 字段在整个季节性检测逻辑中完全未被使用。这说明模型缺乏在设计阶段对不同技术方案的适用场景和局限做前置对比的意识。正确做法是在设计时明确列出序列索引和时间戳索引两种方案的优缺点再选型。

@@ -1,0 +1,17 @@
+产物不满意：
+1. mockgen.go 的 AnyOf 函数命名为"任意匹配"但实际实现为精确匹配，函数签名 `func AnyOf(expected interface{}) Matcher` 只接受单个参数，内部调用 exactMatcher 做 `reflect.DeepEqual` 比较。更严重的问题是 On 方法中对非 Matcher 类型的参数已自动包装为 exactMatcher，导致 AnyOf(42) 与直接传 42 的调用行为完全等价，AnyOf 成为完全冗余的设计。命名与语义的背离会让用户误以为该函数可传入多个候选值做"匹配任意一个"而实际只能做精确匹配，应在命名上明确表达"精确"语义或直接移除该函数。
+
+2. 提示词第5条要求未匹配调用的失败报告需"包含方法名称、实际传入的参数值、已注册但未匹配的期望列表"，但 types.go 的 Verify 方法在检测到存在未匹配调用时仅返回 `"mockgen: no matching expectation found: N unmatched calls"` 包装在 ErrNoMatchingExpectation 中，完全没有包含方法名和参数值。详细的报告信息只在 VerifyVerbose 中提供且格式为多行字符串，不便于用户用 errors.Is 做精确断言。根因是 Verify 的错误信息生成逻辑过于简略，应将关键信息融入错误消息。
+
+3. types.go 的 VerifyVerbose 方法在持有 Mock.mu 锁的保护下遍历 expectations 列表，但直接读取 `exp.callCount` 字段而非调用 exp.CallCount 方法后者持有 exp.mu 锁保护。当 IncrementCallCount 与 VerifyVerbose 在并发场景下同时执行时，Go race detector 会报告数据竞争。根因是不同层级锁的保护范围不一致，Mock.mu 不覆盖 Expectation 内部字段的并发访问，应统一通过 CallCount 方法读取计数值。
+
+4. errors.go 中定义了 ErrInvalidInterface 和 ErrMethodNotFound 两个错误变量，但通过搜索全包代码发现这两个变量从未被引用。CreateMock 遇到非接口类型时使用 panic 而非返回错误，MockProxy.Method 遇到方法不存在时同样 panic。这些未使用的错误定义属于死代码，表明开发时先定义了错误变量但未在对应场景中实际使用，应删除未引用的定义或在 panic 场景中改用错误返回以保持错误处理方式一致。
+
+5. 提示词第1条明确要求"Mock 实例自动实现接口的所有方法"即 CreateMock 返回的实例应可直接作为传入接口类型使用。但 CreateMock 返回的是 *MockProxy，MockProxy 结构体不实现任何用户传入的接口，用户必须通过 `mock.Method("MethodName").(func(...)...))` 手动做类型断言后才能调用。Mock 实例并未真正"自动实现接口"，框架只是通过 reflect.MakeFunc 生成动态函数供用户自行转换，接口实现的负担被转嫁给了调用方，与提示词的"自动实现"语义不符。
+
+过程不满意：
+1. 模型在刚收到提示词后仅浏览了项目根目录的 go.mod 和 retry 包的参考代码，就立即用 todo_write 创建了 9 项子任务计划，之后才开始编写核心类型定义。这违反了"先分析问题再规划"的正确流程，此时模型对 Mock 框架的需求边界、模块间职责划分、API 设计取舍尚无清晰认知。缺少前置分析导出的计划往往与实际实现路径不匹配，后续可能需要反复调整任务拆解导致效率下降。
+
+2. 整个思考过程记录中模型的行为模式是"写文件、编译、测试通过、标记完成"的单向流水线，没有体现对提示词 8 条需求的逐一分析和显式验证环节。例如提示词第1条要求 Mock 实例自动实现接口，模型完成后并未验证 MockProxy 是否真的实现了传入的接口类型。提示词第5条要求失败报告包含方法名和参数，模型也未检查 Verify 的错误字符串是否满足信息完整度要求。这属于典型的"代码写完就当功能实现"的幻觉思维。
+
+3. 编译修复过程过于简略且缺少根因分析。思考记录显示模型运行 go build 后遇到"某个代码错误"，直接用 edit_file_search_replace 修复了它但未记录具体是什么错误、为什么会产生、修复方案为什么有效。第二次遇到测试代码错误时同样只记录了"修复"动作而无具体错误内容和修复逻辑。这种缺乏错误分析记录的调试过程让标注员无法判断模型是真正理解了错误根因还是靠试错碰运气修好的，也无法评估修复方案的质量和正确性。
