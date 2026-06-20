@@ -1,5 +1,5 @@
 产物不满意：
-1. TestSetTotalOffsetHasPrevPageLogic 在 page=10 缩容至 5 时 TotalPages=1 但 CurrentPage=10 超范围，SetTotal 清空 Data 后 HasPrevPage 却为 true 且 PrevPage 指向无效页，返回空白页却带翻页导航。COT 中承认逻辑上无有效上一页却对齐 BuildOffsetResponse，应在 CurrentPage 超 TotalPages 时将 HasPrevPage 也设 false。
+1. TestSetTotalOffsetHasPrevPageLogic 在 page=10 缩容到 5 时 CurrentPage 超范围，SetTotal 清空 Data 却让 HasPrevPage 为 true、PrevPage 指向无效页，返回空列表却带翻页导航。COT 承认逻辑无有效上一页却照搬 BuildOffsetResponse 的做法，应在 CurrentPage 超 TotalPages 时把 HasPrevPage 也设 false。
 
 过程不满意：
 1. 模型收到提示词后第一个工具调用是 todo_write 创建 5 项子任务，然后才用 view_files 查看 pagination.go 定位缺陷。提示词已明确指出 SetTotal 偏移量分页分支中两个缺陷的位置和原因，不需要先建 todo 再看代码。正确做法是先阅读代码分析问题再制定计划，逆序操作表明模型形成了僵化的"先计划再执行"模式。

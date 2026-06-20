@@ -1,6 +1,6 @@
 产物不满意：
-1. contentneg.go的WriteNotAcceptable方法中备选路径的message字段已修正为与主路径一致，但同一消息字符串在结构体初始化（第371行）和Sprintf手动拼接（第381行）两处以字面量重复出现。会话2引入备选路径拼接逻辑时正是因为未提取公共常量才导致两处消息文本不一致，本轮修复仅改了字符串值而未消除字面量重复，未来若需修改提示文本仍会因遗漏同步引发同类Bug。根因是未将重复的消息常量提升为包级常量引用，正确做法是定义notAcceptableMessage常量并在主路径和备选路径两处统一引用，从源头上杜绝字面量漂移。
+1. contentneg.go 的 WriteNotAcceptable 方法备选路径 message 已修正，但同一消息字符串在结构体初始化和 Sprintf 手动拼接两处以字面量重复出现。会话 2 正是因为没抽常量才导致两处文本不一致，本轮只改了字符串值没消除字面量重复，以后再改提示文本还会因漏同步闹出同样 Bug。根因是没把重复消息提成包级常量，正确做法是定义 notAcceptableMessage 常量两处统一引用，从源头杜绝字面量漂移。
 
 过程不满意：
-1. 模型在收到提示词后直接调用view_files查看contentneg.go，随后用edit_file_search_replace完成修改并运行测试，全程未读取提示词中明确引用的docs/contentneg.md第6.2节。提示词原文指明主路径消息与文档定义一致，模型却仅凭提示词中的文字描述进行修复而未交叉验证权威文档来源，一旦提示词中对消息文本的描述与文档有偏差模型将无法发现。正确做法是先阅读docs/contentneg.md验证文档定义的消息文本与控制代码中的实际值是否对齐，再执行修改。
-2. 模型执行的测试命令在COT中记录为`go test ./internal/contentneg/ -v -count=1 undefined`，命令末尾出现了无法解释的`undefined`尾部字符串。虽然该条记录的status字段标记为success且实际代码运行后所有测试通过，但命令字符串中的`undefined`表明tool calling时存在参数值未正确填充的问题，可能是模型构造shell命令时某个可选参数未赋值直接序列化为`undefined`文本混入命令。这反映出模型在使用run_command工具时未对构造的命令字符串做完整性校验，正确做法是在发出命令前确认所有参数值均已正确赋值且无`undefined`等占位符泄漏。
+1. 模型收到提示词后直接用 view_files 查看 contentneg.go，随后做修改并运行测试，全程未读取提示词中引用的 docs/contentneg.md 第 6.2 节。提示词说主路径消息与文档一致，模型仅凭提示词文字描述修复而未交叉验证文档，一旦描述与文档有偏差就会修错。正确做法是先读 docs/contentneg.md 验证文档消息与代码实际值是否对齐，再动手改。
+2. 模型执行测试的 COT 中记录了 `go test ./internal/contentneg/ -v -count=1 undefined`，命令末尾出现了 `undefined` 尾部字符串。虽然测试通过了，但 `undefined` 说明工具调用时某个参数没正确赋值就被序列化混进了命令里。这反映出模型没用 run_command 前校验命令字符串完整性，正确做法是发命令前确认所有参数值都正确填了、没有 `undefined` 等占位符泄漏。

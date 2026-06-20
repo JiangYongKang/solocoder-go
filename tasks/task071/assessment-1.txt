@@ -1,7 +1,7 @@
 产物不满意：
-1. schema.go 的 parseTypeReference 方法对所有命名类型统一设为 TypeKindObject，例如字段 `id: ID!` 中 ID 本是标量却被标为对象类型，导致 validator.go 的 validateField 和 executor.go 的 executeField 各维护了一套"从 Schema 重新查找真实类型"的补救逻辑。同一类型分类问题在两个模块重复修补，增加了代码冗余和维护成本。根因是解析阶段未区分标量和对象，应在 parseTypeReference 创建 Type 时就查 Schema 中该名称对应的已注册类型确定正确的 Kind。
-2. 提示词第 4 条要求 DataLoader 在嵌套查询中批量收集键并统一加载数据，但 setupTestExecutor 创建的 userDL 和 postDL 实例传递给了 Execute 后，所有解析器如 Query.user、Post.author、User.posts 全部直接从内存 map 读取数据，从未调用过 dl.Load。DataLoader 的批量加载能力在执行器中从未被测试覆盖，N+1 查询优化在生产级嵌套查询中实际上不会生效。根因是解析器设计时未将 DataLoader 作为默认数据获取通道，应在解析器内部通过 DataLoader 加载子字段数据。
-3. executor.go 的 executeObject 方法使用 `fmt.Sprintf("%T", value)` 获取 Go 运行时类型名去 Schema 中查类型，传入 `map[string]interface{}` 时返回的 `"map[string]interface {}"` 永远匹配不到任何 GraphQL 类型名，第 244 行这条查询是一条死代码路径。根因是混淆了 Go 类型名和 GraphQL 类型名两个不同命名空间，应通过 value 的内容结构推断其 GraphQL 类型或在调用点确保 objType 参数不为 nil。
+1. schema.go 的 parseTypeReference 方法把所有命名类型统一设为 TypeKindObject，像字段 `id: ID!` 中 ID 本是标量却被标为对象，导致 validator.go 和 executor.go 各维护了一套按名称查 Schema 找真实类型的补救逻辑，同一问题在两个模块重复修补。根因是解析阶段没区分标量和对象，应在 parseTypeReference 创建 Type 时就查 Schema 中已注册类型确定正确的 Kind。
+2. 提示词第 4 条要求 DataLoader 在嵌套查询中批量收集键并统一加载，但 testExecutor 创建的 userDL 和 postDL 传给 Execute 后，所有解析器全部直接从内存 map 读数据，从未调用 dl.Load。DataLoader 批量加载能力在执行器中完全没有被测试覆盖，N+1 查询优化在生产环境不会生效。根因是解析器未将 DataLoader 作为默认数据获取通道，应在解析器内部通过 dl.Load 加载子字段数据。
+3. executor.go 的 executeObject 用 `fmt.Sprintf("%T", value)` 获取 Go 类型名去 Schema 查类型，传入 map[string]interface{} 时返回 `"map[string]interface {}"` 永远匹配不到任何 GraphQL 类型名，是一条死代码。根因是混淆了 Go 类型名和 GraphQL 类型名两个命名空间，应通过 value 的内容推断其 GraphQL 类型，或在调用点确保 objType 不为 nil。
 4. validator.go 的 validateArguments 方法在检查必选参数时对 VariableRef 类型直接返回 true 不做类型校验和值存在性检查。当查询声明 `query GetUser($id: ID!)` 但调用方未在 variables map 中提供 `id` 的实际值时，查询会在执行阶段才因 nil 参数出错而非在验证阶段被拦截。根因是变量引用的校验路径与常量参数脱钩，应将变量引用也纳入统一的参数值校验逻辑中。
 
 过程不满意：

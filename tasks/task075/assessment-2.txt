@@ -1,6 +1,6 @@
 产物不满意：
-1. 在suggest.go的AddWord方法中，模型调用InsertWithFreq(word, 0)将频率初始化为0，解决了初始化词库时频率错误递增的问题。但InsertWithFreq在suggest.go第104行无条件将node.freq设为指定值，当AddWord作用在已通过SubmitSearch累积频率的已有词上时，会将真实搜索频率直接擦除为0，导致GetHotWords中原本热门的高频词排名暴跌至末尾。根本原因是AddWord没有区分新词和已有词，也未在Trie层提供仅新增节点不改频率的方法。正确做法是先检查词是否已存在，仅对新词设频率为0，已有词保持原始频率不变。
-2. suggest.go中CorrectLimit方法与correctNoLock方法存在超过50行的完全重复纠错逻辑。correctNoLock是CorrectLimit去掉e.mu.RLock锁获取后的逐行复制粘贴，从参数校验、词存在检查、获取全部候选词、编辑距离筛选到排序截断逻辑完全一致。当未来纠错排序规则或编辑距离阈值变更时，两处代码必须同步更新，一旦遗漏correctNoLock会导致SuggestLimit方法中的纠错结果与直接调用Correct时不一致。正确做法是将纠错核心逻辑抽取为一个接收是否加锁参数的内部方法，由CorrectLimit和SuggestLimit共同调用。
+1. suggest.go 的 AddWord 调用 InsertWithFreq(word, 0) 解决了初始化频率误增问题，但 InsertWithFreq 无条件覆盖 node.freq，对已通过 SubmitSearch 累积频率的已有词执行 AddWord 时会将其真实搜索频率擦除为 0，导致 GetHotWords 中热门词排名暴跌。根因是 AddWord 没区分新词和已有词。正确做法是先检查词是否存在，仅对新词设频率为 0，已有词保持原频率不变。
+2. suggest.go 中 CorrectLimit 与 correctNoLock 存在超过 50 行的完全重复纠错逻辑，correctNoLock 是 CorrectLimit 去掉锁获取后的逐行复制粘贴，从参数校验到排序截断完全一致。未来规则变更时两处需同步更新，遗漏会导致两方法的纠错结果不一致。正确做法是将纠错核心逻辑抽取为内部方法，由 CorrectLimit 和 SuggestLimit 共同调用。
 过程不满意：
 1. 模型在收到提示词后的第一个动作就是用todo_write创建了5项子任务计划，然后才开始读取suggest.go代码文件。模型在思考过程中称"让我先分析问题并制定修复计划"，但实际行为是先创建TODO后读取代码，这与标注示例中批评的未分析先规划模式完全一致。由于缺乏对现有代码结构和缺陷分布的前置分析，TODO列表的粒度划分基于对提示词两点的表面理解而非对代码问题的深入诊断。
 2. 模型第一次运行测试使用命令go test ./internal/suggest/ -v -count=1，该命令已明确限定测试范围在suggest包内，其他包的测试根本不会被执行。但模型在测试运行后声称"后面的 templater 测试失败是其他模块的，与我们无关"，templater测试因命令已限定在suggest包内而不可能出现在输出中。模型关于观察到templater测试失败的描述属于对未实际发生的事件的幻觉式陈述。正确做法是仅基于实际测试输出做判断，不应臆测未运行的其他包测试状态。

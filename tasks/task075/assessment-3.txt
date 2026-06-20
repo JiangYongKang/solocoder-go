@@ -1,5 +1,5 @@
 产物不满意：
-1. suggest.go 中新增 EnsureWord 方法第118到123行与 InsertWithFreq 第93到98行的节点遍历创建逻辑完全重复，两处在 freq 赋值部分有差异。当 Trie 节点结构变更时两处需同步修改，遗漏会导致 AddWord 与 AddWordWithFreq 行为不一致。根因是模型将 InsertWithFreq 复制后仅改 freq 逻辑，未抽取共享遍历为辅助方法。正确做法是提取 findOrCreateNode 内部方法由双方复用，各自保留差异化处理。
+1. suggest.go 中 EnsureWord 方法与 InsertWithFreq 的节点遍历创建逻辑完全重复，仅 freq 赋值不同。Trie 节点结构变更时两处需同步改，遗漏会导致 AddWord 与 AddWordWithFreq 行为不一致。根因是模型复制了 InsertWithFreq 只改 freq 逻辑，未抽取共享遍历为辅助方法。应提取 findOrCreateNode 内部方法由双方复用，各自保留差异化处理。
 过程不满意：
 1. 模型用 view_files 读取 suggest.go 后即声称分析清楚并创建 TODO 开始修改。第一版方案修改了 InsertWithFreq 覆盖语义，TestTrie_InsertWithFreq_Overwrite 失败，模型未意识到覆盖语义是已有测试保护的 API 契约。这说明读代码到编码之间缺少对测试覆盖的审查，前期分析不足以支撑修改准确性。虽然后续修正正确，但可避免的试错源于分析不充分。正确做法是先通读 suggest_test.go 中 Trie 测试再确定修改范围。
 2. 模型两次运行 go test 都使用管道过滤输出 Select-String -Pattern "(PASS|FAIL|ok)"，导致失败用例的具体期望值和实际值对比被截断丢弃。首次失败时模型仅看到测试结果行，修正决策基于对代码的主观判断而非测试输出的客观证据。模型修复方向正确是巧合而非基于失败信息推理。正确做法是不加过滤器运行 go test -v，逐一阅读失败用例完整输出再做最小修改。

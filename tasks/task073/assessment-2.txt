@@ -1,7 +1,7 @@
 产物不满意：
-1. 在 contentneg.go 的 WriteNotAcceptable 方法中，备选 JSON 拼接路径的 message 字段值为 `No acceptable representation found.`，而主路径构造的 NotAcceptableResponse 使用的消息是 `No acceptable representation found for the requested resource.`，与 docs/contentneg.md 第 6.2 节定义的 406 响应体规范不一致。当 json.MarshalIndent 序列化异常失败触发备选路径时，客户端收到的错误消息会缺少 `for the requested resource` 部分，导致依赖错误消息文本做故障分类的监控系统或自动化客户端产生判断偏差。原因是模型在重写备选拼接逻辑时仅关注了提示词要求的双引号包裹修复，未核对规范文档以确保备选路径与主路径的消息文本完全一致，应在备选路径中使用与主路径相同的完整 message 字符串。
+1. contentneg.go 的 WriteNotAcceptable 备选拼接 message 与主路径不一致少了 `for the requested resource`，与文档 406 响应规范不符。当 json.MarshalIndent 异常走备选路径时客户端收到不完整错误文本，依赖消息做故障分类的监控会误判。根因是模型只修了双引号包裹忘了核对文档对齐消息，两处应使用同一个完整的 message 字符串。
 
 过程不满意：
-1. 模型在收到提示词后，第一个动作为 todo_write 创建 3 项子任务（修复 WriteNotAcceptable、完善 TestMarshalProtobuf、运行测试），然后才开始读取 contentneg.go 和 contentneg_test.go。在会话开头未经任何代码分析和需求理解就直接制定执行计划，与标注规范要求先分析问题再规划的原则不符。提示词描述的两个缺陷各有具体的根因和修复范围，正确做法是先阅读相关源码理解代码结构和缺陷上下文，再根据分析结果拆解任务步骤，而不是机械地将提示词的每条要求直接映射为 Todo 项。
+1. 模型收到提示词后第一个动作就是 todo_write 创建 3 项子任务，然后才开始读 contentneg.go 和 contentneg_test.go。未经代码分析就制定计划，违反了先分析再规划的原则。正确做法是先阅读源码理解缺陷上下文，再根据分析结果拆解任务步骤，而不是把提示词的每条要求直接映射为 Todo 项。
 
-2. 模型在修复 TestMarshalProtobuf 过程中对 contentneg_test.go 进行了三次独立读取：首次与 contentneg.go 并行批量读取已获取完整文件内容，随后用 search_by_regex 在同一文件中搜索 TestMarshalProtobuf 位置，之后又再次读取该文件声称检查 import 部分。该文件的导入语句在首次读取时已可完整查看，不需要重复读取。这种冗余的文件访问模式表明模型在首轮读取后未能有效保留和利用已获取的代码信息，降低了修复效率，正确做法是一次性读取并充分理解文件内容后再执行修改，避免多次重复获取已知信息。
+2. 模型在修复 TestMarshalProtobuf 时对 contentneg_test.go 做了三次独立读取：首次已获取完整内容，之后又用 search_by_regex 搜函数位置，然后又再读一次说检查 import。导入语句首次就能看全，不需要反复读。这种重复读取说明模型首轮读完后没有有效保留代码信息，降低了修复效率，正确做法是一次读完理解透再改，避免反复获取已知内容。

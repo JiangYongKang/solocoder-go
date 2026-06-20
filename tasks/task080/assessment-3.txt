@@ -1,6 +1,6 @@
 产物不满意：
-1. isInternalFrame 函数中判断 Windows 反斜杠路径的条件 `strings.Contains(frame.File, "\\internal\\structlog\\")` 是不可达死代码。Go 运行时的 runtime.Frame.File 字段在所有平台上均统一返回正斜杠作为路径分隔符，模型的 Windows 路径防护分支实际上永远不会被触发。虽然不影响当前测试通过，但反映出模型在添加跨平台防御代码时未查阅 runtime 包文档确认 File 字段在各平台的路径格式约定，凭直觉而非证据做决策。正确的做法应先确认 runtime 的路径规范化行为再决定是否需要平台分离匹配。
-2. isInternalFrame 使用 `strings.Contains` 对 frame.File 做子串匹配来判断帧是否属于 structlog 包，未对路径边界做锚定。例如当项目依赖的第三方库中存在路径 `vendor/github.com/somelib/internal/structlog/v2/logger.go` 时，该库的栈帧也会被误判为内部帧而过滤掉，导致 caller 和 stack 输出丢失真实的第三方调用信息。虽然在本项目测试场景下不会触发，但包路径使用裸子串匹配而非路径段级别比较降低了过滤策略的精确性。应当在匹配时附加路径分隔符锚定或使用 filepath.SplitList 组件拆分比对。
+1. isInternalFrame 中判断 Windows 反斜杠路径的条件是不可达死代码。Go 运行时 Frame.File 在所有平台统一返回正斜杠作分隔符，此分支永不触发。虽不影响测试，但反映模型添加跨平台防御时未查阅 runtime 文档确认路径格式约定，凭直觉而非证据决策。应先确认 runtime 路径规范化行为再决定是否需平台分离匹配。
+2. isInternalFrame 用 `strings.Contains` 对 frame.File 做子串匹配判断是否属于 structlog 包，未对路径边界做锚定。第三方库中若有 `vendor/.../internal/structlog/v2/logger.go`，该库的栈帧会被误判为内部帧而过滤，导致 caller 和 stack 丢失真实调用信息。虽本项目未触发，但裸子串匹配而非路径段级比较降低了过滤精确性。应在匹配时附加路径分隔符或使用 SplitList 拆分比对。
 过程不满意：
-1. 模型在收到 session-3 提示词后的第一次工具调用就是 todo_write 创建了两项子任务计划，此时尚未打开 structlog.go 查看当前 isInternalFrame 的实际实现。思考过程中虽表述「让我先查看当前的 isInternalFrame 实现」，但实际行为是先规划后分析，违反了标注规范中"应先分析问题再规划执行步骤"的原则。这种先规划后分析的模式在 session-2 中就已出现（当时也是首个动作为创建 6 项子任务 todo），说明模型在多轮修复中仍未改进工作习惯。正确做法是先读取相关源文件理解当前代码与提示词描述的差异，再制定针对性的修复计划。
-2. 模型完成 isInternalFrame 的目录级过滤修改后仅运行了现有 48 个测试验证通过，但未创建新的内部辅助文件来实际验证自动扩展过滤能力。提示词明确以 encoder.go 和 formatter.go 为例指出新增文件会泄露栈帧，模型的修复目标正是确保新增文件能被自动过滤，但验证环节完全依赖 structlog.go 和 structlog_test.go 两个已有文件中的代码路径，未增加任何与多文件过滤场景相关的测试覆盖。应当创建临时内部文件并编写验证用例来证明过滤机制的自动扩展性是否真正生效。
+1. 模型收到 session-3 提示词后第一次工具调用就是 todo_write 创建两项子任务，此时还没打开 structlog.go 看实际的 isInternalFrame 实现。思考过程说让我先查看当前实现，但实际行为是先规划后分析，违反先分析问题再规划的原则。这种模式在 session-2 中已出现过，说明模型在多轮修复中仍未改进工作习惯。正确做法是先读源文件理解代码与提示词的差异再制定修复计划。
+2. 模型完成 isInternalFrame 目录级过滤修改后仅运行现有 48 个测试验证通过，但未创建新的内部辅助文件来实际验证自动扩展过滤能力。提示词以 encoder.go 和 formatter.go 为例指出新增文件会泄露栈帧，修复目标正是确保新增文件能被自动过滤，但验证环节完全依赖 structlog.go 和 structlog_test.go 两个已有文件的代码路径，未增加多文件过滤场景的测试覆盖。应当创建临时内部文件并编写验证用例来证明过滤机制的自动扩展性是否真正生效。
