@@ -1,9 +1,20 @@
 package gqlparser
 
+import (
+	"time"
+)
+
+const defaultBatchWindow = 200 * time.Microsecond
+
 func NewDataLoader(fn DataLoaderFunc) *DataLoader {
+	return NewDataLoaderWithWindow(fn, defaultBatchWindow)
+}
+
+func NewDataLoaderWithWindow(fn DataLoaderFunc, batchWindow time.Duration) *DataLoader {
 	return &DataLoader{
-		fn:      fn,
-		pending: make([]*loaderRequest, 0),
+		fn:          fn,
+		pending:     make([]*loaderRequest, 0),
+		batchWindow: batchWindow,
 	}
 }
 
@@ -15,6 +26,13 @@ func (dl *DataLoader) Load(key interface{}) (interface{}, error) {
 		result: make(chan loaderResult, 1),
 	}
 	dl.pending = append(dl.pending, req)
+
+	if dl.batchTimer == nil && dl.batchWindow > 0 {
+		dl.batchTimer = time.AfterFunc(dl.batchWindow, func() {
+			dl.Flush()
+		})
+	}
+
 	dl.mu.Unlock()
 
 	res := <-req.result
@@ -35,6 +53,13 @@ func (dl *DataLoader) LoadMany(keys []interface{}) ([]interface{}, []error) {
 		requests[i] = req
 		dl.pending = append(dl.pending, req)
 	}
+
+	if dl.batchTimer == nil && dl.batchWindow > 0 {
+		dl.batchTimer = time.AfterFunc(dl.batchWindow, func() {
+			dl.Flush()
+		})
+	}
+
 	dl.mu.Unlock()
 
 	for i, req := range requests {
@@ -48,6 +73,12 @@ func (dl *DataLoader) LoadMany(keys []interface{}) ([]interface{}, []error) {
 
 func (dl *DataLoader) Flush() error {
 	dl.mu.Lock()
+
+	if dl.batchTimer != nil {
+		dl.batchTimer.Stop()
+		dl.batchTimer = nil
+	}
+
 	if len(dl.pending) == 0 {
 		dl.mu.Unlock()
 		return nil
@@ -97,6 +128,11 @@ func (dl *DataLoader) Clear(key interface{}) {
 		}
 	}
 	dl.pending = newPending
+
+	if len(dl.pending) == 0 && dl.batchTimer != nil {
+		dl.batchTimer.Stop()
+		dl.batchTimer = nil
+	}
 }
 
 func (dl *DataLoader) ClearAll() {
@@ -107,4 +143,9 @@ func (dl *DataLoader) ClearAll() {
 		req.result <- loaderResult{nil, ErrDataLoaderCleared}
 	}
 	dl.pending = make([]*loaderRequest, 0)
+
+	if dl.batchTimer != nil {
+		dl.batchTimer.Stop()
+		dl.batchTimer = nil
+	}
 }

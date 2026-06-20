@@ -23,8 +23,6 @@ type summary struct {
 	rand      *rand.Rand
 }
 
-var _ snapshotProtected = (*summary)(nil)
-
 func (s *summary) snapshotGuardPtr() *snapshotGuard { return &s.guard }
 
 func newSummary(name string, labels Labels, quantiles []float64, guard snapshotGuard) *summary {

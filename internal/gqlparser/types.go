@@ -1,6 +1,9 @@
 package gqlparser
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 type TypeKind int
 
@@ -52,10 +55,11 @@ type ResolverFunc func(ctx *ExecutionContext, parent interface{}, args map[strin
 type DataLoaderFunc func(keys []interface{}) ([]interface{}, error)
 
 type DataLoader struct {
-	fn      DataLoaderFunc
-	pending []*loaderRequest
-	mu      sync.Mutex
-	flushed bool
+	fn          DataLoaderFunc
+	pending     []*loaderRequest
+	mu          sync.Mutex
+	batchWindow time.Duration
+	batchTimer  *time.Timer
 }
 
 type loaderRequest struct {

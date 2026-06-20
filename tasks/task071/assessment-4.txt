@@ -1,0 +1,7 @@
+产物不满意：
+1. executor.go 的 runConcurrentlyWithFlush 改为 wg.Wait 后 flushDataLoaders，配合 DataLoader 侧 200μs 自动窗口，但同一层级内执行耗时不同的 goroutine 后到的 Load 会因前批窗口到期错过已清空 pending，导致同层级请求分割为多批。提示词要求解决 Load 跨越 tick 边界被分割的问题，模型仅缩短窗口并移到 DataLoader 侧，未消除因时序差异导致的请求分割，合并批次减少查询的效果仍被削弱。
+2. validator.go 新增 normalizeVariableType 通过 schema.GetType 查真实 Kind 修正变量类型分类，但 query_parser.go 的 parseTypeReference 仍用硬编码识五个标量，自定义标量 DateTime 解析后仍为 TypeKindObject。提示词要求两个 parseTypeReference 对自定义标量分类一致，模型选验证层覆盖而非解析层统一，若验证前用 VariableDefinition.Type.Kind 判断，自定义标量会被误作对象。
+过程不满意：
+1. 模型收到提示词后第一步就调用 todo_write 创建三项子任务计划，然后才开始逐个查看 dataloader.go、executor.go 和 query_parser.go 源码。此时模型对两个缺陷的代码位置和修改范围没有实际了解，创建的计划仅是提示词文本的字面转述，违背标注规范先分析问题再规划的原则。该问题在 assessment-3 中已被指出，模型在第四轮仍在重复相同的错误行为模式，应先通读所有相关源文件理解缺陷触发条件和代码范围后再制定计划。
+2. 模型对 dataloader.go、types.go、executor.go 连续编辑后直接运行测试，未提前审查 gqlparser_test.go 中依赖手动控制 Flush 时机的 DataLoader 测试用例。TestDataLoader_Clear 因自动窗口 timer 触发 Flush 导致 pending 在检查前被清空而失败，模型收到失败后才读测试代码并添加 NewDataLoaderWithWindow 规避自动窗口。这是先改代码让测试驱动的试错模式，应在变更前审查所有受影响的测试用例的依赖前提动手修改。
+3. 模型在修复总结中两次声称 `62 个测试全部通过`，但实际 go test 输出共 64 个测试用例全部通过，存在测试数量计数偏差。这属于幻觉与虚假完成的表现，虽不影响测试通过的事实结论，但反映出模型在声称完成时未仔细核对实际执行的测试用例总数，仅凭模糊印象做出了不准确的数字陈述，缺乏对最终结果的严谨校验意识。

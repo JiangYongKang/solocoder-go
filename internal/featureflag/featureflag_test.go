@@ -1025,14 +1025,8 @@ func TestQueryAuditLogs_ByTimeRange(t *testing.T) {
 		t.Fatalf("log timestamps not monotonic: ts2=%v before ts1=%v", ts2, ts1)
 	}
 
-	distinctCount := 1
-	if ts1.After(ts0) {
-		distinctCount++
-	}
-	if ts2.After(ts1) {
-		distinctCount++
-	}
-	t.Logf("timestamps: ts0=%v, ts1=%v, ts2=%v (distinct=%d)", ts0, ts1, ts2, distinctCount)
+	tsAllEqual := ts0.Equal(ts1) && ts1.Equal(ts2)
+	t.Logf("timestamps: ts0=%v, ts1=%v, ts2=%v (allEqual=%v)", ts0, ts1, ts2, tsAllEqual)
 
 	beforeAll := ts0.Add(-1 * time.Hour)
 	afterAll := ts2.Add(1 * time.Hour)
@@ -1056,11 +1050,117 @@ func TestQueryAuditLogs_ByTimeRange(t *testing.T) {
 		t.Errorf("range entirely after last log should return 0, got %d", len(afterRange))
 	}
 
-	exactStartAll := ts0
-	exactEndAll := ts2
-	exactRange := e.QueryAuditLogs(AuditLogQuery{StartTime: &exactStartAll, EndTime: &exactEndAll})
-	if len(exactRange) != 3 {
-		t.Errorf("[ts0, ts2] should include all 3 logs (inclusive bounds), got %d", len(exactRange))
+	startAtTs0 := ts0
+	startAtTs1 := ts1
+	startAtTs2 := ts2
+	endAtTs0 := ts0
+	endAtTs1 := ts1
+	endAtTs2 := ts2
+
+	startOnlyTs1 := e.QueryAuditLogs(AuditLogQuery{StartTime: &startAtTs1})
+	if len(startOnlyTs1) < 1 {
+		t.Errorf("StartTime=ts1 should return at least 1 log (index 1 and 2), got %d", len(startOnlyTs1))
+	}
+	for _, l := range startOnlyTs1 {
+		if l.Timestamp.Before(startAtTs1) {
+			t.Errorf("StartTime=ts1 returned log with ts=%v before %v", l.Timestamp, startAtTs1)
+		}
+	}
+	foundSetBoolean := false
+	foundLateCreate := false
+	for _, l := range startOnlyTs1 {
+		if l.FlagKey == "early-flag" && l.Operation == "SET_BOOLEAN" {
+			foundSetBoolean = true
+		}
+		if l.FlagKey == "late-flag" && l.Operation == "CREATE" {
+			foundLateCreate = true
+		}
+	}
+	if tsAllEqual {
+		if len(startOnlyTs1) != 3 {
+			t.Errorf("StartTime=ts1 (all equal) should return all 3 logs (inclusive), got %d", len(startOnlyTs1))
+		}
+	} else {
+		if !foundSetBoolean {
+			t.Error("StartTime=ts1 should include SET_BOOLEAN log")
+		}
+		if !foundLateCreate {
+			t.Error("StartTime=ts1 should include late-flag CREATE log")
+		}
+	}
+
+	endOnlyTs1 := e.QueryAuditLogs(AuditLogQuery{EndTime: &endAtTs1})
+	if len(endOnlyTs1) < 1 {
+		t.Errorf("EndTime=ts1 should return at least 1 log (index 0 and 1), got %d", len(endOnlyTs1))
+	}
+	for _, l := range endOnlyTs1 {
+		if l.Timestamp.After(endAtTs1) {
+			t.Errorf("EndTime=ts1 returned log with ts=%v after %v", l.Timestamp, endAtTs1)
+		}
+	}
+	foundEarlyCreate := false
+	for _, l := range endOnlyTs1 {
+		if l.FlagKey == "early-flag" && l.Operation == "CREATE" {
+			foundEarlyCreate = true
+		}
+	}
+	if tsAllEqual {
+		if len(endOnlyTs1) != 3 {
+			t.Errorf("EndTime=ts1 (all equal) should return all 3 logs (inclusive), got %d", len(endOnlyTs1))
+		}
+	} else {
+		if !foundEarlyCreate {
+			t.Error("EndTime=ts1 should include early-flag CREATE log")
+		}
+		if !foundSetBoolean {
+			t.Error("EndTime=ts1 should include SET_BOOLEAN log")
+		}
+	}
+
+	startTs0EndTs0 := e.QueryAuditLogs(AuditLogQuery{StartTime: &startAtTs0, EndTime: &endAtTs0})
+	if len(startTs0EndTs0) < 1 {
+		t.Errorf("[ts0, ts0] should return at least 1 log, got %d", len(startTs0EndTs0))
+	}
+	for _, l := range startTs0EndTs0 {
+		if !l.Timestamp.Equal(ts0) {
+			t.Errorf("[ts0, ts0] returned log with ts=%v != %v", l.Timestamp, ts0)
+		}
+	}
+	if tsAllEqual {
+		if len(startTs0EndTs0) != 3 {
+			t.Errorf("[ts0, ts0] (all equal) should return all 3 logs, got %d", len(startTs0EndTs0))
+		}
+	} else if ts0.Equal(ts1) && !ts1.Equal(ts2) {
+		if len(startTs0EndTs0) != 2 {
+			t.Errorf("[ts0, ts0] (ts0==ts1 != ts2) should return 2 logs, got %d", len(startTs0EndTs0))
+		}
+	} else {
+		if len(startTs0EndTs0) != 1 {
+			t.Errorf("[ts0, ts0] (ts0 distinct) should return exactly 1 log, got %d", len(startTs0EndTs0))
+		}
+	}
+
+	startTs2EndTs2 := e.QueryAuditLogs(AuditLogQuery{StartTime: &startAtTs2, EndTime: &endAtTs2})
+	if len(startTs2EndTs2) < 1 {
+		t.Errorf("[ts2, ts2] should return at least 1 log, got %d", len(startTs2EndTs2))
+	}
+	for _, l := range startTs2EndTs2 {
+		if !l.Timestamp.Equal(ts2) {
+			t.Errorf("[ts2, ts2] returned log with ts=%v != %v", l.Timestamp, ts2)
+		}
+	}
+	if tsAllEqual {
+		if len(startTs2EndTs2) != 3 {
+			t.Errorf("[ts2, ts2] (all equal) should return all 3 logs, got %d", len(startTs2EndTs2))
+		}
+	} else if !ts0.Equal(ts1) && ts1.Equal(ts2) {
+		if len(startTs2EndTs2) != 2 {
+			t.Errorf("[ts2, ts2] (ts0 != ts1==ts2) should return 2 logs, got %d", len(startTs2EndTs2))
+		}
+	} else {
+		if len(startTs2EndTs2) != 1 {
+			t.Errorf("[ts2, ts2] (ts2 distinct) should return exactly 1 log, got %d", len(startTs2EndTs2))
+		}
 	}
 
 	beforeFirst := ts0.Add(-1 * time.Nanosecond)
@@ -1075,31 +1175,26 @@ func TestQueryAuditLogs_ByTimeRange(t *testing.T) {
 		t.Errorf("single point [ts2+1ns, ts2+1ns] should return 0, got %d", len(excludeLastEnd))
 	}
 
-	if ts1.After(ts0) {
-		betweenStart := ts0.Add(1 * time.Nanosecond)
-		betweenEnd := ts1.Add(-1 * time.Nanosecond)
-		if betweenEnd.After(betweenStart) || betweenEnd.Equal(betweenStart) {
-			midRange := e.QueryAuditLogs(AuditLogQuery{StartTime: &betweenStart, EndTime: &betweenEnd})
-			for _, l := range midRange {
-				if l.Timestamp.Before(betweenStart) || l.Timestamp.After(betweenEnd) {
-					t.Errorf("log ts=%v outside strict range [%v, %v]", l.Timestamp, betweenStart, betweenEnd)
-				}
-			}
+	startAtTs2Only := e.QueryAuditLogs(AuditLogQuery{StartTime: &startAtTs2})
+	foundTs2Start := false
+	for _, l := range startAtTs2Only {
+		if l.FlagKey == "late-flag" && l.Operation == "CREATE" {
+			foundTs2Start = true
 		}
 	}
+	if !foundTs2Start {
+		t.Error("StartTime=ts2 should include late-flag CREATE log")
+	}
 
-	if distinctCount == 3 {
-		strictStart := ts0.Add(1 * time.Nanosecond)
-		strictEnd := ts2.Add(-1 * time.Nanosecond)
-		excludeOuter := e.QueryAuditLogs(AuditLogQuery{StartTime: &strictStart, EndTime: &strictEnd})
-		for _, l := range excludeOuter {
-			if l.FlagKey == "early-flag" && l.Operation == "CREATE" {
-				t.Error("strict range should exclude first log (CREATE early-flag)")
-			}
-			if l.FlagKey == "late-flag" && l.Operation == "CREATE" {
-				t.Error("strict range should exclude last log (CREATE late-flag)")
-			}
+	endAtTs0Only := e.QueryAuditLogs(AuditLogQuery{EndTime: &endAtTs0})
+	foundTs0End := false
+	for _, l := range endAtTs0Only {
+		if l.FlagKey == "early-flag" && l.Operation == "CREATE" {
+			foundTs0End = true
 		}
+	}
+	if !foundTs0End {
+		t.Error("EndTime=ts0 should include early-flag CREATE log")
 	}
 }
 
@@ -1450,10 +1545,6 @@ func TestQueryAuditLogs_TimeRangeWithFlagKey(t *testing.T) {
 
 	aCreateTs := aLogs[0].Timestamp
 	aSetTs := aLogs[1].Timestamp
-	bCreateTs := bLogs[0].Timestamp
-	bSetTs := bLogs[1].Timestamp
-	_ = bCreateTs
-	_ = bSetTs
 
 	allBeforeA := aCreateTs.Add(-1 * time.Hour)
 	allAfterA := aSetTs.Add(1 * time.Hour)
@@ -1554,8 +1645,6 @@ func TestQueryAuditLogs_TimeRangeWithFlagKey(t *testing.T) {
 	t.Run("three-param query (exclusive range boundaries)", func(t *testing.T) {
 		if aSetTs.After(aCreateTs) {
 			strictStart := aCreateTs.Add(1 * time.Nanosecond)
-			strictEnd := aSetTs.Add(-1 * time.Nanosecond)
-			_ = strictEnd
 
 			afterCreate := e.QueryAuditLogs(AuditLogQuery{
 				FlagKey:   "flag-a",

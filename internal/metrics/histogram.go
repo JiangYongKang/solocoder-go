@@ -18,8 +18,6 @@ type histogram struct {
 	count   uint64
 }
 
-var _ snapshotProtected = (*histogram)(nil)
-
 func (h *histogram) snapshotGuardPtr() *snapshotGuard { return &h.guard }
 
 func newHistogram(name string, labels Labels, buckets []float64, guard snapshotGuard) *histogram {

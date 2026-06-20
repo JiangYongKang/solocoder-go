@@ -1,0 +1,9 @@
+你实现的指标采集器模块存在以下问题，需要修复：
+
+1. guard.go 中定义的 snapshotProtected 接口和 snapshotGuardPtr 方法在全部生产代码中从未被调用过。四个指标类型文件中手工添加的 `var _ snapshotProtected = (*xxx)(nil)` 检查行是零散的编译时防线，若未来新增指标类型遗漏此行代码依然能编译通过，snapshotProtected 接口并未提供比构造函数参数更强的编译期保证。
+
+2. TestSummary_ConcurrentReservoirSampling 中 P50 的容差设为 ±1500，预期值约 5000，容差比例达到 30%。同一测试文件的顺序场景十万样本下 P50 容差仅 20%，并发场景一万样本的断言标准反而比顺序场景更宽松，即使蓄水池采样在并发竞争下产生严重偏差也会被漏报，无法有效证明并发竞争条件下的统计无偏性。
+
+3. counter.go 和 gauge.go 的 Inc、Add、Set 等写入方法在 guard.write 闭包内部获取自身 mu.Lock 后没有用 defer 释放锁。若闭包内的操作因异常触发 panic，mu 将永久处于锁定状态导致该指标后续所有读写操作永久阻塞。histogram.go 和 summary.go 的对应方法使用了 defer unlock 的释放方式，counter.go 和 gauge.go 的写法与它们不一致。
+
+修复后需要确保所有测试通过。运行 go test ./internal/metrics/ -v 验证。

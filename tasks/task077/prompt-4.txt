@@ -1,0 +1,7 @@
+你实现的功能开关评估器模块存在以下问题，需要修复：
+
+1. TestQueryAuditLogs_ByTimeRange 重写后在三个审计日志时间戳完全相同时 distinctCount 为 1，中间范围的时间区间过滤断言和严格边界排除断言被条件跳过，测试虽通过但未验证两个操作之间的时间区间过滤逻辑。原测试通过保证时间戳有序来覆盖边界场景，新测试在时钟精度不足时自动退化为基础宽范围全包含和全排除检查，丧失了边界覆盖能力。
+
+2. TestQueryAuditLogs_TimeRangeWithFlagKey 中存在 bCreateTs、bSetTs 和 strictEnd 三个计算后未被任何断言使用的中间变量，仅用 `_ =` 抑制编译错误。这些变量是多次迭代修改测试代码后未彻底清理的残留。
+
+修复后需要确保所有测试通过。运行 go test ./internal/featureflag/ -v 验证。

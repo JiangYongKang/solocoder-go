@@ -13,8 +13,6 @@ type counter struct {
 	value  float64
 }
 
-var _ snapshotProtected = (*counter)(nil)
-
 func (c *counter) snapshotGuardPtr() *snapshotGuard { return &c.guard }
 
 func newCounter(name string, labels Labels, guard snapshotGuard) *counter {
@@ -42,8 +40,8 @@ func (c *counter) Labels() Labels {
 func (c *counter) Inc() {
 	c.guard.write(func() {
 		c.mu.Lock()
+		defer c.mu.Unlock()
 		c.value++
-		c.mu.Unlock()
 	})
 }
 
@@ -53,8 +51,8 @@ func (c *counter) Add(delta float64) {
 	}
 	c.guard.write(func() {
 		c.mu.Lock()
+		defer c.mu.Unlock()
 		c.value += delta
-		c.mu.Unlock()
 	})
 }
 
@@ -67,8 +65,8 @@ func (c *counter) Value() float64 {
 func (c *counter) Reset() {
 	c.guard.write(func() {
 		c.mu.Lock()
+		defer c.mu.Unlock()
 		c.value = 0
-		c.mu.Unlock()
 	})
 }
 

@@ -13,8 +13,6 @@ type gauge struct {
 	value  float64
 }
 
-var _ snapshotProtected = (*gauge)(nil)
-
 func (g *gauge) snapshotGuardPtr() *snapshotGuard { return &g.guard }
 
 func newGauge(name string, labels Labels, guard snapshotGuard) *gauge {
@@ -42,8 +40,8 @@ func (g *gauge) Labels() Labels {
 func (g *gauge) Set(value float64) {
 	g.guard.write(func() {
 		g.mu.Lock()
+		defer g.mu.Unlock()
 		g.value = value
-		g.mu.Unlock()
 	})
 }
 
@@ -58,16 +56,16 @@ func (g *gauge) Dec() {
 func (g *gauge) Add(delta float64) {
 	g.guard.write(func() {
 		g.mu.Lock()
+		defer g.mu.Unlock()
 		g.value += delta
-		g.mu.Unlock()
 	})
 }
 
 func (g *gauge) Sub(delta float64) {
 	g.guard.write(func() {
 		g.mu.Lock()
+		defer g.mu.Unlock()
 		g.value -= delta
-		g.mu.Unlock()
 	})
 }
 

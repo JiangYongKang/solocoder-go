@@ -290,11 +290,12 @@ request_duration_seconds_count 15
    - 每个指标类型嵌入 `snapshotGuard`，所有写入操作必须通过 `guard.write(fn)` 方法执行
    - `guard.write()` 内部获取注册器全局 `snapshotMu` 的读锁后执行写入闭包
    - 快照操作获取 `snapshotMu` 的写锁，阻塞所有写入，确保各指标值反映同一时刻的瞬时状态
-   - **编译时保证**：所有指标类型必须实现 `snapshotProtected` 接口，通过 `var _ snapshotProtected = (*metricType)(nil)` 进行编译时检查，确保新增指标类型不会遗漏快照保护
+   - **集中式编译期保证**：注册器维护 `allMetrics map[string]snapshotProtected` 统一存储所有指标，任何新指标类型只有实现了 `snapshotProtected` 接口才能成功注册，编译期即可发现遗漏快照保护的指标类型，不再依赖各指标文件中零散的 `var _` 检查行
+   - `snapshotProtected` 接口嵌入 `Metric` 接口，要求同时实现 `Snapshot()` 方法和 `snapshotGuardPtr()` 方法
    - 新增写入方法时，必须使用 `guard.write()` 包裹写入逻辑，裸访问 `mu.Lock()` 而不经过 `guard` 的写法在代码审查中易于识别
 
 3. **指标内部锁**：每个指标实例维护自己的读写锁，保护单个指标的数据一致性。
-   - 写入操作：获取写锁（在 `guard.write()` 闭包内）
+   - 写入操作：获取写锁（在 `guard.write()` 闭包内），并使用 `defer` 释放，确保即使闭包内发生 panic 也能正确解锁，避免死锁
    - 读取操作：获取读锁
 
 这种多层锁设计既保证了快照的原子性，又尽量减少了锁竞争对写入性能的影响。`snapshotGuard` 的 `write()` 方法将锁获取模式封装为一处，避免未来新增指标类型或写入方法时遗漏快照保护。
@@ -327,5 +328,6 @@ go test ./internal/metrics/ -v
 - 边界条件和异常分支
 - Summary 蓄水池采样算法验证
 - 大样本量下的分位统计准确性
-- 并发蓄水池采样的分位值无偏性验证（P50/P90/P99 区间断言）
-- snapshotProtected 接口的编译时检查保证
+- 并发蓄水池采样的分位值无偏性验证（P50/P90/P99 与顺序场景同标准断言）
+- allMetrics 集中式快照保护的编译期接口保证
+- 写入操作 panic 安全（defer unlock）

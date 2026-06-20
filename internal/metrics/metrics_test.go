@@ -1036,29 +1036,24 @@ func TestSummary_ConcurrentReservoirSampling(t *testing.T) {
 		t.Errorf("expected sum %v, got %v", expectedSum, s.Sum())
 	}
 
-	tolerance := 1500.0
-
 	if qs[0].Quantile != 0.5 {
 		t.Errorf("expected quantile 0.5, got %v", qs[0].Quantile)
 	}
-	expectedP50 := float64(numGoroutines*iterations-1) / 2
-	if math.Abs(qs[0].Value-expectedP50) > tolerance {
-		t.Errorf("P50: expected ~%v, got %v (tolerance %v)", expectedP50, qs[0].Value, tolerance)
+	if qs[0].Value < 4000 || qs[0].Value > 6000 {
+		t.Errorf("P50 out of expected range [4000, 6000], got %v", qs[0].Value)
 	}
 
 	if qs[1].Quantile != 0.9 {
 		t.Errorf("expected quantile 0.9, got %v", qs[1].Quantile)
 	}
-	expectedP90 := float64(numGoroutines*iterations-1) * 0.9
-	if math.Abs(qs[1].Value-expectedP90) > tolerance {
-		t.Errorf("P90: expected ~%v, got %v (tolerance %v)", expectedP90, qs[1].Value, tolerance)
+	if qs[1].Value < 8000 || qs[1].Value > 10000 {
+		t.Errorf("P90 out of expected range [8000, 10000], got %v", qs[1].Value)
 	}
 
 	if qs[2].Quantile != 0.99 {
 		t.Errorf("expected quantile 0.99, got %v", qs[2].Quantile)
 	}
-	expectedP99 := float64(numGoroutines*iterations-1) * 0.99
-	if math.Abs(qs[2].Value-expectedP99) > tolerance {
-		t.Errorf("P99: expected ~%v, got %v (tolerance %v)", expectedP99, qs[2].Value, tolerance)
+	if qs[2].Value < 9000 || qs[2].Value > 10000 {
+		t.Errorf("P99 out of expected range [9000, 10000], got %v", qs[2].Value)
 	}
 }

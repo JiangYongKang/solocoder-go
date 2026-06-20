@@ -7,13 +7,14 @@ import (
 )
 
 type registry struct {
-	mu       sync.RWMutex
+	mu         sync.RWMutex
 	snapshotMu sync.RWMutex
 	guard      snapshotGuard
 	counters   map[string]map[string]*counter
 	gauges     map[string]map[string]*gauge
 	histograms map[string]map[string]*histogram
 	summaries  map[string]map[string]*summary
+	allMetrics map[string]snapshotProtected
 }
 
 func NewRegistry() Registry {
@@ -22,6 +23,7 @@ func NewRegistry() Registry {
 		gauges:     make(map[string]map[string]*gauge),
 		histograms: make(map[string]map[string]*histogram),
 		summaries:  make(map[string]map[string]*summary),
+		allMetrics: make(map[string]snapshotProtected),
 	}
 	r.guard = newSnapshotGuard(&r.snapshotMu)
 	return r
@@ -54,6 +56,7 @@ func (r *registry) RegisterCounter(name string, labels Labels) CounterMetric {
 
 	c := newCounter(name, labels, r.guard)
 	r.counters[name][hash] = c
+	r.allMetrics[name+"\x00"+hash] = c
 	return c
 }
 
@@ -82,6 +85,7 @@ func (r *registry) RegisterGauge(name string, labels Labels) GaugeMetric {
 
 	g := newGauge(name, labels, r.guard)
 	r.gauges[name][hash] = g
+	r.allMetrics[name+"\x00"+hash] = g
 	return g
 }
 
@@ -113,6 +117,7 @@ func (r *registry) RegisterHistogram(name string, labels Labels, buckets []float
 
 	h := newHistogram(name, labels, buckets, r.guard)
 	r.histograms[name][hash] = h
+	r.allMetrics[name+"\x00"+hash] = h
 	return h
 }
 
@@ -149,6 +154,7 @@ func (r *registry) RegisterSummary(name string, labels Labels, quantiles []float
 
 	s := newSummary(name, labels, quantiles, r.guard)
 	r.summaries[name][hash] = s
+	r.allMetrics[name+"\x00"+hash] = s
 	return s
 }
 
@@ -212,29 +218,8 @@ func (r *registry) Snapshot() []MetricValue {
 	defer r.mu.RUnlock()
 
 	var result []MetricValue
-
-	for _, m := range r.counters {
-		for _, c := range m {
-			result = append(result, c.Snapshot())
-		}
-	}
-
-	for _, m := range r.gauges {
-		for _, g := range m {
-			result = append(result, g.Snapshot())
-		}
-	}
-
-	for _, m := range r.histograms {
-		for _, h := range m {
-			result = append(result, h.Snapshot())
-		}
-	}
-
-	for _, m := range r.summaries {
-		for _, s := range m {
-			result = append(result, s.Snapshot())
-		}
+	for _, m := range r.allMetrics {
+		result = append(result, m.Snapshot())
 	}
 
 	return result
@@ -251,6 +236,7 @@ func (r *registry) Unregister(name string, labels Labels) bool {
 			if len(m) == 0 {
 				delete(r.counters, name)
 			}
+			delete(r.allMetrics, name+"\x00"+hash)
 			return true
 		}
 	}
@@ -261,6 +247,7 @@ func (r *registry) Unregister(name string, labels Labels) bool {
 			if len(m) == 0 {
 				delete(r.gauges, name)
 			}
+			delete(r.allMetrics, name+"\x00"+hash)
 			return true
 		}
 	}
@@ -271,6 +258,7 @@ func (r *registry) Unregister(name string, labels Labels) bool {
 			if len(m) == 0 {
 				delete(r.histograms, name)
 			}
+			delete(r.allMetrics, name+"\x00"+hash)
 			return true
 		}
 	}
@@ -281,6 +269,7 @@ func (r *registry) Unregister(name string, labels Labels) bool {
 			if len(m) == 0 {
 				delete(r.summaries, name)
 			}
+			delete(r.allMetrics, name+"\x00"+hash)
 			return true
 		}
 	}

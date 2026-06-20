@@ -55,13 +55,44 @@ func (v *Validator) validateOperation(schema *Schema, op *Operation) []*Validati
 
 	variableTypes := make(map[string]*Type)
 	for _, vd := range op.VariableDefs {
-		variableTypes[vd.Name] = vd.Type
+		variableTypes[vd.Name] = normalizeVariableType(schema, vd.Type)
 	}
 
 	fieldErrs := v.validateSelectionSet(schema, rootType, op.SelectionSet, variableTypes, 0)
 	errs = append(errs, fieldErrs...)
 
 	return errs
+}
+
+func normalizeVariableType(schema *Schema, t *Type) *Type {
+	if t == nil {
+		return nil
+	}
+	switch t.Kind {
+	case TypeKindNonNull:
+		return &Type{
+			Kind:   TypeKindNonNull,
+			OfType: normalizeVariableType(schema, t.OfType),
+		}
+	case TypeKindList:
+		return &Type{
+			Kind:   TypeKindList,
+			OfType: normalizeVariableType(schema, t.OfType),
+		}
+	default:
+		if t.Name != "" {
+			if realType, ok := schema.GetType(t.Name); ok {
+				return &Type{
+					Kind: realType.Kind,
+					Name: t.Name,
+				}
+			}
+		}
+		return &Type{
+			Kind: t.Kind,
+			Name: t.Name,
+		}
+	}
 }
 
 func (v *Validator) validateSelectionSet(

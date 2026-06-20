@@ -4,10 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
-	"time"
 )
-
-const dataloaderFlushInterval = 500 * time.Microsecond
 
 type Executor struct {
 	Schema    *Schema
@@ -180,26 +177,7 @@ func (e *Executor) runConcurrentlyWithFlush(
 	spawnGoroutines func(),
 ) {
 	spawnGoroutines()
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	ticker := time.NewTicker(dataloaderFlushInterval)
-	defer ticker.Stop()
-
-loop:
-	for {
-		select {
-		case <-done:
-			break loop
-		case <-ticker.C:
-			e.flushDataLoaders(ctx)
-		}
-	}
-
+	wg.Wait()
 	e.flushDataLoaders(ctx)
 }
 

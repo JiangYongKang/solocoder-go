@@ -17,5 +17,6 @@ func (g snapshotGuard) write(fn func()) {
 }
 
 type snapshotProtected interface {
+	Metric
 	snapshotGuardPtr() *snapshotGuard
 }

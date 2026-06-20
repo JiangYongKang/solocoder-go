@@ -776,13 +776,13 @@ func TestDataLoader_LoadMany(t *testing.T) {
 }
 
 func TestDataLoader_Clear(t *testing.T) {
-	dl := NewDataLoader(func(keys []interface{}) ([]interface{}, error) {
+	dl := NewDataLoaderWithWindow(func(keys []interface{}) ([]interface{}, error) {
 		results := make([]interface{}, len(keys))
 		for i, k := range keys {
 			results[i] = k
 		}
 		return results, nil
-	})
+	}, 0)
 
 	go func() { dl.Load("key1") }()
 	go func() { dl.Load("key2") }()
@@ -800,9 +800,9 @@ func TestDataLoader_Clear(t *testing.T) {
 }
 
 func TestDataLoader_ClearAll(t *testing.T) {
-	dl := NewDataLoader(func(keys []interface{}) ([]interface{}, error) {
+	dl := NewDataLoaderWithWindow(func(keys []interface{}) ([]interface{}, error) {
 		return make([]interface{}, len(keys)), nil
-	})
+	}, 0)
 
 	go func() { dl.Load("key1") }()
 	go func() { dl.Load("key2") }()
