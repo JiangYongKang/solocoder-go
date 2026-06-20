@@ -1,0 +1,7 @@
+你实现的 GraphQL 查询解析器模块仍存在以下问题，需要修复：
+
+1. executor.go 的 runConcurrentlyWithFlush 在 wg.Wait 后调用 flushDataLoaders，配合 DataLoader 侧 200μs 自动窗口机制。但同一层级内不同 goroutine 的 Load 调用时机因业务逻辑执行耗时差异而不同步，先到的 Load 触发自动窗口到期清空 pending 后，后到的 Load 收集的键只能进入下一批窗口，导致同层级请求仍然被分割为多次小批量 Flush，合并批次减少查询次数的效果未达到。
+
+2. query_parser.go 的 parseTypeReference 方法仍用硬编码的五个内置标量名称做类型判定，测试 SDL 中定义的 DateTime 等自定义标量类型在解析阶段仍被标记为 TypeKindObject。validator.go 在验证阶段通过 schema.GetType 做了事后修正，但解析器和验证器对同一类型的 Kind 判定仍然不一致，两个 parseTypeReference 的分类行为未统一。
+
+修复后需要确保所有测试通过。运行 go test ./internal/gqlparser/ -v 验证。

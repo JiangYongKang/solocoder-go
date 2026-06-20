@@ -1057,3 +1057,76 @@ func TestSummary_ConcurrentReservoirSampling(t *testing.T) {
 		t.Errorf("P99 out of expected range [9000, 10000], got %v", qs[2].Value)
 	}
 }
+
+func TestRegistry_SameNameDifferentTypes(t *testing.T) {
+	r := NewRegistry()
+
+	c := r.RegisterCounter("same_name", nil)
+	g := r.RegisterGauge("same_name", nil)
+	h := r.RegisterHistogram("same_name", nil, []float64{1, 2, 3})
+	s := r.RegisterSummary("same_name", nil, []float64{0.5})
+
+	c.Add(42)
+	g.Set(100)
+	h.Observe(1.5)
+	s.Observe(50)
+
+	snap := r.Snapshot()
+
+	if len(snap) != 4 {
+		t.Fatalf("expected 4 metrics in snapshot, got %d", len(snap))
+	}
+
+	typeCount := map[MetricType]int{}
+	for _, m := range snap {
+		if m.Name != "same_name" {
+			t.Errorf("unexpected metric name: %v", m.Name)
+		}
+		typeCount[m.Type]++
+	}
+
+	if typeCount[CounterType] != 1 {
+		t.Errorf("expected 1 counter, got %d", typeCount[CounterType])
+	}
+	if typeCount[GaugeType] != 1 {
+		t.Errorf("expected 1 gauge, got %d", typeCount[GaugeType])
+	}
+	if typeCount[HistogramType] != 1 {
+		t.Errorf("expected 1 histogram, got %d", typeCount[HistogramType])
+	}
+	if typeCount[SummaryType] != 1 {
+		t.Errorf("expected 1 summary, got %d", typeCount[SummaryType])
+	}
+
+	ok := r.Unregister("same_name", nil)
+	if !ok {
+		t.Error("unregister should succeed")
+	}
+
+	snap2 := r.Snapshot()
+	if len(snap2) != 3 {
+		t.Fatalf("expected 3 metrics after unregistering counter, got %d", len(snap2))
+	}
+
+	_, counterExists := r.GetCounter("same_name", nil)
+	if counterExists {
+		t.Error("counter should not exist after unregister")
+	}
+
+	_, gaugeExists := r.GetGauge("same_name", nil)
+	if !gaugeExists {
+		t.Error("gauge should still exist after unregistering counter")
+	}
+
+	snap3 := r.Snapshot()
+	hasGauge := false
+	for _, m := range snap3 {
+		if m.Type == GaugeType {
+			hasGauge = true
+			break
+		}
+	}
+	if !hasGauge {
+		t.Error("gauge should still be visible in snapshot after unregistering counter")
+	}
+}

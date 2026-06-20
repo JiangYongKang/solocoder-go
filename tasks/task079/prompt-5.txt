@@ -1,0 +1,7 @@
+你实现的指标采集器模块仍存在以下问题，需要修复：
+
+1. registry.go 中 allMetrics 使用 name 拼接 hash 作为所有指标类型的统一键，未区分指标类型。当同一名称分别注册为 counter 和 gauge 时（携带相同标签），后注册的指标在 allMetrics 中覆盖了先注册的指标。旧 Snapshot 对四种类型 map 分别遍历，同名的不同类指标都能出现在快照中；新 Snapshot 只遍历 allMetrics 导致被覆盖的指标永久丢失。同时 Unregister 被覆盖的 counter 时删除的键实质属于 gauge，留在原分类 map 中的 gauge 变成无法通过 Snapshot 访问的幽灵指标，指标仍可正常操作但快照中永远看不到它，注册体系内部数据不一致。
+
+2. guard.go 中 snapshotProtected 接口的 snapshotGuardPtr 方法在所有生产代码路径上从未被实际调用过，始终只是用于满足编译期类型约束的纯装饰方法，接口本身未产生运行时实质价值。
+
+修复后需要确保所有测试通过。运行 go test ./internal/metrics/ -v 验证。

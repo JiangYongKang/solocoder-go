@@ -1050,6 +1050,13 @@ func TestQueryAuditLogs_ByTimeRange(t *testing.T) {
 		t.Errorf("range entirely after last log should return 0, got %d", len(afterRange))
 	}
 
+	exactStartAll := ts0
+	exactEndAll := ts2
+	exactFullRange := e.QueryAuditLogs(AuditLogQuery{StartTime: &exactStartAll, EndTime: &exactEndAll})
+	if len(exactFullRange) != 3 {
+		t.Errorf("[ts0, ts2] exact range should include all 3 logs (inclusive bounds), got %d", len(exactFullRange))
+	}
+
 	startAtTs0 := ts0
 	startAtTs1 := ts1
 	startAtTs2 := ts2
@@ -1099,9 +1106,13 @@ func TestQueryAuditLogs_ByTimeRange(t *testing.T) {
 		}
 	}
 	foundEarlyCreate := false
+	foundSetBooleanInEnd := false
 	for _, l := range endOnlyTs1 {
 		if l.FlagKey == "early-flag" && l.Operation == "CREATE" {
 			foundEarlyCreate = true
+		}
+		if l.FlagKey == "early-flag" && l.Operation == "SET_BOOLEAN" {
+			foundSetBooleanInEnd = true
 		}
 	}
 	if tsAllEqual {
@@ -1112,7 +1123,7 @@ func TestQueryAuditLogs_ByTimeRange(t *testing.T) {
 		if !foundEarlyCreate {
 			t.Error("EndTime=ts1 should include early-flag CREATE log")
 		}
-		if !foundSetBoolean {
+		if !foundSetBooleanInEnd {
 			t.Error("EndTime=ts1 should include SET_BOOLEAN log")
 		}
 	}
@@ -1195,6 +1206,38 @@ func TestQueryAuditLogs_ByTimeRange(t *testing.T) {
 	}
 	if !foundTs0End {
 		t.Error("EndTime=ts0 should include early-flag CREATE log")
+	}
+
+	if ts1.After(ts0) && ts2.After(ts1) {
+		midStart := ts0.Add(1 * time.Nanosecond)
+		midEnd := ts2.Add(-1 * time.Nanosecond)
+		middleRange := e.QueryAuditLogs(AuditLogQuery{StartTime: &midStart, EndTime: &midEnd})
+		if len(middleRange) != 1 {
+			t.Errorf("strict range (ts0+1ns, ts2-1ns) should return exactly 1 middle log, got %d", len(middleRange))
+		}
+		if len(middleRange) > 0 {
+			if middleRange[0].Operation != "SET_BOOLEAN" {
+				t.Errorf("middle log should be SET_BOOLEAN, got %s", middleRange[0].Operation)
+			}
+		}
+
+		between01Start := ts0.Add(1 * time.Nanosecond)
+		between01End := ts1.Add(-1 * time.Nanosecond)
+		if between01End.After(between01Start) || between01End.Equal(between01Start) {
+			gap01 := e.QueryAuditLogs(AuditLogQuery{StartTime: &between01Start, EndTime: &between01End})
+			if len(gap01) != 0 {
+				t.Errorf("gap between ts0 and ts1 should return 0 logs, got %d", len(gap01))
+			}
+		}
+
+		between12Start := ts1.Add(1 * time.Nanosecond)
+		between12End := ts2.Add(-1 * time.Nanosecond)
+		if between12End.After(between12Start) || between12End.Equal(between12Start) {
+			gap12 := e.QueryAuditLogs(AuditLogQuery{StartTime: &between12Start, EndTime: &between12End})
+			if len(gap12) != 0 {
+				t.Errorf("gap between ts1 and ts2 should return 0 logs, got %d", len(gap12))
+			}
+		}
 	}
 }
 

@@ -1,0 +1,5 @@
+产物不满意：
+1. 模型在四个 Register 方法中增加了 `snapshotGuardPtr().mu == nil` 的 panic 检查声称 guard 方法具有运行时价值，但 guard 由 `newSnapshotGuard(&r.snapshotMu)` 初始化，r.snapshotMu 取地址永远非 nil，该检查是永不触发的恒真断言。提示词问题二要求消除 snapshotGuardPtr 纯装饰方法的冗余性，当前方案只是套了一层永不失败的假运行时检查，接口仍未产生真正的运行时判别价值。
+过程不满意：
+1. 模型在收到提示词后第一步就用 todo_write 创建了 4 项子任务计划，之后才查看 registry.go 代码现状。这与 assessment-3 和 assessment-4 中均明确指出的"先做计划后分析需求"流程缺陷完全一致，属于跨三轮重复出现且未修正的流程硬伤。提示词的两条修复要求已精确指向 registry.go 和 guard.go 两个目标文件及具体缺陷，正确做法是先阅读目标代码现状理解现有缺陷再基于理解设计有针对性的修复步骤。
+2. 模型在修复问题二时看到 snapshotGuardPtr 未被调用后直接在 Register 方法中添加了 nil 检查并断言使接口具备运行时价值，但整个过程中从未分析 guard 初始化链路确认 nil 检查能否触发。由于 guard 由 `newSnapshotGuard(&r.snapshotMu)` 初始化且 mu 从不可能是 nil，该检查是永不触发的恒真断言。这说明模型对运行时价值的理解停在表面——看到未调用就加调用，而未分析数据来源能否产生有效守卫。

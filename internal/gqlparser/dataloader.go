@@ -149,3 +149,29 @@ func (dl *DataLoader) ClearAll() {
 		dl.batchTimer = nil
 	}
 }
+
+func (dl *DataLoader) SetBatchWindow(d time.Duration) {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+
+	dl.batchWindow = d
+	if d <= 0 && dl.batchTimer != nil {
+		dl.batchTimer.Stop()
+		dl.batchTimer = nil
+	}
+}
+
+func (dl *DataLoader) ResetBatchWindow() {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+
+	if dl.batchWindow <= 0 {
+		return
+	}
+	if dl.batchTimer != nil {
+		dl.batchTimer.Stop()
+	}
+	dl.batchTimer = time.AfterFunc(dl.batchWindow, func() {
+		dl.Flush()
+	})
+}

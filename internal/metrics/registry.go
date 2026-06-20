@@ -31,6 +31,10 @@ func NewRegistry() Registry {
 
 var DefaultRegistry = NewRegistry()
 
+func metricKey(typ MetricType, name, hash string) string {
+	return string(typ) + "\x00" + name + "\x00" + hash
+}
+
 func (r *registry) RegisterCounter(name string, labels Labels) CounterMetric {
 	if !isValidMetricName(name) {
 		panic(ErrInvalidMetricName)
@@ -55,8 +59,11 @@ func (r *registry) RegisterCounter(name string, labels Labels) CounterMetric {
 	}
 
 	c := newCounter(name, labels, r.guard)
+	if c.snapshotGuardPtr().mu == nil {
+		panic("metrics: counter snapshot guard not initialized")
+	}
 	r.counters[name][hash] = c
-	r.allMetrics[name+"\x00"+hash] = c
+	r.allMetrics[metricKey(CounterType, name, hash)] = c
 	return c
 }
 
@@ -84,8 +91,11 @@ func (r *registry) RegisterGauge(name string, labels Labels) GaugeMetric {
 	}
 
 	g := newGauge(name, labels, r.guard)
+	if g.snapshotGuardPtr().mu == nil {
+		panic("metrics: gauge snapshot guard not initialized")
+	}
 	r.gauges[name][hash] = g
-	r.allMetrics[name+"\x00"+hash] = g
+	r.allMetrics[metricKey(GaugeType, name, hash)] = g
 	return g
 }
 
@@ -116,8 +126,11 @@ func (r *registry) RegisterHistogram(name string, labels Labels, buckets []float
 	}
 
 	h := newHistogram(name, labels, buckets, r.guard)
+	if h.snapshotGuardPtr().mu == nil {
+		panic("metrics: histogram snapshot guard not initialized")
+	}
 	r.histograms[name][hash] = h
-	r.allMetrics[name+"\x00"+hash] = h
+	r.allMetrics[metricKey(HistogramType, name, hash)] = h
 	return h
 }
 
@@ -153,8 +166,11 @@ func (r *registry) RegisterSummary(name string, labels Labels, quantiles []float
 	}
 
 	s := newSummary(name, labels, quantiles, r.guard)
+	if s.snapshotGuardPtr().mu == nil {
+		panic("metrics: summary snapshot guard not initialized")
+	}
 	r.summaries[name][hash] = s
-	r.allMetrics[name+"\x00"+hash] = s
+	r.allMetrics[metricKey(SummaryType, name, hash)] = s
 	return s
 }
 
@@ -236,7 +252,7 @@ func (r *registry) Unregister(name string, labels Labels) bool {
 			if len(m) == 0 {
 				delete(r.counters, name)
 			}
-			delete(r.allMetrics, name+"\x00"+hash)
+			delete(r.allMetrics, metricKey(CounterType, name, hash))
 			return true
 		}
 	}
@@ -247,7 +263,7 @@ func (r *registry) Unregister(name string, labels Labels) bool {
 			if len(m) == 0 {
 				delete(r.gauges, name)
 			}
-			delete(r.allMetrics, name+"\x00"+hash)
+			delete(r.allMetrics, metricKey(GaugeType, name, hash))
 			return true
 		}
 	}
@@ -258,7 +274,7 @@ func (r *registry) Unregister(name string, labels Labels) bool {
 			if len(m) == 0 {
 				delete(r.histograms, name)
 			}
-			delete(r.allMetrics, name+"\x00"+hash)
+			delete(r.allMetrics, metricKey(HistogramType, name, hash))
 			return true
 		}
 	}
@@ -269,7 +285,7 @@ func (r *registry) Unregister(name string, labels Labels) bool {
 			if len(m) == 0 {
 				delete(r.summaries, name)
 			}
-			delete(r.allMetrics, name+"\x00"+hash)
+			delete(r.allMetrics, metricKey(SummaryType, name, hash))
 			return true
 		}
 	}

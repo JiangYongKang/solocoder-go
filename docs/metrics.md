@@ -291,7 +291,9 @@ request_duration_seconds_count 15
    - `guard.write()` 内部获取注册器全局 `snapshotMu` 的读锁后执行写入闭包
    - 快照操作获取 `snapshotMu` 的写锁，阻塞所有写入，确保各指标值反映同一时刻的瞬时状态
    - **集中式编译期保证**：注册器维护 `allMetrics map[string]snapshotProtected` 统一存储所有指标，任何新指标类型只有实现了 `snapshotProtected` 接口才能成功注册，编译期即可发现遗漏快照保护的指标类型，不再依赖各指标文件中零散的 `var _` 检查行
+   - **allMetrics 键约定**：使用 `type\0name\0hash` 格式作为键，确保同名不同类型的指标互不覆盖，都能出现在快照中
    - `snapshotProtected` 接口嵌入 `Metric` 接口，要求同时实现 `Snapshot()` 方法和 `snapshotGuardPtr()` 方法
+   - **snapshotGuardPtr 的运行时价值**：指标注册时调用 `snapshotGuardPtr()` 校验 `guard.mu` 不为 nil，确保快照保护已正确初始化，防止未正确配置 guard 的指标被错误地注册到系统中
    - 新增写入方法时，必须使用 `guard.write()` 包裹写入逻辑，裸访问 `mu.Lock()` 而不经过 `guard` 的写法在代码审查中易于识别
 
 3. **指标内部锁**：每个指标实例维护自己的读写锁，保护单个指标的数据一致性。
@@ -331,3 +333,4 @@ go test ./internal/metrics/ -v
 - 并发蓄水池采样的分位值无偏性验证（P50/P90/P99 与顺序场景同标准断言）
 - allMetrics 集中式快照保护的编译期接口保证
 - 写入操作 panic 安全（defer unlock）
+- 同名不同类型指标共存与快照完整性（allMetrics 键不冲突）

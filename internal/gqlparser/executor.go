@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
 )
+
+const levelBatchWindow = 2 * time.Millisecond
 
 type Executor struct {
 	Schema    *Schema
@@ -31,7 +34,7 @@ func (e *Executor) Execute(query string, variables map[string]interface{}, dataL
 		Errors: make([]error, 0),
 	}
 
-	doc, err := ParseQuery(query)
+	doc, err := ParseQueryWithSchema(query, e.Schema)
 	if err != nil {
 		result.Errors = append(result.Errors, err)
 		return result
@@ -176,8 +179,27 @@ func (e *Executor) runConcurrentlyWithFlush(
 	wg *sync.WaitGroup,
 	spawnGoroutines func(),
 ) {
+	type savedWindow struct {
+		dl     *DataLoader
+		window time.Duration
+	}
+	var saved []savedWindow
+	if ctx.DataLoaders != nil {
+		saved = make([]savedWindow, 0, len(ctx.DataLoaders))
+		for _, dl := range ctx.DataLoaders {
+			saved = append(saved, savedWindow{dl: dl, window: dl.batchWindow})
+			dl.SetBatchWindow(levelBatchWindow)
+			dl.ResetBatchWindow()
+		}
+	}
+
 	spawnGoroutines()
 	wg.Wait()
+
+	for _, s := range saved {
+		s.dl.SetBatchWindow(s.window)
+	}
+
 	e.flushDataLoaders(ctx)
 }
 

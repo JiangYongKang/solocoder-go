@@ -7,12 +7,17 @@ import (
 )
 
 type queryParser struct {
-	input string
-	pos   int
+	input  string
+	pos    int
+	schema *Schema
 }
 
 func ParseQuery(query string) (*Document, error) {
-	p := &queryParser{input: query, pos: 0}
+	return ParseQueryWithSchema(query, nil)
+}
+
+func ParseQueryWithSchema(query string, schema *Schema) (*Document, error) {
+	p := &queryParser{input: query, pos: 0, schema: schema}
 	return p.parseDocument()
 }
 
@@ -411,7 +416,11 @@ func (p *queryParser) parseTypeReference() (*Type, error) {
 			return nil, err
 		}
 		kind := TypeKindObject
-		if builtinScalarNames[name] {
+		if p.schema != nil {
+			if realType, ok := p.schema.GetType(name); ok {
+				kind = realType.Kind
+			}
+		} else if builtinScalarNames[name] {
 			kind = TypeKindScalar
 		}
 		t = &Type{
