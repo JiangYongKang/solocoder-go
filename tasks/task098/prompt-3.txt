@@ -1,0 +1,5 @@
+你实现的雪花 ID 生成模块上一次修复存在遗留问题，需要处理：
+
+1. Next 方法在小幅时钟回拨路径中，调用 s.mu.Unlock() 之后直接读取 s.lastTS 传入 waitUntilNextMs，此时 s.lastTS 的读取未受互斥锁保护。当另一个 goroutine 持锁写入 s.lastTS 时，此处的无锁读取与持锁写入构成数据竞态，违反 Go 内存模型。
+
+2. 修复后运行 go test ./internal/snowflake/ -v，需要让所有测试通过。

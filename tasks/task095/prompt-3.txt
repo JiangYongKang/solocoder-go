@@ -1,0 +1,7 @@
+你实现的 MIME 类型检测模块上一次修复存在问题，需要处理：
+
+1. builtInSignatures 中 audio/wav 的 offset-0 签名将 RIFF 容器字节 4 到 7 的大小字段硬编码为零，而真实 RIFF 文件该字段的值是可变的，该签名对任何真实 WAV 文件都无法命中，audio/wav 成为死代码。image/webp 的 offset-0 签名存在同样的硬编码问题。
+
+2. 修复 WAV 与 WebP 的签名冲突后未添加对应的测试用例，当前测试未覆盖完整 RIFF 容器头部（偏移 0 到 11 共 12 字节加上偏移 8 的格式标识符）的检测场景，无法验证 WAV 是否被正确识别。
+
+3. 修复后运行 go test ./internal/mimedetect/ -v，需要让所有测试通过。

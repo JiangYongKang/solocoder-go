@@ -1,0 +1,7 @@
+你实现的链式哈希模块中部分测试用例存在质量问题，需要修复：
+
+1. TestConcurrency 的 verify_node_count 子测试中，对节点数量的断言使用了 `nodeCount < 0`，但 Go 中 len(map) 返回值永远非负，该断言在任何情况下都无法触发失败，无法验证并发后节点数量的正确性。
+
+2. decrease_weight 子测试在验证迁移比例偏离时使用了 t.Logf 记录日志而非 t.Errorf 标记失败，当实际比例超出容差范围时测试依然显示 PASS，丧失了比例偏离的拦截能力。
+
+3. 修复后运行 go test ./internal/chainhash/ -v，需要让所有测试通过。

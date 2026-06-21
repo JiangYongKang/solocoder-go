@@ -86,20 +86,6 @@ func (b *Bucket) refill() {
 	b.lastRefill = now
 }
 
-func (b *Bucket) currentRate(now time.Time) float64 {
-	if !b.warmup {
-		return b.rate
-	}
-
-	elapsed := now.Sub(b.warmupStartTime)
-	if elapsed >= b.warmupDuration {
-		return b.rate
-	}
-
-	progress := float64(elapsed) / float64(b.warmupDuration)
-	return b.warmupStartRate + (b.rate-b.warmupStartRate)*progress
-}
-
 func (b *Bucket) currentRateLocked(now time.Time) float64 {
 	if !b.warmup {
 		return b.rate

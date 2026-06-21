@@ -74,6 +74,9 @@ func diffToChanges(diffResult *DiffResult) []change {
 		var deleted int
 		var inserted []string
 		changeStart := hunk.OldStart - 1
+		if changeStart < 0 {
+			changeStart = 0
+		}
 
 		for _, line := range hunk.Lines {
 			switch line.Type {
@@ -91,7 +94,8 @@ func diffToChanges(diffResult *DiffResult) []change {
 					deleted = 0
 					inserted = nil
 				}
-				changeStart = line.OldLineNo - 1			}
+				changeStart = line.OldLineNo
+			}
 		}
 
 		if deleted > 0 || len(inserted) > 0 {

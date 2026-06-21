@@ -1,0 +1,7 @@
+你实现的短链接生成模块上一次修复仍存在问题，需要处理：
+
+1. NewManagerWithConfig 中 HashConfig.Length 的校验对所有哈希算法统一使用 64 作为上限，未区分不同算法的实际十六进制输出长度。当用户使用 MD5 算法配置 Length=40 时校验通过，但 generateWithHash 实际截取长度仅为 MD5 输出长度 32 而非用户配置的 40，调用方传入合法配置却得到不符合预期的结果。
+
+2. TestGenerateWithRandomNoModuloBias 测试用于验证取模偏差已消除，但判定逻辑的容差设置过宽。在 10 位字符集下 4000 次采样的场景中，即使使用修复前的旧取模代码也能通过该测试，该测试不具备区分修复前后代码行为的偏差回归检测能力。
+
+3. 修复后运行 go test ./internal/shortlink/ -v，需要让所有测试通过。

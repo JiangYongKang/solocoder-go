@@ -1138,3 +1138,99 @@ func TestSameContent(t *testing.T) {
 		t.Error("both nil should be equal")
 	}
 }
+
+func TestDiffToChanges_SingleHunkMultipleChanges(t *testing.T) {
+	diffResult := &DiffResult{
+		Hunks: []Hunk{
+			{
+				OldStart: 1, OldCount: 10,
+				NewStart: 1, NewCount: 10,
+				Lines: []Line{
+					{Content: "line1", Type: LineEqual, OldLineNo: 1, NewLineNo: 1},
+					{Content: "line2", Type: LineDelete, OldLineNo: 2, NewLineNo: 0},
+					{Content: "OURS2", Type: LineInsert, OldLineNo: 0, NewLineNo: 2},
+					{Content: "line3", Type: LineEqual, OldLineNo: 3, NewLineNo: 3},
+					{Content: "line4", Type: LineEqual, OldLineNo: 4, NewLineNo: 4},
+					{Content: "line5", Type: LineEqual, OldLineNo: 5, NewLineNo: 5},
+					{Content: "line6", Type: LineDelete, OldLineNo: 6, NewLineNo: 0},
+					{Content: "OURS6", Type: LineInsert, OldLineNo: 0, NewLineNo: 6},
+					{Content: "line7", Type: LineEqual, OldLineNo: 7, NewLineNo: 7},
+					{Content: "line8", Type: LineEqual, OldLineNo: 8, NewLineNo: 8},
+					{Content: "line9", Type: LineDelete, OldLineNo: 9, NewLineNo: 0},
+					{Content: "OURS9", Type: LineInsert, OldLineNo: 0, NewLineNo: 9},
+					{Content: "line10", Type: LineEqual, OldLineNo: 10, NewLineNo: 10},
+				},
+			},
+		},
+	}
+
+	changes := diffToChanges(diffResult)
+
+	if len(changes) != 3 {
+		t.Fatalf("expected 3 changes, got %d", len(changes))
+	}
+
+	if changes[0].oldStart != 1 {
+		t.Errorf("change 0 oldStart: expected 1, got %d", changes[0].oldStart)
+	}
+	if changes[0].oldEnd != 2 {
+		t.Errorf("change 0 oldEnd: expected 2, got %d", changes[0].oldEnd)
+	}
+	if len(changes[0].newLines) != 1 || changes[0].newLines[0] != "OURS2" {
+		t.Errorf("change 0 newLines: expected [OURS2], got %v", changes[0].newLines)
+	}
+
+	if changes[1].oldStart != 5 {
+		t.Errorf("change 1 oldStart: expected 5, got %d", changes[1].oldStart)
+	}
+	if changes[1].oldEnd != 6 {
+		t.Errorf("change 1 oldEnd: expected 6, got %d", changes[1].oldEnd)
+	}
+	if len(changes[1].newLines) != 1 || changes[1].newLines[0] != "OURS6" {
+		t.Errorf("change 1 newLines: expected [OURS6], got %v", changes[1].newLines)
+	}
+
+	if changes[2].oldStart != 8 {
+		t.Errorf("change 2 oldStart: expected 8, got %d", changes[2].oldStart)
+	}
+	if changes[2].oldEnd != 9 {
+		t.Errorf("change 2 oldEnd: expected 9, got %d", changes[2].oldEnd)
+	}
+	if len(changes[2].newLines) != 1 || changes[2].newLines[0] != "OURS9" {
+		t.Errorf("change 2 newLines: expected [OURS9], got %v", changes[2].newLines)
+	}
+}
+
+func TestThreeWayMerge_SingleHunkMultipleChanges(t *testing.T) {
+	base := "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n"
+	ours := "line1\nOURS2\nline3\nline4\nline5\nOURS6\nline7\nline8\nOURS9\nline10\n"
+	theirs := "line1\nline2\nline3\nTHEIRS4\nline5\nline6\nline7\nTHEIRS8\nline9\nline10\n"
+
+	result, err := ThreeWayMerge(base, ours, theirs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.HasConflicts {
+		t.Error("should not have conflicts for non-overlapping changes")
+	}
+
+	expectedChanges := []string{"OURS2", "THEIRS4", "OURS6", "THEIRS8", "OURS9"}
+	for _, expected := range expectedChanges {
+		if !strings.Contains(result.Text, expected) {
+			t.Errorf("merged text should contain %q", expected)
+		}
+	}
+
+	unwantedChanges := []string{"line2", "line4", "line6", "line8", "line9"}
+	for _, unwanted := range unwantedChanges {
+		if strings.Contains(result.Text, unwanted+"\n") {
+			t.Errorf("merged text should not contain original %q", unwanted)
+		}
+	}
+
+	expectedLineCount := 10
+	actualLines := len(splitLines(result.Text))
+	if actualLines != expectedLineCount {
+		t.Errorf("expected %d lines, got %d lines\nresult:\n%s", expectedLineCount, actualLines, result.Text)
+	}
+}

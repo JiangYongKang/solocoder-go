@@ -427,7 +427,7 @@ func TestUpdateNodeWeight(t *testing.T) {
 		actualMigratedRatio := float64(migratedKeys) / 1000.0
 		tolerance := 0.15
 		if abs(actualMigratedRatio-expectedMigratedRatio) > tolerance {
-			t.Logf("migration ratio %.4f differs from expected %.4f (within tolerance %.4f)",
+			t.Errorf("migration ratio %.4f differs from expected %.4f by more than tolerance %.4f",
 				actualMigratedRatio, expectedMigratedRatio, tolerance)
 		}
 	})
@@ -803,8 +803,9 @@ func TestConcurrency(t *testing.T) {
 
 	t.Run("verify node count", func(t *testing.T) {
 		nodeCount := hr.NodeCount()
-		if nodeCount < 0 {
-			t.Errorf("node count should not be negative, got %d", nodeCount)
+		maxPossibleNodes := numGoroutines * 5
+		if nodeCount < 0 || nodeCount > maxPossibleNodes {
+			t.Errorf("node count %d out of expected range [0, %d]", nodeCount, maxPossibleNodes)
 		}
 	})
 

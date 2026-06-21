@@ -33,7 +33,7 @@ var (
 	ErrInvalidCustomShortCode  = errors.New("shortlink: invalid custom short code format")
 	ErrGenerateFailed          = errors.New("shortlink: failed to generate unique short code after max retries")
 	ErrMaxRetriesZeroOrNegative = errors.New("shortlink: max retries must be positive")
-	ErrHashLengthInvalid       = errors.New("shortlink: hash length must be between 1 and 64")
+	ErrHashLengthInvalid       = errors.New("shortlink: hash length is invalid for the selected algorithm")
 	ErrRandomLengthInvalid     = errors.New("shortlink: random length must be positive")
 	ErrInvalidCharset          = errors.New("shortlink: charset cannot be empty")
 	ErrUnsupportedHashAlgo     = errors.New("shortlink: unsupported hash algorithm")
@@ -136,7 +136,8 @@ func NewManagerWithConfig(cfg Config) (*Manager, error) {
 	if cfg.HashConfig.Algorithm == "" {
 		cfg.HashConfig.Algorithm = HashMD5
 	}
-	if cfg.HashConfig.Length <= 0 || cfg.HashConfig.Length > 64 {
+	maxLen := hashHexLength(cfg.HashConfig.Algorithm)
+	if cfg.HashConfig.Length <= 0 || cfg.HashConfig.Length > maxLen {
 		return nil, ErrHashLengthInvalid
 	}
 	if cfg.HashConfig.MaxRetries <= 0 {
@@ -215,6 +216,19 @@ func newHash(algo HashAlgorithm) (hash.Hash, error) {
 	}
 }
 
+func hashHexLength(algo HashAlgorithm) int {
+	switch algo {
+	case HashMD5:
+		return 32
+	case HashSHA1:
+		return 40
+	case HashSHA256:
+		return 64
+	default:
+		return 64
+	}
+}
+
 func (m *Manager) generateWithAutoIncrement() (string, error) {
 	id := m.autoIncrement.Add(1)
 	return base62Encode(id), nil
@@ -240,24 +254,11 @@ func (m *Manager) generateWithHash(originalURL string, config HashStrategyConfig
 		hashHex := hex.EncodeToString(hashBytes)
 
 		var startPos int
-		if config.Length >= len(hashHex) {
-			startPos = 0
-		} else {
+		if config.Length < len(hashHex) {
 			startPos = (attempt * 2) % (len(hashHex) - config.Length)
 		}
-		if startPos < 0 {
-			startPos = 0
-		}
-		endPos := startPos + config.Length
-		if endPos > len(hashHex) {
-			endPos = len(hashHex)
-			startPos = endPos - config.Length
-			if startPos < 0 {
-				startPos = 0
-				endPos = len(hashHex)
-			}
-		}
-		shortCode := hashHex[startPos:endPos]
+
+		shortCode := hashHex[startPos : startPos+config.Length]
 
 		m.mu.RLock()
 		_, exists := m.links[shortCode]

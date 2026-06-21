@@ -1,0 +1,5 @@
+你实现的令牌桶限流模块上一次修复引入了新问题，需要处理：
+
+1. tokenbucket.go 中定义的 currentRate 方法在包内没有任何调用者，属于死代码。该方法是在修复 IsWarmingUp 副作用问题时从原有逻辑拆分出的只读版本，但 refill、Take、CurrentRate 等所有调用点全部使用的是 currentRateLocked，IsWarmingUp 自身也未调用该方法。
+
+2. 修复后运行 go test ./internal/tokenbucket/ -v，需要让所有测试通过。

@@ -70,8 +70,9 @@ func (s *Snowflake) Next() (ID, error) {
 		if now < s.lastTS {
 			offset := s.lastTS - now
 			if offset <= clockBackwardSmallMaxMs {
+				targetTS := s.lastTS
 				s.mu.Unlock()
-				if s.waitUntilNextMs(s.lastTS, waitUntilNextMsMaxMs) {
+				if s.waitUntilNextMs(targetTS, waitUntilNextMsMaxMs) {
 					return 0, fmt.Errorf("%w: offset %dms, exceeded max wait %dms", ErrClockBackwardMax, offset, waitUntilNextMsMaxMs)
 				}
 				continue
@@ -82,8 +83,9 @@ func (s *Snowflake) Next() (ID, error) {
 
 		if now == s.lastTS {
 			if s.sequence >= maxSequence {
+				targetTS := s.lastTS
 				s.mu.Unlock()
-				if s.waitUntilNextMs(s.lastTS, sequenceOverflowMaxMs) {
+				if s.waitUntilNextMs(targetTS, sequenceOverflowMaxMs) {
 					return 0, fmt.Errorf("%w: sequence reached max %d, clock did not advance after %dms", ErrSequenceOverflow, maxSequence, sequenceOverflowMaxMs)
 				}
 				continue

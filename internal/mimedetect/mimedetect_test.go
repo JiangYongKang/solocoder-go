@@ -118,6 +118,80 @@ func TestDetectFromBytesMP4(t *testing.T) {
 	}
 }
 
+func TestDetectFromBytesWebP(t *testing.T) {
+	d := NewDetector()
+	data := make([]byte, 32)
+	copy(data[0:], []byte{0x52, 0x49, 0x46, 0x46})
+	copy(data[4:], []byte{0x24, 0x00, 0x00, 0x00})
+	copy(data[8:], []byte{0x57, 0x45, 0x42, 0x50})
+	copy(data[12:], []byte{0x56, 0x50, 0x38, 0x20})
+	mime := d.DetectFromBytes(data)
+	if mime != "image/webp" {
+		t.Errorf("expected image/webp, got %s", mime)
+	}
+}
+
+func TestDetectFromBytesWebP_DifferentSize(t *testing.T) {
+	d := NewDetector()
+	data := make([]byte, 64)
+	copy(data[0:], []byte{0x52, 0x49, 0x46, 0x46})
+	copy(data[4:], []byte{0xA0, 0x01, 0x00, 0x00})
+	copy(data[8:], []byte{0x57, 0x45, 0x42, 0x50})
+	mime := d.DetectFromBytes(data)
+	if mime != "image/webp" {
+		t.Errorf("expected image/webp with non-zero size, got %s", mime)
+	}
+}
+
+func TestDetectFromBytesWAV(t *testing.T) {
+	d := NewDetector()
+	data := make([]byte, 44)
+	copy(data[0:], []byte{0x52, 0x49, 0x46, 0x46})
+	copy(data[4:], []byte{0x88, 0x58, 0x01, 0x00})
+	copy(data[8:], []byte{0x57, 0x41, 0x56, 0x45})
+	copy(data[12:], []byte{0x66, 0x6D, 0x74, 0x20})
+	mime := d.DetectFromBytes(data)
+	if mime != "audio/wav" {
+		t.Errorf("expected audio/wav, got %s", mime)
+	}
+}
+
+func TestDetectFromBytesWAV_DifferentSize(t *testing.T) {
+	d := NewDetector()
+	data := make([]byte, 32)
+	copy(data[0:], []byte{0x52, 0x49, 0x46, 0x46})
+	copy(data[4:], []byte{0x10, 0x00, 0x00, 0x00})
+	copy(data[8:], []byte{0x57, 0x41, 0x56, 0x45})
+	mime := d.DetectFromBytes(data)
+	if mime != "audio/wav" {
+		t.Errorf("expected audio/wav with small size, got %s", mime)
+	}
+}
+
+func TestDetectFromBytesRIFF_WebPNotConfusedWithWAV(t *testing.T) {
+	d := NewDetector()
+	data := make([]byte, 16)
+	copy(data[0:], []byte{0x52, 0x49, 0x46, 0x46})
+	copy(data[4:], []byte{0x08, 0x00, 0x00, 0x00})
+	copy(data[8:], []byte{0x57, 0x45, 0x42, 0x50})
+	mime := d.DetectFromBytes(data)
+	if mime != "image/webp" {
+		t.Errorf("expected image/webp, not audio/wav, got %s", mime)
+	}
+}
+
+func TestDetectFromBytesRIFF_WAVNotConfusedWithWebP(t *testing.T) {
+	d := NewDetector()
+	data := make([]byte, 16)
+	copy(data[0:], []byte{0x52, 0x49, 0x46, 0x46})
+	copy(data[4:], []byte{0x08, 0x00, 0x00, 0x00})
+	copy(data[8:], []byte{0x57, 0x41, 0x56, 0x45})
+	mime := d.DetectFromBytes(data)
+	if mime != "audio/wav" {
+		t.Errorf("expected audio/wav, not image/webp, got %s", mime)
+	}
+}
+
 func TestDetectFromBytesHTMLVariable(t *testing.T) {
 	d := NewDetector()
 	data := []byte("   <html><head>...</head></html>")
