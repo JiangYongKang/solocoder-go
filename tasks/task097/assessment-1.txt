@@ -1,0 +1,9 @@
+产物不满意：
+1. prompt-1.txt 要求实现文本差异与补丁引擎模块（Myers 行级差异计算、统一格式补丁生成、补丁应用与上下文校验、三方合并冲突处理），并要求代码放在 internal/diffpatch/ 包下。但 internal/shortlink/shortlink.go 实现的是一个短链接生成器模块（自增 ID Base62 编码、URL 哈希摘要、随机字符串、自定义短码、访问统计等），与提示词列出的 7 条需求完全无关，shortlink.go 中不包含任何 diff、patch、merge、myers 相关的函数或数据结构。根因是任务提示词内容与任务编号不对应，提示词描述的是 diffpatch 模块而非 shortlink 模块，导致代码实现与预期功能域完全脱节。
+2. shortlink.go 的 generateWithHash 方法中 startPos 计算表达式 `(attempt * 2) % (len(hashHex) - config.Length)` 在哈希算法为 SHA256 且 Length 配置为 64 时会导致除零 panic，因为 SHA256 十六进制输出长度为 64，config.Length 也为 64 时除数变成 0。MD5 配置 Length=32、SHA1 配置 Length=40 同样触发此问题。NewManagerWithConfig 中 Length 校验仅排除 <=0 和 >64 的值，64 是合法配置，调用方一旦使用会被运行时 panic 中断服务。根因是缺少 Length 必须严格小于哈希十六进制长度的约束校验，应在截取前检查并拒绝或回退到安全默认值。
+3. shortlink.go 定义了 ErrMaxRetriesZeroOrNegative、ErrHashLengthInvalid、ErrRandomLengthInvalid、ErrInvalidCharset 四个导出错误变量，但 NewManagerWithConfig 对所有非法配置值均采用静默替换默认值的策略，从未返回这些错误。shortlink_test.go 中也没有任何测试用例验证这些错误能被触发。调用方传入非法配置后无法通过代码感知配置错误，可能在非预期参数下运行而不自知。根因是定义了校验错误类型却没有实际执行校验，应在新管理器的构造函数中对非法配置值返回对应错误而非静默修正。
+4. shortlink.go 的 generateWithRandom 方法使用 `int(bytes[i]) % charsetLen` 将随机字节映射到字符集下标，当字符集长度不能整除 256 时存在取模偏差，部分字符出现概率略高于其他字符。虽然对短码唯一性影响极小，但在需要均匀分布的随机策略场景下会产生统计上不均匀的字符分布。应在生成随机索引时使用 `crypto/rand` 读取足够的随机字节并通过拒绝采样或大整数取模消除偏差。
+过程不满意：
+1. 模型的 session-cot-1.md 显示其收到的提示词要求实现 diffpatch 模块而非 shortlink 模块，模型按提示词要求将所有代码写入 internal/diffpatch/ 包，整个会话过程中从未创建或修改 internal/shortlink/ 下的任何文件。这意味着 internal/shortlink/ 目录下的代码并非由本次模型会话生成，本轮标注所审查的短链接代码与模型实际产出的 diffpatch 代码属于不同模块。这暴露出提示词内容与任务编号不匹配的工程组织问题，也使得对模型在短链接任务上的实现能力无从评估。
+2. 模型在收到提示词后未经任何需求分析和代码调研就直接通过 todo_write 创建了 8 项子任务计划，之后才开始查看项目目录、搜索 Go 文件、阅读 dedup 示例代码和 go.mod。这种先规划后理解的顺序导致计划粒度可能与实际模块边界不匹配。正确做法是先理解需求文档和项目骨架，理清模块职责和边界后再制定执行计划。
+3. 模型写完 myers.go 后发现回溯逻辑存在问题，做出的决策是重写 diffpatch.go 和 myers.go 两个文件而非对 myers.go 中回溯逻辑做最小范围修复。这种整文件重写的方式存在两个风险：一是在 diffpatch.go 中引入原本不存在的新错误，二是丢失了第一版中可能正确的部分代码。应在定位到具体出错函数后对出错代码做最小修改，保持其他已验证正确的逻辑不变。

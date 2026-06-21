@@ -1,0 +1,10 @@
+产物不满意：
+1. prompt-1.txt 要求实现短链接生成器模块并放在 internal/shortlink/ 包下，但最终提交的代码在 internal/chainhash/ 包下实现了一致性哈希环功能。提示词要求的自增 ID 策略、哈希策略、随机字符串策略、自定义短码、访问统计计数、短码冲突重试等 7 项功能需求在 chainhash 包中全部缺失，产物与提示词完全脱节。原因是没有在编码前确认任务编号、目标包名和需求文档三者是否一致，应先将提示词、任务编号和 docs 目录下的对应文档做交叉校验再动手实现。
+2. serialize.go 的 Snapshot 方法在构建 VirtualNode 列表时只填充了 Hash 和 NodeID 字段，未填充 Index 字段，导致快照中所有虚拟节点的 Index 均为默认值零。虽然 Restore 恢复功能时不依赖 Index 字段，但快照用于审计和排查时无法追溯虚拟节点的原始生成顺序和索引位置。应在 Snapshot 循环中从虚拟节点映射关系中解析出原始 Index 值并完整填充 VirtualNode 结构体的所有字段。
+3. chainhash_test.go 的 TestConcurrency 测试启动了 10 个 goroutine 并发执行 AddNode、GetNode 和 RemoveNode，但仅在 sync.WaitGroup 结束即判定通过，从未验证并发操作后哈希环状态是否正确，例如节点数量、ring 排序一致性、虚拟节点映射完整性均未检查。并发测试的核心目标是验证数据一致性而非仅检测 panic 或竞态，当前测试形同虚设无法发现并发下的数据错乱。应增加操作后的状态校验断言。
+4. chainhash_test.go 中 TestUpdateNodeWeight 只测试了权重从 1 提升到 3 的场景，未覆盖权重下降的情况。而 calculateWeightMigration 方法内部对权重下降和上升走的是两条独立逻辑分支——下降时生成 removedRanges 将数据从目标节点迁出，上升时生成 addedRanges 将数据迁入目标节点。权重下降分支完全没有单测覆盖，一旦该路径存在计算错误将无法被现有测试发现。应补充权重减小的测试用例验证迁移范围和方向正确性。
+
+过程不满意：
+1. 模型的 session-cot-1.md 全程记录的是短链接生成器的实现过程——先浏览 apikey 和 kvstore 模块代码风格作参考，然后直接编写 internal/shortlink/ 包下的代码并运行 go test ./internal/shortlink/ 进行调试，最后撰写 docs/shortlink.md 文档。整个思考过程中从未出现 chainhash 或一致性哈希环相关的分析和讨论，也没有读取 docs/chainhash.md 需求文档。模型完全按照 prompt-1.txt 文字表面执行了短链接任务，未意识到任务编号 task091 与代码包 internal/chainhash/ 的对应关系，属于对任务上下文缺乏整体验证的盲从式执行。
+2. 模型在收到提示词后的第一个动作就是调用 todo_write 创建了 7 项子任务计划，然后才开始通过目录浏览和文件搜索了解项目结构。这种先规划后分析的顺序导致规划完全基于提示词的文字内容，而忽略了项目内已有的 docs/chainhash.md 需求文档和 internal/chainhash/ 包骨架。在尚未确认当前任务到底要实现什么功能、任务编号对应哪个包的情况下就制定了详细计划，属于规划与目标脱节。正确做法是先通读所有相关上下文再做任务拆分。
+3. 模型的思考过程显示其在测试通过后立即宣称所有工作完成并更新 todo 列表为全部完成状态，但 chainhash 包的 TestConcurrency 测试仅在 sync.WaitGroup 结束后就判定通过从未验证并发后哈希环状态正确性，TestUpdateNodeWeight 也缺少权重下降分支的测试覆盖。模型将"测试跑过"等同于"产物质量合格"，没有对通过测试做任何深度审查如检查断言强度和分支覆盖率，属于典型的幻觉式完成——把流程走完视为任务做完而非真正审视交付物质量。

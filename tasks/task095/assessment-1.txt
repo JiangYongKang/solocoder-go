@@ -1,0 +1,5 @@
+产物不满意：
+1. 在 mimedetect.go 的 builtInSignatures 中，image/webp、audio/wav、audio/x-wav 三条签名使用完全相同的魔术字且偏移量均为 0、模式均为固定偏移。DetectFromBytes 对内置签名采用顺序扫描返回首个命中的策略，后两条签名永远无法命中成为死代码。当 WAV 文件被检测时 RIFF 前缀被第一顺位 image/webp 捕获，WAV 被错误识别为 WebP，业务方基于错误的 MIME 类型做分发处理会产生不可预期后果。根因是 RIFF 容器前缀被多格式共享，仅凭前四字节无法区分，需读取偏移 8 处的子格式字段二次判定并合并为一条签名。
+2. 在 mimedetect.go 中声明了 ErrNilMagicSignature 错误变量但未在任何函数中返回。RegisterMagicSignature 接收值类型参数而非指针，调用方无法传入 nil，该错误永远不会触发沦为死代码。需求文档第 6 节错误定义表列出了该项，预期在 nil 签名时返回此错误，但接口设计导致该路径不可达，模块错误报告不完整。根因是模型照搬文档枚举而未审视各错误与函数签名的匹配性。正确做法是删除该变量或改参数为指针并增加 nil 校验。
+过程不满意：
+1. 模型拿到提示词后查看了项目目录结构、go.mod 及已有模块代码，但未阅读 docs/ 下任何需求文档就创建了 TodoList 开始编码。提示词 prompt-1.txt 实际要求实现令牌桶限流器到 internal/tokenbucket/ 包下，模型完全按字面含义完成了 tokenbucket 开发，但 task095 目录实际对应 mimedetect MIME 检测任务，两者完全不匹配。模型始终未阅读 docs/mimedetect.md 核对任务域，也未交叉查看 tokenbucket.md 是否存在，导致交付了与任务槽位不符的错误模块。正确做法是先阅读当前任务的需求文档再规划实现。

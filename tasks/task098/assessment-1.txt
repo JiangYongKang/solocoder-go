@@ -1,0 +1,6 @@
+产物不满意：
+1. prompt-1.txt 要求"实现一个可扩展布隆过滤器"放在 internal/scalablebloom/ 包下，但模型在 internal/snowflake/ 包下交付了雪花 ID 生成器。snowflake.go 只有 Snowflake 结构体和 ID 生成逻辑，完全缺失布隆过滤器的动态扩容、哈希自适应、序列化、联合查询等核心方法。执行 `go test ./internal/scalablebloom/ -v` 找不到对应包，全部七条需求均未实现，与任务要求本质错位。
+2. snowflake.go 的 waitUntilNextMs 方法接收 lastTS 参数但内部直接调用 `s.timestamp()` 与传入的参数做比较，参数与调用的目标语义重叠形成冗余设计。该接口暗示调用者可指定任意目标时间戳，实际却总是用生成器自身时间驱动等待，方法契约不清晰。在大型团队协作场景下这种不一致的接口设计容易让调用者误用参数，增加维护成本。
+过程不满意：
+1. 模型在收到提示词后立即通过 todo_write 创建了 7 项子任务计划，然后才开始依次查看项目目录结构和已有模块代码。从思考记录可见 todo_write 调用发生在 view_folder 和 file_search 之前，模型的初始规划是在不了解项目骨架和包导入规则的情况下制定的。正确做法是先探索项目环境理解 module 配置和代码风格，理清边界后再做计划。
+2. 模型思考过程只记录了 scalablebloom 工作轨迹，包括创建 scalablebloom.go、修复序列化和互斥锁问题，最终声称 47 个测试通过。但 git 状态显示 internal/snowflake/ 下的 snowflake.go 和 snowflake_test.go 同样是新增文件，思考过程中完全没有 Bit 位布局计算、时钟回拨策略、Parse 位移掩码等雪花 ID 核心设计的记录。33 个测试全部通过但代码生成过程无轨迹可查，模型输出与思考轨迹不匹配。
