@@ -1,0 +1,6 @@
+你实现的SLA指标计算器模块在修复ErrWindowNotFound使用时引入了新问题，需要修复：
+1. 为了让ErrWindowNotFound有返回路径而修改了GetViolationEventsByWindow的方法签名，产生了新的破坏性变更。
+2. 移除RecordRequest和RecordRequests的error返回值后，ErrEmptyErrorKey变量不再被任何代码路径返回，失去了其存在的意义。
+3. 移除CalculatePercentile方法后，ErrInvalidPercentile变量也不再被任何代码使用。
+4. docs/slametrics.md仍然描述已删除的CalculatePercentile方法，ErrWindowNotFound和ErrEmptyErrorKey的文档说明也与代码现状不一致。
+5. 修复后运行 go test ./internal/slametrics/ -v，需要让所有测试通过。

@@ -3,7 +3,6 @@ package mockgen
 import (
 	"fmt"
 	"reflect"
-	"sync"
 )
 
 type MockController struct {
@@ -247,75 +246,59 @@ func (mp *MockProxy) TryMethod(methodName string) (interface{}, error) {
 	return fn.Interface(), nil
 }
 
-
 func (mp *MockProxy) Instance() interface{} {
-	ifaceType := mp.targetType
-	numMethods := ifaceType.NumMethod()
-
+	numMethods := mp.targetType.NumMethod()
 	fields := make([]reflect.StructField, numMethods)
+
 	for i := 0; i < numMethods; i++ {
-		method := ifaceType.Method(i)
+		method := mp.targetType.Method(i)
+		fn, err := mp.TryMethod(method.Name)
+		if err != nil {
+			panic(err)
+		}
 		fields[i] = reflect.StructField{
 			Name: method.Name,
-			Type: method.Type,
+			Type: reflect.TypeOf(fn),
 		}
 	}
 
 	structType := reflect.StructOf(fields)
-	structPtr := reflect.New(structType)
-	structVal := structPtr.Elem()
+	structValue := reflect.New(structType).Elem()
 
 	for i := 0; i < numMethods; i++ {
-		method := ifaceType.Method(i)
-		methodName := method.Name
-		methodType := method.Type
-		mpCapture := mp
-
-		fn := reflect.MakeFunc(methodType, func(args []reflect.Value) []reflect.Value {
-			in := make([]interface{}, len(args))
-			for j, arg := range args {
-				in[j] = arg.Interface()
-			}
-
-			results := mpCapture.controller.CallMethod(methodName, in)
-
-			out := make([]reflect.Value, methodType.NumOut())
-			for j := 0; j < methodType.NumOut(); j++ {
-				if j < len(results) && results[j] != nil {
-					out[j] = reflect.ValueOf(results[j])
-				} else {
-					out[j] = reflect.Zero(methodType.Out(j))
-				}
-			}
-
-			return out
-		})
-
-		structVal.Field(i).Set(fn)
+		method := mp.targetType.Method(i)
+		fn, err := mp.TryMethod(method.Name)
+		if err != nil {
+			panic(err)
+		}
+		structValue.Field(i).Set(reflect.ValueOf(fn))
 	}
 
-	return structPtr.Interface()
-}
-
-var mockRegistry sync.Map
-
-func RegisterMock[T any](factory func(*MockProxy) T) {
-	var zero T
-	targetType := reflect.TypeOf(&zero).Elem()
-	mockRegistry.Store(targetType, func(mp *MockProxy) interface{} {
-		return factory(mp)
-	})
+	return structValue.Interface()
 }
 
 func As[T any](mp *MockProxy) T {
 	var zero T
 	targetType := reflect.TypeOf(&zero).Elem()
 
-	if targetType.Kind() == reflect.Interface && targetType == mp.targetType {
-		if factory, ok := mockRegistry.Load(targetType); ok {
-			return factory.(func(*MockProxy) interface{})(mp).(T)
+	if targetType.Kind() != reflect.Struct {
+		return zero
+	}
+
+	instance := mp.Instance()
+	instanceValue := reflect.ValueOf(instance)
+	targetValue := reflect.New(targetType).Elem()
+
+	for i := 0; i < targetType.NumField(); i++ {
+		field := targetType.Field(i)
+		instanceField := instanceValue.FieldByName(field.Name)
+		if !instanceField.IsValid() {
+			continue
+		}
+		if instanceField.Type().AssignableTo(field.Type) {
+			targetValue.Field(i).Set(instanceField)
 		}
 	}
 
-	return zero
+	return targetValue.Interface().(T)
 }

@@ -1684,24 +1684,3 @@ func TestDetector_SeasonalReset(t *testing.T) {
 		t.Errorf("Seasonal baseline count after reset: got %d, want 0", countAfter)
 	}
 }
-
-func TestGcdHelper(t *testing.T) {
-	tests := []struct {
-		a, b int
-		want int
-	}{
-		{4, 6, 2},
-		{6, 4, 2},
-		{12, 8, 4},
-		{7, 13, 1},
-		{0, 5, 5},
-		{5, 0, 5},
-		{-4, 6, 2},
-	}
-	for _, tt := range tests {
-		got := gcd(tt.a, tt.b)
-		if got != tt.want {
-			t.Errorf("gcd(%d,%d) = %d, want %d", tt.a, tt.b, got, tt.want)
-		}
-	}
-}

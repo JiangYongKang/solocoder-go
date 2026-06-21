@@ -1,0 +1,3 @@
+你实现的时序异常检测器模块在UpdateConfig修复后还存在代码清理问题：
+1. gcd函数在PeriodLength变更逻辑重构后已没有调用方，但函数和对应的测试仍然保留在代码中。
+2. 清理后运行 go test ./internal/tsanomaly/ -v，需要让所有测试通过。

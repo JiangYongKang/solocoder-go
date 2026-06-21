@@ -1,0 +1,3 @@
+你实现的基准测试框架模块的文档存在错误，需要修复：
+1. docs/benchfrm.md的示例5中使用了benchmarker结构体的SetImplementation方法，但该方法在实际代码中并不存在，用户复制此示例会编译失败。
+2. 修复后运行 go test ./internal/benchfrm/ -v，需要让所有测试通过。

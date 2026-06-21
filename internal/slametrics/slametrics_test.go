@@ -909,10 +909,7 @@ func TestGetViolationEventsByWindow(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	events1, err := s.GetViolationEventsByWindow(window1)
-	if err != nil {
-		t.Fatalf("unexpected error for window1: %v", err)
-	}
+	events1 := s.GetViolationEventsByWindow(window1)
 	if len(events1) == 0 {
 		t.Error("expected events for window1")
 	}
@@ -923,12 +920,9 @@ func TestGetViolationEventsByWindow(t *testing.T) {
 		}
 	}
 
-	events2, err := s.GetViolationEventsByWindow(window2)
-	if err != ErrWindowNotFound {
-		t.Errorf("expected ErrWindowNotFound for window2, got %v", err)
-	}
-	if events2 != nil {
-		t.Errorf("expected nil events for window2, got %d", len(events2))
+	events2 := s.GetViolationEventsByWindow(window2)
+	if len(events2) != 0 {
+		t.Errorf("expected 0 events for window2, got %d", len(events2))
 	}
 }
 
@@ -1119,7 +1113,7 @@ func TestConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			s.GetViolationEvents()
-			_, _ = s.GetViolationEventsByWindow(TimeWindow{Start: base, End: base.Add(time.Second)})
+			s.GetViolationEventsByWindow(TimeWindow{Start: base, End: base.Add(time.Second)})
 			s.RecordCount()
 			s.Generation()
 		}()
@@ -1271,10 +1265,7 @@ func TestViolationEventWindowTimeDimension(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	events, err := s.GetViolationEventsByWindow(recordWindow)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	events := s.GetViolationEventsByWindow(recordWindow)
 	if len(events) == 0 {
 		t.Fatal("expected events for the window")
 	}
@@ -1472,10 +1463,7 @@ func TestViolationEventQueryDimensions(t *testing.T) {
 		t.Fatalf("expected at least 3 violation events, got %d", s.ViolationCount())
 	}
 
-	events, err := s.GetViolationEventsByWindow(windows[1])
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	events := s.GetViolationEventsByWindow(windows[1])
 	if len(events) == 0 {
 		t.Error("expected events for window 1")
 	}

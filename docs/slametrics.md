@@ -353,10 +353,7 @@ sla.Reset()  // 清空所有请求记录和违约事件
 | ErrNoLatencyData | 时间窗口内没有延迟数据 |
 | ErrInvalidTimeRange | 时间窗口起始时间不早于结束时间 |
 | ErrInvalidDecimalPlaces | 指定的小数位数为负数 |
-| ErrInvalidPercentile | 百分位值超出有效范围 (0, 100]（CalculatePercentile 方法） |
-| ErrEmptyErrorKey | 失败请求的错误码为空（RecordRequest/RecordRequests 校验） |
 | ErrNilSLAConfig | SLA 配置为 nil |
-| ErrWindowNotFound | 窗口未找到（预留） |
 
 ## 并发安全与数据一致性
 
@@ -399,13 +396,12 @@ go test ./internal/slametrics/ -v
 
 测试覆盖范围：
 - 可用性计算：正常、100%、0%、无请求、小数位精度、时间过滤、边界校验
-- 百分位计算：最近秩算法验证、所有结果均来自数据集、空数据、单元素、边界值、任意百分位计算
-- 错误率统计：多类型错误、无错误、空错误键处理、无请求、边界校验
+- 百分位计算：最近秩算法验证、所有结果均来自数据集、空数据、单元素、边界值
+- 错误率统计：多类型错误、无错误、无请求、边界校验
 - SLA 判定：全达标、可用性违约、延迟违约、错误率违约、多指标同时违约、阈值边界（等于目标值不违约）
 - SLA 数据一致性：快照一致性验证（三项指标基于同一数据集）
 - 违约事件：去重验证、排序验证、多维度查询（按记录时间、按窗口、按窗口范围）、字段完整性
 - 并发安全：多 goroutine 同时读写、EvaluateSLA 与 Reset 竞态保护
 - 版本号机制：Reset 递增验证、stale 违约丢弃验证
-- 输入校验：失败请求空错误码、无效百分位值
 - 数据重置：清空请求记录和违约事件
 - 纯函数验证：计算逻辑纯函数化测试

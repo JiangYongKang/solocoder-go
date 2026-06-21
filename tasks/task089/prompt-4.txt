@@ -1,0 +1,5 @@
+你实现的模糊测试驱动器模块的覆盖率统计和内存检测仍存在缺陷，需要修复：
+1. DefaultCoverageHook本身未被修改，仍然捕获框架自身的调用栈地址，导致未使用InstrumentedTarget包装的普通目标函数的覆盖率数据无法反映被测函数内部执行路径。
+2. 在同时使用DefaultCoverageHook和InstrumentedTarget的场景下，框架栈地址和Cover标记地址混合存储在同一覆盖率对象中，增加了无意义的数据噪声。
+3. processInput方法对每个可疑输入调用了两次checkMemory，一次在外层判断是否可疑，一次在recordSuspiciousMemory内部再次判断。
+4. 修复后运行 go test ./internal/fuzzdriver/ -v，需要让所有测试通过。

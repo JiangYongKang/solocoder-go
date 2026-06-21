@@ -170,16 +170,12 @@ func Cover(addr uint64) {
 
 func DefaultCoverageHook(depth int) CoverageHook {
 	return func(input []byte) []uint64 {
-		pcs := make([]uintptr, depth)
-		n := runtime.Callers(2, pcs)
-		if n == 0 {
-			return nil
+		addrs := InputBasedCoverageHook(input)
+		maxPoints := depth * 2
+		if maxPoints > 0 && len(addrs) > maxPoints {
+			addrs = addrs[:maxPoints]
 		}
-		result := make([]uint64, n)
-		for i := 0; i < n; i++ {
-			result[i] = uint64(pcs[i])
-		}
-		return result
+		return addrs
 	}
 }
 
@@ -650,16 +646,21 @@ func (f *Fuzzer) executeWithCoverage(input []byte) (coverage *Coverage, execErr 
 	coverage = NewCoverage()
 	SetCurrentCoverage(coverage)
 
+	hookCov := NewCoverage()
 	preAddrs := f.coverageHook(input)
 	for _, addr := range preAddrs {
-		coverage.Add(addr)
+		hookCov.Add(addr)
 	}
 
 	execErr = f.target(input)
 
 	postAddrs := f.coverageHook(input)
 	for _, addr := range postAddrs {
-		coverage.Add(addr | 0x8000000000000000)
+		hookCov.Add(addr | 0x8000000000000000)
+	}
+
+	if coverage.Count() == 0 {
+		coverage.Merge(hookCov)
 	}
 
 	if execErr != nil {
@@ -680,9 +681,11 @@ func (f *Fuzzer) executeSafe(input []byte) (cov *Coverage, execErr error, crashe
 			if cov == nil {
 				cov = NewCoverage()
 			}
-			postAddrs := f.coverageHook(input)
-			for _, addr := range postAddrs {
-				cov.Add(addr | 0x8000000000000000)
+			if cov.Count() == 0 {
+				hookAddrs := f.coverageHook(input)
+				for _, addr := range hookAddrs {
+					cov.Add(addr)
+				}
 			}
 			cov.Add(0xDEADBEEF)
 		}
@@ -841,12 +844,7 @@ func (f *Fuzzer) checkMemory(before, after MemoryStats) (suspicious bool, allocD
 	return suspicious, allocDiff, allocCountDiff, thresholdBytes, thresholdAllocs, triggeredByBytes, triggeredByAllocs
 }
 
-func (f *Fuzzer) recordSuspiciousMemory(input []byte, before, after MemoryStats) {
-	suspicious, allocDiff, allocCountDiff, thresholdBytes, thresholdAllocs, triggeredByBytes, triggeredByAllocs := f.checkMemory(before, after)
-	if !suspicious {
-		return
-	}
-
+func (f *Fuzzer) recordSuspiciousMemory(input []byte, allocDiff, allocCountDiff, thresholdBytes, thresholdAllocs uint64, triggeredByBytes, triggeredByAllocs bool) {
 	record := SuspiciousMemoryRecord{
 		Input:             input,
 		Timestamp:         time.Now(),
@@ -874,9 +872,9 @@ func (f *Fuzzer) processInput(input []byte) (foundNewPath bool) {
 		f.saveCrash(input, err)
 		return false
 	}
-	suspicious, _, _, _, _, _, _ := f.checkMemory(beforeMem, afterMem)
+	suspicious, allocDiff, allocCountDiff, thresholdBytes, thresholdAllocs, triggeredByBytes, triggeredByAllocs := f.checkMemory(beforeMem, afterMem)
 	if suspicious {
-		f.recordSuspiciousMemory(input, beforeMem, afterMem)
+		f.recordSuspiciousMemory(input, allocDiff, allocCountDiff, thresholdBytes, thresholdAllocs, triggeredByBytes, triggeredByAllocs)
 	}
 	newPaths := f.globalCoverage.Merge(cov)
 	if newPaths > 0 {

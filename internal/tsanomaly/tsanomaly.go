@@ -338,16 +338,6 @@ func (d *Detector) UpdateConfig(cfg Config) error {
 	return nil
 }
 
-func gcd(a, b int) int {
-	for b != 0 {
-		a, b = b, a%b
-	}
-	if a < 0 {
-		return -a
-	}
-	return a
-}
-
 func (d *Detector) addLocked(point *DataPoint) (*AnomalyEvent, error) {
 	if point == nil {
 		return nil, ErrNilDataPoint

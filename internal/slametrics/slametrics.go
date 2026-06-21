@@ -352,7 +352,7 @@ func (s *SLAMetrics) GetViolationEventsByRecordedAt(start, end time.Time) []Viol
 	return result
 }
 
-func (s *SLAMetrics) GetViolationEventsByWindow(window TimeWindow) ([]ViolationEvent, error) {
+func (s *SLAMetrics) GetViolationEventsByWindow(window TimeWindow) []ViolationEvent {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -362,12 +362,7 @@ func (s *SLAMetrics) GetViolationEventsByWindow(window TimeWindow) ([]ViolationE
 			result = append(result, e)
 		}
 	}
-
-	if len(result) == 0 {
-		return nil, ErrWindowNotFound
-	}
-
-	return result, nil
+	return result
 }
 
 func (s *SLAMetrics) GetViolationEventsByWindowRange(windowStart, windowEnd time.Time) []ViolationEvent {
