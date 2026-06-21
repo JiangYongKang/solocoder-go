@@ -77,7 +77,7 @@ func (b *Bucket) refill() {
 		return
 	}
 
-	currentRate := b.currentRate(now)
+	currentRate := b.currentRateLocked(now)
 	added := elapsed.Seconds() * currentRate
 	b.tokens += added
 	if b.tokens > b.capacity {
@@ -93,6 +93,20 @@ func (b *Bucket) currentRate(now time.Time) float64 {
 
 	elapsed := now.Sub(b.warmupStartTime)
 	if elapsed >= b.warmupDuration {
+		return b.rate
+	}
+
+	progress := float64(elapsed) / float64(b.warmupDuration)
+	return b.warmupStartRate + (b.rate-b.warmupStartRate)*progress
+}
+
+func (b *Bucket) currentRateLocked(now time.Time) float64 {
+	if !b.warmup {
+		return b.rate
+	}
+
+	elapsed := now.Sub(b.warmupStartTime)
+	if elapsed >= b.warmupDuration {
 		b.warmup = false
 		return b.rate
 	}
@@ -102,12 +116,13 @@ func (b *Bucket) currentRate(now time.Time) float64 {
 }
 
 func (b *Bucket) Take(count float64) Result {
-	if count <= 0 {
-		return Result{Allowed: true, Remaining: b.tokens}
-	}
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if count <= 0 {
+		b.refill()
+		return Result{Allowed: true, Remaining: b.tokens}
+	}
 
 	b.refill()
 
@@ -117,7 +132,7 @@ func (b *Bucket) Take(count float64) Result {
 	}
 
 	now := time.Now()
-	currentRate := b.currentRate(now)
+	currentRate := b.currentRateLocked(now)
 	deficit := count - b.tokens
 	var retryAfter time.Duration
 	if currentRate > 0 {
@@ -178,20 +193,17 @@ func (b *Bucket) Rate() float64 {
 func (b *Bucket) CurrentRate() float64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.currentRate(time.Now())
+	return b.currentRateLocked(time.Now())
 }
 
 func (b *Bucket) IsWarmingUp() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.warmup {
-		b.currentRate(time.Now())
+	if !b.warmup {
+		return false
 	}
-	return b.warmup
-}
-
-type LimiterConfig struct {
-	DefaultBucket BucketConfig
+	elapsed := time.Now().Sub(b.warmupStartTime)
+	return elapsed < b.warmupDuration
 }
 
 type Limiter struct {
@@ -236,9 +248,6 @@ func (l *Limiter) Take(key string, count float64) (Result, error) {
 	if key == "" {
 		return Result{}, ErrEmptyKey
 	}
-	if count <= 0 {
-		return Result{Allowed: true}, nil
-	}
 
 	b, err := l.getOrCreateBucket(key)
 	if err != nil {
@@ -249,9 +258,6 @@ func (l *Limiter) Take(key string, count float64) (Result, error) {
 }
 
 func (l *Limiter) TakeMulti(keys []string, count float64) (Result, error) {
-	if count <= 0 {
-		return Result{Allowed: true}, nil
-	}
 	if len(keys) == 0 {
 		return Result{Allowed: true}, nil
 	}
@@ -262,13 +268,34 @@ func (l *Limiter) TakeMulti(keys []string, count float64) (Result, error) {
 		}
 	}
 
-	buckets := make([]*Bucket, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	uniqueKeys := make([]string, 0, len(keys))
 	for _, key := range keys {
+		if _, exists := seen[key]; !exists {
+			seen[key] = struct{}{}
+			uniqueKeys = append(uniqueKeys, key)
+		}
+	}
+
+	buckets := make([]*Bucket, 0, len(uniqueKeys))
+	for _, key := range uniqueKeys {
 		b, err := l.getOrCreateBucket(key)
 		if err != nil {
 			return Result{}, err
 		}
 		buckets = append(buckets, b)
+	}
+
+	if count <= 0 {
+		var worstResult Result
+		worstResult.Allowed = true
+		for i, b := range buckets {
+			r := b.Take(count)
+			if i == 0 || r.Remaining < worstResult.Remaining {
+				worstResult.Remaining = r.Remaining
+			}
+		}
+		return worstResult, nil
 	}
 
 	var worstResult Result
@@ -333,12 +360,15 @@ func (l *Limiter) SetAllRates(rate float64) error {
 		return ErrInvalidRate
 	}
 
-	l.mu.RLock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.config.Rate = rate
+
 	buckets := make([]*Bucket, 0, len(l.buckets))
 	for _, b := range l.buckets {
 		buckets = append(buckets, b)
 	}
-	l.mu.RUnlock()
 
 	for _, b := range buckets {
 		if err := b.SetRate(rate); err != nil {
@@ -353,12 +383,15 @@ func (l *Limiter) SetAllCapacities(capacity float64) error {
 		return ErrInvalidCapacity
 	}
 
-	l.mu.RLock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.config.Capacity = capacity
+
 	buckets := make([]*Bucket, 0, len(l.buckets))
 	for _, b := range l.buckets {
 		buckets = append(buckets, b)
 	}
-	l.mu.RUnlock()
 
 	for _, b := range buckets {
 		if err := b.SetCapacity(capacity); err != nil {

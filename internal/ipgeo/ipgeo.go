@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/bits"
 	"net"
 	"os"
 	"sort"
@@ -74,13 +73,9 @@ type cidrEntry struct {
 	GeoInfo    *GeoInfo
 }
 
-type sortedIndex struct {
-	entries   []cidrEntry
-	count     int
-}
-
 type ipIndex struct {
 	byStartIP []cidrEntry
+	maxEndIP  []uint32
 }
 
 type Engine struct {
@@ -168,27 +163,22 @@ func parseDataLine(line string) (*cidrEntry, error) {
 	if len(parts) >= 2 {
 		geo.Country = strings.TrimSpace(parts[1])
 		geo.Names.Country["zh-CN"] = geo.Country
-		geo.Names.Country["en"] = geo.Country
 	}
 	if len(parts) >= 3 {
 		geo.Province = strings.TrimSpace(parts[2])
 		geo.Names.Province["zh-CN"] = geo.Province
-		geo.Names.Province["en"] = geo.Province
 	}
 	if len(parts) >= 4 {
 		geo.City = strings.TrimSpace(parts[3])
 		geo.Names.City["zh-CN"] = geo.City
-		geo.Names.City["en"] = geo.City
 	}
 	if len(parts) >= 5 {
 		geo.District = strings.TrimSpace(parts[4])
 		geo.Names.District["zh-CN"] = geo.District
-		geo.Names.District["en"] = geo.District
 	}
 	if len(parts) >= 6 {
 		geo.ISP = strings.TrimSpace(parts[5])
 		geo.Names.ISP["zh-CN"] = geo.ISP
-		geo.Names.ISP["en"] = geo.ISP
 	}
 
 	for i := 6; i < len(parts); i++ {
@@ -236,8 +226,22 @@ func buildIndex(entries []cidrEntry) *ipIndex {
 		return entries[i].PrefixLen > entries[j].PrefixLen
 	})
 
+	n := len(entries)
+	maxEndIP := make([]uint32, n)
+	if n > 0 {
+		maxEndIP[0] = entries[0].EndIP
+		for i := 1; i < n; i++ {
+			if entries[i].EndIP > maxEndIP[i-1] {
+				maxEndIP[i] = entries[i].EndIP
+			} else {
+				maxEndIP[i] = maxEndIP[i-1]
+			}
+		}
+	}
+
 	return &ipIndex{
 		byStartIP: entries,
+		maxEndIP:  maxEndIP,
 	}
 }
 
@@ -376,6 +380,9 @@ func (e *Engine) findLongestPrefixMatch(idx *ipIndex, targetIP uint32) *cidrEntr
 	pos--
 
 	for i := pos; i >= 0; i-- {
+		if idx.maxEndIP[i] < targetIP {
+			break
+		}
 		entry := &entries[i]
 		if entry.PrefixLen <= bestPrefixLen {
 			continue
@@ -515,8 +522,4 @@ func (e *Engine) HotReloadFromData(data []string) error {
 	e.currentIdx.Store(newIdx)
 
 	return nil
-}
-
-func CountLeadingZeros32(x uint32) int {
-	return bits.LeadingZeros32(x)
 }

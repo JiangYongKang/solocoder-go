@@ -20,11 +20,15 @@ const (
 	timestampShift uint8 = sequenceBits + machineIDBits
 
 	clockBackwardSmallMaxMs int64 = 5
+	waitUntilNextMsMaxMs    int64 = 200
+	sequenceOverflowMaxMs   int64 = 200
 )
 
 var (
 	ErrInvalidMachineID = errors.New("snowflake: machine id out of range")
 	ErrClockBackward     = errors.New("snowflake: clock moved backward")
+	ErrClockBackwardMax  = errors.New("snowflake: clock moved backward beyond maximum wait")
+	ErrSequenceOverflow  = errors.New("snowflake: sequence overflowed within same millisecond")
 )
 
 type ID int64
@@ -67,7 +71,9 @@ func (s *Snowflake) Next() (ID, error) {
 			offset := s.lastTS - now
 			if offset <= clockBackwardSmallMaxMs {
 				s.mu.Unlock()
-				time.Sleep(time.Duration(offset) * time.Millisecond)
+				if s.waitUntilNextMs(s.lastTS, waitUntilNextMsMaxMs) {
+					return 0, fmt.Errorf("%w: offset %dms, exceeded max wait %dms", ErrClockBackwardMax, offset, waitUntilNextMsMaxMs)
+				}
 				continue
 			}
 			s.mu.Unlock()
@@ -77,7 +83,9 @@ func (s *Snowflake) Next() (ID, error) {
 		if now == s.lastTS {
 			if s.sequence >= maxSequence {
 				s.mu.Unlock()
-				s.waitUntilNextMs(s.lastTS)
+				if s.waitUntilNextMs(s.lastTS, sequenceOverflowMaxMs) {
+					return 0, fmt.Errorf("%w: sequence reached max %d, clock did not advance after %dms", ErrSequenceOverflow, maxSequence, sequenceOverflowMaxMs)
+				}
 				continue
 			}
 			s.sequence++
@@ -96,10 +104,16 @@ func (s *Snowflake) timestamp() int64 {
 	return s.nowFunc().UnixMilli() - epoch
 }
 
-func (s *Snowflake) waitUntilNextMs(lastTS int64) {
-	for s.timestamp() <= lastTS {
+func (s *Snowflake) waitUntilNextMs(targetTS int64, maxWaitMs int64) bool {
+	start := time.Now()
+	timeout := time.Duration(maxWaitMs) * time.Millisecond
+	for s.timestamp() <= targetTS {
+		if time.Since(start) >= timeout {
+			return true
+		}
 		time.Sleep(100 * time.Microsecond)
 	}
+	return false
 }
 
 func Parse(id ID) ParsedID {

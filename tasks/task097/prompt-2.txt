@@ -1,0 +1,9 @@
+你实现的短链接生成模块存在一些问题，需要修复：
+
+1. generateWithHash 方法中计算起始位置时，当哈希算法的十六进制输出长度与配置的短码长度相等时除数变为零。例如 SHA256 输出 64 位十六进制字符，Length 配置为 64 时除法运算触发运行时 panic。NewManagerWithConfig 中 Length 校验允许 64 为合法值。
+
+2. ErrMaxRetriesZeroOrNegative、ErrHashLengthInvalid、ErrRandomLengthInvalid、ErrInvalidCharset 四个错误变量已定义，但 NewManagerWithConfig 对所有非法配置值全部采用静默替换默认值的策略，从未返回这些错误。调用方传入非法配置后无法感知配置被修改。
+
+3. generateWithRandom 方法使用取模运算将随机字节映射到字符集下标，当字符集长度不能整除 256 时存在取模偏差，部分字符出现概率略高于其他字符。
+
+4. 修复后运行 go test ./internal/shortlink/ -v，需要让所有测试通过。

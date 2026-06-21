@@ -26,6 +26,7 @@ var (
 	ErrRecoveryNotFound  = errors.New("totpauth: recovery code not found")
 	ErrInvalidDigits     = errors.New("totpauth: digits must be between 6 and 8")
 	ErrInvalidPeriod     = errors.New("totpauth: period must be positive")
+	ErrInvalidSecretSize = errors.New("totpauth: secret size must be positive")
 )
 
 type Algorithm int
@@ -67,12 +68,8 @@ type TOTP struct {
 	cfg Config
 }
 
-func NewTOTP() *TOTP {
-	t, err := NewTOTPWithConfig(DefaultConfig())
-	if err != nil {
-		panic("totpauth: DefaultConfig is invalid: " + err.Error())
-	}
-	return t
+func NewTOTP() (*TOTP, error) {
+	return NewTOTPWithConfig(DefaultConfig())
 }
 
 func NewTOTPWithConfig(cfg Config) (*TOTP, error) {
@@ -86,7 +83,7 @@ func NewTOTPWithConfig(cfg Config) (*TOTP, error) {
 		return nil, ErrInvalidConfig
 	}
 	if cfg.SecretSize <= 0 {
-		cfg.SecretSize = DefaultSecretSize
+		return nil, ErrInvalidSecretSize
 	}
 
 	return &TOTP{

@@ -1,0 +1,7 @@
+你实现的 MIME 类型检测模块存在一些问题，需要修复：
+
+1. builtInSignatures 中 image/webp、audio/wav、audio/x-wav 三条签名使用完全相同的魔术字。DetectFromBytes 对内置签名采用顺序扫描返回首个命中的策略，WAV 文件的前四字节被第一顺位的 image/webp 捕获，导致 WAV 被错误识别为 WebP。RIFF 容器前缀被多个格式共享，仅凭前四字节无法区分。
+
+2. ErrNilMagicSignature 错误变量已声明但从未在任何函数中被返回。RegisterMagicSignature 的参数类型决定了调用方无法传入 nil 值，该错误的触发路径在结构上不可达，属于死代码。
+
+3. 修复后运行 go test ./internal/mimedetect/ -v，需要让所有测试通过。

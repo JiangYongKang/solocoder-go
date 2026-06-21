@@ -1,0 +1,9 @@
+你实现的 TOTP 认证模块存在一些问题，需要修复：
+
+1. TestDifferentAlgorithms 测试函数声明了期待验证码的期望值字段，但只通过日志输出实际生成码而未执行相等性断言。SHA256 和 SHA512 的期望值与测试中实际密钥生成的代码不符，三种哈希算法的正确性验证形同虚设。
+
+2. NewTOTP 函数中调用 NewTOTPWithConfig 后对错误执行 panic，但默认配置的所有字段都是硬编码常量，在校验逻辑中永远不会触发错误分支。如果未来有人修改默认配置为非法值，应用初始化时会直接崩溃而非优雅返回错误。
+
+3. NewTOTPWithConfig 中对不同类型配置项的处理策略不统一：Digits 超出范围返回错误、Period 非正返回错误、DriftWindows 为负返回错误，但 SecretSize 小于等于零时却静默修正为默认值而不返回错误。
+
+4. 修复后运行 go test ./internal/totpauth/ -v，需要让所有测试通过。

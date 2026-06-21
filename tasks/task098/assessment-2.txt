@@ -1,0 +1,6 @@
+产物不满意：
+1. Next 方法中小幅时钟回拨路径在 `s.mu.Unlock()` 之后立即调用 `s.waitUntilNextMs(s.lastTS, ...)`，此时 `s.lastTS` 的读取已脱离互斥锁保护范围。另一 goroutine 持锁写入 `s.lastTS` 的更新值时，此处无锁读与持锁写构成数据竞态，在 `go test -race` 下会被检测报错。虽功能层面读到更新后的更大时间戳不会导致业务错误，但违反 Go 内存模型使程序存在未定义行为。正确做法是在持锁状态下将 `s.lastTS` 拷贝到局部变量例如 `snapshotTS`，解锁后再以局部变量传入 `waitUntilNextMs`。
+过程不满意：
+1. 模型在收到提示词后第一时间未做任何代码或文档分析，直接调用 todo_write 创建了包含 Fix waitUntilNextMs、Fix clock backward、Fix sequence overflow 等 5 项子任务的工作计划。在此之后才通过 file_search 搜索 snowflake 目录文件并用 view_files 逐步阅读 snowflake.go 和 snowflake_test.go 的源码，此时对代码的实际缺陷分布和模块内部耦合关系完全不了解，创建的计划粒度划分与后续实际执行的编辑步骤自然不匹配。正确做法是先阅读需求文档和现有代码骨架，理清问题范围和模块边界之后再制定执行计划。
+2. 模型在编辑 snowflake.go 时，第一轮修改 Next 方法中小幅回拨和序列号溢出两条路径的 `waitUntilNextMs` 调用，将返回值的 true/false 语义写反——把「成功等到时钟推进」当作超时错误返回，把「超时」当作成功继续循环。模型随后在未运行测试的情况下自行发现逻辑翻转并修正，但暴露出初版修改缺乏对方法契约的严谨校验，属于未经验证就提交代码的典型行为。
+3. 模型在添加超时常量时将 `waitUntilNextMsMaxMs` 初始设为 10ms，随后在分析测试场景时意识到 `TestNext_SequenceExhaustion_WaitsForNextMS` 需要在测试 sleep 50ms 后仍能等待到时钟推进，10ms 远远不够，才调整为 200ms。初始值的选择缺乏对测试用例中使用的 `time.Sleep(50ms)` 等时序机制的前置分析，属于试错式手动调整而非推理驱动的精准参数设置。

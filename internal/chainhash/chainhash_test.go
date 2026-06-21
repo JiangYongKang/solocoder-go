@@ -358,6 +358,80 @@ func TestUpdateNodeWeight(t *testing.T) {
 		}
 	})
 
+	t.Run("decrease weight", func(t *testing.T) {
+		hr2, _ := NewHashRing(10)
+		hr2.AddNode("nodeA", 3)
+		hr2.AddNode("nodeB", 1)
+		hr2.SetTotalKeys(1000000)
+
+		beforeMapping := make(map[string]string)
+		for i := 0; i < 1000; i++ {
+			key := fmt.Sprintf("testkey%d", i)
+			node, _ := hr2.GetNode(key)
+			beforeMapping[key] = node
+		}
+
+		migrations, err := hr2.UpdateNodeWeight("nodeA", 1)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+
+		info, _ := hr2.GetNodeInfo("nodeA")
+		if info.Weight != 1 {
+			t.Errorf("expected weight 1, got %d", info.Weight)
+		}
+
+		expectedVN := 10*1 + 10*1
+		if hr2.VirtualNodeCount() != expectedVN {
+			t.Errorf("expected %d virtual nodes, got %d", expectedVN, hr2.VirtualNodeCount())
+		}
+
+		if len(migrations) == 0 {
+			t.Errorf("expected migration info for weight decrease")
+		}
+
+		hasRemovedMigration := false
+		totalMigrated := int64(0)
+		for _, m := range migrations {
+			if m.FromNode == "nodeA" && m.ToNode != "nodeA" {
+				hasRemovedMigration = true
+				totalMigrated += m.EstimatedCount
+			}
+		}
+		if !hasRemovedMigration {
+			t.Errorf("expected migration from nodeA to other nodes (removedRanges)")
+		}
+		if totalMigrated <= 0 {
+			t.Errorf("expected positive estimated count for removed ranges")
+		}
+
+		migratedKeys := 0
+		stableKeys := 0
+		for i := 0; i < 1000; i++ {
+			key := fmt.Sprintf("testkey%d", i)
+			oldNode := beforeMapping[key]
+			newNode, _ := hr2.GetNode(key)
+
+			if oldNode == "nodeA" && newNode != "nodeA" {
+				migratedKeys++
+			} else if oldNode == newNode {
+				stableKeys++
+			}
+		}
+
+		if migratedKeys == 0 {
+			t.Errorf("expected some keys to migrate away from nodeA after weight decrease")
+		}
+
+		expectedMigratedRatio := (3.0/4.0 - 1.0/2.0)
+		actualMigratedRatio := float64(migratedKeys) / 1000.0
+		tolerance := 0.15
+		if abs(actualMigratedRatio-expectedMigratedRatio) > tolerance {
+			t.Logf("migration ratio %.4f differs from expected %.4f (within tolerance %.4f)",
+				actualMigratedRatio, expectedMigratedRatio, tolerance)
+		}
+	})
+
 	t.Run("non-existent node", func(t *testing.T) {
 		_, err := hr.UpdateNodeWeight("non-existent", 2)
 		if err != ErrNodeNotFound {
@@ -525,6 +599,59 @@ func TestSerialization(t *testing.T) {
 			t.Errorf("expected totalKeys 100000, got %d", snapshot.TotalKeys)
 		}
 
+		t.Run("verify vnode index field", func(t *testing.T) {
+			node1VNodes := make([]VirtualNode, 0)
+			node2VNodes := make([]VirtualNode, 0)
+			for _, vn := range snapshot.VNodes {
+				switch vn.NodeID {
+				case "node1":
+					node1VNodes = append(node1VNodes, vn)
+				case "node2":
+					node2VNodes = append(node2VNodes, vn)
+				}
+			}
+
+			if len(node1VNodes) != 50*2 {
+				t.Errorf("expected %d vnodes for node1, got %d", 50*2, len(node1VNodes))
+			}
+			if len(node2VNodes) != 50*3 {
+				t.Errorf("expected %d vnodes for node2, got %d", 50*3, len(node2VNodes))
+			}
+
+			indexSet1 := make(map[int]bool)
+			for _, vn := range node1VNodes {
+				if vn.Index < 0 || vn.Index >= 50*2 {
+					t.Errorf("node1 vnode index %d out of range [0, %d)", vn.Index, 50*2)
+				}
+				if indexSet1[vn.Index] {
+					t.Errorf("node1 has duplicate vnode index %d", vn.Index)
+				}
+				indexSet1[vn.Index] = true
+			}
+
+			indexSet2 := make(map[int]bool)
+			for _, vn := range node2VNodes {
+				if vn.Index < 0 || vn.Index >= 50*3 {
+					t.Errorf("node2 vnode index %d out of range [0, %d)", vn.Index, 50*3)
+				}
+				if indexSet2[vn.Index] {
+					t.Errorf("node2 has duplicate vnode index %d", vn.Index)
+				}
+				indexSet2[vn.Index] = true
+			}
+
+			for i := 0; i < 50*2; i++ {
+				if !indexSet1[i] {
+					t.Errorf("node1 missing vnode index %d", i)
+				}
+			}
+			for i := 0; i < 50*3; i++ {
+				if !indexSet2[i] {
+					t.Errorf("node2 missing vnode index %d", i)
+				}
+			}
+		})
+
 		hr2, _ := NewHashRing(10)
 		err := hr2.Restore(snapshot)
 		if err != nil {
@@ -673,6 +800,69 @@ func TestConcurrency(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	t.Run("verify node count", func(t *testing.T) {
+		nodeCount := hr.NodeCount()
+		if nodeCount < 0 {
+			t.Errorf("node count should not be negative, got %d", nodeCount)
+		}
+	})
+
+	t.Run("verify ring sorted", func(t *testing.T) {
+		if !sort.SliceIsSorted(hr.ring, func(i, j int) bool {
+			return hr.ring[i] < hr.ring[j]
+		}) {
+			t.Errorf("ring should be sorted after concurrent operations")
+		}
+
+		prev := uint64(0)
+		for idx, h := range hr.ring {
+			if idx > 0 && h < prev {
+				t.Errorf("ring not sorted at index %d: %d < %d", idx, h, prev)
+			}
+			prev = h
+		}
+	})
+
+	t.Run("verify vnodeMap and ring consistency", func(t *testing.T) {
+		if len(hr.ring) != len(hr.vnodeMap) {
+			t.Errorf("ring length %d should equal vnodeMap length %d", len(hr.ring), len(hr.vnodeMap))
+		}
+
+		for _, hash := range hr.ring {
+			if _, exists := hr.vnodeMap[hash]; !exists {
+				t.Errorf("ring hash %d not found in vnodeMap", hash)
+			}
+		}
+
+		ringSet := make(map[uint64]struct{}, len(hr.ring))
+		for _, h := range hr.ring {
+			ringSet[h] = struct{}{}
+		}
+		for hash := range hr.vnodeMap {
+			if _, exists := ringSet[hash]; !exists {
+				t.Errorf("vnodeMap hash %d not found in ring", hash)
+			}
+		}
+	})
+
+	t.Run("verify vnodeMap references valid nodes", func(t *testing.T) {
+		for hash, nodeID := range hr.vnodeMap {
+			if !hr.NodeExists(nodeID) {
+				t.Errorf("vnode hash %d references non-existent node %s", hash, nodeID)
+			}
+		}
+	})
+
+	t.Run("verify virtual node count matches weight", func(t *testing.T) {
+		expectedTotal := 0
+		for _, node := range hr.nodes {
+			expectedTotal += hr.virtualNodes * node.Weight
+		}
+		if hr.VirtualNodeCount() != expectedTotal {
+			t.Errorf("expected %d virtual nodes, got %d", expectedTotal, hr.VirtualNodeCount())
+		}
+	})
 }
 
 func TestRingOrder(t *testing.T) {

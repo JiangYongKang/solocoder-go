@@ -128,27 +128,28 @@ type Manager struct {
 }
 
 func NewManager() *Manager {
-	return NewManagerWithConfig(DefaultConfig())
+	m, _ := NewManagerWithConfig(DefaultConfig())
+	return m
 }
 
-func NewManagerWithConfig(cfg Config) *Manager {
+func NewManagerWithConfig(cfg Config) (*Manager, error) {
 	if cfg.HashConfig.Algorithm == "" {
 		cfg.HashConfig.Algorithm = HashMD5
 	}
 	if cfg.HashConfig.Length <= 0 || cfg.HashConfig.Length > 64 {
-		cfg.HashConfig.Length = defaultHashLen
+		return nil, ErrHashLengthInvalid
 	}
 	if cfg.HashConfig.MaxRetries <= 0 {
-		cfg.HashConfig.MaxRetries = defaultMaxRetries
+		return nil, ErrMaxRetriesZeroOrNegative
 	}
 	if cfg.RandomConfig.Length <= 0 {
-		cfg.RandomConfig.Length = defaultRandomLen
+		return nil, ErrRandomLengthInvalid
 	}
 	if cfg.RandomConfig.Charset == "" {
-		cfg.RandomConfig.Charset = defaultRandomCharset
+		return nil, ErrInvalidCharset
 	}
 	if cfg.RandomConfig.MaxRetries <= 0 {
-		cfg.RandomConfig.MaxRetries = defaultMaxRetries
+		return nil, ErrMaxRetriesZeroOrNegative
 	}
 	if cfg.AutoIncrement.StartID < 0 {
 		cfg.AutoIncrement.StartID = 1
@@ -162,7 +163,7 @@ func NewManagerWithConfig(cfg Config) *Manager {
 		cfg:   cfg,
 	}
 	m.autoIncrement.Store(cfg.AutoIncrement.StartID - 1)
-	return m
+	return m, nil
 }
 
 func base62Encode(num int64) string {
@@ -238,14 +239,25 @@ func (m *Manager) generateWithHash(originalURL string, config HashStrategyConfig
 		hashBytes := h.Sum(nil)
 		hashHex := hex.EncodeToString(hashBytes)
 
-		startPos := (attempt * 2) % (len(hashHex) - config.Length)
+		var startPos int
+		if config.Length >= len(hashHex) {
+			startPos = 0
+		} else {
+			startPos = (attempt * 2) % (len(hashHex) - config.Length)
+		}
 		if startPos < 0 {
 			startPos = 0
 		}
-		if startPos+config.Length > len(hashHex) {
-			startPos = 0
+		endPos := startPos + config.Length
+		if endPos > len(hashHex) {
+			endPos = len(hashHex)
+			startPos = endPos - config.Length
+			if startPos < 0 {
+				startPos = 0
+				endPos = len(hashHex)
+			}
 		}
-		shortCode := hashHex[startPos : startPos+config.Length]
+		shortCode := hashHex[startPos:endPos]
 
 		m.mu.RLock()
 		_, exists := m.links[shortCode]
@@ -260,16 +272,23 @@ func (m *Manager) generateWithHash(originalURL string, config HashStrategyConfig
 
 func (m *Manager) generateWithRandom(config RandomStrategyConfig) (string, error) {
 	charsetLen := len(config.Charset)
-	for attempt := 0; attempt < config.MaxRetries; attempt++ {
-		bytes := make([]byte, config.Length)
-		_, err := rand.Read(bytes)
-		if err != nil {
-			return "", err
-		}
+	maxByte := 255 - (256 % charsetLen)
+	buf := make([]byte, 1)
 
+	for attempt := 0; attempt < config.MaxRetries; attempt++ {
 		shortCode := make([]byte, config.Length)
-		for i := 0; i < config.Length; i++ {
-			shortCode[i] = config.Charset[int(bytes[i])%charsetLen]
+		idx := 0
+		for idx < config.Length {
+			_, err := rand.Read(buf)
+			if err != nil {
+				return "", err
+			}
+			b := buf[0]
+			if int(b) > maxByte {
+				continue
+			}
+			shortCode[idx] = config.Charset[int(b)%charsetLen]
+			idx++
 		}
 		code := string(shortCode)
 

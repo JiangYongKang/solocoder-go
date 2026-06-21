@@ -25,11 +25,17 @@ func (hr *HashRing) Snapshot() *RingSnapshot {
 	})
 
 	vnodes := make([]VirtualNode, 0, len(hr.vnodeMap))
-	for hash, nodeID := range hr.vnodeMap {
-		vnodes = append(vnodes, VirtualNode{
-			Hash:   hash,
-			NodeID: nodeID,
-		})
+	for _, node := range hr.nodes {
+		vnCount := hr.calculateVirtualNodeCount(node.Weight)
+		for i := 0; i < vnCount; i++ {
+			virtualKey := generateVirtualKey(node.ID, i)
+			hash := hashKey(virtualKey)
+			vnodes = append(vnodes, VirtualNode{
+				Hash:   hash,
+				NodeID: node.ID,
+				Index:  i,
+			})
+		}
 	}
 
 	sort.Slice(vnodes, func(i, j int) bool {

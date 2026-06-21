@@ -1,4 +1,4 @@
-package diffpatch
+﻿package diffpatch
 
 import (
 	"fmt"
@@ -91,8 +91,7 @@ func diffToChanges(diffResult *DiffResult) []change {
 					deleted = 0
 					inserted = nil
 				}
-				changeStart = line.OldLineNo
-			}
+				changeStart = line.OldLineNo - 1			}
 		}
 
 		if deleted > 0 || len(inserted) > 0 {
@@ -277,3 +276,5 @@ func FormatConflict(conflict ConflictRange) string {
 	sb.WriteString(">>>>>>> theirs\n")
 	return sb.String()
 }
+
+

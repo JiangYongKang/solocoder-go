@@ -1,0 +1,9 @@
+﻿产物不满意：
+无
+
+过程不满意：
+1. 模型在收到提示词后未经分析就直接用 todo_write 创建了 4 项子任务计划，之后才开始阅读 totpauth.go 和 totpauth_test.go 源文件。计划内容直接照搬提示词中的 4 个编号项，没有结合代码实际状态做针对性拆解和排序。这属于典型的先规划后理解行为，正确做法是先完整阅读两个源文件，理清每个缺陷涉及的具体函数和影响范围后再制定分步执行计划。
+
+2. 模型使用 replace_all 将测试文件中所有 totp := NewTOTP() 批量替换为 totp, err := NewTOTP()，这次全局替换破坏了 TestEdgeCases 的缩进，并在 TestGenerateCode、TestValidateCode 等 6 个函数中触发了 err 变量重复声明的编译错误，模型随后不得不多次往返修复这些连锁问题。正确做法是先审查各调用点上下文，识别 err 是否已在上层作用域声明，再有针对性地修改，而非全局无差别文本替换。
+
+3. 模型在完成 NewTOTPWithConfig 中 SecretSize 校验逻辑修改后首次运行 go test，TestNewTOTPWithConfig_ValidConfigs 测试失败，因为其中 8 个测试用例的 Config 结构体缺少新增的 SecretSize 必填字段。这反映出模型修改生产代码时没有同步排查所有受影响测试用例。正确做法是在修改校验逻辑后系统性扫描所有构造 Config 的用例，确保新增必填字段在所有测试路径中提供了合法值，而非等测试失败后再被动补字段。

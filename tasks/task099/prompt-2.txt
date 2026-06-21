@@ -1,0 +1,15 @@
+你实现的令牌桶限流模块存在一些问题，需要修复：
+
+1. Bucket.Take 方法在 count 小于等于零时直接返回未持锁状态下的 tokens 值，其他 goroutine 正在扣减或归还令牌时形成数据竞态。
+
+2. IsWarmingUp 是一个对外声明为只读的查询方法，但内部调用会修改 warmup 状态字段。调用方可能在非预期时机触发预热状态被提前终止。
+
+3. SetAllRates 和 SetAllCapacities 方法先获取所有桶的快照再逐一修改，获取快照和修改之间存在时间窗口，期间新创建的桶不会收到速率或容量变更。
+
+4. TakeMulti 方法未对传入的键做去重处理，重复的键会导致同一个桶被双重扣减令牌。
+
+5. Limiter.Take 方法在 count 小于等于零时返回的 Remaining 为零值，与 Bucket.Take 同分支返回实际剩余令牌的行为不一致。
+
+6. LimiterConfig 结构体已定义但在包内未被任何函数使用，属于死代码。
+
+7. 修复后运行 go test ./internal/tokenbucket/ -v，需要让所有测试通过。

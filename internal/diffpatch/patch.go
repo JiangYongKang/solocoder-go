@@ -65,6 +65,33 @@ func ParsePatch(patchText string) (*Patch, error) {
 	var currentHunk *Hunk
 	i := 0
 
+	finalizeHunk := func() error {
+		if currentHunk == nil {
+			return nil
+		}
+		actualOld := 0
+		actualNew := 0
+		for _, line := range currentHunk.Lines {
+			switch line.Type {
+			case LineEqual:
+				actualOld++
+				actualNew++
+			case LineDelete:
+				actualOld++
+			case LineInsert:
+				actualNew++
+			}
+		}
+		if actualOld != currentHunk.OldCount {
+			return fmt.Errorf("%w: hunk declares old count %d but has %d old-side lines", ErrInvalidPatch, currentHunk.OldCount, actualOld)
+		}
+		if actualNew != currentHunk.NewCount {
+			return fmt.Errorf("%w: hunk declares new count %d but has %d new-side lines", ErrInvalidPatch, currentHunk.NewCount, actualNew)
+		}
+		hunks = append(hunks, *currentHunk)
+		return nil
+	}
+
 	for i < len(lines) {
 		line := lines[i]
 
@@ -81,8 +108,8 @@ func ParsePatch(patchText string) (*Patch, error) {
 		}
 
 		if strings.HasPrefix(line, "@@ ") {
-			if currentHunk != nil {
-				hunks = append(hunks, *currentHunk)
+			if err := finalizeHunk(); err != nil {
+				return nil, err
 			}
 
 			hunk, err := parseHunkHeader(line)
@@ -110,14 +137,16 @@ func ParsePatch(patchText string) (*Patch, error) {
 					Content: line[1:],
 					Type:    LineEqual,
 				})
+			} else {
+				return nil, fmt.Errorf("%w: unrecognized line prefix in hunk: %q", ErrInvalidPatch, line)
 			}
 		}
 
 		i++
 	}
 
-	if currentHunk != nil {
-		hunks = append(hunks, *currentHunk)
+	if err := finalizeHunk(); err != nil {
+		return nil, err
 	}
 
 	if header.OldFile == "" && header.NewFile == "" && len(hunks) == 0 {

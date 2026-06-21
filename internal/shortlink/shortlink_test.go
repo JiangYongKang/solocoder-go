@@ -20,11 +20,13 @@ func TestNewManager(t *testing.T) {
 }
 
 func TestNewManagerWithConfig(t *testing.T) {
-	cfg := Config{
-		AutoIncrement:   AutoIncrementConfig{StartID: 100},
-		DefaultStrategy: StrategyAutoIncrement,
+	cfg := DefaultConfig()
+	cfg.AutoIncrement = AutoIncrementConfig{StartID: 100}
+	cfg.DefaultStrategy = StrategyAutoIncrement
+	m, err := NewManagerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewManagerWithConfig returned error: %v", err)
 	}
-	m := NewManagerWithConfig(cfg)
 	if m == nil {
 		t.Fatal("NewManagerWithConfig returned nil")
 	}
@@ -50,25 +52,125 @@ func TestNewManagerWithConfig(t *testing.T) {
 }
 
 func TestNewManagerWithConfigDefaults(t *testing.T) {
+	tests := []struct {
+		name      string
+		cfg       Config
+		expectErr error
+	}{
+		{
+			name: "invalid hash length zero",
+			cfg: Config{
+				HashConfig: HashStrategyConfig{Length: 0, MaxRetries: 10},
+				RandomConfig: RandomStrategyConfig{Length: 8, Charset: "abc", MaxRetries: 10},
+			},
+			expectErr: ErrHashLengthInvalid,
+		},
+		{
+			name: "invalid hash length negative",
+			cfg: Config{
+				HashConfig: HashStrategyConfig{Length: -1, MaxRetries: 10},
+				RandomConfig: RandomStrategyConfig{Length: 8, Charset: "abc", MaxRetries: 10},
+			},
+			expectErr: ErrHashLengthInvalid,
+		},
+		{
+			name: "invalid hash length too large",
+			cfg: Config{
+				HashConfig: HashStrategyConfig{Length: 65, MaxRetries: 10},
+				RandomConfig: RandomStrategyConfig{Length: 8, Charset: "abc", MaxRetries: 10},
+			},
+			expectErr: ErrHashLengthInvalid,
+		},
+		{
+			name: "invalid hash max retries zero",
+			cfg: Config{
+				HashConfig: HashStrategyConfig{Length: 8, MaxRetries: 0},
+				RandomConfig: RandomStrategyConfig{Length: 8, Charset: "abc", MaxRetries: 10},
+			},
+			expectErr: ErrMaxRetriesZeroOrNegative,
+		},
+		{
+			name: "invalid hash max retries negative",
+			cfg: Config{
+				HashConfig: HashStrategyConfig{Length: 8, MaxRetries: -1},
+				RandomConfig: RandomStrategyConfig{Length: 8, Charset: "abc", MaxRetries: 10},
+			},
+			expectErr: ErrMaxRetriesZeroOrNegative,
+		},
+		{
+			name: "invalid random length zero",
+			cfg: Config{
+				HashConfig: HashStrategyConfig{Length: 8, MaxRetries: 10},
+				RandomConfig: RandomStrategyConfig{Length: 0, Charset: "abc", MaxRetries: 10},
+			},
+			expectErr: ErrRandomLengthInvalid,
+		},
+		{
+			name: "invalid random length negative",
+			cfg: Config{
+				HashConfig: HashStrategyConfig{Length: 8, MaxRetries: 10},
+				RandomConfig: RandomStrategyConfig{Length: -1, Charset: "abc", MaxRetries: 10},
+			},
+			expectErr: ErrRandomLengthInvalid,
+		},
+		{
+			name: "invalid charset empty",
+			cfg: Config{
+				HashConfig: HashStrategyConfig{Length: 8, MaxRetries: 10},
+				RandomConfig: RandomStrategyConfig{Length: 8, Charset: "", MaxRetries: 10},
+			},
+			expectErr: ErrInvalidCharset,
+		},
+		{
+			name: "invalid random max retries zero",
+			cfg: Config{
+				HashConfig: HashStrategyConfig{Length: 8, MaxRetries: 10},
+				RandomConfig: RandomStrategyConfig{Length: 8, Charset: "abc", MaxRetries: 0},
+			},
+			expectErr: ErrMaxRetriesZeroOrNegative,
+		},
+		{
+			name: "invalid random max retries negative",
+			cfg: Config{
+				HashConfig: HashStrategyConfig{Length: 8, MaxRetries: 10},
+				RandomConfig: RandomStrategyConfig{Length: 8, Charset: "abc", MaxRetries: -5},
+			},
+			expectErr: ErrMaxRetriesZeroOrNegative,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewManagerWithConfig(tt.cfg)
+			if !errors.Is(err, tt.expectErr) {
+				t.Errorf("expected error %v, got %v", tt.expectErr, err)
+			}
+		})
+	}
+}
+
+func TestNewManagerWithConfigValidDefaults(t *testing.T) {
 	cfg := Config{
 		HashConfig: HashStrategyConfig{
-			Length:     0,
-			MaxRetries: -1,
+			Length:     8,
+			MaxRetries: 10,
 		},
 		RandomConfig: RandomStrategyConfig{
-			Length:  0,
-			Charset: "",
-			MaxRetries: 0,
+			Length:     8,
+			Charset:    "0123456789",
+			MaxRetries: 10,
 		},
-		AutoIncrement: AutoIncrementConfig{StartID: -1},
 	}
-	m := NewManagerWithConfig(cfg)
+	m, err := NewManagerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if m == nil {
 		t.Fatal("NewManagerWithConfig returned nil")
 	}
 
-	_, err := m.Create(CreateOptions{
-		Strategy: StrategyRandom,
+	_, err = m.Create(CreateOptions{
+		Strategy:    StrategyRandom,
 		OriginalURL: "https://example.com",
 	})
 	if err != nil {
@@ -303,7 +405,10 @@ func TestCreateHashStrategyDifferentAlgorithms(t *testing.T) {
 		t.Run(string(algo), func(t *testing.T) {
 			cfg := DefaultConfig()
 			cfg.HashConfig.Algorithm = algo
-			m := NewManagerWithConfig(cfg)
+			m, err := NewManagerWithConfig(cfg)
+			if err != nil {
+				t.Fatalf("NewManagerWithConfig failed: %v", err)
+			}
 
 			meta, err := m.Create(CreateOptions{
 				OriginalURL: "https://example.com/test",
@@ -345,7 +450,10 @@ func TestCreateRandomStrategyCustomCharset(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.RandomConfig.Charset = "0123456789"
 	cfg.RandomConfig.Length = 6
-	m := NewManagerWithConfig(cfg)
+	m, err := NewManagerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewManagerWithConfig failed: %v", err)
+	}
 
 	for i := 0; i < 10; i++ {
 		meta, err := m.Create(CreateOptions{
@@ -742,10 +850,12 @@ func TestConcurrentReadWrite(t *testing.T) {
 }
 
 func TestAutoIncrementStartID(t *testing.T) {
-	cfg := Config{
-		AutoIncrement: AutoIncrementConfig{StartID: 1000},
+	cfg := DefaultConfig()
+	cfg.AutoIncrement = AutoIncrementConfig{StartID: 1000}
+	m, err := NewManagerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewManagerWithConfig failed: %v", err)
 	}
-	m := NewManagerWithConfig(cfg)
 
 	meta, err := m.Create(CreateOptions{OriginalURL: "https://example.com"})
 	if err != nil {
@@ -877,5 +987,105 @@ func TestFullWorkflow(t *testing.T) {
 	_, err = m.GetOriginalURL(meta2.ShortCode)
 	if !errors.Is(err, ErrShortCodeNotFound) {
 		t.Error("expected ErrShortCodeNotFound for deleted link")
+	}
+}
+
+func TestGenerateWithHashLengthEqualsHexLength(t *testing.T) {
+	tests := []struct {
+		name   string
+		algo   HashAlgorithm
+		length int
+	}{
+		{"sha256 length 64", HashSHA256, 64},
+		{"sha1 length 40", HashSHA1, 40},
+		{"md5 length 32", HashMD5, 32},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.HashConfig.Algorithm = tt.algo
+			cfg.HashConfig.Length = tt.length
+			m, err := NewManagerWithConfig(cfg)
+			if err != nil {
+				t.Fatalf("NewManagerWithConfig failed: %v", err)
+			}
+
+			meta, err := m.Create(CreateOptions{
+				OriginalURL: "https://example.com/test",
+				Strategy:    StrategyHash,
+			})
+			if err != nil {
+				t.Fatalf("Create with hash strategy failed: %v", err)
+			}
+			if len(meta.ShortCode) != tt.length {
+				t.Errorf("expected shortcode length %d, got %d", tt.length, len(meta.ShortCode))
+			}
+		})
+	}
+}
+
+func TestGenerateWithHashLengthExceedsHexLength(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HashConfig.Algorithm = HashMD5
+	cfg.HashConfig.Length = 40
+	m, err := NewManagerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewManagerWithConfig failed: %v", err)
+	}
+
+	meta, err := m.Create(CreateOptions{
+		OriginalURL: "https://example.com/test",
+		Strategy:    StrategyHash,
+	})
+	if err != nil {
+		t.Fatalf("Create with hash strategy failed: %v", err)
+	}
+	if len(meta.ShortCode) != 32 {
+		t.Errorf("expected shortcode length 32 (max for MD5), got %d", len(meta.ShortCode))
+	}
+}
+
+func TestGenerateWithRandomNoModuloBias(t *testing.T) {
+	charset := "0123456789"
+	charsetLen := len(charset)
+
+	cfg := DefaultConfig()
+	cfg.RandomConfig.Charset = charset
+	cfg.RandomConfig.Length = 4
+
+	m, err := NewManagerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewManagerWithConfig failed: %v", err)
+	}
+
+	numTrials := 1000
+	charCounts := make(map[rune]int)
+	for i := 0; i < numTrials; i++ {
+		meta, err := m.Create(CreateOptions{
+			OriginalURL: fmt.Sprintf("https://example.com/%d", i),
+			Strategy:    StrategyRandom,
+		})
+		if err != nil {
+			t.Fatalf("Create failed at trial %d: %v", i, err)
+		}
+		for _, c := range meta.ShortCode {
+			charCounts[c]++
+		}
+	}
+
+	totalChars := numTrials * 4
+	expectedPerChar := totalChars / charsetLen
+	tolerance := expectedPerChar / 2
+
+	for _, c := range charset {
+		count := charCounts[c]
+		if count < expectedPerChar-tolerance || count > expectedPerChar+tolerance {
+			t.Logf("character %c: count=%d, expected around %d, tolerance=%d",
+				c, count, expectedPerChar, tolerance)
+			if expectedPerChar > 0 && count == 0 {
+				t.Errorf("character %c never appeared, expected ~%d", c, expectedPerChar)
+			}
+		}
 	}
 }

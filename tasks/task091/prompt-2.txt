@@ -1,0 +1,9 @@
+你实现的链式哈希模块存在一些问题，需要修复：
+
+1. Serialize 方法在构建 VirtualNode 快照时漏填了 Index 字段，所有虚拟节点的 Index 在快照中都是默认零值，快照恢复排查时无法追溯节点的原始生成顺序。
+
+2. TestConcurrency 并发测试启动多个 goroutine 之后只检查了 WaitGroup 是否结束，没有验证并发操作后哈希环的状态是否正确，包括节点数量、ring 排序、虚拟节点映射完整性，无法发现并发导致的数据错乱。
+
+3. TestUpdateNodeWeight 只测试了权重从低到高的提升场景，权重下降的分支完全没有覆盖。权重下降和上升在内部走的是两条独立的迁移路径，下降时的 removedRanges 逻辑未经任何测试验证。
+
+4. 修复后运行 go test ./internal/chainhash/ -v，需要让所有测试通过。

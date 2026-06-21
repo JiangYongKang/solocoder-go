@@ -69,7 +69,7 @@ type TOTP struct {
 - 内部实现 HOTP 底层算法和时间窗口计算
 
 **主要方法**:
-- `NewTOTP()` - 使用默认配置创建 TOTP 认证器
+- `NewTOTP()` - 使用默认配置创建 TOTP 认证器，返回错误
 - `NewTOTPWithConfig(cfg)` - 使用自定义配置创建 TOTP 认证器
 - `Config()` - 获取当前配置
 - `GenerateSecret()` - 生成新的共享密钥（Base32 编码）
@@ -394,7 +394,10 @@ import (
 
 func main() {
     // 使用默认配置
-    totp := totpauth.NewTOTP()
+    totp, err := totpauth.NewTOTP()
+    if err != nil {
+        panic(err)
+    }
     
     // 生成新密钥
     secret, err := totp.GenerateSecret()
@@ -456,7 +459,10 @@ func verifyTOTP(totp *totpauth.TOTP, secret, userCode string) bool {
 
 ```go
 func verifyAtTime() {
-    totp := totpauth.NewTOTP()
+    totp, err := totpauth.NewTOTP()
+    if err != nil {
+        panic(err)
+    }
     secret := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
     
     // 生成指定时间的密码
@@ -594,6 +600,7 @@ func listRecoveryCodes(store *totpauth.RecoveryCodeStore) {
 | `ErrInvalidConfig` | 配置无效 | 漂移窗口数为负等配置错误 |
 | `ErrInvalidDigits` | 密码位数无效 | Digits 不在 6-8 范围内 |
 | `ErrInvalidPeriod` | 时间步长无效 | Period 小于等于 0 |
+| `ErrInvalidSecretSize` | 密钥字节数无效 | SecretSize 小于等于 0 |
 | `ErrCodeUsed` | 恢复码已使用 | 对已使用的恢复码再次调用 Validate |
 | `ErrNoRecoveryCodes` | 无可用恢复码 | 最后一个恢复码被使用时返回警告 |
 | `ErrRecoveryCodeEmpty` | 恢复码为空 | 传入空字符串作为恢复码 |

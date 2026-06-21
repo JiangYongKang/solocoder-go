@@ -318,3 +318,115 @@ for _, m := range migrations {
 }
 
 // 执行添加
+hr.AddNode("node4", 2)
+```
+
+### 7.3 移除节点
+
+```go
+migrations, err := hr.RemoveNode("node2")
+if err != nil {
+    panic(err)
+}
+
+fmt.Printf("Removing node2 caused %d migrations:\n", len(migrations))
+for _, m := range migrations {
+    total := int64(0)
+    for _, r := range m.AffectedRanges {
+        fmt.Printf("  Range: [%d, %d]\n", r.Start, r.End)
+    }
+    fmt.Printf("  Total estimated: %d keys\n", m.EstimatedCount)
+}
+```
+
+### 7.4 序列化与恢复
+
+```go
+// 保存到文件
+err := hr.SaveToFile("/var/lib/chainhash/ring.json")
+if err != nil {
+    panic(err)
+}
+
+// 从文件恢复
+hr2, err := chainhash.LoadFromFile("/var/lib/chainhash/ring.json")
+if err != nil {
+    panic(err)
+}
+
+// 验证恢复后的数据一致性
+node1, _ := hr.GetNode("test:key")
+node2, _ := hr2.GetNode("test:key")
+fmt.Printf("Consistent: %v\n", node1 == node2)
+```
+
+### 7.5 权重调整
+
+```go
+// 更新节点权重
+migrations, err := hr.UpdateNodeWeight("node1", 4)
+if err != nil {
+    panic(err)
+}
+
+fmt.Printf("Weight updated, %d migration plans:\n", len(migrations))
+for _, m := range migrations {
+    direction := "gain"
+    if m.ToNode != "node1" {
+        direction = "lose"
+    }
+    fmt.Printf("  Will %s ~%d keys\n", direction, m.EstimatedCount)
+}
+```
+
+### 7.6 使用节点扩展信息
+
+```go
+info := chainhash.NodeInfo{
+    ID:     "server-01",
+    Weight: 3,
+    Addr:   "192.168.1.100:6379",
+    Data: map[string]interface{}{
+        "rack":     "rack-01",
+        "datacenter": "us-west-2",
+        "memory_gb": 32,
+    },
+}
+
+hr.AddNodeWithInfo(info)
+
+// 获取节点信息
+nodeInfo, _ := hr.GetNodeInfo("server-01")
+fmt.Printf("Server address: %s\n", nodeInfo.Addr)
+fmt.Printf("Rack: %s\n", nodeInfo.Data["rack"])
+```
+
+## 8. 错误定义
+
+| 错误 | 说明 |
+|------|------|
+| `ErrNodeNotFound` | 节点不存在 |
+| `ErrNodeAlreadyExists` | 节点已存在 |
+| `ErrEmptyRing` | 哈希环为空 |
+| `ErrInvalidWeight` | 无效的权重值 |
+| `ErrInvalidVirtualNodes` | 无效的虚拟节点数 |
+| `ErrEmptyNodeID` | 节点ID为空 |
+| `ErrSerializationFailed` | 序列化失败 |
+| `ErrDeserializationFailed` | 反序列化失败 |
+| `ErrFileIO` | 文件IO错误 |
+
+## 9. 线程安全
+
+所有公共方法都是线程安全的，内部使用读写锁 (`sync.RWMutex`) 保护：
+
+- **读操作**: `GetNode`, `GetNodes`, `NodeExists`, `GetNodeInfo`, `GetAllNodes`, `NodeCount`, `VirtualNodeCount`, `GetTotalKeys`, `GetMetadata`, `Snapshot`
+- **写操作**: `AddNode`, `AddNodeWithInfo`, `RemoveNode`, `UpdateNodeWeight`, `SetTotalKeys`, `SetMetadata`, `Restore`, `SaveToFile`
+
+## 10. 性能特点
+
+- 键查找: O(log N)，N 为虚拟节点总数
+- 添加节点: O(N log N)，需要排序
+- 移除节点: O(N)，重建环
+- 内存占用: O(N)，N 为虚拟节点总数
+
+推荐虚拟节点数量: 100-1000，在分布均匀性和内存占用之间取得平衡。

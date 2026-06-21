@@ -10,21 +10,26 @@ import (
 )
 
 var (
-	ErrInvalidFPRate    = errors.New("scalablebloom: false positive rate must be in (0, 1)")
-	ErrInvalidCapacity  = errors.New("scalablebloom: capacity must be > 0")
-	ErrInvalidRatio     = errors.New("scalablebloom: ratio must be in (0, 1)")
-	ErrEmptyKey         = errors.New("scalablebloom: key must not be empty")
-	ErrNoFilters        = errors.New("scalablebloom: no filters provided for union query")
-	ErrFileOpen         = errors.New("scalablebloom: failed to open file")
-	ErrFileWrite        = errors.New("scalablebloom: failed to write file")
-	ErrFileRead         = errors.New("scalablebloom: failed to read file")
-	ErrInvalidData      = errors.New("scalablebloom: invalid serialized data")
-	ErrVersionMismatch  = errors.New("scalablebloom: version mismatch in serialized data")
+	ErrInvalidFPRate       = errors.New("scalablebloom: false positive rate must be in (0, 1)")
+	ErrInvalidCapacity     = errors.New("scalablebloom: capacity must be > 0")
+	ErrInvalidRatio        = errors.New("scalablebloom: ratio must be in (0, 1)")
+	ErrEmptyKey            = errors.New("scalablebloom: key must not be empty")
+	ErrNoFilters           = errors.New("scalablebloom: no filters provided for union query")
+	ErrFileOpen            = errors.New("scalablebloom: failed to open file")
+	ErrFileWrite           = errors.New("scalablebloom: failed to write file")
+	ErrFileRead            = errors.New("scalablebloom: failed to read file")
+	ErrInvalidData         = errors.New("scalablebloom: invalid serialized data")
+	ErrVersionMismatch     = errors.New("scalablebloom: version mismatch in serialized data")
+	ErrVersionUnsupported  = errors.New("scalablebloom: serialized data version is too old and not supported")
+	ErrCapacityExceeded    = errors.New("scalablebloom: bloom filter capacity exceeded")
+	ErrIncompatibleFilters = errors.New("scalablebloom: filters have incompatible hash configurations for union query")
+	ErrCorruptedFilter     = errors.New("scalablebloom: corrupted filter state detected")
 )
 
 const (
-	version uint32 = 1
-	defaultRatio float64 = 0.85
+	version           uint32 = 2
+	minSupportedVersion uint32 = 1
+	defaultRatio      float64 = 0.85
 )
 
 type Config struct {
@@ -82,7 +87,10 @@ func doubleHash(key string, numBits uint) (uint, uint) {
 	return uint(h1 % uint64(numBits)), uint(h2 % uint64(numBits))
 }
 
-func (bf *bloomFilter) add(key string) {
+func (bf *bloomFilter) add(key string) error {
+	if bf.isFull() {
+		return ErrCapacityExceeded
+	}
 	h1, h2 := doubleHash(key, bf.numBits)
 	for i := uint(0); i < bf.hashCount; i++ {
 		idx := (h1 + uint(i)*h2) % bf.numBits
@@ -91,6 +99,7 @@ func (bf *bloomFilter) add(key string) {
 		bf.bits[wordIdx] |= 1 << bitIdx
 	}
 	bf.count++
+	return nil
 }
 
 func (bf *bloomFilter) mightContain(key string) bool {
@@ -108,6 +117,30 @@ func (bf *bloomFilter) mightContain(key string) bool {
 
 func (bf *bloomFilter) isFull() bool {
 	return bf.count >= bf.capacity
+}
+
+func (bf *bloomFilter) validate() error {
+	if bf.numBits == 0 {
+		return ErrCorruptedFilter
+	}
+	if bf.hashCount == 0 {
+		return ErrCorruptedFilter
+	}
+	if bf.capacity == 0 {
+		return ErrCorruptedFilter
+	}
+	expectedWords := (bf.numBits + 63) / 64
+	if uint(len(bf.bits)) != expectedWords {
+		return ErrCorruptedFilter
+	}
+	return nil
+}
+
+func (bf *bloomFilter) fillRatio() float64 {
+	if bf.capacity == 0 {
+		return 0
+	}
+	return float64(bf.count) / float64(bf.capacity)
 }
 
 type ScalableBloom struct {
@@ -146,16 +179,46 @@ func (sb *ScalableBloom) Add(key string) error {
 
 	active := sb.filters[len(sb.filters)-1]
 	if active.isFull() {
-		newCapacity := active.capacity * 2
-		newFPRate := sb.cfg.FPRate * math.Pow(sb.cfg.Ratio, float64(len(sb.filters)))
-		newFilter := newBloomFilter(newCapacity, newFPRate)
-		sb.filters = append(sb.filters, newFilter)
-		active = newFilter
+		if err := sb.expandLocked(); err != nil {
+			return err
+		}
+		active = sb.filters[len(sb.filters)-1]
 	}
 
-	active.add(key)
+	if err := active.add(key); err != nil {
+		if errors.Is(err, ErrCapacityExceeded) {
+			if err := sb.expandLocked(); err != nil {
+				return err
+			}
+			active = sb.filters[len(sb.filters)-1]
+			return active.add(key)
+		}
+		return err
+	}
 	sb.count++
 	return nil
+}
+
+func (sb *ScalableBloom) expandLocked() error {
+	last := sb.filters[len(sb.filters)-1]
+	newCapacity := last.capacity * 2
+	if newCapacity < last.capacity {
+		return ErrCapacityExceeded
+	}
+	newFPRate := sb.cfg.FPRate * math.Pow(sb.cfg.Ratio, float64(len(sb.filters)))
+	newFilter := newBloomFilter(newCapacity, newFPRate)
+	sb.filters = append(sb.filters, newFilter)
+	return nil
+}
+
+func (sb *ScalableBloom) FillRatio() float64 {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if len(sb.filters) == 0 {
+		return 0
+	}
+	active := sb.filters[len(sb.filters)-1]
+	return active.fillRatio()
 }
 
 func (sb *ScalableBloom) MightContain(key string) (bool, error) {
@@ -199,6 +262,13 @@ func (sb *ScalableBloom) Capacity() uint {
 func (sb *ScalableBloom) Serialize(path string) error {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
+
+	for _, bf := range sb.filters {
+		if err := bf.validate(); err != nil {
+			return err
+		}
+	}
+
 	f, err := os.Create(path)
 	if err != nil {
 		return ErrFileOpen
@@ -209,6 +279,11 @@ func (sb *ScalableBloom) Serialize(path string) error {
 	buf8 := make([]byte, 8)
 
 	binary.BigEndian.PutUint32(buf4, version)
+	if _, err := f.Write(buf4); err != nil {
+		return ErrFileWrite
+	}
+
+	binary.BigEndian.PutUint32(buf4, minSupportedVersion)
 	if _, err := f.Write(buf4); err != nil {
 		return ErrFileWrite
 	}
@@ -277,6 +352,11 @@ func (sb *ScalableBloom) Serialize(path string) error {
 		}
 	}
 
+	reserved := make([]byte, 32)
+	if _, err := f.Write(reserved); err != nil {
+		return ErrFileWrite
+	}
+
 	return nil
 }
 
@@ -294,8 +374,23 @@ func Deserialize(path string) (*ScalableBloom, error) {
 		return nil, ErrInvalidData
 	}
 	ver := binary.BigEndian.Uint32(buf4)
-	if ver != version {
+
+	if ver < minSupportedVersion {
+		return nil, ErrVersionUnsupported
+	}
+	if ver > version {
 		return nil, ErrVersionMismatch
+	}
+
+	var minVer uint32
+	if ver >= 2 {
+		if _, err := f.Read(buf4); err != nil {
+			return nil, ErrInvalidData
+		}
+		minVer = binary.BigEndian.Uint32(buf4)
+		if minVer > version {
+			return nil, ErrVersionMismatch
+		}
 	}
 
 	if _, err := f.Read(buf4); err != nil {
@@ -333,6 +428,16 @@ func Deserialize(path string) (*ScalableBloom, error) {
 	}
 	numFilters := int(binary.BigEndian.Uint32(buf4))
 	if numFilters <= 0 {
+		return nil, ErrInvalidData
+	}
+
+	if initialCap == 0 {
+		return nil, ErrInvalidData
+	}
+	if fpRate <= 0 || fpRate >= 1 {
+		return nil, ErrInvalidData
+	}
+	if ratio <= 0 || ratio >= 1 {
 		return nil, ErrInvalidData
 	}
 
@@ -374,16 +479,27 @@ func Deserialize(path string) (*ScalableBloom, error) {
 			bits[j] = binary.BigEndian.Uint64(buf8)
 		}
 
-		filters = append(filters, &bloomFilter{
+		bf := &bloomFilter{
 			bits:      bits,
 			numBits:   numBits,
 			hashCount: hashCount,
 			capacity:  capacity,
 			count:     count,
-		})
+		}
+
+		if err := bf.validate(); err != nil {
+			return nil, ErrInvalidData
+		}
+
+		filters = append(filters, bf)
 	}
 
-	return &ScalableBloom{
+	if ver >= 2 {
+		reserved := make([]byte, 32)
+		_, _ = f.Read(reserved)
+	}
+
+	sb := &ScalableBloom{
 		filters: filters,
 		cfg: Config{
 			InitialCapacity: initialCap,
@@ -391,7 +507,30 @@ func Deserialize(path string) (*ScalableBloom, error) {
 			Ratio:           ratio,
 		},
 		count: totalCount,
-	}, nil
+	}
+
+	if err := sb.validateLocked(); err != nil {
+		return nil, ErrInvalidData
+	}
+
+	return sb, nil
+}
+
+func (sb *ScalableBloom) validateLocked() error {
+	if len(sb.filters) == 0 {
+		return ErrCorruptedFilter
+	}
+	var sum uint
+	for _, bf := range sb.filters {
+		if err := bf.validate(); err != nil {
+			return err
+		}
+		sum += bf.count
+	}
+	if sb.count != sum {
+		return ErrCorruptedFilter
+	}
+	return nil
 }
 
 func UnionQuery(filters []*ScalableBloom, key string) (bool, error) {
@@ -400,6 +539,10 @@ func UnionQuery(filters []*ScalableBloom, key string) (bool, error) {
 	}
 	if key == "" {
 		return false, ErrEmptyKey
+	}
+
+	if err := validateFiltersCompatible(filters); err != nil {
+		return false, err
 	}
 
 	for _, sb := range filters {
@@ -412,4 +555,46 @@ func UnionQuery(filters []*ScalableBloom, key string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func validateFiltersCompatible(filters []*ScalableBloom) error {
+	if len(filters) <= 1 {
+		return nil
+	}
+
+	first := filters[0]
+	first.mu.Lock()
+	firstCfg := first.cfg
+	firstFilters := len(first.filters)
+	var firstHashCount uint
+	if firstFilters > 0 {
+		firstHashCount = first.filters[0].hashCount
+	}
+	first.mu.Unlock()
+
+	for i := 1; i < len(filters); i++ {
+		sb := filters[i]
+		sb.mu.Lock()
+		if sb.cfg.FPRate != firstCfg.FPRate {
+			sb.mu.Unlock()
+			return ErrIncompatibleFilters
+		}
+		if sb.cfg.Ratio != firstCfg.Ratio {
+			sb.mu.Unlock()
+			return ErrIncompatibleFilters
+		}
+		if sb.cfg.InitialCapacity != firstCfg.InitialCapacity {
+			sb.mu.Unlock()
+			return ErrIncompatibleFilters
+		}
+		if len(sb.filters) > 0 && firstFilters > 0 {
+			if sb.filters[0].hashCount != firstHashCount {
+				sb.mu.Unlock()
+				return ErrIncompatibleFilters
+			}
+		}
+		sb.mu.Unlock()
+	}
+
+	return nil
 }

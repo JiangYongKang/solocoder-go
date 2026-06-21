@@ -17,7 +17,7 @@ type Store struct {
 	cleanupTicker   *time.Ticker
 	cleanupStopCh   chan struct{}
 	running         bool
-	mu              sync.Mutex
+	mu              sync.RWMutex
 }
 
 func NewStore(cfg Config) (*Store, error) {
@@ -91,8 +91,8 @@ func (s *Store) cleanupLoop() {
 }
 
 func (s *Store) Get(sessionID string) (*Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if !s.running {
 		return nil, ErrClusterStopped
@@ -189,8 +189,8 @@ func (s *Store) Renew(sessionID string) (*Session, error) {
 }
 
 func (s *Store) Exists(sessionID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if !s.running {
 		return false
@@ -200,8 +200,8 @@ func (s *Store) Exists(sessionID string) bool {
 }
 
 func (s *Store) GetAll() ([]*Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if !s.running {
 		return nil, ErrClusterStopped
@@ -234,8 +234,8 @@ func (s *Store) notifyChangeHandlers(notification ChangeNotification) {
 }
 
 func (s *Store) ExportSession(sessionID string) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if !s.running {
 		return nil, ErrClusterStopped
@@ -250,8 +250,8 @@ func (s *Store) ExportSession(sessionID string) ([]byte, error) {
 }
 
 func (s *Store) ExportAll() ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if !s.running {
 		return nil, ErrClusterStopped
@@ -385,8 +385,8 @@ func (s *Store) CleanupExpired() int {
 }
 
 func (s *Store) Stats() Stats {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	return s.store.getStats()
 }

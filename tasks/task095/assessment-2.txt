@@ -1,0 +1,7 @@
+﻿产物不满意：
+1. builtInSignatures 中 audio/wav 的 offset-0 签名用 12 字节 `RIFF\x00\x00\x00\x00WAVE`，字节 4-7 硬编码为零。实际 RIFF 文件大小字段可变，该签名对任何真实 WAV 数据都无法命中。因内置签名按序扫描，audio/x-wav 的 offset-8 匹配 `WAVE` 成为唯一可触达路径，audio/wav 实质为死代码。应删除 offset-0 无效签名，或仅匹配 `WAVE` 标识符不依赖大小字段。
+2. 测试文件未添加任何 WAV 格式检测用例。提示词要求修复 WAV 被误识别为 WebP，但现有 `TestRIFFHeaderAmbiguity` 只提供 8 字节，`TestDetectFromBytesShortForOffset` 只提供 4 字节，都无法触及 offset 8 的格式标识符位置，没有测试能验证 WAV 是否被正确识别为 audio 类型而非 image/webp。修复是否生效完全依赖代码审阅而非测试反馈，背离了修 BUG 须经失败用例验证的原则。
+3. image/webp 的 offset-0 签名存在同样问题，`RIFF\x00\x00\x00\x00WEBP` 中字节 4-7 硬编码为零。好在之后有 offset-8 匹配 `WEBP` 的签名做兜底，WebP 检测尚能工作。但第一条签名形同虚设，增加了维护者阅读困惑，应考虑删除该条冗余签名。
+过程不满意：
+1. 模型收到提示词后只读了两份源文件就直接创建 TodoList，未先分析 RIFF 容器字节结构就修改 builtInSignatures 和删除 ErrNilMagicSignature。RIFF 格式关键在字节 4-7 是可变大小字段，模型跳过格式分析直接编码，设计了硬编码零值的无效签名。应先理解 RIFF 容器中前缀、大小字段、格式标识符三者的布局关系，再决定是通过通配符跳过大小字段还是只用 offset-8 的标识符做区分。
+2. 模型修改完代码后运行 go test 看到 46 个测试全通过，立即将所有 TodoList 任务标记完成并声称"两个问题都已修复完成"。但无任何现有测试提供完整 RIFF 容器数据来验证 WAV 与 WebP 的区分逻辑是否生效，这属于幻觉与虚假完成，将测试通过等同于修复完成而忽略了测试本身未覆盖被修复场景。应手动构造 WAV 和 WebP 的完整头部数据，通过新增测试验证修复效果。

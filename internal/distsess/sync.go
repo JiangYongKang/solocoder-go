@@ -299,10 +299,18 @@ func (n *Node) handleChangeNotify(msg *Message) error {
 			ErrVersionTooOld, msg.SessionID, local.Version, msg.Session.Version, msg.FromNodeID)
 	}
 
+	existed := local != nil
+
 	if n.store.mergeRemoteSession(msg.Session) {
 		atomic.AddUint64(&n.syncedCount, 1)
+
+		changeType := ChangeTypeCreate
+		if existed {
+			changeType = ChangeTypeUpdate
+		}
+
 		n.notifyChangeHandlers(ChangeNotification{
-			Type:       ChangeTypeUpdate,
+			Type:       changeType,
 			SessionID:  msg.SessionID,
 			Version:    msg.Session.Version,
 			NodeID:     msg.FromNodeID,
@@ -353,12 +361,22 @@ func (n *Node) handleSyncResponse(msg *Message) {
 }
 
 func (n *Node) Get(sessionID string) (*Session, error) {
+	if !n.cluster.cfg.AutoRenew || !n.cluster.cfg.EnableSync {
+		return n.store.Get(sessionID)
+	}
+
+	before, _ := n.store.GetWithoutRenew(sessionID)
+	beforeVersion := uint64(0)
+	if before != nil {
+		beforeVersion = before.Version
+	}
+
 	session, err := n.store.Get(sessionID)
 	if err != nil {
 		return nil, err
 	}
 
-	if n.cluster.cfg.EnableSync {
+	if session.Version > beforeVersion {
 		notifyMsg := &Message{
 			Type:       MsgChangeNotify,
 			FromNodeID: n.ID,

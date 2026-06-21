@@ -876,24 +876,36 @@ func TestGetLocalized(t *testing.T) {
 	}
 }
 
-func TestCountLeadingZeros32(t *testing.T) {
-	tests := []struct {
-		x        uint32
-		expected int
-	}{
-		{0, 32},
-		{1, 31},
-		{2, 30},
-		{0xFFFFFFFF, 0},
-		{0x80000000, 0},
-		{0x00000001, 31},
+func TestQueryBasicNoEnglishFallback(t *testing.T) {
+	e, err := NewEngineFromData(testDataBasic)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
 	}
 
-	for _, tc := range tests {
-		result := CountLeadingZeros32(tc.x)
-		if result != tc.expected {
-			t.Errorf("CountLeadingZeros32(%d): expected %d, got %d", tc.x, tc.expected, result)
-		}
+	result, err := e.QueryWithLang("10.1.2.3", "en")
+	if err != nil {
+		t.Fatalf("QueryWithLang failed: %v", err)
+	}
+	if !result.Found {
+		t.Error("expected Found=true")
+	}
+	if result.Country != "中国" {
+		t.Errorf("expected English fallback to Chinese Country='中国', got '%s'", result.Country)
+	}
+	if result.Province != "北京" {
+		t.Errorf("expected English fallback to Chinese Province='北京', got '%s'", result.Province)
+	}
+	if result.City != "北京" {
+		t.Errorf("expected English fallback to Chinese City='北京', got '%s'", result.City)
+	}
+	if result.District != "朝阳区" {
+		t.Errorf("expected English fallback to Chinese District='朝阳区', got '%s'", result.District)
+	}
+	if result.ISP != "中国电信" {
+		t.Errorf("expected English fallback to Chinese ISP='中国电信', got '%s'", result.ISP)
+	}
+	if result.Lang != "en" {
+		t.Errorf("expected Lang='en', got '%s'", result.Lang)
 	}
 }
 

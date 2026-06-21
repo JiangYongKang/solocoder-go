@@ -9,12 +9,10 @@ import (
 )
 
 func TestNewTOTP(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("NewTOTP() panicked: %v", r)
-		}
-	}()
-	totp := NewTOTP()
+	totp, err := NewTOTP()
+	if err != nil {
+		t.Fatalf("NewTOTP() unexpected error: %v", err)
+	}
 	if totp == nil {
 		t.Fatal("NewTOTP() returned nil")
 	}
@@ -30,6 +28,9 @@ func TestNewTOTP(t *testing.T) {
 	}
 	if cfg.Algorithm != SHA1 {
 		t.Errorf("default Algorithm = %v, want SHA1", cfg.Algorithm)
+	}
+	if cfg.SecretSize != DefaultSecretSize {
+		t.Errorf("default SecretSize = %d, want %d", cfg.SecretSize, DefaultSecretSize)
 	}
 }
 
@@ -88,20 +89,42 @@ func TestNewTOTPWithConfig_InvalidDriftWindows(t *testing.T) {
 	}
 }
 
+func TestNewTOTPWithConfig_InvalidSecretSize(t *testing.T) {
+	tests := []struct {
+		name       string
+		secretSize int
+	}{
+		{"secret size zero", 0},
+		{"secret size negative", -1},
+		{"secret size negative large", -20},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.SecretSize = tt.secretSize
+			_, err := NewTOTPWithConfig(cfg)
+			if !errors.Is(err, ErrInvalidSecretSize) {
+				t.Errorf("NewTOTPWithConfig(SecretSize=%d) error = %v, want ErrInvalidSecretSize", tt.secretSize, err)
+			}
+		})
+	}
+}
+
 func TestNewTOTPWithConfig_ValidConfigs(t *testing.T) {
 	tests := []struct {
 		name   string
 		config Config
 	}{
 		{"default config", DefaultConfig()},
-		{"6 digits", Config{Digits: 6, Period: 30, DriftWindows: 1}},
-		{"7 digits", Config{Digits: 7, Period: 30, DriftWindows: 1}},
-		{"8 digits", Config{Digits: 8, Period: 30, DriftWindows: 1}},
-		{"period 60", Config{Digits: 6, Period: 60, DriftWindows: 1}},
-		{"drift 0", Config{Digits: 6, Period: 30, DriftWindows: 0}},
-		{"drift 2", Config{Digits: 6, Period: 30, DriftWindows: 2}},
-		{"SHA256", Config{Digits: 6, Period: 30, DriftWindows: 1, Algorithm: SHA256}},
-		{"SHA512", Config{Digits: 6, Period: 30, DriftWindows: 1, Algorithm: SHA512}},
+		{"6 digits", Config{Digits: 6, Period: 30, DriftWindows: 1, SecretSize: 20}},
+		{"7 digits", Config{Digits: 7, Period: 30, DriftWindows: 1, SecretSize: 20}},
+		{"8 digits", Config{Digits: 8, Period: 30, DriftWindows: 1, SecretSize: 20}},
+		{"period 60", Config{Digits: 6, Period: 60, DriftWindows: 1, SecretSize: 20}},
+		{"drift 0", Config{Digits: 6, Period: 30, DriftWindows: 0, SecretSize: 20}},
+		{"drift 2", Config{Digits: 6, Period: 30, DriftWindows: 2, SecretSize: 20}},
+		{"SHA256", Config{Digits: 6, Period: 30, DriftWindows: 1, Algorithm: SHA256, SecretSize: 20}},
+		{"SHA512", Config{Digits: 6, Period: 30, DriftWindows: 1, Algorithm: SHA512, SecretSize: 20}},
 	}
 
 	for _, tt := range tests {
@@ -118,7 +141,10 @@ func TestNewTOTPWithConfig_ValidConfigs(t *testing.T) {
 }
 
 func TestGenerateSecret(t *testing.T) {
-	totp := NewTOTP()
+	totp, err := NewTOTP()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	t.Run("non-empty secret", func(t *testing.T) {
 		secret, err := totp.GenerateSecret()
@@ -180,8 +206,12 @@ func TestGenerateSecret(t *testing.T) {
 }
 
 func TestGenerateCode(t *testing.T) {
-	totp := NewTOTP()
-	secret, err := totp.GenerateSecret()
+	totp, err := NewTOTP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret string
+	secret, err = totp.GenerateSecret()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,8 +296,12 @@ func TestGenerateCodeAt_KnownVectors(t *testing.T) {
 }
 
 func TestValidateCode(t *testing.T) {
-	totp := NewTOTP()
-	secret, err := totp.GenerateSecret()
+	totp, err := NewTOTP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret string
+	secret, err = totp.GenerateSecret()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,17 +533,20 @@ func TestValidateCodeAt_WiderDrift(t *testing.T) {
 }
 
 func TestDifferentAlgorithms(t *testing.T) {
-	secret := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+	secretSHA1 := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+	secretSHA256 := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA"
+	secretSHA512 := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNA"
 	testTime := time.Unix(1111111109, 0)
 
 	tests := []struct {
 		name      string
 		algorithm Algorithm
+		secret    string
 		wantCode  string
 	}{
-		{"SHA1 6 digits", SHA1, "081804"},
-		{"SHA256 6 digits", SHA256, "584430"},
-		{"SHA512 6 digits", SHA512, "863801"},
+		{"SHA1 6 digits", SHA1, secretSHA1, "081804"},
+		{"SHA256 6 digits", SHA256, secretSHA256, "084774"},
+		{"SHA512 6 digits", SHA512, secretSHA512, "091201"},
 	}
 
 	for _, tt := range tests {
@@ -521,14 +558,16 @@ func TestDifferentAlgorithms(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			code, err := totp.GenerateCodeAt(secret, testTime)
+			code, err := totp.GenerateCodeAt(tt.secret, testTime)
 			if err != nil {
 				t.Fatalf("GenerateCodeAt() unexpected error: %v", err)
 			}
 			if len(code) != 6 {
 				t.Errorf("code length = %d, want 6", len(code))
 			}
-			t.Logf("Algorithm %v: code = %s (expected %s)", tt.algorithm, code, tt.wantCode)
+			if code != tt.wantCode {
+				t.Errorf("Algorithm %v: code = %s, want %s", tt.algorithm, code, tt.wantCode)
+			}
 		})
 	}
 }
@@ -1002,8 +1041,12 @@ func TestGenerateRecoveryCode(t *testing.T) {
 }
 
 func TestTOTP_CodeConsistency(t *testing.T) {
-	totp := NewTOTP()
-	secret, err := totp.GenerateSecret()
+	totp, err := NewTOTP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret string
+	secret, err = totp.GenerateSecret()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1117,8 +1160,12 @@ func TestConcurrentRecoveryCodeValidation(t *testing.T) {
 }
 
 func TestConcurrentTOTPOperations(t *testing.T) {
-	totp := NewTOTP()
-	secret, err := totp.GenerateSecret()
+	totp, err := NewTOTP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret string
+	secret, err = totp.GenerateSecret()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1151,7 +1198,10 @@ func TestConcurrentTOTPOperations(t *testing.T) {
 }
 
 func TestFullWorkflow(t *testing.T) {
-	totp := NewTOTP()
+	totp, err := NewTOTP()
+	if err != nil {
+		t.Fatal(err)
+	}
 	recoveryStore := NewRecoveryCodeStore()
 
 	t.Run("setup user account", func(t *testing.T) {
@@ -1236,7 +1286,10 @@ func TestFullWorkflow(t *testing.T) {
 
 func TestEdgeCases(t *testing.T) {
 	t.Run("zero time", func(t *testing.T) {
-		totp := NewTOTP()
+		totp, err := NewTOTP()
+		if err != nil {
+			t.Fatal(err)
+		}
 		secret, _ := totp.GenerateSecret()
 		code, err := totp.GenerateCodeAt(secret, time.Unix(0, 0))
 		if err != nil {
@@ -1248,7 +1301,10 @@ func TestEdgeCases(t *testing.T) {
 	})
 
 	t.Run("very large time", func(t *testing.T) {
-		totp := NewTOTP()
+		totp, err := NewTOTP()
+		if err != nil {
+			t.Fatal(err)
+		}
 		secret, _ := totp.GenerateSecret()
 		futureTime := time.Unix(9999999999, 0)
 		code, err := totp.GenerateCodeAt(secret, futureTime)
@@ -1344,6 +1400,7 @@ func TestErrorsComparison(t *testing.T) {
 		{"ErrRecoveryNotFound", ErrRecoveryNotFound, "totpauth: recovery code not found"},
 		{"ErrInvalidDigits", ErrInvalidDigits, "totpauth: digits must be between 6 and 8"},
 		{"ErrInvalidPeriod", ErrInvalidPeriod, "totpauth: period must be positive"},
+		{"ErrInvalidSecretSize", ErrInvalidSecretSize, "totpauth: secret size must be positive"},
 	}
 
 	for _, tt := range errTests {
@@ -1385,8 +1442,12 @@ func TestTimeToCounter(t *testing.T) {
 }
 
 func TestValidateCode_ConstantTimeComparison(t *testing.T) {
-	totp := NewTOTP()
-	secret, err := totp.GenerateSecret()
+	totp, err := NewTOTP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secret string
+	secret, err = totp.GenerateSecret()
 	if err != nil {
 		t.Fatal(err)
 	}

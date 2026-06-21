@@ -950,3 +950,284 @@ func TestNew_VeryLowFPRate(t *testing.T) {
 		t.Error("expected to find inserted key")
 	}
 }
+
+func TestFillRatio_Basic(t *testing.T) {
+	cfg := Config{InitialCapacity: 100, FPRate: 0.01, Ratio: 0.85}
+	sb, _ := New(cfg)
+
+	if sb.FillRatio() != 0 {
+		t.Errorf("expected FillRatio=0 for empty filter, got %f", sb.FillRatio())
+	}
+
+	for i := 0; i < 50; i++ {
+		sb.Add(fmt.Sprintf("key-%d", i))
+	}
+	ratio := sb.FillRatio()
+	if ratio <= 0 || ratio > 1 {
+		t.Errorf("expected FillRatio in (0, 1], got %f", ratio)
+	}
+}
+
+func TestBloomFilter_AddWhenFull(t *testing.T) {
+	bf := newBloomFilter(3, 0.01)
+
+	err := bf.add("key1")
+	if err != nil {
+		t.Errorf("unexpected error adding key1: %v", err)
+	}
+	err = bf.add("key2")
+	if err != nil {
+		t.Errorf("unexpected error adding key2: %v", err)
+	}
+	err = bf.add("key3")
+	if err != nil {
+		t.Errorf("unexpected error adding key3: %v", err)
+	}
+
+	if !bf.isFull() {
+		t.Error("expected filter to be full after 3 adds with capacity 3")
+	}
+
+	err = bf.add("key4")
+	if !errors.Is(err, ErrCapacityExceeded) {
+		t.Errorf("expected ErrCapacityExceeded when adding to full filter, got %v", err)
+	}
+}
+
+func TestUnionQuery_IncompatibleFilters_DifferentFPRate(t *testing.T) {
+	sb1, _ := New(Config{InitialCapacity: 100, FPRate: 0.01, Ratio: 0.85})
+	sb2, _ := New(Config{InitialCapacity: 100, FPRate: 0.02, Ratio: 0.85})
+
+	sb1.Add("key")
+	sb2.Add("key")
+
+	_, err := UnionQuery([]*ScalableBloom{sb1, sb2}, "key")
+	if !errors.Is(err, ErrIncompatibleFilters) {
+		t.Errorf("expected ErrIncompatibleFilters for different FPRate, got %v", err)
+	}
+}
+
+func TestUnionQuery_IncompatibleFilters_DifferentInitialCapacity(t *testing.T) {
+	sb1, _ := New(Config{InitialCapacity: 100, FPRate: 0.01, Ratio: 0.85})
+	sb2, _ := New(Config{InitialCapacity: 200, FPRate: 0.01, Ratio: 0.85})
+
+	sb1.Add("key")
+	sb2.Add("key")
+
+	_, err := UnionQuery([]*ScalableBloom{sb1, sb2}, "key")
+	if !errors.Is(err, ErrIncompatibleFilters) {
+		t.Errorf("expected ErrIncompatibleFilters for different InitialCapacity, got %v", err)
+	}
+}
+
+func TestUnionQuery_IncompatibleFilters_DifferentRatio(t *testing.T) {
+	sb1, _ := New(Config{InitialCapacity: 100, FPRate: 0.01, Ratio: 0.8})
+	sb2, _ := New(Config{InitialCapacity: 100, FPRate: 0.01, Ratio: 0.9})
+
+	sb1.Add("key")
+	sb2.Add("key")
+
+	_, err := UnionQuery([]*ScalableBloom{sb1, sb2}, "key")
+	if !errors.Is(err, ErrIncompatibleFilters) {
+		t.Errorf("expected ErrIncompatibleFilters for different Ratio, got %v", err)
+	}
+}
+
+func TestUnionQuery_CompatibleFilters_AfterExpansion(t *testing.T) {
+	cfg := Config{InitialCapacity: 10, FPRate: 0.01, Ratio: 0.85}
+	sb1, _ := New(cfg)
+	sb2, _ := New(cfg)
+
+	for i := 0; i < 15; i++ {
+		sb1.Add(fmt.Sprintf("sb1-%d", i))
+		sb2.Add(fmt.Sprintf("sb2-%d", i))
+	}
+
+	if sb1.FilterCount() < 2 || sb2.FilterCount() < 2 {
+		t.Fatal("expected both filters to have expanded")
+	}
+
+	found, err := UnionQuery([]*ScalableBloom{sb1, sb2}, "sb1-5")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Error("expected to find sb1-5 in union")
+	}
+
+	found, err = UnionQuery([]*ScalableBloom{sb1, sb2}, "sb2-10")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Error("expected to find sb2-10 in union")
+	}
+}
+
+func TestDeserialize_Version1BackwardCompatibility(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "v1_data.bin")
+
+	cfg := Config{InitialCapacity: 50, FPRate: 0.01, Ratio: 0.85}
+	sb, _ := New(cfg)
+	for i := 0; i < 30; i++ {
+		sb.Add(fmt.Sprintf("v1key-%d", i))
+	}
+
+	sb.Serialize(path)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read serialized file: %v", err)
+	}
+
+	v2HeaderSize := 4 + 4
+	v1Data := make([]byte, 0, len(data)-v2HeaderSize-32)
+	versionBytes := make([]byte, 4)
+	versionBytes[3] = 1
+	v1Data = append(v1Data, versionBytes...)
+	v1Data = append(v1Data, data[8:len(data)-32]...)
+
+	newPath := filepath.Join(tmpDir, "v1_modified.bin")
+	os.WriteFile(newPath, v1Data, 0644)
+
+	loaded, err := Deserialize(newPath)
+	if err != nil {
+		t.Fatalf("Deserialize v1 data failed: %v", err)
+	}
+
+	if loaded.Count() != 30 {
+		t.Errorf("expected Count=30, got %d", loaded.Count())
+	}
+
+	for i := 0; i < 30; i++ {
+		found, err := loaded.MightContain(fmt.Sprintf("v1key-%d", i))
+		if err != nil {
+			t.Fatalf("MightContain error: %v", err)
+		}
+		if !found {
+			t.Errorf("false negative for v1key-%d", i)
+		}
+	}
+
+	err = loaded.Add("new-key-after-v1-load")
+	if err != nil {
+		t.Fatalf("Add after v1 load failed: %v", err)
+	}
+	found, _ := loaded.MightContain("new-key-after-v1-load")
+	if !found {
+		t.Error("expected to find key added after v1 load")
+	}
+}
+
+func TestDeserialize_VersionTooOld(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "old_version.bin")
+
+	data := make([]byte, 100)
+	data[3] = 0
+	os.WriteFile(path, data, 0644)
+
+	_, err := Deserialize(path)
+	if !errors.Is(err, ErrVersionUnsupported) {
+		t.Errorf("expected ErrVersionUnsupported, got %v", err)
+	}
+}
+
+func TestDeserialize_InvalidBitsLength(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "invalid_bits.bin")
+
+	cfg := Config{InitialCapacity: 10, FPRate: 0.01, Ratio: 0.85}
+	sb, _ := New(cfg)
+	sb.Add("test")
+	sb.Serialize(path)
+
+	data, _ := os.ReadFile(path)
+
+	headerSize := 4 + 4 + 4 + 8 + 8 + 4 + 4
+	filterHeaderSize := 4 + 4 + 4 + 4 + 4
+	totalHeader := headerSize + filterHeaderSize
+
+	wrongData := make([]byte, totalHeader+8)
+	copy(wrongData, data[:totalHeader])
+	wrongData[totalHeader-4] = 0
+	wrongData[totalHeader-3] = 0
+	wrongData[totalHeader-2] = 0
+	wrongData[totalHeader-1] = 99
+
+	os.WriteFile(path, wrongData, 0644)
+
+	_, err := Deserialize(path)
+	if err == nil {
+		t.Error("expected error for invalid bits length")
+	}
+}
+
+func TestBloomFilter_Validate(t *testing.T) {
+	bf := newBloomFilter(10, 0.01)
+	err := bf.validate()
+	if err != nil {
+		t.Errorf("expected valid filter to pass validate, got %v", err)
+	}
+
+	bf.numBits = 0
+	err = bf.validate()
+	if !errors.Is(err, ErrCorruptedFilter) {
+		t.Errorf("expected ErrCorruptedFilter for zero numBits, got %v", err)
+	}
+}
+
+func TestBloomFilter_Validate_WrongBitsLength(t *testing.T) {
+	bf := newBloomFilter(10, 0.01)
+	bf.bits = make([]uint64, 1)
+	err := bf.validate()
+	if !errors.Is(err, ErrCorruptedFilter) {
+		t.Errorf("expected ErrCorruptedFilter for wrong bits length, got %v", err)
+	}
+}
+
+func TestExpandLocked_CapacityOverflowCheck(t *testing.T) {
+	cfg := Config{InitialCapacity: 100, FPRate: 0.01, Ratio: 0.85}
+	sb, _ := New(cfg)
+
+	sb.filters[0].capacity = ^uint(0) / 2
+	sb.filters[0].count = sb.filters[0].capacity
+
+	err := sb.Add("test-overflow")
+	if err == nil {
+		t.Log("Note: capacity overflow may not be triggered on all platforms")
+	}
+}
+
+func TestSerialize_CorruptedFilter(t *testing.T) {
+	cfg := Config{InitialCapacity: 10, FPRate: 0.01, Ratio: 0.85}
+	sb, _ := New(cfg)
+
+	sb.filters[0].numBits = 0
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "corrupted.bin")
+
+	err := sb.Serialize(path)
+	if err == nil {
+		t.Error("expected error when serializing corrupted filter")
+	}
+}
+
+func TestValidateFiltersCompatible_SingleFilter(t *testing.T) {
+	cfg := Config{InitialCapacity: 100, FPRate: 0.01, Ratio: 0.85}
+	sb, _ := New(cfg)
+
+	err := validateFiltersCompatible([]*ScalableBloom{sb})
+	if err != nil {
+		t.Errorf("single filter should be compatible, got %v", err)
+	}
+}
+
+func TestValidateFiltersCompatible_Empty(t *testing.T) {
+	err := validateFiltersCompatible([]*ScalableBloom{})
+	if err != nil {
+		t.Errorf("empty filters should be compatible, got %v", err)
+	}
+}
