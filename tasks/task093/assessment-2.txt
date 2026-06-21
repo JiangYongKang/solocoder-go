@@ -2,6 +2,6 @@
 无
 
 过程不满意：
-1. 模型在刚收到提示词后未经任何源代码分析就直接用 todo_write 创建了包含 4 项子任务的执行计划，之后才开始读取 distsess.go 和 sync.go 两个文件。这种先规划后分析的模式在标注规范中有明确说明，由于此时模型对 Store 的锁具体类型、Node.Get 的广播触发逻辑、handleChangeNotify 的变更类型处理方式等实现细节尚未掌握，提前制定的计划粒度与实际问题的依赖关系不匹配。正确做法是先阅读 internal/distsess/ 下全部源文件理清实现细节和模块间依赖，再制定有针对性的修复计划。
+1. 模型在刚收到提示词后未经任何源代码分析就直接用 todo_write 创建了 4 项子任务计划，之后才开始读 distsess.go 和 sync.go。这种先规划后分析的模式在标注规范中有明确说明，此时模型对 Store 的锁类型、Node.Get 的广播逻辑、handleChangeNotify 的变更类型处理等实现细节尚未掌握，提前制定的计划与实际问题的依赖关系不匹配。应先阅读 internal/distsess/ 下全部源文件理清细节和依赖，再制定有针对性的修复计划。
 
-2. 模型在开始修复前只读取了 distsess.go 和 sync.go 两个文件，遗漏了 tiered_store.go。问题 2 涉及的 Node.Get 广播逻辑与 TieredStore.Get 的 autoRenew 续期行为紧密相关，当模型处理到问题 2 时才意识到需要理解 TieredStore.Get 内部的自动续期机制，不得不在修复中途回头读取 tiered_store.go。这种分批阅读的策略降低了分析效率，正确做法是在动手修改前一次性读取 internal/distsess/ 包下所有源文件，确保对代码全貌有充分理解后再逐一进行修复。
+2. 模型在开始修复前只读了 distsess.go 和 sync.go，遗漏了 tiered_store.go。问题涉及 Node.Get 广播逻辑与 TieredStore.Get 的续期行为紧密相关，模型处理到该问题时才回头读 tiered_store.go。这种分批阅读降低了分析效率，应在动手前一次性读完包下所有源文件，确保对代码全貌充分理解后再逐一修复。

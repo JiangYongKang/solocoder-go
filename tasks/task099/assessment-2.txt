@@ -2,4 +2,4 @@
 1. tokenbucket.go 中定义的 currentRate 方法没有任何调用者，属于死代码。模型在修复 IsWarmingUp 的副作用问题时，将原来的当前速率计算逻辑拆分为只读的 currentRate 和可修改 warmup 状态的 currentRateLocked 两个版本，但 refill 方法、Take 方法和 CurrentRate 方法三个调用点全部使用的是 currentRateLocked，IsWarmingUp 方法则是直接计算 time.Now 与 warmupStartTime 的差值来判断预热状态，也没有调用 currentRate。拆分后产生的只读版本 currentRate 在包内完全无引用，go vet 虽然不会对该方法报告 unused 警告，但人为审查即可确认它在整个 tokenbucket 包中零调用。这说明模型完成了代码拆分但没有配套修改调用点，留下了引入后从未使用的无效函数，属于修复过程中产生的新代码质量问题。
 
 过程不满意：
-1. 模型在刚收到提示词后，未阅读任何代码文件就直接用 todo_write 创建了包含 8 项子任务的待办列表，之后才通过 view_folder 查看 internal 目录、再通过 view_files 分别读取 tokenbucket.go 和 tokenbucket_test.go。这违反了标注规范中"应先分析问题再规划"的要求，不能在未理解当前代码结构的情况下预先制定任务计划。虽然模型后续执行的修复方向与提示词 7 个要求吻合且所有测试通过，但过早规划存在计划粒度与实际修改范围不匹配的风险。正确做法是先仔细阅读 tokenbucket.go 和 tokenbucket_test.go，对照提示词梳理每个问题涉及的函数和代码行，再根据实际代码结构制定精准的修改顺序和计划。
+1. 模型在刚收到提示词后未读任何代码就直接用 todo_write 创建了 8 项子任务，之后才查看 internal 目录、读取 tokenbucket.go 和 tokenbucket_test.go。这违反"先分析再规划"的要求，不能在未理解代码结构时预先制定计划。虽后续修复方向与提示词吻合且全部测试通过，过早规划存在粒度与实际范围不匹配的风险。应先仔细阅读两个核心文件，对照提示词梳理每个问题涉及的函数，再根据实际代码结构制定精准的修改计划。

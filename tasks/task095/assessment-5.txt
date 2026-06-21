@@ -2,5 +2,5 @@
 本轮的改动是仅从 builtInMIMEToExt 和 builtInMIMEInfo 两个映射中各删除一行 audio/x-wav 条目，改动准确且 go test 全部通过，未发现产物层面的缺陷。
 
 过程不满意：
-1. 模型在 session-cot-5.md 的第一步操作仍然是调用 todo_write 创建 3 项子任务计划，此时尚未阅读 mimedetect.go 或 mimedetect_test.go 中任何一行代码。随后虽然通过 view_files 查看了 mimedetect.go 并用 search_by_regex 扫描了 audio/x-wav 的分布，但这两步信息收集操作都在计划制定之后，延续了前四轮标注反复指出的"先计划后分析"模式。鉴于本轮改动规模极小只需删除两行映射，该模式未导致产物错误，但先锁定计划再理解现状的工作顺序在复杂场景下会增大遗漏风险。正确的执行顺序是先扫描整个 mimedetect 包下所有引用 audio/x-wav 的位置，确认影响范围后再制定修改计划。
+1. 模型在 session-cot-5.md 的第一步仍是调用 todo_write 创建 3 项子任务计划，此时尚未阅读 mimedetect.go 或 mimedetect_test.go。随后虽查看了代码并搜索了 audio/x-wav 分布，但都在计划之后，延续了"先计划后分析"模式。本轮改动极小只需删两行映射，该模式未导致错误，但复杂场景下会增大遗漏风险。应先扫描包下所有引用 audio/x-wav 的位置，确认范围再制定计划。
 2. 模型在连续两次 tool call 中对 mimedetect.go 分别执行了 view_files 操作，第二次打开的是与第一次完全相同的文件且中间没有对该文件做任何修改，属于无意义的重复读取。虽然这不影响产物正确性，但反映了模型在工具使用中缺少对已获取信息的有效复用意识，造成了不必要的冗余 IO。

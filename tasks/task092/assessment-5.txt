@@ -1,6 +1,6 @@
 产物不满意：
-1. TestDiffToChanges_SingleHunkMultipleChanges 在新增的变更块内容校验代码中使用了 `newIdx := ch.oldStart + j` 将 oldStart 当作新文本行数组的索引来比对 ch.newLines[j]，但 oldStart 是旧文本坐标系下的行号，并非新文本坐标。当变更块中被删行数与插入行数不等时，oldStart 加偏移量定位到的不是新文本中对应的行位置，断言就会报出无法解释的假阳性。当前测试数据恰为等量行替换，该隐式假设未被击穿所以用例通过，但如果后续有人修改测试数据引入不等量变更，测试将误报代码缺陷。正确做法是将所有变更块按序应用到旧文本上重建出新文本，再将重建结果与原始 newText 做全量比对，而非用 oldStart 去交叉检索新文本。
+1. TestDiffToChanges_SingleHunkMultipleChanges 用 `newIdx := ch.oldStart + j` 将 oldStart 作新文本索引比对 ch.newLines[j]，但 oldStart 是旧文本坐标。删插行不等时定位出错，断言报假阳性。当前测试恰为等量替换未被击穿，但修改数据引入不等量变更将误报。应把变更块按序应用到旧文本重建新文本做全量比对。
 
 过程不满意：
-1. 模型在 session-cot-5.md 的第一步操作仍然是调用 todo_write 创建了 5 项子任务计划，与此同时尚未阅读 merge.go 或 diffpatch_test.go 中任何一行代码。虽然在此之前运行了一次 go test 来了解 hunk 行号的生成规律，这比前四轮稍有改进，但仅凭测试输出理解 buildHunks 的行为不足以正确掌握 change 结构体中 oldStart 字段的坐标语义，这也直接导致了上述产物中坐标系混淆的问题。正确做法是先阅读 diffToChanges 和 change 结构体的源码定义，明确各字段在旧文本和新文本坐标系中的归属关系，再制定测试增强计划。
+1. 模型在 session-cot-5.md 的第一步仍是调用 todo_write 创建 5 项子任务计划，此时尚未阅读 merge.go 或 diffpatch_test.go。虽先运行了一次 go test 了解行号规律，比前四轮有改进，但仅凭测试输出不足以掌握 change 结构体中 oldStart 的坐标语义，直接导致了上述坐标系混淆。应先阅读 diffToChanges 和 change 源码，明确各字段在旧文本和新文本坐标系中的归属，再制定测试增强计划。
 2. 模型对 debug_test.go 的处理绕了弯路：先将文件中仅有 t.Logf 和 fmt.Println 调试输出的代码改写为带 t.Errorf 断言的测试函数版本，运行 go test 确认通过后，又判定这些新断言与主测试文件中的测试用例重复而执行了 delete_file 将其删除。提示词第 3 条已经明确描述该文件"只包含打印调试信息的代码没有实际的断言逻辑"，模型完全可以直接删除原文件而不必先生成一遍带断言的版本再废弃，中间改写步骤浪费了一轮编辑和一次测试运行的时间。
