@@ -642,7 +642,7 @@ func (f *Fuzzer) saveCrash(input []byte, err error) error {
 	return nil
 }
 
-func (f *Fuzzer) executeWithCoverage(input []byte) (coverage *Coverage, execErr error, crashed bool) {
+func (f *Fuzzer) executeWithCoverage(input []byte) (coverage *Coverage, execErr error) {
 	coverage = NewCoverage()
 	SetCurrentCoverage(coverage)
 
@@ -667,7 +667,7 @@ func (f *Fuzzer) executeWithCoverage(input []byte) (coverage *Coverage, execErr 
 		coverage.Add(0xDEADBEEF)
 	}
 
-	return coverage, execErr, false
+	return coverage, execErr
 }
 
 func (f *Fuzzer) executeSafe(input []byte) (cov *Coverage, execErr error, crashed bool) {
@@ -691,7 +691,7 @@ func (f *Fuzzer) executeSafe(input []byte) (cov *Coverage, execErr error, crashe
 		}
 		ClearCurrentCoverage()
 	}()
-	cov, execErr, crashed = f.executeWithCoverage(input)
+	cov, execErr = f.executeWithCoverage(input)
 	return cov, execErr, crashed
 }
 

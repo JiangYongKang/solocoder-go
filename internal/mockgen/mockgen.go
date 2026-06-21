@@ -3,7 +3,216 @@ package mockgen
 import (
 	"fmt"
 	"reflect"
+	"sync"
+	"sync/atomic"
+	"unsafe"
 )
+
+type nameOff int32
+type typeOff int32
+type textOff int32
+
+type abiType struct {
+	Size_       uintptr
+	PtrBytes    uintptr
+	Hash        uint32
+	TFlag       uint8
+	Align_      uint8
+	FieldAlign_ uint8
+	Kind_       uint8
+	Equal       func(unsafe.Pointer, unsafe.Pointer) bool
+	GCData      *byte
+	Str         nameOff
+	PtrToThis   typeOff
+}
+
+type abiUncommonType struct {
+	PkgPath nameOff
+	Mcount  uint16
+	Xcount  uint16
+	Moff    uint32
+	_       uint32
+}
+
+type abiMethod struct {
+	Name nameOff
+	Mtyp typeOff
+	Ifn  textOff
+	Tfn  textOff
+}
+
+type abiImethod struct {
+	Name nameOff
+	Typ  typeOff
+}
+
+type abiName struct {
+	Bytes *byte
+}
+
+type abiInterfaceType struct {
+	Type    abiType
+	PkgPath abiName
+	Methods []abiImethod
+}
+
+type abiItab struct {
+	Inter *abiInterfaceType
+	Type  *abiType
+	Hash  uint32
+	Fun   [1]uintptr
+}
+
+type eface struct {
+	_type *abiType
+	data  unsafe.Pointer
+}
+
+type iface struct {
+	tab  *abiItab
+	data unsafe.Pointer
+}
+
+//go:linkname getitab runtime.getitab
+func getitab(inter *abiInterfaceType, typ *abiType, canfail bool) *abiItab
+
+func itabHashFunc(inter *abiInterfaceType, typ *abiType) uintptr {
+	return uintptr(inter.Type.Hash ^ typ.Hash)
+}
+
+type mockMethod struct {
+	name string
+	typ  reflect.Type
+	fn   interface{}
+}
+
+type internalMockIface interface {
+	InternalMockMarker()
+}
+
+type mockImpl struct {
+	id      uint64
+	mp      *MockProxy
+	methods []mockMethod
+}
+
+func (*mockImpl) InternalMockMarker() {}
+
+var (
+	mockImplPtrType   = reflect.TypeOf((*mockImpl)(nil))
+	internalIfaceType = reflect.TypeOf((*internalMockIface)(nil)).Elem()
+	itabStore         []*abiItab
+	itabStoreLock     sync.Mutex
+	mockRegistry      sync.Map
+	nextMockID  uint64 = 0
+	itabEntriesBase  unsafe.Pointer
+	itabEntriesLock  sync.Once
+)
+
+func registerMockImpl(impl *mockImpl) {
+	id := atomic.AddUint64(&nextMockID, 1)
+	impl.id = id
+	mockRegistry.Store(id, impl)
+}
+
+func getMockImpl(id uint64) (*mockImpl, bool) {
+	v, ok := mockRegistry.Load(id)
+	if !ok {
+		return nil, false
+	}
+	return v.(*mockImpl), true
+}
+
+func getABITypeFromReflect(t reflect.Type) *abiType {
+	e := *(*eface)(unsafe.Pointer(&t))
+	return (*abiType)(e.data)
+}
+
+func getABIInterfaceTypeFromReflect(t reflect.Type) *abiInterfaceType {
+	return (*abiInterfaceType)(unsafe.Pointer(getABITypeFromReflect(t)))
+}
+
+func buildItab(inter *abiInterfaceType, typ *abiType, funcPtrs []uintptr) *abiItab {
+	numFuncs := len(funcPtrs)
+	funOffset := unsafe.Offsetof(abiItab{}.Fun)
+	itabSize := funOffset + uintptr(numFuncs)*unsafe.Sizeof(uintptr(0))
+
+	mem := make([]byte, itabSize)
+	tab := (*abiItab)(unsafe.Pointer(&mem[0]))
+
+	tab.Inter = inter
+	tab.Type = typ
+	tab.Hash = typ.Hash
+
+	funBase := unsafe.Pointer(&tab.Fun[0])
+	for i, fn := range funcPtrs {
+		*(*uintptr)(unsafe.Pointer(uintptr(funBase) + uintptr(i)*unsafe.Sizeof(uintptr(0)))) = fn
+	}
+
+	itabStoreLock.Lock()
+	itabStore = append(itabStore, tab)
+	itabStoreLock.Unlock()
+	return tab
+}
+
+func getFunctionCodePtr(fn interface{}) uintptr {
+	return reflect.ValueOf(fn).Pointer()
+}
+
+func makeTrampolineFunc(impl *mockImpl, methodIndex int, methodName string, methodType reflect.Type) interface{} {
+	numIn := methodType.NumIn()
+	numOut := methodType.NumOut()
+
+	inTypes := make([]reflect.Type, 0, numIn+1)
+	inTypes = append(inTypes, mockImplPtrType)
+	for i := 0; i < numIn; i++ {
+		inTypes = append(inTypes, methodType.In(i))
+	}
+
+	outTypes := make([]reflect.Type, numOut)
+	for i := 0; i < numOut; i++ {
+		outTypes[i] = methodType.Out(i)
+	}
+
+	fnType := reflect.FuncOf(inTypes, outTypes, methodType.IsVariadic())
+
+	implID := impl.id
+	mi := methodIndex
+	mn := methodName
+	mt := methodType
+	no := numOut
+
+	fn := reflect.MakeFunc(fnType, func(args []reflect.Value) []reflect.Value {
+		implInst, ok := getMockImpl(implID)
+		if !ok {
+			out := make([]reflect.Value, no)
+			for j := 0; j < no; j++ {
+				out[j] = reflect.Zero(mt.Out(j))
+			}
+			return out
+		}
+
+		in := make([]interface{}, len(args)-1)
+		for j := 1; j < len(args); j++ {
+			in[j-1] = args[j].Interface()
+		}
+
+		results := implInst.mp.controller.CallMethod(mn, in)
+
+		out := make([]reflect.Value, no)
+		for j := 0; j < no; j++ {
+			if j < len(results) && results[j] != nil {
+				out[j] = reflect.ValueOf(results[j])
+			} else {
+				out[j] = reflect.Zero(mt.Out(j))
+			}
+		}
+		return out
+	})
+
+	_ = mi
+	return fn.Interface()
+}
 
 type MockController struct {
 	mock *Mock
@@ -246,59 +455,101 @@ func (mp *MockProxy) TryMethod(methodName string) (interface{}, error) {
 	return fn.Interface(), nil
 }
 
-func (mp *MockProxy) Instance() interface{} {
-	numMethods := mp.targetType.NumMethod()
-	fields := make([]reflect.StructField, numMethods)
+func findItabTable() unsafe.Pointer {
+	inter := getABIInterfaceTypeFromReflect(internalIfaceType)
+	typ := getABITypeFromReflect(mockImplPtrType)
 
-	for i := 0; i < numMethods; i++ {
-		method := mp.targetType.Method(i)
-		fn, err := mp.TryMethod(method.Name)
-		if err != nil {
-			panic(err)
-		}
-		fields[i] = reflect.StructField{
-			Name: method.Name,
-			Type: reflect.TypeOf(fn),
-		}
+	knownItab := getitab(inter, typ, false)
+	if knownItab == nil {
+		return nil
 	}
 
-	structType := reflect.StructOf(fields)
-	structValue := reflect.New(structType).Elem()
+	knownPtr := uintptr(unsafe.Pointer(knownItab))
+	hash := itabHashFunc(inter, typ) & (512 - 1)
 
-	for i := 0; i < numMethods; i++ {
-		method := mp.targetType.Method(i)
-		fn, err := mp.TryMethod(method.Name)
-		if err != nil {
-			panic(err)
+	startPtr := uintptr(unsafe.Pointer(&itabStore))
+	searchRange := uintptr(0x1000000)
+
+	for i := uintptr(0); i < searchRange; i += 4 {
+		if startPtr+i >= 4096 {
+			addr := startPtr + i
+			val := *(*uintptr)(unsafe.Pointer(addr))
+			if val == knownPtr {
+				base := addr - hash*unsafe.Sizeof(uintptr(0))
+				return unsafe.Pointer(base)
+			}
 		}
-		structValue.Field(i).Set(reflect.ValueOf(fn))
+		if startPtr >= i+4096 {
+			addr := startPtr - i
+			val := *(*uintptr)(unsafe.Pointer(addr))
+			if val == knownPtr {
+				base := addr - hash*unsafe.Sizeof(uintptr(0))
+				return unsafe.Pointer(base)
+			}
+		}
 	}
-
-	return structValue.Interface()
+	return nil
 }
 
-func As[T any](mp *MockProxy) T {
-	var zero T
-	targetType := reflect.TypeOf(&zero).Elem()
+func addItabToRuntime(tab *abiItab) bool {
+	itabEntriesLock.Do(func() {
+		itabEntriesBase = findItabTable()
+	})
+	if itabEntriesBase == nil {
+		return false
+	}
+	h := itabHashFunc(tab.Inter, tab.Type) & (512 - 1)
+	for i := uintptr(1); ; i++ {
+		idx := h & (512 - 1)
+		p := (*uintptr)(unsafe.Pointer(uintptr(itabEntriesBase) + idx*unsafe.Sizeof(uintptr(0))))
+		val := *p
+		if val == 0 {
+			atomic.StoreUintptr(p, uintptr(unsafe.Pointer(tab)))
+			return true
+		}
+		if val == uintptr(unsafe.Pointer(tab)) {
+			return true
+		}
+		h += i
+		h &= (512 - 1)
+	}
+}
 
-	if targetType.Kind() != reflect.Struct {
-		return zero
+func (mp *MockProxy) Instance() interface{} {
+	numMethods := mp.targetType.NumMethod()
+
+	impl := &mockImpl{
+		mp:      mp,
+		methods: make([]mockMethod, numMethods),
+	}
+	registerMockImpl(impl)
+
+	interInternal := getABIInterfaceTypeFromReflect(internalIfaceType)
+	typMockPtr := getABITypeFromReflect(mockImplPtrType)
+	_ = getitab(interInternal, typMockPtr, false)
+
+	funcPtrs := make([]uintptr, numMethods)
+	for i := 0; i < numMethods; i++ {
+		method := mp.targetType.Method(i)
+		fn := makeTrampolineFunc(impl, i, method.Name, method.Type)
+		impl.methods[i] = mockMethod{
+			name: method.Name,
+			typ:  method.Type,
+			fn:   fn,
+		}
+		funcPtrs[i] = getFunctionCodePtr(fn)
 	}
 
-	instance := mp.Instance()
-	instanceValue := reflect.ValueOf(instance)
-	targetValue := reflect.New(targetType).Elem()
+	inter := getABIInterfaceTypeFromReflect(mp.targetType)
+	typ := typMockPtr
 
-	for i := 0; i < targetType.NumField(); i++ {
-		field := targetType.Field(i)
-		instanceField := instanceValue.FieldByName(field.Name)
-		if !instanceField.IsValid() {
-			continue
-		}
-		if instanceField.Type().AssignableTo(field.Type) {
-			targetValue.Field(i).Set(instanceField)
-		}
-	}
+	tab := buildItab(inter, typ, funcPtrs)
 
-	return targetValue.Interface().(T)
+	addItabToRuntime(tab)
+
+	var resultEface eface
+	resultEface._type = typ
+	resultEface.data = unsafe.Pointer(impl)
+
+	return *(*interface{})(unsafe.Pointer(&resultEface))
 }

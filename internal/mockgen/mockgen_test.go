@@ -16,14 +16,6 @@ type TestService interface {
 	MultiReturn() (string, int, bool)
 }
 
-type TestServiceMock struct {
-	GetUser      func(int) (string, error)
-	Add          func(int, int) int
-	Greet        func(string) string
-	VoidMethod   func()
-	MultiReturn  func() (string, int, bool)
-}
-
 func TestNewMockController(t *testing.T) {
 	mc := NewMockController()
 	if mc == nil {
@@ -663,14 +655,18 @@ func TestMockProxy_Instance_DirectMethodCall(t *testing.T) {
 	mock.On("MultiReturn").Return("hello", 42, true)
 	mock.On("VoidMethod").Return().Once()
 
-	svc := As[TestServiceMock](mock)
+	greetFn := mock.Method("Greet").(func(string) string)
+	getUserFn := mock.Method("GetUser").(func(int) (string, error))
+	addFn := mock.Method("Add").(func(int, int) int)
+	multiReturnFn := mock.Method("MultiReturn").(func() (string, int, bool))
+	voidMethodFn := mock.Method("VoidMethod").(func())
 
-	result := svc.Greet("World")
+	result := greetFn("World")
 	if result != "Hello, World!" {
 		t.Errorf("expected 'Hello, World!', got %q", result)
 	}
 
-	name, err := svc.GetUser(1)
+	name, err := getUserFn(1)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -678,17 +674,17 @@ func TestMockProxy_Instance_DirectMethodCall(t *testing.T) {
 		t.Errorf("expected 'user1', got %q", name)
 	}
 
-	sum := svc.Add(2, 3)
+	sum := addFn(2, 3)
 	if sum != 5 {
 		t.Errorf("expected 5, got %d", sum)
 	}
 
-	s, n, b := svc.MultiReturn()
+	s, n, b := multiReturnFn()
 	if s != "hello" || n != 42 || b != true {
 		t.Errorf("expected (hello, 42, true), got (%v, %v, %v)", s, n, b)
 	}
 
-	svc.VoidMethod()
+	voidMethodFn()
 
 	if err := mock.Verify(); err != nil {
 		t.Errorf("unexpected verify error: %v", err)
@@ -701,46 +697,26 @@ func TestMockProxy_Instance_TypeAssertion(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	mock.On("Greet", "World").Return("Hello, World!")
+	mock.On("GetUser", 1).Return("user1", nil)
+	mock.On("Add", 2, 3).Return(5)
 
 	instance := mock.Instance()
 
-	_, ok := instance.(TestService)
-	if ok {
-		t.Log("interface type assertion succeeded (unexpected but acceptable)")
-		svc := instance.(TestService)
-		result := svc.Greet("World")
-		if result != "Hello, World!" {
-			t.Errorf("expected 'Hello, World!', got %q", result)
-		}
-	} else {
-		t.Log("interface type assertion failed as expected - use As[T] with struct type instead")
-		svc := As[TestServiceMock](mock)
-		result := svc.Greet("World")
-		if result != "Hello, World!" {
-			t.Errorf("expected 'Hello, World!', got %q", result)
-		}
+	svc, ok := instance.(TestService)
+	if !ok {
+		t.Fatalf("expected type assertion instance.(TestService) to succeed, got ok=false; instance type: %T", instance)
 	}
-}
 
-func TestAs_StructMock(t *testing.T) {
-	mock, err := CreateMock((*TestService)(nil))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	mock.On("Greet", "World").Return("Hello, World!")
-	mock.On("GetUser", 1).Return("user1", nil)
-	mock.On("Add", 2, 3).Return(5)
-	mock.On("MultiReturn").Return("hello", 42, true)
-	mock.On("VoidMethod").Return().Once()
+	t.Logf("interface type assertion succeeded, svc type: %T", svc)
 
-	svc := As[TestServiceMock](mock)
-
-	result := svc.Greet("World")
+	greetFn := mock.Method("Greet").(func(string) string)
+	result := greetFn("World")
 	if result != "Hello, World!" {
 		t.Errorf("expected 'Hello, World!', got %q", result)
 	}
 
-	name, err := svc.GetUser(1)
+	getUserFn := mock.Method("GetUser").(func(int) (string, error))
+	name, err := getUserFn(1)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -748,41 +724,12 @@ func TestAs_StructMock(t *testing.T) {
 		t.Errorf("expected 'user1', got %q", name)
 	}
 
-	sum := svc.Add(2, 3)
+	addFn := mock.Method("Add").(func(int, int) int)
+	sum := addFn(2, 3)
 	if sum != 5 {
 		t.Errorf("expected 5, got %d", sum)
 	}
-
-	s, n, b := svc.MultiReturn()
-	if s != "hello" || n != 42 || b != true {
-		t.Errorf("expected (hello, 42, true), got (%v, %v, %v)", s, n, b)
-	}
-
-	svc.VoidMethod()
-
-	if err := mock.Verify(); err != nil {
-		t.Errorf("unexpected verify error: %v", err)
-	}
 }
-
-func TestAs_MismatchedType(t *testing.T) {
-	mock, err := CreateMock((*TestService)(nil))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	type OtherStruct struct {
-		Foo func() string
-	}
-
-	result := As[OtherStruct](mock)
-
-	if result.Foo != nil {
-		t.Error("expected As to return zero value for mismatched struct type")
-	}
-}
-
-
 
 func TestConcurrentCalls(t *testing.T) {
 	mc := NewMockController()

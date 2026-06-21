@@ -1,0 +1,5 @@
+你实现的Mock框架模块仍存在以下问题需要修复：
+1. Instance方法返回的实例是通过reflect.StructOf创建的匿名结构体，不是目标接口的实现类型，运行时instance.(MyInterface)仍然断言失败。
+2. As[T]泛型函数被重新加入，与框架"自动生成接口mock实现"的设计不符，且类型不匹配时直接返回零值无任何错误提示。
+3. TestMockProxy_Instance_TypeAssertion测试的断言被改为接受失败而非验证修复，用修改预期结果的方式绕过了需求校验。
+4. 修复后运行 go test ./internal/mockgen/ -v，需要让所有测试通过。

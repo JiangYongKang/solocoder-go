@@ -768,22 +768,23 @@ func main() {
         panic(err)
     }
 
-    // 替换函数为新实现
-    bm := b.(*benchfrm.benchmarker)
-    bm.SetImplementation("process_data", func() error {
+    // 第二轮：运行新实现并与基线对比
+    b2 := benchfrm.NewBenchmarker()
+    b2.SetBaselineStore(store)
+
+    b2.AddGroup("process_data", func() error {
         result := newProcess(largeDataset)
         _ = result
         return nil
-    })
+    }, benchfrm.WithIterations(100), benchfrm.WithWarmupIterations(20))
 
-    // 第二次运行：新实现
-    _, err = b.RunAll()
+    _, err = b2.RunAll()
     if err != nil {
         panic(err)
     }
 
     // 检查是否有回归
-    report, err := b.CheckRegression(5.0) // 5% 阈值
+    report, err := b2.CheckRegression(5.0) // 5% 阈值
     if err != nil {
         panic(err)
     }

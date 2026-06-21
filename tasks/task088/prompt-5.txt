@@ -1,0 +1,4 @@
+你实现的基准测试框架模块的文档问题仍未修复，存在以下问题需要解决：
+1. docs/benchfrm.md示例5中依然存在SetImplementation方法的调用，这个方法在实际代码中不存在，用户复制示例会编译失败。
+2. 示例中还通过(*benchfrm.benchmarker)引用了未导出的benchmarker结构体，用户的package main代码无法访问该类型，同样会导致编译失败。
+3. 修复后运行 go test ./internal/benchfrm/ -v，需要让所有测试通过。

@@ -898,7 +898,7 @@ func TestCustomCoverageHook(t *testing.T) {
 		t.Fatalf("NewFuzzer failed: %v", err)
 	}
 	input := []byte{0x41, 0x42, 0x43}
-	cov, _, _ := f.executeWithCoverage(input)
+	cov, _ := f.executeWithCoverage(input)
 	if cov.Count() == 0 {
 		t.Error("expected coverage to be collected")
 	}
@@ -1049,7 +1049,7 @@ func TestFuzzerCoverageHookSwitch(t *testing.T) {
 	config1.EnableBaselineCalibration = false
 	f1, _ := NewFuzzer(target, config1)
 	input := []byte("test input")
-	cov1, _, _ := f1.executeWithCoverage(input)
+	cov1, _ := f1.executeWithCoverage(input)
 	if cov1.Count() == 0 {
 		t.Error("expected default hook to collect coverage")
 	}
@@ -1063,7 +1063,7 @@ func TestFuzzerCoverageHookSwitch(t *testing.T) {
 	config2.CoverageHook = customHook
 	config2.EnableBaselineCalibration = false
 	f2, _ := NewFuzzer(target, config2)
-	cov2, _, _ := f2.executeWithCoverage(input)
+	cov2, _ := f2.executeWithCoverage(input)
 	for _, addr := range customAddrs {
 		if !cov2.Has(addr) {
 			t.Errorf("expected custom hook address 0x%X", addr)

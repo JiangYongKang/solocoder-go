@@ -1,0 +1,3 @@
+你实现的模糊测试驱动器模块在覆盖率统计修复后还存在代码遗留问题：
+1. executeWithCoverage方法的crashed返回值始终被硬编码为false，实际崩溃判定完全依赖executeSafe的defer recover，crashed参数成为死代码。
+2. 修复后运行 go test ./internal/fuzzdriver/ -v，需要让所有测试通过。
