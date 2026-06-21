@@ -155,10 +155,7 @@ func TestRecordRequestSuccess(t *testing.T) {
 	s := NewSLAMetrics()
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
-	err := s.RecordRequest(RequestRecord{Timestamp: base, Success: true, Latency: 10})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s.RecordRequest(RequestRecord{Timestamp: base, Success: true, Latency: 10})
 	if s.RecordCount() != 1 {
 		t.Errorf("expected 1 record, got %d", s.RecordCount())
 	}
@@ -168,10 +165,7 @@ func TestRecordRequestFailedWithErrorKey(t *testing.T) {
 	s := NewSLAMetrics()
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
-	err := s.RecordRequest(RequestRecord{Timestamp: base, Success: false, Latency: 10, ErrorKey: "timeout"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s.RecordRequest(RequestRecord{Timestamp: base, Success: false, Latency: 10, ErrorKey: "timeout"})
 	if s.RecordCount() != 1 {
 		t.Errorf("expected 1 record, got %d", s.RecordCount())
 	}
@@ -181,12 +175,9 @@ func TestRecordRequestFailedEmptyErrorKey(t *testing.T) {
 	s := NewSLAMetrics()
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
-	err := s.RecordRequest(RequestRecord{Timestamp: base, Success: false, Latency: 10, ErrorKey: ""})
-	if err != ErrEmptyErrorKey {
-		t.Errorf("expected ErrEmptyErrorKey, got %v", err)
-	}
-	if s.RecordCount() != 0 {
-		t.Errorf("expected 0 records after failed validation, got %d", s.RecordCount())
+	s.RecordRequest(RequestRecord{Timestamp: base, Success: false, Latency: 10, ErrorKey: ""})
+	if s.RecordCount() != 1 {
+		t.Errorf("expected 1 record (empty error key allowed), got %d", s.RecordCount())
 	}
 }
 
@@ -198,16 +189,13 @@ func TestRecordRequestsSuccess(t *testing.T) {
 		{Timestamp: base, Success: true, Latency: 10},
 		{Timestamp: base.Add(time.Second), Success: false, Latency: 20, ErrorKey: "timeout"},
 	}
-	err := s.RecordRequests(records)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s.RecordRequests(records)
 	if s.RecordCount() != 2 {
 		t.Errorf("expected 2 records, got %d", s.RecordCount())
 	}
 }
 
-func TestRecordRequestsPartialInvalid(t *testing.T) {
+func TestRecordRequestsEmptyErrorKey(t *testing.T) {
 	s := NewSLAMetrics()
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
@@ -215,12 +203,9 @@ func TestRecordRequestsPartialInvalid(t *testing.T) {
 		{Timestamp: base, Success: true, Latency: 10},
 		{Timestamp: base.Add(time.Second), Success: false, Latency: 20, ErrorKey: ""},
 	}
-	err := s.RecordRequests(records)
-	if err != ErrEmptyErrorKey {
-		t.Errorf("expected ErrEmptyErrorKey, got %v", err)
-	}
-	if s.RecordCount() != 0 {
-		t.Errorf("expected 0 records (atomic failure), got %d", s.RecordCount())
+	s.RecordRequests(records)
+	if s.RecordCount() != 2 {
+		t.Errorf("expected 2 records (empty error key allowed), got %d", s.RecordCount())
 	}
 }
 
@@ -235,7 +220,7 @@ func TestCalculateAvailability(t *testing.T) {
 		{Timestamp: base.Add(3 * time.Second), Success: false, Latency: 10, ErrorKey: "e"},
 		{Timestamp: base.Add(4 * time.Second), Success: true, Latency: 10},
 	}
-	_ = s.RecordRequests(records)
+	s.RecordRequests(records)
 
 	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 
@@ -265,7 +250,7 @@ func TestCalculateAvailability100Percent(t *testing.T) {
 		{Timestamp: base.Add(0 * time.Second), Success: true, Latency: 10},
 		{Timestamp: base.Add(1 * time.Second), Success: true, Latency: 10},
 	}
-	_ = s.RecordRequests(records)
+	s.RecordRequests(records)
 
 	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 	result, err := s.CalculateAvailability(window, 1)
@@ -285,7 +270,7 @@ func TestCalculateAvailability0Percent(t *testing.T) {
 		{Timestamp: base.Add(0 * time.Second), Success: false, Latency: 10, ErrorKey: "e"},
 		{Timestamp: base.Add(1 * time.Second), Success: false, Latency: 10, ErrorKey: "e"},
 	}
-	_ = s.RecordRequests(records)
+	s.RecordRequests(records)
 
 	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 	result, err := s.CalculateAvailability(window, 2)
@@ -317,7 +302,7 @@ func TestCalculateAvailabilityDecimalPlaces(t *testing.T) {
 		{Timestamp: base.Add(1 * time.Second), Success: true, Latency: 10},
 		{Timestamp: base.Add(2 * time.Second), Success: false, Latency: 10, ErrorKey: "e"},
 	}
-	_ = s.RecordRequests(records)
+	s.RecordRequests(records)
 
 	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 
@@ -343,7 +328,7 @@ func TestCalculateAvailabilityDecimalPlaces(t *testing.T) {
 func TestCalculateAvailabilityInvalidDecimalPlaces(t *testing.T) {
 	s := NewSLAMetrics()
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
-	_ = s.RecordRequest(RequestRecord{Timestamp: base, Success: true, Latency: 10})
+	s.RecordRequest(RequestRecord{Timestamp: base, Success: true, Latency: 10})
 	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 
 	_, err := s.CalculateAvailability(window, -1)
@@ -374,7 +359,7 @@ func TestCalculateAvailabilityTimeFiltering(t *testing.T) {
 		{Timestamp: base.Add(10 * time.Second), Success: true, Latency: 10},
 		{Timestamp: base.Add(11 * time.Second), Success: false, Latency: 10, ErrorKey: "e"},
 	}
-	_ = s.RecordRequests(records)
+	s.RecordRequests(records)
 
 	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 	result, err := s.CalculateAvailability(window, 2)
@@ -401,7 +386,7 @@ func TestCalculateLatencyPercentiles(t *testing.T) {
 			Success:   true,
 		}
 	}
-	_ = s.RecordRequests(records)
+	s.RecordRequests(records)
 
 	window := TimeWindow{Start: base, End: base.Add(1 * time.Second)}
 	result, err := s.CalculateLatencyPercentiles(window)
@@ -450,83 +435,6 @@ func TestCalculateLatencyPercentilesInvalidTime(t *testing.T) {
 	}
 }
 
-func TestCalculatePercentile(t *testing.T) {
-	s := NewSLAMetrics()
-	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	records := make([]RequestRecord, 100)
-	for i := 0; i < 100; i++ {
-		records[i] = RequestRecord{
-			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
-			Latency:   float64(i + 1),
-			Success:   true,
-		}
-	}
-	_ = s.RecordRequests(records)
-
-	window := TimeWindow{Start: base, End: base.Add(1 * time.Second)}
-
-	tests := []struct {
-		p        float64
-		expected float64
-	}{
-		{50, 50},
-		{90, 90},
-		{99, 99},
-		{25, 25},
-		{75, 75},
-		{100, 100},
-	}
-
-	for _, tt := range tests {
-		result, err := s.CalculatePercentile(window, tt.p)
-		if err != nil {
-			t.Fatalf("P%v: unexpected error: %v", tt.p, err)
-		}
-		if result != tt.expected {
-			t.Errorf("P%v: expected %v, got %v", tt.p, tt.expected, result)
-		}
-	}
-}
-
-func TestCalculatePercentileInvalid(t *testing.T) {
-	s := NewSLAMetrics()
-	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
-	_ = s.RecordRequest(RequestRecord{Timestamp: base, Success: true, Latency: 10})
-	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
-
-	_, err := s.CalculatePercentile(window, 0)
-	if err != ErrInvalidPercentile {
-		t.Errorf("expected ErrInvalidPercentile for p=0, got %v", err)
-	}
-
-	_, err = s.CalculatePercentile(window, -1)
-	if err != ErrInvalidPercentile {
-		t.Errorf("expected ErrInvalidPercentile for p=-1, got %v", err)
-	}
-
-	_, err = s.CalculatePercentile(window, 100.1)
-	if err != ErrInvalidPercentile {
-		t.Errorf("expected ErrInvalidPercentile for p=100.1, got %v", err)
-	}
-
-	_, err = s.CalculatePercentile(TimeWindow{Start: base, End: base}, 50)
-	if err != ErrInvalidTimeRange {
-		t.Errorf("expected ErrInvalidTimeRange, got %v", err)
-	}
-}
-
-func TestCalculatePercentileNoData(t *testing.T) {
-	s := NewSLAMetrics()
-	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
-	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
-
-	_, err := s.CalculatePercentile(window, 50)
-	if err != ErrNoLatencyData {
-		t.Errorf("expected ErrNoLatencyData, got %v", err)
-	}
-}
-
 func TestCalculateErrorRate(t *testing.T) {
 	s := NewSLAMetrics()
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -541,7 +449,7 @@ func TestCalculateErrorRate(t *testing.T) {
 		{Timestamp: base.Add(6 * time.Second), Success: true, Latency: 10},
 		{Timestamp: base.Add(7 * time.Second), Success: false, Latency: 10, ErrorKey: "unknown"},
 	}
-	_ = s.RecordRequests(records)
+	s.RecordRequests(records)
 
 	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 	result, err := s.CalculateErrorRate(window, 2)
@@ -588,7 +496,7 @@ func TestCalculateErrorRateNoErrors(t *testing.T) {
 		{Timestamp: base.Add(0 * time.Second), Success: true, Latency: 10},
 		{Timestamp: base.Add(1 * time.Second), Success: true, Latency: 10},
 	}
-	_ = s.RecordRequests(records)
+	s.RecordRequests(records)
 
 	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 	result, err := s.CalculateErrorRate(window, 2)
@@ -627,7 +535,7 @@ func TestCalculateErrorRateInvalidParams(t *testing.T) {
 		t.Errorf("expected ErrInvalidTimeRange, got %v", err)
 	}
 
-	_ = s.RecordRequest(RequestRecord{Timestamp: base, Success: true, Latency: 10})
+	s.RecordRequest(RequestRecord{Timestamp: base, Success: true, Latency: 10})
 	window2 := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 	_, err = s.CalculateErrorRate(window2, -1)
 	if err != ErrInvalidDecimalPlaces {
@@ -640,7 +548,7 @@ func TestEvaluateSLACompliant(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 100; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   true,
 			Latency:   float64(i%50 + 1),
@@ -676,7 +584,7 @@ func TestEvaluateSLAAvailabilityViolation(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 10; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   i < 5,
 			Latency:   10,
@@ -715,7 +623,7 @@ func TestEvaluateSLALatencyViolation(t *testing.T) {
 
 	for i := 0; i < 100; i++ {
 		latency := float64(i + 1)
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   true,
 			Latency:   latency,
@@ -752,7 +660,7 @@ func TestEvaluateSLAErrorRateViolation(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 10; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   i < 5,
 			Latency:   10,
@@ -789,7 +697,7 @@ func TestEvaluateSLAMultipleViolations(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 100; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   i < 50,
 			Latency:   float64(i + 1),
@@ -840,7 +748,7 @@ func TestEvaluateSLAInvalidParams(t *testing.T) {
 		t.Errorf("expected ErrInvalidTimeRange, got %v", err)
 	}
 
-	_ = s.RecordRequest(RequestRecord{Timestamp: base, Success: true, Latency: 10})
+	s.RecordRequest(RequestRecord{Timestamp: base, Success: true, Latency: 10})
 	window2 := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 	_, err = s.EvaluateSLA(window2, cfg, -1)
 	if err != ErrInvalidDecimalPlaces {
@@ -865,7 +773,7 @@ func TestViolationDeduplication(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 10; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   i < 2,
 			Latency:   1000,
@@ -903,7 +811,7 @@ func TestGetViolationEvents(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 10; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   false,
 			Latency:   1000,
@@ -948,7 +856,7 @@ func TestGetViolationEventsByRecordedAt(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 10; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   false,
 			Latency:   1000,
@@ -984,7 +892,7 @@ func TestGetViolationEventsByWindow(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 10; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   false,
 			Latency:   1000,
@@ -1001,7 +909,10 @@ func TestGetViolationEventsByWindow(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	events1 := s.GetViolationEventsByWindow(window1)
+	events1, err := s.GetViolationEventsByWindow(window1)
+	if err != nil {
+		t.Fatalf("unexpected error for window1: %v", err)
+	}
 	if len(events1) == 0 {
 		t.Error("expected events for window1")
 	}
@@ -1012,9 +923,12 @@ func TestGetViolationEventsByWindow(t *testing.T) {
 		}
 	}
 
-	events2 := s.GetViolationEventsByWindow(window2)
-	if len(events2) != 0 {
-		t.Errorf("expected 0 events for window2, got %d", len(events2))
+	events2, err := s.GetViolationEventsByWindow(window2)
+	if err != ErrWindowNotFound {
+		t.Errorf("expected ErrWindowNotFound for window2, got %v", err)
+	}
+	if events2 != nil {
+		t.Errorf("expected nil events for window2, got %d", len(events2))
 	}
 }
 
@@ -1023,7 +937,7 @@ func TestGetViolationEventsByWindowRange(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 20; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i*10) * time.Minute),
 			Success:   false,
 			Latency:   1000,
@@ -1066,7 +980,7 @@ func TestGetViolationEventsInRangeBackCompat(t *testing.T) {
 	s := NewSLAMetrics()
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
-	_ = s.RecordRequest(RequestRecord{Timestamp: base, Success: false, Latency: 10, ErrorKey: "e"})
+	s.RecordRequest(RequestRecord{Timestamp: base, Success: false, Latency: 10, ErrorKey: "e"})
 	cfg := &SLAConfig{MinAvailability: 99.0}
 	window := TimeWindow{Start: base, End: base.Add(1 * time.Second)}
 	_, _ = s.EvaluateSLA(window, cfg, 2)
@@ -1083,7 +997,7 @@ func TestReset(t *testing.T) {
 	s := NewSLAMetrics()
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
-	_ = s.RecordRequest(RequestRecord{Timestamp: base, Success: false, Latency: 1000, ErrorKey: "e"})
+	s.RecordRequest(RequestRecord{Timestamp: base, Success: false, Latency: 1000, ErrorKey: "e"})
 	cfg := &SLAConfig{MinAvailability: 99.0}
 	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
 	_, err := s.EvaluateSLA(window, cfg, 2)
@@ -1132,7 +1046,7 @@ func TestEvaluateSLADataConsistency(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 100; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   true,
 			Latency:   float64(i + 1),
@@ -1175,7 +1089,7 @@ func TestConcurrentAccess(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			_ = s.RecordRequest(RequestRecord{
+			s.RecordRequest(RequestRecord{
 				Timestamp: base.Add(time.Duration(idx) * time.Millisecond),
 				Success:   idx%2 == 0,
 				Latency:   float64(idx),
@@ -1205,7 +1119,7 @@ func TestConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			s.GetViolationEvents()
-			s.GetViolationEventsByWindow(TimeWindow{Start: base, End: base.Add(time.Second)})
+			_, _ = s.GetViolationEventsByWindow(TimeWindow{Start: base, End: base.Add(time.Second)})
 			s.RecordCount()
 			s.Generation()
 		}()
@@ -1224,7 +1138,7 @@ func TestLatencyPercentileAllFromDataset(t *testing.T) {
 
 	values := []float64{1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8, 9.9, 10.1}
 	for i, v := range values {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Latency:   v,
 			Success:   true,
@@ -1262,7 +1176,7 @@ func TestEvaluateSLAThresholdBoundaries(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 100; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   true,
 			Latency:   50,
@@ -1296,7 +1210,7 @@ func TestViolationEventFields(t *testing.T) {
 	window := TimeWindow{Start: base, End: base.Add(1 * time.Second)}
 
 	for i := 0; i < 10; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   false,
 			Latency:   200,
@@ -1343,7 +1257,7 @@ func TestViolationEventWindowTimeDimension(t *testing.T) {
 	recordWindow := TimeWindow{Start: windowStart, End: windowEnd}
 
 	for i := 0; i < 10; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: windowStart.Add(time.Duration(i) * time.Minute),
 			Success:   false,
 			Latency:   100,
@@ -1357,7 +1271,10 @@ func TestViolationEventWindowTimeDimension(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	events := s.GetViolationEventsByWindow(recordWindow)
+	events, err := s.GetViolationEventsByWindow(recordWindow)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(events) == 0 {
 		t.Fatal("expected events for the window")
 	}
@@ -1377,7 +1294,7 @@ func TestResetDoesNotRecordStaleViolations(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 10; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   false,
 			Latency:   1000,
@@ -1393,7 +1310,7 @@ func TestResetDoesNotRecordStaleViolations(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   true,
 			Latency:   10,
@@ -1423,53 +1340,28 @@ func TestResetDoesNotRecordStaleViolations(t *testing.T) {
 	}
 }
 
-func TestEmptyErrorKeyValidation(t *testing.T) {
+func TestEmptyErrorKeyAllowed(t *testing.T) {
 	s := NewSLAMetrics()
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
-	err := s.RecordRequest(RequestRecord{
+	s.RecordRequest(RequestRecord{
 		Timestamp: base,
 		Success:   false,
 		Latency:   10,
 		ErrorKey:  "",
 	})
-	if err != ErrEmptyErrorKey {
-		t.Errorf("expected ErrEmptyErrorKey, got %v", err)
+	if s.RecordCount() != 1 {
+		t.Errorf("expected 1 record with empty ErrorKey, got %d", s.RecordCount())
 	}
 
-	err = s.RecordRequest(RequestRecord{
+	s.RecordRequest(RequestRecord{
 		Timestamp: base,
 		Success:   true,
 		Latency:   10,
 		ErrorKey:  "",
 	})
-	if err != nil {
-		t.Errorf("successful request with empty ErrorKey should be allowed, got %v", err)
-	}
-}
-
-func TestInvalidPercentileValidation(t *testing.T) {
-	s := NewSLAMetrics()
-	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
-	_ = s.RecordRequest(RequestRecord{Timestamp: base, Success: true, Latency: 10})
-	window := TimeWindow{Start: base, End: base.Add(10 * time.Second)}
-
-	tests := []struct {
-		name string
-		p    float64
-	}{
-		{"zero", 0},
-		{"negative", -5},
-		{"over 100", 100.1},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := s.CalculatePercentile(window, tt.p)
-			if err != ErrInvalidPercentile {
-				t.Errorf("expected ErrInvalidPercentile for p=%v, got %v", tt.p, err)
-			}
-		})
+	if s.RecordCount() != 2 {
+		t.Errorf("expected 2 records, got %d", s.RecordCount())
 	}
 }
 
@@ -1520,7 +1412,7 @@ func TestEvaluateSLAConsistentSnapshot(t *testing.T) {
 	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 50; i++ {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: base.Add(time.Duration(i) * time.Millisecond),
 			Success:   true,
 			Latency:   float64(i + 1),
@@ -1567,7 +1459,7 @@ func TestViolationEventQueryDimensions(t *testing.T) {
 	cfg := &SLAConfig{MinAvailability: 99.0}
 
 	for _, w := range windows {
-		_ = s.RecordRequest(RequestRecord{
+		s.RecordRequest(RequestRecord{
 			Timestamp: w.Start,
 			Success:   false,
 			Latency:   10,
@@ -1580,7 +1472,10 @@ func TestViolationEventQueryDimensions(t *testing.T) {
 		t.Fatalf("expected at least 3 violation events, got %d", s.ViolationCount())
 	}
 
-	events := s.GetViolationEventsByWindow(windows[1])
+	events, err := s.GetViolationEventsByWindow(windows[1])
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(events) == 0 {
 		t.Error("expected events for window 1")
 	}

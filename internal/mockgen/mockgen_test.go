@@ -3,6 +3,7 @@ package mockgen
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,41 @@ type TestService interface {
 	Greet(name string) string
 	VoidMethod()
 	MultiReturn() (string, int, bool)
+}
+
+type testServiceMock struct {
+	mp *MockProxy
+}
+
+func (m *testServiceMock) GetUser(id int) (string, error) {
+	fn := m.mp.Method("GetUser").(func(int) (string, error))
+	return fn(id)
+}
+
+func (m *testServiceMock) Add(a, b int) int {
+	fn := m.mp.Method("Add").(func(int, int) int)
+	return fn(a, b)
+}
+
+func (m *testServiceMock) Greet(name string) string {
+	fn := m.mp.Method("Greet").(func(string) string)
+	return fn(name)
+}
+
+func (m *testServiceMock) VoidMethod() {
+	fn := m.mp.Method("VoidMethod").(func())
+	fn()
+}
+
+func (m *testServiceMock) MultiReturn() (string, int, bool) {
+	fn := m.mp.Method("MultiReturn").(func() (string, int, bool))
+	return fn()
+}
+
+func init() {
+	RegisterMock[TestService](func(mp *MockProxy) TestService {
+		return &testServiceMock{mp: mp}
+	})
 }
 
 func TestNewMockController(t *testing.T) {
@@ -641,6 +677,141 @@ func TestMockProxy_Instance(t *testing.T) {
 	instance := mock.Instance()
 	if instance == nil {
 		t.Fatal("expected non-nil instance")
+	}
+}
+
+func TestMockProxy_Instance_DirectMethodCall(t *testing.T) {
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	mock.On("Greet", "World").Return("Hello, World!")
+	mock.On("GetUser", 1).Return("user1", nil)
+	mock.On("Add", 2, 3).Return(5)
+	mock.On("MultiReturn").Return("hello", 42, true)
+
+	instance := mock.Instance()
+
+	instanceVal := reflect.ValueOf(instance).Elem()
+
+	greetField := instanceVal.FieldByName("Greet")
+	if !greetField.IsValid() {
+		t.Fatal("expected Greet field to exist")
+	}
+	greetFn := greetField.Interface().(func(string) string)
+	result := greetFn("World")
+	if result != "Hello, World!" {
+		t.Errorf("expected 'Hello, World!', got %q", result)
+	}
+
+	getUserField := instanceVal.FieldByName("GetUser")
+	if !getUserField.IsValid() {
+		t.Fatal("expected GetUser field to exist")
+	}
+	getUserFn := getUserField.Interface().(func(int) (string, error))
+	name, err := getUserFn(1)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if name != "user1" {
+		t.Errorf("expected 'user1', got %q", name)
+	}
+
+	addField := instanceVal.FieldByName("Add")
+	if !addField.IsValid() {
+		t.Fatal("expected Add field to exist")
+	}
+	addFn := addField.Interface().(func(int, int) int)
+	sum := addFn(2, 3)
+	if sum != 5 {
+		t.Errorf("expected 5, got %d", sum)
+	}
+
+	multiReturnField := instanceVal.FieldByName("MultiReturn")
+	if !multiReturnField.IsValid() {
+		t.Fatal("expected MultiReturn field to exist")
+	}
+	multiReturnFn := multiReturnField.Interface().(func() (string, int, bool))
+	s, n, b := multiReturnFn()
+	if s != "hello" || n != 42 || b != true {
+		t.Errorf("expected (hello, 42, true), got (%v, %v, %v)", s, n, b)
+	}
+}
+
+func TestMockProxy_Instance_TypeAssertion(t *testing.T) {
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	mock.On("Greet", "World").Return("Hello, World!")
+
+	instance := mock.Instance()
+
+	svc, ok := instance.(TestService)
+	if ok {
+		t.Error("expected type assertion to fail for dynamic struct type")
+		_ = svc
+	}
+}
+
+func TestAs_GenericMock(t *testing.T) {
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	mock.On("Greet", "World").Return("Hello, World!")
+	mock.On("GetUser", 1).Return("user1", nil)
+	mock.On("Add", 2, 3).Return(5)
+	mock.On("MultiReturn").Return("hello", 42, true)
+	mock.On("VoidMethod").Return().Once()
+
+	svc := As[TestService](mock)
+
+	result := svc.Greet("World")
+	if result != "Hello, World!" {
+		t.Errorf("expected 'Hello, World!', got %q", result)
+	}
+
+	name, err := svc.GetUser(1)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if name != "user1" {
+		t.Errorf("expected 'user1', got %q", name)
+	}
+
+	sum := svc.Add(2, 3)
+	if sum != 5 {
+		t.Errorf("expected 5, got %d", sum)
+	}
+
+	s, n, b := svc.MultiReturn()
+	if s != "hello" || n != 42 || b != true {
+		t.Errorf("expected (hello, 42, true), got (%v, %v, %v)", s, n, b)
+	}
+
+	svc.VoidMethod()
+
+	if err := mock.Verify(); err != nil {
+		t.Errorf("unexpected verify error: %v", err)
+	}
+}
+
+func TestAs_GenericMock_MismatchedType(t *testing.T) {
+	mock, err := CreateMock((*TestService)(nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	type OtherInterface interface {
+		Foo() string
+	}
+
+	result := As[OtherInterface](mock)
+
+	var zero OtherInterface
+	if !reflect.DeepEqual(result, zero) {
+		t.Error("expected As to return zero value for mismatched interface type")
 	}
 }
 

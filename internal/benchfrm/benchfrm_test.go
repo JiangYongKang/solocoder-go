@@ -248,8 +248,11 @@ func TestRunAll_FunctionError(t *testing.T) {
 	}, WithIterations(3), WithWarmupIterations(1))
 
 	_, err := b.RunAll()
+	if !errors.Is(err, ErrGroupEmptyResult) {
+		t.Errorf("expected ErrGroupEmptyResult, got %v", err)
+	}
 	if !errors.Is(err, errTest) {
-		t.Errorf("expected errTest, got %v", err)
+		t.Errorf("expected wrapped errTest, got %v", err)
 	}
 }
 
@@ -262,8 +265,72 @@ func TestRunAll_Timeout(t *testing.T) {
 	}, WithIterations(3), WithWarmupIterations(0), WithTimeout(10*time.Millisecond), WithMemoryCollection(false))
 
 	_, err := b.RunAll()
+	if !errors.Is(err, ErrGroupEmptyResult) {
+		t.Errorf("expected ErrGroupEmptyResult, got %v", err)
+	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("expected context.DeadlineExceeded, got %v", err)
+		t.Errorf("expected wrapped context.DeadlineExceeded, got %v", err)
+	}
+}
+
+func TestRunAll_PartialErrors(t *testing.T) {
+	b := NewBenchmarker()
+
+	var callCount int
+	b.AddGroup("partial-error", func() error {
+		callCount++
+		if callCount%2 == 0 {
+			return errTest
+		}
+		time.Sleep(1 * time.Microsecond)
+		return nil
+	}, WithIterations(5), WithWarmupIterations(0), WithMemoryCollection(false))
+
+	results, err := b.RunAll()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 group result, got %d", len(results))
+	}
+
+	stats := results[0]
+	if stats.Iterations != 3 {
+		t.Errorf("expected 3 successful iterations (out of 5 with even failures), got %d", stats.Iterations)
+	}
+}
+
+func TestRunAll_ErrGroupEmptyResult_AllFail(t *testing.T) {
+	b := NewBenchmarker()
+
+	b.AddGroup("all-fail", func() error {
+		return errTest
+	}, WithIterations(3), WithWarmupIterations(0))
+
+	_, err := b.RunAll()
+	if !errors.Is(err, ErrGroupEmptyResult) {
+		t.Errorf("expected ErrGroupEmptyResult, got %v", err)
+	}
+	if !errors.Is(err, errTest) {
+		t.Errorf("expected error to wrap original errTest, got %v", err)
+	}
+}
+
+func TestErrGroupEmptyResult_Unwrap(t *testing.T) {
+	b := NewBenchmarker()
+
+	testErr := errors.New("custom failure")
+	b.AddGroup("unwrap-test", func() error {
+		return testErr
+	}, WithIterations(2), WithWarmupIterations(0))
+
+	_, err := b.RunAll()
+	if !errors.Is(err, ErrGroupEmptyResult) {
+		t.Errorf("expected ErrGroupEmptyResult, got %v", err)
+	}
+	if !errors.Is(err, testErr) {
+		t.Errorf("expected error chain to contain testErr, got %v", err)
 	}
 }
 

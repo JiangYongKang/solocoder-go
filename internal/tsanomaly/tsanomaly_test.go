@@ -1260,8 +1260,8 @@ func TestDetector_UpdateConfig_SeasonalToNonSeasonal(t *testing.T) {
 	}
 
 	_, _, globalCount := d.GetBaseline()
-	if globalCount < totalSamplesSeasonal {
-		t.Errorf("Global count=%d after migration, want at least %d", globalCount, totalSamplesSeasonal)
+	if globalCount != totalSamplesSeasonal {
+		t.Errorf("Global count=%d after migration, want exactly %d (no duplicate data)", globalCount, totalSamplesSeasonal)
 	}
 
 	gotCfg := d.Config()
@@ -1390,19 +1390,39 @@ func TestDetector_UpdateConfig_ChangePeriodLength(t *testing.T) {
 	}
 
 	totalAfter := 0
-	anyNonZero := false
+	slotCounts := make([]int, 6)
 	for i := 0; i < 6; i++ {
 		_, _, cnt, _ := d.GetSeasonalBaseline(i)
+		slotCounts[i] = cnt
 		totalAfter += cnt
-		if cnt > 0 {
-			anyNonZero = true
-		}
 	}
-	if !anyNonZero {
-		t.Error("No seasonal baseline data after period length change (migration failed)")
+
+	if totalAfter != totalBefore {
+		t.Errorf("Total seasonal samples after migration=%d, want exactly %d (no data duplication across slots)", totalAfter, totalBefore)
 	}
-	if totalAfter < totalBefore {
-		t.Errorf("Total seasonal samples after migration=%d, expected at least as many as before=%d", totalAfter, totalBefore)
+
+	if slotCounts[0] != 3 || slotCounts[1] != 3 || slotCounts[2] != 3 || slotCounts[3] != 3 {
+		t.Errorf("First 4 slots should have 3 samples each (one-to-one mapping), got counts=%v", slotCounts)
+	}
+	if slotCounts[4] != 0 || slotCounts[5] != 0 {
+		t.Errorf("Slots 4 and 5 should be empty (no data sharing across different phases), got counts=%v", slotCounts)
+	}
+
+	mean0, _, _, _ := d.GetSeasonalBaseline(0)
+	if !floatApproxEqual(mean0, 10.0) {
+		t.Errorf("Slot 0 mean should be 10.0 (mapped from old slot 0), got %v", mean0)
+	}
+	mean1, _, _, _ := d.GetSeasonalBaseline(1)
+	if !floatApproxEqual(mean1, 20.0) {
+		t.Errorf("Slot 1 mean should be 20.0 (mapped from old slot 1), got %v", mean1)
+	}
+	mean2, _, _, _ := d.GetSeasonalBaseline(2)
+	if !floatApproxEqual(mean2, 30.0) {
+		t.Errorf("Slot 2 mean should be 30.0 (mapped from old slot 2), got %v", mean2)
+	}
+	mean3, _, _, _ := d.GetSeasonalBaseline(3)
+	if !floatApproxEqual(mean3, 40.0) {
+		t.Errorf("Slot 3 mean should be 40.0 (mapped from old slot 3), got %v", mean3)
 	}
 }
 

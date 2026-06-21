@@ -272,13 +272,13 @@ func (d *Detector) UpdateConfig(cfg Config) error {
 	}
 
 	if oldEnable && !newEnable {
-		if oldCfg.PeriodLength > 0 && len(oldSeasonal) > 0 {
-			merged := newWindowStats()
-			for _, s := range oldSeasonal {
-				mergeWindowStats(merged, s, cfg.WindowSize)
-			}
-			for e := merged.values.Front(); e != nil; e = e.Next() {
-				d.globalStats.add(e.Value.(float64), cfg.WindowSize)
+		if d.globalStats.count() > cfg.WindowSize {
+			for d.globalStats.count() > cfg.WindowSize {
+				e := d.globalStats.values.Front()
+				oldVal := e.Value.(float64)
+				d.globalStats.sum -= oldVal
+				d.globalStats.sumSq -= oldVal * oldVal
+				d.globalStats.values.Remove(e)
 			}
 		}
 		d.seasonalStats = nil
@@ -324,20 +324,12 @@ func (d *Detector) UpdateConfig(cfg Config) error {
 				}
 			}
 		} else {
-			gcdVal := gcd(oldLen, newLen)
 			for oldIdx := 0; oldIdx < oldLen && oldIdx < len(oldSeasonal); oldIdx++ {
 				if oldSeasonal[oldIdx] == nil {
 					continue
 				}
 				newIdx := oldIdx % newLen
-				if gcdVal > 0 {
-					for k := 0; k < newLen/gcdVal; k++ {
-						mappedIdx := (newIdx + k*gcdVal) % newLen
-						mergeWindowStats(newSeasonal[mappedIdx], oldSeasonal[oldIdx], cfg.WindowSize)
-					}
-				} else {
-					mergeWindowStats(newSeasonal[newIdx], oldSeasonal[oldIdx], cfg.WindowSize)
-				}
+				mergeWindowStats(newSeasonal[newIdx], oldSeasonal[oldIdx], cfg.WindowSize)
 			}
 		}
 	}

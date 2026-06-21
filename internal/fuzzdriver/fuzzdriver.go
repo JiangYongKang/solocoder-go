@@ -1,10 +1,12 @@
 package fuzzdriver
 
 import (
+	"bytes"
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -125,6 +127,47 @@ func (c *Coverage) Snapshot() []uint64 {
 	return addrs
 }
 
+var (
+	coverageMap   = make(map[uint64]*Coverage)
+	coverageMapMu sync.RWMutex
+)
+
+func getGoroutineID() uint64 {
+	b := make([]byte, 64)
+	b = b[:runtime.Stack(b, false)]
+	b = bytes.TrimPrefix(b, []byte("goroutine "))
+	b = b[:bytes.IndexByte(b, ' ')]
+	n, _ := strconv.ParseUint(string(b), 10, 64)
+	return n
+}
+
+func SetCurrentCoverage(cov *Coverage) {
+	gid := getGoroutineID()
+	coverageMapMu.Lock()
+	defer coverageMapMu.Unlock()
+	coverageMap[gid] = cov
+}
+
+func GetCurrentCoverage() *Coverage {
+	gid := getGoroutineID()
+	coverageMapMu.RLock()
+	defer coverageMapMu.RUnlock()
+	return coverageMap[gid]
+}
+
+func ClearCurrentCoverage() {
+	gid := getGoroutineID()
+	coverageMapMu.Lock()
+	defer coverageMapMu.Unlock()
+	delete(coverageMap, gid)
+}
+
+func Cover(addr uint64) {
+	if cov := GetCurrentCoverage(); cov != nil {
+		cov.Add(addr)
+	}
+}
+
 func DefaultCoverageHook(depth int) CoverageHook {
 	return func(input []byte) []uint64 {
 		pcs := make([]uintptr, depth)
@@ -152,6 +195,14 @@ func InputBasedCoverageHook(input []byte) []uint64 {
 		result = append(result, uint64(input[i])*2654435761+uint64(input[i+1]))
 	}
 	return result
+}
+
+type InstrumentedTarget func(input []byte, cover func(uint64)) error
+
+func WrapInstrumentedTarget(target InstrumentedTarget) TargetFunc {
+	return func(input []byte) error {
+		return target(input, Cover)
+	}
 }
 
 type Mutator struct {
@@ -399,11 +450,14 @@ func ReadMemoryStats() MemoryStats {
 }
 
 type SuspiciousMemoryRecord struct {
-	Input          []byte
-	Timestamp      time.Time
-	AllocatedDiff  uint64
-	AllocationDiff uint64
-	Threshold      uint64
+	Input              []byte
+	Timestamp          time.Time
+	AllocatedDiff      uint64
+	AllocationDiff     uint64
+	ThresholdBytes     uint64
+	ThresholdAllocs    uint64
+	TriggeredByBytes   bool
+	TriggeredByAllocs  bool
 }
 
 type CrashRecord struct {
@@ -594,6 +648,7 @@ func (f *Fuzzer) saveCrash(input []byte, err error) error {
 
 func (f *Fuzzer) executeWithCoverage(input []byte) (coverage *Coverage, execErr error, crashed bool) {
 	coverage = NewCoverage()
+	SetCurrentCoverage(coverage)
 
 	preAddrs := f.coverageHook(input)
 	for _, addr := range preAddrs {
@@ -620,6 +675,9 @@ func (f *Fuzzer) executeSafe(input []byte) (cov *Coverage, execErr error, crashe
 			crashed = true
 			execErr = fmt.Errorf("panic: %v", r)
 			if cov == nil {
+				cov = GetCurrentCoverage()
+			}
+			if cov == nil {
 				cov = NewCoverage()
 			}
 			postAddrs := f.coverageHook(input)
@@ -628,6 +686,7 @@ func (f *Fuzzer) executeSafe(input []byte) (cov *Coverage, execErr error, crashe
 			}
 			cov.Add(0xDEADBEEF)
 		}
+		ClearCurrentCoverage()
 	}()
 	cov, execErr, crashed = f.executeWithCoverage(input)
 	return cov, execErr, crashed
@@ -726,8 +785,10 @@ func (f *Fuzzer) computeBaselineStats() {
 	stdDevBytes := 0.0
 	stdDevAllocs := 0.0
 	if n > 1 {
-		stdDevBytes = varianceBytes / float64(n-1)
-		stdDevAllocs = varianceAllocs / float64(n-1)
+		varianceBytes /= float64(n - 1)
+		varianceAllocs /= float64(n - 1)
+		stdDevBytes = math.Sqrt(varianceBytes)
+		stdDevAllocs = math.Sqrt(varianceAllocs)
 	}
 
 	f.memoryBaseline = MemoryBaseline{
@@ -747,62 +808,54 @@ func (f *Fuzzer) GetMemoryBaseline() MemoryBaseline {
 	return f.memoryBaseline
 }
 
-func (f *Fuzzer) checkMemory(before, after MemoryStats) (bool, uint64, uint64) {
-	allocDiff := uint64(0)
+func (f *Fuzzer) checkMemory(before, after MemoryStats) (suspicious bool, allocDiff uint64, allocCountDiff uint64, thresholdBytes uint64, thresholdAllocs uint64, triggeredByBytes bool, triggeredByAllocs bool) {
+	allocDiff = 0
 	if after.AllocatedBytes > before.AllocatedBytes {
 		allocDiff = after.AllocatedBytes - before.AllocatedBytes
 	}
-	allocCountDiff := uint64(0)
+	allocCountDiff = 0
 	if after.NumAllocations > before.NumAllocations {
 		allocCountDiff = after.NumAllocations - before.NumAllocations
 	}
 
-	bytesSuspicious := false
-	allocsSuspicious := false
-
 	if f.memoryBaseline.Calibrated && f.config.EnableBaselineCalibration {
-		thresholdBytes := uint64(f.memoryBaseline.AvgAllocatedBytes * f.config.MemoryMultiplier)
+		thresholdBytes = uint64(f.memoryBaseline.AvgAllocatedBytes * f.config.MemoryMultiplier)
 		if thresholdBytes < f.config.MemoryThreshold {
 			thresholdBytes = f.config.MemoryThreshold
 		}
-		bytesSuspicious = allocDiff > thresholdBytes
+		triggeredByBytes = allocDiff > thresholdBytes
 
-		thresholdAllocs := uint64(f.memoryBaseline.AvgNumAllocations * f.config.MemoryMultiplier)
+		thresholdAllocs = uint64(f.memoryBaseline.AvgNumAllocations * f.config.MemoryMultiplier)
 		if thresholdAllocs < f.config.MemoryAllocThreshold {
 			thresholdAllocs = f.config.MemoryAllocThreshold
 		}
-		allocsSuspicious = allocCountDiff > thresholdAllocs
+		triggeredByAllocs = allocCountDiff > thresholdAllocs
 	} else {
-		bytesSuspicious = allocDiff > f.config.MemoryThreshold
-		allocsSuspicious = allocCountDiff > f.config.MemoryAllocThreshold
+		thresholdBytes = f.config.MemoryThreshold
+		thresholdAllocs = f.config.MemoryAllocThreshold
+		triggeredByBytes = allocDiff > thresholdBytes
+		triggeredByAllocs = allocCountDiff > thresholdAllocs
 	}
 
-	return bytesSuspicious || allocsSuspicious, allocDiff, allocCountDiff
+	suspicious = triggeredByBytes || triggeredByAllocs
+	return suspicious, allocDiff, allocCountDiff, thresholdBytes, thresholdAllocs, triggeredByBytes, triggeredByAllocs
 }
 
 func (f *Fuzzer) recordSuspiciousMemory(input []byte, before, after MemoryStats) {
-	allocDiff := uint64(0)
-	if after.AllocatedBytes > before.AllocatedBytes {
-		allocDiff = after.AllocatedBytes - before.AllocatedBytes
-	}
-	allocCountDiff := uint64(0)
-	if after.NumAllocations > before.NumAllocations {
-		allocCountDiff = after.NumAllocations - before.NumAllocations
-	}
-
-	var threshold uint64
-	if f.memoryBaseline.Calibrated && f.config.EnableBaselineCalibration {
-		threshold = uint64(f.memoryBaseline.AvgAllocatedBytes * f.config.MemoryMultiplier)
-	} else {
-		threshold = f.config.MemoryThreshold
+	suspicious, allocDiff, allocCountDiff, thresholdBytes, thresholdAllocs, triggeredByBytes, triggeredByAllocs := f.checkMemory(before, after)
+	if !suspicious {
+		return
 	}
 
 	record := SuspiciousMemoryRecord{
-		Input:          input,
-		Timestamp:      time.Now(),
-		AllocatedDiff:  allocDiff,
-		AllocationDiff: allocCountDiff,
-		Threshold:      threshold,
+		Input:             input,
+		Timestamp:         time.Now(),
+		AllocatedDiff:     allocDiff,
+		AllocationDiff:    allocCountDiff,
+		ThresholdBytes:    thresholdBytes,
+		ThresholdAllocs:   thresholdAllocs,
+		TriggeredByBytes:  triggeredByBytes,
+		TriggeredByAllocs: triggeredByAllocs,
 	}
 	f.statsMu.Lock()
 	f.suspiciousRecords = append(f.suspiciousRecords, record)
@@ -821,7 +874,7 @@ func (f *Fuzzer) processInput(input []byte) (foundNewPath bool) {
 		f.saveCrash(input, err)
 		return false
 	}
-	suspicious, _, _ := f.checkMemory(beforeMem, afterMem)
+	suspicious, _, _, _, _, _, _ := f.checkMemory(beforeMem, afterMem)
 	if suspicious {
 		f.recordSuspiciousMemory(input, beforeMem, afterMem)
 	}

@@ -3,6 +3,7 @@ package mockgen
 import (
 	"fmt"
 	"reflect"
+	"sync"
 )
 
 type MockController struct {
@@ -151,10 +152,6 @@ func callReturnFunc(fn interface{}, args []interface{}) []interface{} {
 	return out
 }
 
-type MethodCaller interface {
-	Call(methodName string, args ...interface{}) []interface{}
-}
-
 func (mc *MockController) Call(methodName string, args ...interface{}) []interface{} {
 	return mc.CallMethod(methodName, args)
 }
@@ -250,15 +247,8 @@ func (mp *MockProxy) TryMethod(methodName string) (interface{}, error) {
 	return fn.Interface(), nil
 }
 
+
 func (mp *MockProxy) Instance() interface{} {
-	return createInterfaceInstance(mp)
-}
-
-type mockInterfaceWrapper struct {
-	mockProxy *MockProxy
-}
-
-func createInterfaceInstance(mp *MockProxy) interface{} {
 	ifaceType := mp.targetType
 	numMethods := ifaceType.NumMethod()
 
@@ -304,22 +294,28 @@ func createInterfaceInstance(mp *MockProxy) interface{} {
 		structVal.Field(i).Set(fn)
 	}
 
-	wrapperType := reflect.StructOf([]reflect.StructField{
-		{
-			Name: "Data", Type: structType,
-		},
+	return structPtr.Interface()
+}
+
+var mockRegistry sync.Map
+
+func RegisterMock[T any](factory func(*MockProxy) T) {
+	var zero T
+	targetType := reflect.TypeOf(&zero).Elem()
+	mockRegistry.Store(targetType, func(mp *MockProxy) interface{} {
+		return factory(mp)
 	})
-	wrapperPtr := reflect.New(wrapperType)
-	wrapperVal := wrapperPtr.Elem()
-	wrapperVal.Field(0).Set(structVal)
-
-	return wrapperPtr.Interface()
 }
 
-func (m mockInterfaceWrapper) GetMockProxy() *MockProxy {
-	return m.mockProxy
-}
+func As[T any](mp *MockProxy) T {
+	var zero T
+	targetType := reflect.TypeOf(&zero).Elem()
 
-func zeroValue(t reflect.Type) reflect.Value {
-	return reflect.Zero(t)
+	if targetType.Kind() == reflect.Interface && targetType == mp.targetType {
+		if factory, ok := mockRegistry.Load(targetType); ok {
+			return factory.(func(*MockProxy) interface{})(mp).(T)
+		}
+	}
+
+	return zero
 }

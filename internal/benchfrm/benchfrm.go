@@ -83,16 +83,23 @@ func (b *benchmarker) runGroup(group *BenchmarkGroup) (GroupStatistics, error) {
 	}
 
 	runResults := make([]RunResult, 0, cfg.Iterations)
+	var firstErr error
 
 	for i := 0; i < cfg.Iterations; i++ {
 		result := b.runSingleWithTimeout(group, cfg.CollectMemory, cfg.Timeout)
 		if result.Error != nil {
-			return GroupStatistics{}, result.Error
+			if firstErr == nil {
+				firstErr = result.Error
+			}
+			continue
 		}
 		runResults = append(runResults, result)
 	}
 
 	if len(runResults) == 0 {
+		if firstErr != nil {
+			return GroupStatistics{}, fmt.Errorf("%w: %w", ErrGroupEmptyResult, firstErr)
+		}
 		return GroupStatistics{}, ErrGroupEmptyResult
 	}
 

@@ -1,0 +1,4 @@
+你实现的基准测试框架模块的文档存在问题，需要修复：
+1. docs/benchfrm.md 文档内容在数据结构定义表格的中途就截断了，文档中声明的完整执行流程说明、统计指标定义和对比报告格式说明等内容均不存在。
+2. benchfrm.go 中 runGroup 方法新增的 ErrGroupEmptyResult 检查逻辑所在的代码路径实际上永远无法被触发。
+3. 修复后运行 go test ./internal/benchfrm/ -v，需要让所有测试通过。

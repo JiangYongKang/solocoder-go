@@ -1,0 +1,4 @@
+你实现的 Mock 框架模块在自动接口实现方面存在问题，需要修复：
+1. Instance 方法返回的实例无法通过类型断言转为用户传入的接口类型，调用方使用 instance.(MyInterface) 会在运行时失败。
+2. mockgen.go 中存在从未被引用的辅助类型和函数。
+3. 修复后运行 go test ./internal/mockgen/ -v，需要让所有测试通过。

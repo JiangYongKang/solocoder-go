@@ -1,0 +1,5 @@
+你实现的 SLA 指标计算器模块在上次修复中引入了一些问题，需要修复：
+1. 预定义的错误变量 ErrWindowNotFound 在代码中仍然没有任何路径返回它。
+2. RecordRequest 和 RecordRequests 方法的签名被改为返回 error，这是一个破坏性变更，所有已有的调用方被迫使用 _ 忽略了返回值。
+3. 为了使用 ErrInvalidPercentile 而新增了 CalculatePercentile 公有方法，这是在修复中引入的新功能而非修复既有缺陷。
+4. 修复后运行 go test ./internal/slametrics/ -v，需要让所有测试通过。

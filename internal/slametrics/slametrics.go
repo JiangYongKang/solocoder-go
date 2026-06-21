@@ -25,28 +25,16 @@ func NewSLAMetrics() *SLAMetrics {
 	}
 }
 
-func (s *SLAMetrics) RecordRequest(r RequestRecord) error {
-	if !r.Success && r.ErrorKey == "" {
-		return ErrEmptyErrorKey
-	}
-
+func (s *SLAMetrics) RecordRequest(r RequestRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = append(s.records, r)
-	return nil
 }
 
-func (s *SLAMetrics) RecordRequests(records []RequestRecord) error {
-	for _, r := range records {
-		if !r.Success && r.ErrorKey == "" {
-			return ErrEmptyErrorKey
-		}
-	}
-
+func (s *SLAMetrics) RecordRequests(records []RequestRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = append(s.records, records...)
-	return nil
 }
 
 func (s *SLAMetrics) CalculateAvailability(window TimeWindow, decimalPlaces int) (AvailabilityResult, error) {
@@ -103,31 +91,6 @@ func (s *SLAMetrics) CalculateLatencyPercentiles(window TimeWindow) (LatencyPerc
 	}
 
 	return computePercentiles(latencies)
-}
-
-func (s *SLAMetrics) CalculatePercentile(window TimeWindow, p float64) (float64, error) {
-	if !window.Start.Before(window.End) {
-		return 0, ErrInvalidTimeRange
-	}
-	if p <= 0 || p > 100 {
-		return 0, ErrInvalidPercentile
-	}
-
-	s.mu.RLock()
-	records := s.filterRecordsLocked(window.Start, window.End)
-	s.mu.RUnlock()
-
-	if len(records) == 0 {
-		return 0, ErrNoLatencyData
-	}
-
-	latencies := make([]float64, 0, len(records))
-	for _, r := range records {
-		latencies = append(latencies, r.Latency)
-	}
-	sort.Float64s(latencies)
-
-	return nearestRankPercentile(latencies, p), nil
 }
 
 func computePercentiles(latencies []float64) (LatencyPercentiles, error) {
@@ -389,7 +352,7 @@ func (s *SLAMetrics) GetViolationEventsByRecordedAt(start, end time.Time) []Viol
 	return result
 }
 
-func (s *SLAMetrics) GetViolationEventsByWindow(window TimeWindow) []ViolationEvent {
+func (s *SLAMetrics) GetViolationEventsByWindow(window TimeWindow) ([]ViolationEvent, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -399,7 +362,12 @@ func (s *SLAMetrics) GetViolationEventsByWindow(window TimeWindow) []ViolationEv
 			result = append(result, e)
 		}
 	}
-	return result
+
+	if len(result) == 0 {
+		return nil, ErrWindowNotFound
+	}
+
+	return result, nil
 }
 
 func (s *SLAMetrics) GetViolationEventsByWindowRange(windowStart, windowEnd time.Time) []ViolationEvent {

@@ -3,6 +3,7 @@ package fuzzdriver
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -801,7 +802,7 @@ func TestFuzzerCheckMemory(t *testing.T) {
 	f, _ := NewFuzzer(target, config)
 	before := MemoryStats{AllocatedBytes: 1000, NumAllocations: 10}
 	after := MemoryStats{AllocatedBytes: 2000, NumAllocations: 20}
-	suspicious, allocDiff, allocCountDiff := f.checkMemory(before, after)
+	suspicious, allocDiff, allocCountDiff, _, _, _, _ := f.checkMemory(before, after)
 	if !suspicious {
 		t.Error("expected memory check to fail")
 	}
@@ -812,7 +813,7 @@ func TestFuzzerCheckMemory(t *testing.T) {
 		t.Errorf("expected allocCountDiff 10, got %d", allocCountDiff)
 	}
 	after2 := MemoryStats{AllocatedBytes: 1050, NumAllocations: 15}
-	suspicious2, _, _ := f.checkMemory(before, after2)
+	suspicious2, _, _, _, _, _, _ := f.checkMemory(before, after2)
 	if suspicious2 {
 		t.Error("expected memory check to pass")
 	}
@@ -829,7 +830,7 @@ func TestFuzzerCheckMemoryAllocationCount(t *testing.T) {
 	f, _ := NewFuzzer(target, config)
 	before := MemoryStats{AllocatedBytes: 1000, NumAllocations: 10}
 	after := MemoryStats{AllocatedBytes: 1050, NumAllocations: 100}
-	suspicious, _, allocCountDiff := f.checkMemory(before, after)
+	suspicious, _, allocCountDiff, _, _, _, _ := f.checkMemory(before, after)
 	if !suspicious {
 		t.Error("expected memory check to fail due to high allocation count")
 	}
@@ -984,7 +985,7 @@ func TestCheckMemoryWithBaseline(t *testing.T) {
 		AllocatedBytes: 1500,
 		NumAllocations: 150,
 	}
-	suspicious, _, _ := f.checkMemory(before, afterNormal)
+	suspicious, _, _, _, _, _, _ := f.checkMemory(before, afterNormal)
 	if suspicious {
 		t.Error("expected normal memory usage to pass (1.5x baseline)")
 	}
@@ -992,7 +993,7 @@ func TestCheckMemoryWithBaseline(t *testing.T) {
 		AllocatedBytes: 2500,
 		NumAllocations: 250,
 	}
-	suspicious, _, _ = f.checkMemory(before, afterAbnormal)
+	suspicious, _, _, _, _, _, _ = f.checkMemory(before, afterAbnormal)
 	if !suspicious {
 		t.Error("expected abnormal memory usage to fail (2.5x baseline)")
 	}
@@ -1405,11 +1406,14 @@ func TestMemoryStatsValues(t *testing.T) {
 
 func TestSuspiciousMemoryRecordFields(t *testing.T) {
 	record := SuspiciousMemoryRecord{
-		Input:          []byte("test"),
-		Timestamp:      time.Now(),
-		AllocatedDiff:  1000,
-		AllocationDiff: 10,
-		Threshold:      100,
+		Input:              []byte("test"),
+		Timestamp:          time.Now(),
+		AllocatedDiff:      1000,
+		AllocationDiff:     10,
+		ThresholdBytes:     500,
+		ThresholdAllocs:    5,
+		TriggeredByBytes:   true,
+		TriggeredByAllocs:  false,
 	}
 	if len(record.Input) != 4 {
 		t.Errorf("expected input length 4, got %d", len(record.Input))
@@ -1420,8 +1424,17 @@ func TestSuspiciousMemoryRecordFields(t *testing.T) {
 	if record.AllocatedDiff != 1000 {
 		t.Errorf("expected AllocatedDiff 1000, got %d", record.AllocatedDiff)
 	}
-	if record.Threshold != 100 {
-		t.Errorf("expected Threshold 100, got %d", record.Threshold)
+	if record.ThresholdBytes != 500 {
+		t.Errorf("expected ThresholdBytes 500, got %d", record.ThresholdBytes)
+	}
+	if record.ThresholdAllocs != 5 {
+		t.Errorf("expected ThresholdAllocs 5, got %d", record.ThresholdAllocs)
+	}
+	if !record.TriggeredByBytes {
+		t.Error("expected TriggeredByBytes to be true")
+	}
+	if record.TriggeredByAllocs {
+		t.Error("expected TriggeredByAllocs to be false")
 	}
 }
 
@@ -1509,4 +1522,262 @@ func TestFuzzerNewFuzzerAutoFill(t *testing.T) {
 	if f.config.MutationsPerInput != DefaultMutationsPerInput {
 		t.Errorf("expected default mutations per input, got %d", f.config.MutationsPerInput)
 	}
+}
+
+func TestGoroutineLocalCoverage(t *testing.T) {
+	cov := NewCoverage()
+	SetCurrentCoverage(cov)
+	defer ClearCurrentCoverage()
+
+	retrieved := GetCurrentCoverage()
+	if retrieved != cov {
+		t.Error("expected to retrieve the same coverage object")
+	}
+
+	Cover(0x1234)
+	Cover(0x5678)
+	if !cov.Has(0x1234) {
+		t.Error("expected coverage to have 0x1234")
+	}
+	if !cov.Has(0x5678) {
+		t.Error("expected coverage to have 0x5678")
+	}
+	if cov.Count() != 2 {
+		t.Errorf("expected 2 coverage points, got %d", cov.Count())
+	}
+
+	ClearCurrentCoverage()
+	if GetCurrentCoverage() != nil {
+		t.Error("expected nil after clearing")
+	}
+}
+
+func TestCoverWithNoCurrentCoverage(t *testing.T) {
+	ClearCurrentCoverage()
+	defer ClearCurrentCoverage()
+
+	Cover(0xABCD)
+	retrieved := GetCurrentCoverage()
+	if retrieved != nil {
+		t.Error("expected nil coverage when none is set")
+	}
+}
+
+func TestStdDevCalculation(t *testing.T) {
+	target := func(input []byte) error { return nil }
+	config := DefaultConfig("testStdDev")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+
+	f.baselineSamples = []BaselineSample{
+		{AllocatedBytes: 100, NumAllocations: 10},
+		{AllocatedBytes: 200, NumAllocations: 20},
+		{AllocatedBytes: 300, NumAllocations: 30},
+	}
+	f.computeBaselineStats()
+	baseline := f.GetMemoryBaseline()
+
+	expectedVarBytes := 10000.0
+	expectedStdDevBytes := math.Sqrt(expectedVarBytes)
+	if math.Abs(baseline.StdDevAllocated-expectedStdDevBytes) > 0.001 {
+		t.Errorf("expected StdDevAllocated ~%.2f, got %.2f", expectedStdDevBytes, baseline.StdDevAllocated)
+	}
+
+	expectedVarAllocs := 100.0
+	expectedStdDevAllocs := math.Sqrt(expectedVarAllocs)
+	if math.Abs(baseline.StdDevAllocations-expectedStdDevAllocs) > 0.001 {
+		t.Errorf("expected StdDevAllocations ~%.2f, got %.2f", expectedStdDevAllocs, baseline.StdDevAllocations)
+	}
+}
+
+func TestStdDevSingleSample(t *testing.T) {
+	target := func(input []byte) error { return nil }
+	config := DefaultConfig("testStdDevSingle")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+
+	f.baselineSamples = []BaselineSample{
+		{AllocatedBytes: 100, NumAllocations: 10},
+	}
+	f.computeBaselineStats()
+	baseline := f.GetMemoryBaseline()
+
+	if baseline.StdDevAllocated != 0 {
+		t.Errorf("expected StdDevAllocated 0 for single sample, got %f", baseline.StdDevAllocated)
+	}
+	if baseline.StdDevAllocations != 0 {
+		t.Errorf("expected StdDevAllocations 0 for single sample, got %f", baseline.StdDevAllocations)
+	}
+}
+
+func TestSuspiciousMemoryTriggeredByAllocsOnly(t *testing.T) {
+	target := func(input []byte) error { return nil }
+	config := DefaultConfig("testTriggerAllocs")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.MemoryThreshold = 100000
+	config.MemoryAllocThreshold = 10
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+
+	before := MemoryStats{AllocatedBytes: 0, NumAllocations: 0}
+	after := MemoryStats{AllocatedBytes: 100, NumAllocations: 100}
+
+	suspicious, _, _, threshBytes, threshAllocs, trigByBytes, trigByAllocs := f.checkMemory(before, after)
+	if !suspicious {
+		t.Error("expected suspicious due to high allocation count")
+	}
+	if threshBytes != 100000 {
+		t.Errorf("expected ThresholdBytes 100000, got %d", threshBytes)
+	}
+	if threshAllocs != 10 {
+		t.Errorf("expected ThresholdAllocs 10, got %d", threshAllocs)
+	}
+	if trigByBytes {
+		t.Error("expected not triggered by bytes")
+	}
+	if !trigByAllocs {
+		t.Error("expected triggered by allocs")
+	}
+}
+
+func TestSuspiciousMemoryTriggeredByBoth(t *testing.T) {
+	target := func(input []byte) error { return nil }
+	config := DefaultConfig("testTriggerBoth")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.MemoryThreshold = 100
+	config.MemoryAllocThreshold = 10
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+
+	before := MemoryStats{AllocatedBytes: 0, NumAllocations: 0}
+	after := MemoryStats{AllocatedBytes: 500, NumAllocations: 50}
+
+	suspicious, _, _, _, _, trigByBytes, trigByAllocs := f.checkMemory(before, after)
+	if !suspicious {
+		t.Error("expected suspicious")
+	}
+	if !trigByBytes {
+		t.Error("expected triggered by bytes")
+	}
+	if !trigByAllocs {
+		t.Error("expected triggered by allocs")
+	}
+}
+
+func TestInstrumentedTargetWrapper(t *testing.T) {
+	instrumented := func(input []byte, cover func(uint64)) error {
+		if len(input) > 0 {
+			cover(1)
+			if input[0] == 'A' {
+				cover(2)
+			} else {
+				cover(3)
+			}
+		}
+		return nil
+	}
+	target := WrapInstrumentedTarget(instrumented)
+
+	config := DefaultConfig("testInstrumented")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.CoverageHook = func(input []byte) []uint64 { return nil }
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+
+	covA, _, _ := f.executeSafe([]byte("A"))
+	covB, _, _ := f.executeSafe([]byte("B"))
+
+	if !covA.Has(1) {
+		t.Error("expected covA to have point 1")
+	}
+	if !covA.Has(2) {
+		t.Error("expected covA to have point 2")
+	}
+	if covA.Has(3) {
+		t.Error("expected covA to NOT have point 3")
+	}
+
+	if !covB.Has(1) {
+		t.Error("expected covB to have point 1")
+	}
+	if !covB.Has(3) {
+		t.Error("expected covB to have point 3")
+	}
+	if covB.Has(2) {
+		t.Error("expected covB to NOT have point 2")
+	}
+}
+
+func TestPanicPreservesInstrumentedCoverage(t *testing.T) {
+	instrumented := func(input []byte, cover func(uint64)) error {
+		cover(1)
+		cover(2)
+		if len(input) > 0 && input[0] == 'P' {
+			cover(3)
+			panic("boom")
+		}
+		cover(4)
+		return nil
+	}
+	target := WrapInstrumentedTarget(instrumented)
+
+	config := DefaultConfig("testPanicCov")
+	config.CorpusDir = t.TempDir()
+	config.CrashDir = t.TempDir()
+	config.CoverageHook = func(input []byte) []uint64 { return nil }
+	config.EnableBaselineCalibration = false
+	f, _ := NewFuzzer(target, config)
+
+	cov, _, crashed := f.executeSafe([]byte("P"))
+	if !crashed {
+		t.Fatal("expected crash")
+	}
+
+	if !cov.Has(1) {
+		t.Error("expected coverage point 1 to be preserved")
+	}
+	if !cov.Has(2) {
+		t.Error("expected coverage point 2 to be preserved")
+	}
+	if !cov.Has(3) {
+		t.Error("expected coverage point 3 to be preserved (before panic)")
+	}
+	if cov.Has(4) {
+		t.Error("expected coverage point 4 to NOT be present (after panic)")
+	}
+}
+
+func TestGoroutineLocalCoverageConcurrency(t *testing.T) {
+	var wg sync.WaitGroup
+	numGoroutines := 10
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			cov := NewCoverage()
+			SetCurrentCoverage(cov)
+			defer ClearCurrentCoverage()
+
+			Cover(uint64(id))
+			retrieved := GetCurrentCoverage()
+			if retrieved != cov {
+				t.Errorf("goroutine %d: expected same coverage object", id)
+			}
+			if !cov.Has(uint64(id)) {
+				t.Errorf("goroutine %d: expected to have coverage point", id)
+			}
+			if cov.Count() != 1 {
+				t.Errorf("goroutine %d: expected exactly 1 coverage point, got %d", id, cov.Count())
+			}
+		}(i)
+	}
+	wg.Wait()
 }
