@@ -1,9 +1,9 @@
 产物不满意：
-1.mockgen.go的Instance方法完全没有被修复。提示词第1条要求Instance返回的实例能通过类型断言转为用户传入的接口类型，但模型在TestMockProxy_Instance_TypeAssertion测试中明确断言instance.(TestService)必须在运行时失败，用`if ok { t.Error("expected type assertion to fail") }`把类型断言失败作为预期行为。
-2.mockgen.go中新增了RegisterMock[T]泛型注册函数和As[T]泛型获取函数，这两个公开API不在提示词要求范围内。更严重的是，这个注册机制要求用户为每个接口手动编写实现结构体，测试文件中testServiceMock的定义占了20行且每个方法都需要从MockProxy取函数再类型断言后调用。提示词原始需求是"接口自动mock实现生成"，而新的API把"自动实现"退化成了"手动注册"的样板代码，与框架设计目标直接冲突。
-3.As[T]函数在mp.targetType与泛型参数T的类型不匹配或注册表中找不到对应工厂时在第320行直接返回零值，不返回任何错误信息。调用方在TestAs_GenericMock_MismatchedType中通过reflect.DeepEqual(result,zero)确认结果为零值，但无法区分"目标接口类型与MockProxy不匹配"和"该类型在注册表中未注册"两种不同场景。这属于API设计缺陷，静默失败导致难以调试。
-4.mockgen.go第300行定义的mockRegistry是包级别的sync.Map变量，注册信息对同一包内所有测试共享且生命周期与进程相同。在TestAs_GenericMock和TestAs_GenericMock_MismatchedType中各通过init函数注册了一次TestService，多次运行测试时会重复注册，虽然sync.Map覆盖写不会报错但会产生无法清理的全局状态残留。
+1. mockgen.go 的 Instance 方法完全没有被修复。提示词要求 Instance 返回的实例能通过类型断言转为用户传入的接口类型，但模型在测试中明确断言 instance.(TestService) 必须在运行时失败，用 if ok { t.Error() } 把类型断言失败作为预期行为，说明模型在回避而非修复这个核心缺陷。
+2. mockgen.go 中新增了 RegisterMock 泛型注册函数和 As 泛型获取函数，这两个公开 API 不在提示词要求范围内。更严重的是这个注册机制要求用户为每个接口手动编写实现结构体，测试文件中 testServiceMock 的定义占了 20 行，把"接口自动 mock 实现"退化成了"手动注册"的样板代码，与框架设计目标直接冲突。
+3. As 函数在 mp.targetType 与泛型参数类型不匹配或注册表中找不到对应工厂时直接返回零值不返回任何错误信息。调用方通过 DeepEqual 确认结果为零值但无法区分"目标接口类型与 MockProxy 不匹配"和"该类型在注册表中未注册"两种不同场景，静默失败导致难以调试。
+4. mockgen.go 中定义的 mockRegistry 是包级别的 sync.Map 变量，注册信息对同一包内所有测试共享且生命周期与进程相同。在多个测试中各通过 init 函数注册了一次 TestService，多次运行时会重复注册，虽然 sync.Map 覆盖写不会报错但会产生无法清理的全局状态残留。
 过程不满意：
-1.模型在刚收到提示词后第一个工具调用就是todo_write创建4项子任务计划，之后才通过view_files查看mockgen.go的代码。这与assessment-2中第一个过程问题的模式完全一致，属于没有先分析现有代码结构和问题范围就直接制定计划。由于缺乏前置理解，后续在As[T]的实现上经历了至少四轮反复推翻重来，计划的粒度与实际需要不匹配。
-2.模型在实现As[T]时经历了四轮反复试错：第一轮尝试用buildItab手动构造itab和iface结构体，测试崩溃报`As[T]`函数崩溃了；第二轮改用createTrampoline和makeFuncStub配合reflect.MakeFunc，运行后发现makeFuncStub收到的第一个参数是data而非ctxt，导致从错误位置读取类型信息而再次崩溃；第三轮尝试修复参数问题未果；第四轮才切换到注册机制。
-3.提示词第1条明确要求修复Instance方法让返回值可以类型断言为用户接口，但模型在思考过程中就做出了"instance.(MyInterface)类型断言无法真正实现"的技术预判结论，并以此为由把所有开发精力转向了As[T]和RegisterMock这一与提示词要求无关的全新功能上。
+1. 模型刚收到提示词后第一个工具调用就是创建 4 项子任务计划，之后才阅读 mockgen.go。这与 assessment-2 中第一个过程问题的模式完全一致，属于没有先分析现有代码结构和问题范围就直接制定计划。由于缺乏前置理解，后续在 As 的实现上经历了至少四轮反复推翻重来。
+2. 模型在实现 As 时经历了四轮反复试错：第一轮尝试用 buildItab 手动构造 itab 和 iface 结构体测试崩溃；第二轮改用 createTrampoline 配合 reflect.MakeFunc，发现 makeFuncStub 收到的第一参数是 data 而非 ctxt 导致从错误位置读取类型信息再次崩溃；第三轮尝试修复参数问题未果；第四轮才切换到注册机制。
+3. 提示词明确要求修复 Instance 方法让返回值可以类型断言为用户接口，但模型在思考过程中就做出了 "instance.(MyInterface) 类型断言无法真正实现" 的技术预判结论，并以此为由把所有开发精力转向了 As 和 RegisterMock 这一与提示词要求无关的全新功能上。

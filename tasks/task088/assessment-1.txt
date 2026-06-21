@@ -1,8 +1,8 @@
 产物不满意：
-1.benchfrm.go的runGroup方法在正式迭代循环中只调用了runSingle，runSingleWithTimeout方法已实现但从未被任何执行路径引用，导致用户通过WithTimeout设置的超时配置完全无效。如果被测函数出现死循环或长时间阻塞，基准测试会永久挂起无法终止。
-2.benchfrm.go的calculateStatistics函数在188-191行把AllocsPerOp赋值为meanAllocCount的float64转换、BytesPerOp赋值为meanAllocBytes的float64转换，与MeanAllocCount和MeanAllocBytes存储了完全相同的值。
-3. docs/benchfrm.md 文件在第 29 行 "报告列出每组的所有统计指标以及各组" 处被截断，第 5 项核心功能（性能回归自动检测）的说明尚未写完，提示词第 8 条要求的核心结构体职责说明、基准测试执行流程阶段、对比报告格式说明以及使用示例等内容全部缺失。根因是模型在编写文档时未校验文件完整性就直接标记 todo_write 为已完成，属于典型的幻觉与虚假完成行为，应在标记任务完成前读取文件内容确认文档已完整写入。
+1. benchfrm.go 的 runGroup 方法在正式迭代循环中只调用了 runSingle，runSingleWithTimeout 方法已实现但从未被任何执行路径引用，导致用户通过 WithTimeout 设置的超时配置完全无效。如果被测函数出现死循环或长时间阻塞，基准测试会永久挂起无法终止。
+2. benchfrm.go 的 calculateStatistics 函数中 AllocsPerOp 和 BytesPerOp 分别赋值为 meanAllocCount 和 meanAllocBytes 的 float64 转换，与 MeanAllocCount 和 MeanAllocBytes 存储了完全相同的值。这两个字段是冗余的重复存储，应该删除其中一个。
+3. docs/benchfrm.md 文件在第 29 行"报告列出每组的所有统计指标以及各组"处被截断，第 5 项核心功能的说明尚未写完，提示词要求的核心结构体职责说明、执行流程阶段、对比报告格式说明以及使用示例等内容全部缺失。根因是模型在编写文档时未校验文件完整性就直接标记为已完成。
 过程不满意：
-1.模型在收到提示词后的第一步（COT第1-7行）就调用了todo_write创建了5项子任务计划，之后（第13-88行）才去浏览项目目录结构、搜索internal和docs子目录、阅读metrics和retry包的代码了解现有模块的组织方式。这导致初始计划的粒度和步骤与实际开发需要不匹配，后续又将Todo从5项调整为7项。
-2.首次运行 go test 出现了 4 个失败用例，包括TestRunAll_SingleGroup耗时为零、TestMemoryCollection内存分配可能被编译器优化、TestCheckRegression_WithRegression中RunAll自动保存结果覆盖了预设基线、TestConcurrentAccess中goroutine在对比组添加前就访问了内部字段。
-3.errors.go中定义了ErrBaselineNotFound和ErrGroupEmptyResult两个错误变量，但在benchfrm.go的LoadBaseline方法中遇到未找到基线时使用continue静默跳过而非返回ErrBaselineNotFound，calculateStatistics在results为空时也只返回零值GroupStatistics而不返回ErrGroupEmptyResult。
+1. 模型收到提示词后第一步就创建了 5 项子任务计划，之后才去浏览项目目录结构和阅读代码了解现有模块的组织方式。这导致初始计划的粒度和步骤与实际开发需要不匹配，后续又将 Todo 从 5 项调整为 7 项。
+2. 首次运行 go test 出现了 4 个失败用例，包括 TestRunAll_SingleGroup 耗时为零、TestMemoryCollection 内存分配可能被编译器优化、TestCheckRegression_WithRegression 中自动保存结果覆盖了预设基线、TestConcurrentAccess 中 goroutine 在对比组添加前就访问了内部字段。
+3. errors.go 中定义了 ErrBaselineNotFound 和 ErrGroupEmptyResult 两个错误变量，但在 LoadBaseline 中遇到未找到基线时使用 continue 静默跳过而非返回 ErrBaselineNotFound，calculateStatistics 在 results 为空时也只返回零值 GroupStatistics 而不返回 ErrGroupEmptyResult。错误变量定义了但从未被使用。

@@ -1,9 +1,9 @@
 产物不满意：
-1.mockgen.go的findItabTable函数通过从&itabStore出发做16MB线性内存扫描来定位runtime的itabTable全局数组，扫描过程中对任意内存地址用unsafe.Pointer直接解引用读取uintptr值。
-2.mockgen.go的Instance方法返回的instance.(TestService)类型断言虽然成功，但通过断言后的svc直接调用svc.Greet("World")会因runtime调用约定的不匹配而崩溃。itab.fun数组中存储的函数指针来自reflect.MakeFunc创建的闭包，这些闭包在内部捕获了implID、methodName和methodType等外部变量，需要ctxt寄存器传递闭包上下文。
-3.mockgen_test.go的TestMockProxy_Instance_DirectMethodCall测试用mock.Method("Greet").(func(string)string)获取独立函数来验证方法调用，而从未通过类型断言所得的svc接口值直接调用svc.Greet("World")。
+1. mockgen.go 的 findItabTable 函数通过从 &itabStore 出发做 16MB 线性内存扫描来定位 runtime 的 itabTable 全局数组，扫描过程中对任意内存地址用 unsafe.Pointer 直接解引用读取 uintptr 值。这属于极度危险的实现方式，在生产环境中扫描未映射内存区域可能直接导致段错误。
+2. mockgen.go 的 Instance 返回的 instance.(TestService) 类型断言虽然成功了，但通过断言后的 svc 直接调用 svc.Greet 会因 runtime 调用约定不匹配而崩溃。itab.fun 数组中存储的函数指针来自 reflect.MakeFunc 创建的闭包，这些闭包捕获了外部变量需要 ctxt 寄存器传递闭包上下文，但直接接口调用不会传递此上下文导致崩溃。
+3. mockgen_test.go 的 TestMockProxy_Instance_DirectMethodCall 测试用 mock.Method("Greet").(func(string)string) 获取独立函数来验证方法调用，而从未通过类型断言所得的 svc 接口值直接调用 svc.Greet("World")。这规避了真实场景中接口断言后直接调用会崩溃的缺陷，测试成了掩耳盗铃。
 过程不满意：
-1.模型在收到提示词后未经任何代码分析就在第4行用todo_write创建了5项子任务计划，之后才开始大量阅读runtime/iface.go、runtime/type.go和internal/abi/type.go等源码研究底层机制。这导致了创建的计划与实际需要执行的工作完全不匹配——例如计划中的"实现itab动态注入"一项在制定时缺乏对runtime内部itabTable哈希结构和二次探测算法的理解，后续在linkname、内存扫描、I2I路径等多种方案之间反复切换架构方向。
-2.模型在整轮会话中先后尝试了linkname注入、unsafe手动构造iface/eface值、16MB内存扫描定位itabTable、让eface._type指向接口类型走I2I路径、回归StructOf结构体方案、再到最终的内存扫描加itab注入等至少6种不同的技术方向。mockgen.go被完整重写了4次以上，每次方向切换都是因为前一方案遇编译或运行错误就直接全盘推翻重写而非做精确诊断后的小范围修正。
-3.模型在mockgen.go中使用了大量超出Go安全边界的操作：通过//go:linkname访问runtime未公开标记的getitab函数，定义abiType、abiItab、eface、iface等十余个runtime内部类型的镜像结构体，16MB范围扫描进程内存空间读取任意地址，用atomic.StoreUintptr直接写入runtime全局itabTable数据结构注入伪造itab。
-4.模型在发现通过itab调用reflect.MakeFunc创建的闭包函数会触发`panic: reflect: funcLayout of non-func type`崩溃后，没有深入分析闭包崩溃的根本原因——runtime不传递ctxt导致闭包访问捕获变量失败——并尝试从根源解决，而是直接将TestMockProxy_Instance_DirectMethodCall中的所有接口方法调用替换为mock.Method()独立函数调用。
+1. 模型在收到提示词后没做任何代码分析就创建了 5 项子任务计划，之后才开始大量阅读 runtime 内部源码研究底层机制。这导致计划与实际需要完全脱节，后续在 linkname、内存扫描、I2I 路径等多种方案之间反复切换架构方向。
+2. 模型在本轮中先后尝试了 linkname 注入、unsafe 手动构造 iface 值、16MB 内存扫描定位 itabTable、让 eface._type 指向接口类型走 I2I 路径、回归 StructOf 方案、再到最终的内存扫描加 itab 注入等至少 6 种不同技术方向。mockgen.go 被完整重写了 4 次以上，每次方向切换都是因遇到错误就直接全盘推翻重写而非精准诊断后做小范围修正。
+3. 模型在 mockgen.go 中使用了大量超出 Go 安全边界的操作：通过 //go:linkname 访问 runtime 未公开标记的 getitab 函数，定义十余个 runtime 内部类型的镜像结构体，16MB 范围扫描进程内存空间读取任意地址，用 atomic.StoreUintptr 直接写入 runtime 全局数据结构注入伪造 itab。
+4. 模型在发现通过 itab 调用 reflect.MakeFunc 创建的闭包函数会触发 panic 后，没有深入分析闭包崩溃的根本原因 —— runtime 不传递 ctxt 导致闭包访问捕获变量失败 —— 而是直接将测试中所有接口方法调用替换为 mock.Method() 独立函数调用来绕过问题，属于回避根因的做法。

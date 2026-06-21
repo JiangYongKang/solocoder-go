@@ -1,8 +1,8 @@
 产物不满意：
-1.proptest.go中定义了`ErrPropertyFailed`、`ErrInvalidConfig`、`ErrShrinkLimit`三个导出错误变量，但整个模块中从未有函数返回或使用这些错误，只有`ErrGeneratorNil`被实际用于panic和错误消息。用户导入包看到这些错误定义会误以为框架在属性验证失败、配置非法或收缩超限时会返回对应语义的错误，但实际运行中这些场景均以字符串消息或静默方式处理。
-2.proptest.go中`Config.Verbose`字段和`WithVerbose`选项函数已完整暴露给用户，但`Runner.Check`和`shrinkValue`内部从未读取该字段，整个运行流程没有任何基于Verbose的条件输出。用户设置Verbose为true后运行测试与默认模式输出完全一致，一个有接口无实现的功能空壳。
-3.proptest.go末尾存在`appendUnique`和`appendUniqueInt`两个签名和实现完全相同的函数，均对[]int做去重追加。前者用于IntGenerator.Shrink中去重value±1，后者用于StringGenerator和SliceGenerator的Shrink中去重targetLens。
+1. proptest.go 中定义了 ErrPropertyFailed 等三个导出错误变量，但整个模块中从未有函数返回或使用这些错误，只有 ErrGeneratorNil 被实际用于 panic。用户导入包看到这些错误定义会误以为框架在对应场景会返回对应语义的错误，但实际运行中这些场景均以字符串消息或静默方式处理。
+2. proptest.go 中 Config.Verbose 字段和 WithVerbose 选项函数已完整暴露给用户，但 Runner.Check 和 shrinkValue 内部从未读取该字段，整个运行流程没有任何基于 Verbose 的条件输出。用户设置 Verbose 为 true 后运行与默认模式完全一致，一个有接口无实现的功能空壳。
+3. proptest.go 末尾存在 appendUnique 和 appendUniqueInt 两个签名和实现完全相同的函数，均对 []int 做去重追加。前者用于 IntGenerator.Shrink，后者用于 StringGenerator 和 SliceGenerator 的 Shrink，属于重复代码，应合并成一个函数。
 过程不满意：
-1.模型在查看项目目录结构和retry.go代码风格后，未经深入分析属性测试框架四个核心子系统（生成器接口、收缩策略、不变量验证、种子复现）的交互关系就用todo_write创建了7项子任务计划，然后直接编码。此时模型对泛型Generator接口的设计取舍、收缩策略在各类型上的一致性与差异化处理、以及Option配置模式的适用性等关键设计问题均未在思考过程中讨论。
-2.模型修复IntGenerator.Generate的整数溢出时经历了四轮方向不同的修改：第一轮删掉span+1中的+1，第二轮改用uint64转换，第三轮调整uint64减法逻辑，第四轮才用int64统一做范围计算。每次失败后直接换方案而未先分析`g.Max - g.Min + 1`在int类型上溢出的根本原因是类型宽度不足。
-3. 模型一次性写入了完整的 proptest.go 共 781 行和 proptest_test.go 共 1040 行后才首次运行 `go test`，测试暴露了变量名冲突、整数溢出和浮点 Inf 三类问题。如果改为渐进式策略，先完成一个生成器并为其编写测试通过后再扩展，溢出和 Inf 问题会在首个测试中暴露而非等到全部代码写完后才从众多失败中分类定位。一次性提交大量未验证代码使问题以组合方式集中暴露，模型中后期不得不在同一文件中对同一函数反复修改，增加了定位成本。
+1. 模型在查看项目目录结构和 retry.go 代码风格后，未经深入分析属性测试框架四个核心子系统（生成器接口、收缩策略、验证、种子复现）的交互关系就创建了 7 项子任务计划然后直接编码。此时模型对泛型 Generator 接口的设计取舍等关键设计问题均未在思考中讨论。
+2. 模型修复 IntGenerator.Generate 的整数溢出时经历了四轮方向不同的修改：第一轮删 span+1 的 +1，第二轮改用 uint64 转换，第三轮调整 uint64 减法逻辑，第四轮才用 int64 统一做范围计算。每次失败后直接换方案而未先分析 g.Max-g.Min+1 在 int 类型上溢出的根因是类型宽度不足。
+3. 模型一次性写入了完整的 proptest.go 共 781 行和 proptest_test.go 共 1040 行后才首次运行 go test，测试暴露了变量名冲突、整数溢出和浮点 Inf 三类问题。如果改为渐进式先完成一个生成器并写测试通过后再扩展，溢出和 Inf 问题会在首个测试中暴露而非等全部写完后才从众多失败中分类定位。

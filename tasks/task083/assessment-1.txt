@@ -1,8 +1,8 @@
 产物不满意：
-1.tsanomaly.go的Add方法中季节性周期位置索引seasonalIdx通过`(pointCount-1) % PeriodLength`的纯序列计数器计算，完全忽略了DataPoint.Timestamp时间戳字段。提示词要求支持"每天或每周的周期规律"，隐含了基于实际时间戳确定周期位置的语义。若数据点时间间隔不均匀（如遗漏某些时段的数据或数据密度变化），序列索引与实际时间位置将产生错位，同一时刻的数据被映射到不同周期位置，季节性基线学习完全失效。
-2.tsanomaly.go的UpdateConfig方法在检测到PeriodLength变化或EnableSeasonal状态切换时，直接`make([]*windowStats, cfg.PeriodLength)`重建seasonalStats数组，旧有的所有周期位置基线数据（均值、标准差、样本计数）全部被静默丢弃。
-3.tsanomaly.go的BatchAdd方法中closed状态检查在第336行持锁后立即在第341行释放，后续循环调用Add方法每一次独立加解锁。从检查到首次Add调用之间存在时间窗口，其他goroutine可在此期间调用Close关闭检测器，构成TOCTOU竞态条件。
+1. tsanomaly.go 的 Add 方法用 (pointCount-1)%PeriodLength 做序列计数器计算季节性周期位置，完全忽略了 DataPoint.Timestamp 字段。提示词要求支持每天或每周的周期规律，隐含了基于实际时间戳确定周期位置的语义。若数据点间隔不均，序列索引会与实际时间位置错位，同一时刻的数据被映射到不同周期位置，季节性基线学习完全失效。
+2. tsanomaly.go 的 UpdateConfig 在检测到 PeriodLength 变化或季节模式切换时，直接 make 重建 seasonalStats 数组，旧有的所有周期位置基线数据全部被静默丢弃。这意味着之前积累的季节性知识全部丢失，应至少将旧数据按新配置做合理迁移。
+3. tsanomaly.go 的 BatchAdd 中 closed 状态检查持锁后立即释放，后续循环调用 Add 每次独立加解锁。从检查到首次 Add 之间存在时间窗口，其他 goroutine 可在此期间调用 Close 关闭检测器，构成 TOCTOU 竞态条件。应在批量操作期间持锁或用状态机防止中间关闭。
 过程不满意：
-1.模型在第3步用file_search搜索`**/*.go`后，又用view_files阅读了`internal/windowagg/windowagg.go`和`internal/tsdb/engine.go`两个与当前tsanomaly任务完全无关的模块代码。tsanomaly是一个全新的独立模块，任务明确要求代码集中在`internal/tsanomaly/`包下，不需要参考其他包的实现风格。阅读无关模块浪费了推理资源和上下文窗口长度。
-2.模型在第7步就通过todo_write创建了6项子任务计划，此时仅阅读了go.mod和两个无关模块文件，尚未对提示词中的四个核心需求做结构化分析，也未梳理tsanomaly应包含哪些核心结构体和它们的职责边界。结果后续所有生产代码通过一次Write写入整个tsanomaly.go文件，缺乏先设计接口和数据结构、再逐功能模块实现的渐进式开发过程，也不利于在遇到被忽略的边界条件时做局部调整。
-3.模型在第一次实现时直接将Add方法中基线更新放在检测之前（新点先入窗口再检测），导致新点污染基线使季节性子测试失败，经测试暴露后才做了顺序调换修复。更关键的是季节性周期索引的计算方案（基于pointCount序列计数器）自始至终未经推敲和评估，模型既没有对比过基于DataPoint.Timestamp的时间戳映射方案，也未意识到Timestamp字段在整个季节性检测逻辑中完全未被使用。这说明模型缺乏在设计阶段对不同技术方案的适用场景和局限做前置对比的意识。
+1. 模型用 file_search 搜索所有 Go 文件后又阅读了 windowagg 和 tsdb 两个与 tsanomaly 完全无关的模块。tsanomaly 是全新独立模块，任务明确要求代码集中在一个包下，不需要参考其他包的实现风格，阅读无关模块浪费了上下文。
+2. 模型在第 7 步就创建了 6 项子任务计划，此时仅读了 go.mod 和两个无关文件，尚未对四个核心需求做结构化分析。结果所有代码通过一次 Write 写入整个文件，缺乏先设计接口再逐功能模块实现的渐进式开发过程。
+3. 模型第一次实现时 Add 方法里把基线更新放在检测之前，导致新点污染基线使季节性子测试失败，经测试暴露后才调换了顺序。更关键的是基于 pointCount 序列计数器的索引方案从未被推敲，模型没对比过 Timestamp 映射方案，也未意识到 Timestamp 字段在季节性检测逻辑中完全未被使用。

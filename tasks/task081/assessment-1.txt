@@ -1,7 +1,7 @@
 产物不满意：
-1.tracectx.go的ExtractTraceContext函数在解析traceparent请求头时，将W3C格式中的parent-id字段（即调用方的SpanID）直接赋值给了返回TraceContext的SpanID字段，而ParentSpanID在第435行被恒置为空字符串。这导致提取后的上下文丢失了显式的父Span信息，任何检查ParentSpanID的逻辑都会错误地认为该上下文是一个根上下文。
-2.SpanTree的AddSpan方法在添加Span节点时仅校验了SpanID唯一性和非空性，完全没有检查待添加Span的TraceID是否与父Span的TraceID一致。这导致可以将TraceID为`trace-A`的Span作为`trace-B`的子节点加入同一棵树，来自不同分布式链路的Span被混合形成无效追踪树。
-3.SpanTree的GetChildren和traverseSubtree两个方法均采用遍历全部spans做ParentSpanID逐条比对的线性扫描来查找子节点，每次子节点查找的时间复杂度都是O(n)。traverseSubtree对子树中每个节点递归调用全表扫描，使得包含N个节点的树执行GetSubtree的最坏时间复杂度达到O(N平方)。Span数量较大时子树查询性能将急剧下降。
+1. tracectx.go 的 ExtractTraceContext 在解析 traceparent 头时，把 W3C 格式的 parent-id 字段赋给了 SpanID，ParentSpanID 却被恒置为空。这导致提取后的上下文丢失了显式的父 Span 信息，任何检查 ParentSpanID 的逻辑都会错误地认为这是个根上下文。根因是混淆了 traceparent 里两个 ID 字段的语义。
+2. SpanTree 的 AddSpan 只校验了 SpanID 唯一性和非空性，没检查待添加 Span 的 TraceID 与父 Span 是否一致。结果是 trace-A 的 Span 可以被当作 trace-B 的子节点加入，不同分布式链路的 Span 混在一起形成了无效追踪树。应该在添加时增加 TraceID 一致性校验。
+3. SpanTree 的 GetChildren 和 traverseSubtree 都用遍历全部 spans 做 ParentSpanID 逐条比对的线性扫描，每次子节点查找都是 O(n)。traverseSubtree 对每个节点递归做全表扫描，导致 N 个节点的树做 GetSubtree 最坏 O(N 平方)，Span 数量大时子树查询性能会急剧下降。应该用 map 索引加速子节点定位。
 过程不满意：
-1.模型在第52行创建TodoList前仅浏览了go.mod和apikey包代码，apikey与tracectx模块毫无关联，模型未对提示词需求做前置分析就直接制定了7项执行计划并进入编码。模型完全没有对W3CTraceContext规范中traceparent字段的语义边界做分析，跳过理解直接跳到实现阶段。
-2.模型将tracectx.go和tracectx_test.go两个文件一次性全量写入，缺少增量开发和分步验证。首次运行 go test 后出现编译错误，包括未使用的import和未使用的变量，说明单文件全量写入时缺少逐段检查。虽然最终修复，但这种工作方式增加了调试成本且容易遗漏边界条件——例如SpanTree跨TraceID一致性校验的缺失在一次性交付中未被注意到。
+1. 模型在创建 TodoList 前仅浏览了 go.mod 和 apikey 包代码，apikey 跟 tracectx 毫无关联，没做前置分析就定了 7 项计划然后直接编码。模型完全没有分析 W3C TraceContext 规范里 traceparent 字段的语义边界，跳过了理解直接进入实现阶段，导致字段赋值错误。
+2. 模型把 tracectx.go 和 tracectx_test.go 一次性全量写入，缺少增量开发和分步验证。首次 go test 就报了未使用的 import 和变量这类编译错误，说明一次性写入时没逐段检查。虽然最终修复了，但 SpanTree 跨 TraceID 一致性校验这种边界条件在一次交付里被遗漏了。

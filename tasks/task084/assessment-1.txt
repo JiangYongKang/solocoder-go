@@ -1,7 +1,7 @@
 产物不满意：
-1. ProbabilitySampler的ShouldSample方法中，当请求ID长度不足16字符或前16字符不是合法十六进制字符串时，回退逻辑直接返回`s.rate > 0`，导致只要采样率大于零这类请求就被无条件采样。如果配置10%的采样率，短ID或非法格式ID请求的实际采样率变成了100%，完全违背了提示词第4条按请求比例配置采样的要求。根因是模型没有为异常ID场景设计合理的降级策略，应在ID无效时利用随机数生成器按配置的rate做概率判定而非一刀切通过。
-2.Export方法在校验`!p.stopped`条件时返回了`ErrProfilerNotStarted`错误，错误信息是"profilernotstarted"，但此时profiler已经调用过Start处于运行中状态，真正的阻断条件是尚未调用Stop结束采样。调用方看到"notstarted"错误会误以为需要重新执行Start，而无法定位到应先Stop再Export的正确操作顺序。
-3.perfsampler.go的RequestProfiler结构体中定义了`cpuNodeMap map[string]*CPUStackNode`字段，在NewRequestProfiler里通过make分配了堆内存，但整个perfsampler.go文件中没有任何方法对该字段进行读取或写入操作，该map从对象构造到销毁始终为空。这属于无效代码增加了每个RequestProfiler实例不必要的内存开销。
+1. ProbabilitySampler 的 ShouldSample 里，当请求 ID 长度不足 16 字符或前 16 字符不是合法十六进制时，回退逻辑直接返回 rate>0，导致只要采样率大于零这类请求就被无条件采样。若配置 10% 采样率，短 ID 或非法 ID 的请求实际采样率变成 100%，完全违背了按比例采样的要求。应该在 ID 无效时用随机数生成器按配置的 rate 做概率判定。
+2. Export 方法在校验 !p.stopped 条件时返回 ErrProfilerNotStarted，错误信息是 "profiler not started"，但此时 profiler 已在运行中，真正的阻断条件是没有先调用 Stop 结束采样。调用方看到 "not started" 会误以为需重新执行 Start，而无法定位到应先 Stop 再 Export 的正确顺序。
+3. perfsampler.go 的 RequestProfiler 里定义了 cpuNodeMap 字段且在构造函数里分配了堆内存，但整个文件中没有任何方法读写这个 map，从构造到销毁始终为空。这是无效代码增加了每个实例不必要的内存开销。
 过程不满意：
-1. 模型收到提示词后的第一个工具调用就是todo_write创建了10项子任务计划，随后才开始用view_folder浏览internal目录下的模块结构和查看其他模块代码风格。这违反了先充分分析需求上下文再制定执行计划的正确流程，虽然模型在探索项目结构后将计划精简为7项并全部完成，但如果项目结构与模型初始预期差异较大，仓促制定的计划会导致后续反复调整浪费推理资源。正确做法是先理解项目目录布局和模块路径规则再划分合理的子任务粒度。
-2. 修复calculateCPUTotals函数时间重复累加的问题时，模型先用view_files读取perfsampler.go全文，接着用search_by_regex定位calculateCPUTotals的位置，随后又用view_files再次读取同一文件的全文。同一份文件在同一个bug的修复周期内被读取了三遍，第一次全文读取就已经包含了函数定义和调用位置的完整上下文。模型在读第一遍时就应形成对代码结构的完整认知并直接定位修改位置，而非在两轮工具调用后再次全文读取增加不必要的推理延迟。
+1. 模型收到提示词后第一个工具调用就是创建 10 项子任务计划，随后才浏览目录结构和其他模块代码。这违反了先充分分析再制定计划的正确流程，虽然后续将计划精简为 7 项并完成，但如果结构差异大仓促制定的计划会导致反复调整浪费资源。
+2. 修复 calculateCPUTotals 函数时间重复累加的问题时，模型先用 view_files 读 perfsampler.go 全文，接着用 search_by_regex 定位函数位置，随后又用 view_files 再次读全文。同一个文件在同一个 bug 修复里读了三遍，第一次全文读完就应该形成完整的代码结构认知并直接定位修改位置，不必在两轮调用后再次全文读取。

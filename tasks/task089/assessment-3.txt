@@ -1,10 +1,9 @@
 产物不满意：
-1.DefaultCoverageHook方法在fuzzdriver.go中未做任何修改，仍然使用runtime.Callers(2,pcs)获取调用栈。executeWithCoverage在目标函数执行前后各调用一次该钩子，但钩子所在goroutine属于fuzzdriver框架自身，两次调用捕获到的始终是executeWithCoverage/executeSafe/processInput这条框架调用链的栈帧地址，唯一的区别是post阶段地址被或上高位bit。
-2.executeWithCoverage方法在fuzzdriver.go第651行无条件调用SetCurrentCoverage设置goroutine-local覆盖率对象，无论目标函数是否使用了InstrumentedTarget机制。当目标函数未插桩时，该覆盖率对象中hook收集的pre和post地址来自框架自身调用栈，不含任何被测函数内部路径信息，但SetCurrentCoverage/getGoroutineID涉及的goroutine栈解析和map读写开销依然产生。
-3.processInput方法在fuzzdriver.go第877行直接调用checkMemory判断是否suspicious，若为真再在第879行调用recordSuspiciousMemory，而recordSuspiciousMemory内部第845行又调用了checkMemory。对于每个触发内存异常的输入，checkMemory被执行了两次，产生了重复的阈值计算和比较开销。
+1. DefaultCoverageHook 在 fuzzdriver.go 中未做任何修改，仍然使用 runtime.Callers(2, pcs) 获取调用栈。executeWithCoverage 在目标函数执行前后各调用一次该钩子，但钩子所在 goroutine 属于框架自身，两次捕获到的始终是 executeWithCoverage、executeSafe、processInput 这条框架调用链的栈帧地址，唯一的区别是 post 阶段地址被或上高位 bit，覆盖率引导形同虚设。
+2. executeWithCoverage 无条件调用 SetCurrentCoverage 设置 goroutine-local 覆盖率对象，无论目标函数是否使用了 InstrumentedTarget 机制。当目标函数未插桩时该覆盖率对象中 hook 收集的 pre 和 post 地址来自框架自身调用栈，不含任何被测函数内部路径信息，但 SetCurrentCoverage 涉及的 goroutine 栈解析和 map 读写开销依然在产生。
+3. processInput 直接调用 checkMemory 判断是否可疑，若为真再调用 recordSuspiciousMemory，而 recordSuspiciousMemory 内部又调用了 checkMemory。对于每个触发内存异常的输入 checkMemory 被执行了两次，产生了重复的阈值计算和比较开销。
 过程不满意：
-1.模型在刚收到提示词后未经阅读fuzzdriver.go现有代码，直接就创建了包含6项子任务的TodoList并开始编码，随后才在第4步查看fuzzdriver.go源码。
-2.模型对fuzzdriver.go连续执行了8次以上的编辑操作后才首次运行 go test 验证，期间经历了添加goroutine-local覆盖率API、修改executeSafe的defer结构、重构checkMemory返回值签名、更新recordSuspiciousMemory等多轮改动。首次测试结果显示TestFuzzerProcessInputNewPath和TestCheckMemoryWithBaseline两个用例失败，不得不在大量代码改动之后追溯是哪一步引入了回归。
-3.TestCheckMemoryWithBaseline测试失败后，模型在第一轮将配置中的EnableBaselineCalibration设为false，测试仍然失败，第二轮才改为true并设MemoryMultiplier为2.0。
-4.模型在完成fuzzdriver.go的大量代码修改后，在第170行和第284行两次用view_files重新阅读了fuzzdriver.go的完整源码，而此时距离上一次读取（第135行）仅隔了一次executeWithCoverage相关修改。
-测试结果：运行go test ./internal/fuzzdriver/ -v -count=1，79个测试用例全部通过（1个SKIP为非确定性测试用例的正常行为）。
+1. 模型刚收到提示词没阅读现有代码就直接创建了包含 6 项子任务的 TodoList 并开始编码，随后才查看源码。这与前两轮的同类问题模式完全一致，说明模型在同一类型的流程错误上未从之前的标注中吸取教训。
+2. 模型对 fuzzdriver.go 连续执行了 8 次以上的编辑操作后才首次运行 go test 验证，期间经历了添加 goroutine-local 覆盖率 API、修改 defer 结构、重构 checkMemory 返回值签名、更新 recordSuspiciousMemory 等多轮改动。首次测试结果两个用例失败，不得不在大量改动之后追溯回归。
+3. TestCheckMemoryWithBaseline 测试失败后模型第一轮将 EnableBaselineCalibration 设为 false 测试仍然失败，第二轮才改为 true 并设 MemoryMultiplier 为 2.0。这说明模型在没有充分理解测试失败原因的情况下就动手修改，属于试错式调试。
+4. 模型在完成大量代码修改后两次用 view_files 重新阅读 fuzzdriver.go 的完整源码，而距上一次读取仅隔了一次修改。这表明模型缺乏对当前编辑状态的整体把握，属于推理效率低的信号。

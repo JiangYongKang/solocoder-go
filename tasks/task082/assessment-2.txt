@@ -1,8 +1,8 @@
 产物不满意：
-1.RegisterNotifier方法在notifier为nil时返回ErrInvalidCondition，空名称时返回ErrInvalidRule，两个错误常量语义均不匹配：nil入参不是"条件无效"，空名称也跟"规则无效"无关，属于随意复用已有常量。同时errors.go定义的ErrNotifierNotFound在整个生产代码中从未被任何函数返回，模型总结声称"所有12个错误常量均已使用"并不属实。
-2.TestRegisterNotifierValidation测试用例对nilnotifier和空名称notifier仅判断了`err == nil`或`err != nil`，没有通过`err != ErrXXX`方式断言返回的具体错误常量类型。这意味着即使RegisterNotifier返回了语义错误的常量，测试也查不出来——例如nil入参实际返回的是ErrInvalidCondition而非更合适的错误，测试照样通过。
-3. 引擎方法文档中 RegisterNotifier 的签名仍写为 `RegisterNotifier(notifier Notifier)` 无返回值，但实际代码已改为返回 error。文档中告警生命周期部分的"通知发送"描述写的是"根据规则配置的通知渠道列表选择渠道"，未补充 getNotifiersForLevel 的按等级渠道选择逻辑。原因是修改代码后仅更新了新增章节而未复查已有描述是否仍然准确，应将文档中过时的方法签名和流程描述同步修正为当前代码的完整逻辑。
+1. RegisterNotifier 在 notifier 为 nil 时返回 ErrInvalidCondition，空名称时返回 ErrInvalidRule，两个错误常量语义都不匹配：nil 入参不是"条件无效"，空名称也跟"规则无效"无关，属于随意复用已有常量。errors.go 定义的 ErrNotifierNotFound 在整个生产代码中从未被返回，模型声称所有错误常量已使用不属实。
+2. TestRegisterNotifierValidation 对 nil 和空名称 notifier 只判断了 err 是否为 nil，没有断言返回的具体错误常量类型。这意味着即使 RegisterNotifier 返回了语义错误的常量，测试也查不出来，例如 nil 入参实际返回 ErrInvalidCondition 而非更合适的错误，测试照样通过。
+3. 文档中 RegisterNotifier 的签名仍写为无返回值，但实际代码已改为返回 error。告警生命周期里的通知发送描述也未补充按等级选择渠道的逻辑。原因是修改代码后只更新了新增章节，没复查已有描述是否仍准确，应把过时的方法签名和流程描述同步修正。
 过程不满意：
-1. 模型在刚收到提示词后未经任何分析就直接用 todo_write 创建了 9 项子任务计划，之后才开始依次读取 alertengine.go、types.go、errors.go 了解代码现状。这与标注规范中"不能在刚收到任务时就直接创建 TodoList，应先分析问题再规划"的要求相违背，导致计划粒度划分与实际模块边界和问题修复顺序不相匹配。正确做法是先通读现有代码和需求文档，理清 7 个缺陷的触发根因和修复范围后再制定执行计划。
-2. 模型使用 Write 工具完整重写了 alertengine.go 和 alertengine_test.go 两个核心文件，而非对提示词列出的 7 个具体问题做逐一增量修改。这种大爆炸式重写导致代码 diff 巨大难以追踪每处变更的意图，同时存在引入新缺陷的风险——例如 InitialLevel 校验顺序错误就是重写时新引入的问题。正确做法是对每个修复点做独立的、最小的、可追溯的增量修改。
-3. AddRule 方法中 InitialLevel 的校验逻辑在初稿里被放在了默认值赋值之前，导致所有未显式设置等级的合法规则在 AddRule 阶段均返回 ErrInvalidLevel 校验失败，首轮 go test 运行后大量测试用例失败。模型通过阅读测试输出才定位到校验顺序问题并在第二轮修复。这属于试错式调试——编写代码时未考虑"先设默认值再校验"的执行顺序，正确做法是在编码时就推理清楚校验逻辑与默认值注入的先后依赖关系。
+1. 模型刚收到提示词没做任何分析就创建了 9 项子任务计划，之后才开始阅读代码了解现状。这导致计划粒度与实际模块边界和修复顺序不匹配，正确做法是先通读现有代码和需求文档，理清 7 个缺陷的触发根因和修复范围后再制定计划。
+2. 模型用 Write 工具完整重写了 alertengine.go 和 alertengine_test.go 两个核心文件，而非对提示词列出的 7 个具体问题逐一增量修改。这种大爆炸式重写导致 diff 巨大难以追踪每处变更的意图，同时存在引入新缺陷的风险，InitialLevel 校验顺序错误就是重写时新引入的。应该对每个修复点做独立的、最小的增量修改。
+3. AddRule 中 InitialLevel 的校验逻辑被放在了默认值赋值之前，导致所有未显式设置等级的合法规则在 AddRule 阶段都返回 ErrInvalidLevel 校验失败。首轮 go test 后大量测试用例失败，模型通过阅读测试输出才定位到校验顺序问题。这属于试错式调试，编码时没考虑先设默认值再校验的执行顺序。

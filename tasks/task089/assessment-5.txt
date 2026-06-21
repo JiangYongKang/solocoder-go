@@ -1,7 +1,7 @@
 产物不满意：
-1.模型在修复crashed死代码期间对executeWithCoverage方法进行了超出提示词范围的修改，新增了hookCov局部变量和`if coverage.Count() == 0 { coverage.Merge(hookCov) }`的覆盖率合并逻辑。
-2.模型对executeSafe的defer recover 逻辑做了未授权修改，将原代码中panic恢复后添加覆盖率地址时使用的`addr | 0x8000000000000000`高位标记改为了`addr`，去掉了用于区分执行前后覆盖点的高位标记。与此同时executeWithCoverage的正常执行路径中仍然保留了对post地址使用`addr | 0x8000000000000000`的编码方式。
-3.模型修改了recordSuspiciousMemory方法的函数签名，从原来接收before和after两个MemoryStats结构体参数改为接收拆解后的allocDiff、allocCountDiff、thresholdBytes、thresholdAllocs、triggeredByBytes、triggeredByAllocs六个独立参数，并同步修改了processInput中的调用方式。
+1. 模型在修复 crashed 死代码期间对 executeWithCoverage 方法进行了超出提示词范围的修改，新增了 hookCov 局部变量和覆盖率合并逻辑。提示词仅要求移除 crashed 相关代码，模型自行扩展修改范围增加了不必要的变更量。
+2. 模型对 executeSafe 的 defer+recover 逻辑做了未授权修改，将原代码中 panic 恢复后添加覆盖率地址时使用的高位标记去掉了。与此同时 executeWithCoverage 的正常执行路径中仍然保留了对 post 地址使用高位标记的编码方式，导致同一个模块内两个路径的覆盖地址编码不一致。
+3. 模型修改了 recordSuspiciousMemory 的函数签名，从原来的两个 MemoryStats 结构体参数改为接收六个独立参数。这是对已有 API 的破坏性重构，超出了提示词要求移除 crashed 死代码的修复范围，增加了级联修改的变更量。
 过程不满意：
-1.模型在收到提示词后先用search_by_regex搜索executeWithCoverage的调用点，随后用todo_write创建了四项子任务，但并未在计划阶段分析提示词的精确边界。
-2.模型在最终的修复总结中只描述了executeWithCoverage签名简化、executeSafe调用更新和测试代码更新这三项与crashed移除直接相关的改动，完全没有提及executeWithCoverage中新增的hookCov合并逻辑、executeSafe的recover中高位标记被移除、recordSuspiciousMemory签名被重构等未授权修改。
+1. 模型收到提示词后先用 search_by_regex 搜索 executeWithCoverage 的调用点随后用 todo_write 创建了四项子任务，但并未在计划阶段分析提示词的精确边界。提示词明确只要求移除 crashed 相关代码，模型却在执行过程中自行做了大量未授权的重构。
+2. 模型在最终的修复总结中只描述了签名简化、调用更新和测试更新这三项与 crashed 移除直接相关的改动，完全没有提及 executeWithCoverage 中新增的 hookCov 合并逻辑、recover 中高位标记被移除、recordSuspiciousMemory 签名被重构等未授权修改。这种选择性汇报掩盖了实际执行内容与提示词要求的偏差。
