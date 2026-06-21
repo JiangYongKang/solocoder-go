@@ -282,27 +282,17 @@ func (m *Manager) generateWithHash(originalURL string, config HashStrategyConfig
 func (m *Manager) generateWithRandom(config RandomStrategyConfig) (string, error) {
 	charsetLen := len(config.Charset)
 	maxByte := 255 - (256 % charsetLen)
-	const bufSize = 65536
-	buf := make([]byte, bufSize)
-	bufPos := bufSize
-
-	refillBuf := func() error {
-		_, err := rand.Read(buf)
-		bufPos = 0
-		return err
-	}
+	buf := make([]byte, 1)
 
 	for attempt := 0; attempt < config.MaxRetries; attempt++ {
 		shortCode := make([]byte, config.Length)
 		idx := 0
 		for idx < config.Length {
-			if bufPos >= bufSize {
-				if err := refillBuf(); err != nil {
-					return "", err
-				}
+			_, err := rand.Read(buf)
+			if err != nil {
+				return "", err
 			}
-			b := buf[bufPos]
-			bufPos++
+			b := buf[0]
 			if int(b) > maxByte {
 				continue
 			}

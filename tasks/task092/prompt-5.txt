@@ -1,0 +1,9 @@
+你实现的文本差异与补丁引擎模块中仍然存在两个测试质量问题：
+
+1. TestDiffToChanges_SingleHunkMultipleChanges 测试仍然手工构造 DiffResult 结构体直接传给 diffToChanges，没有通过 Diff 函数从两段真实文本生成 DiffResult，测试无法验证从原始文本到最终变更块的完整转换链路。
+
+2. TestThreeWayMerge_SingleHunkMultipleChanges 合并结果的断言仍然只检查内容是否包含以及总行数是否正确，没有对合并结果中变更块插入位置做逐坐标校验。
+
+3. debug_test.go 只包含打印调试信息的代码，没有实际的断言逻辑。
+
+4. 修复后运行 go test ./internal/diffpatch/ -v，需要让所有测试通过。

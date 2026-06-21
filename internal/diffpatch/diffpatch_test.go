@@ -1140,64 +1140,105 @@ func TestSameContent(t *testing.T) {
 }
 
 func TestDiffToChanges_SingleHunkMultipleChanges(t *testing.T) {
-	diffResult := &DiffResult{
-		Hunks: []Hunk{
-			{
-				OldStart: 1, OldCount: 10,
-				NewStart: 1, NewCount: 10,
-				Lines: []Line{
-					{Content: "line1", Type: LineEqual, OldLineNo: 1, NewLineNo: 1},
-					{Content: "line2", Type: LineDelete, OldLineNo: 2, NewLineNo: 0},
-					{Content: "OURS2", Type: LineInsert, OldLineNo: 0, NewLineNo: 2},
-					{Content: "line3", Type: LineEqual, OldLineNo: 3, NewLineNo: 3},
-					{Content: "line4", Type: LineEqual, OldLineNo: 4, NewLineNo: 4},
-					{Content: "line5", Type: LineEqual, OldLineNo: 5, NewLineNo: 5},
-					{Content: "line6", Type: LineDelete, OldLineNo: 6, NewLineNo: 0},
-					{Content: "OURS6", Type: LineInsert, OldLineNo: 0, NewLineNo: 6},
-					{Content: "line7", Type: LineEqual, OldLineNo: 7, NewLineNo: 7},
-					{Content: "line8", Type: LineEqual, OldLineNo: 8, NewLineNo: 8},
-					{Content: "line9", Type: LineDelete, OldLineNo: 9, NewLineNo: 0},
-					{Content: "OURS9", Type: LineInsert, OldLineNo: 0, NewLineNo: 9},
-					{Content: "line10", Type: LineEqual, OldLineNo: 10, NewLineNo: 10},
-				},
-			},
-		},
+	oldText := "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n"
+	newText := "line1\nCHANGED2\nline3\nline4\nline5\nCHANGED6\nline7\nline8\nCHANGED9\nline10\n"
+
+	result, err := Diff(oldText, newText)
+	if err != nil {
+		t.Fatalf("Diff error: %v", err)
 	}
 
-	changes := diffToChanges(diffResult)
-
-	if len(changes) != 3 {
-		t.Fatalf("expected 3 changes, got %d", len(changes))
+	if len(result.Hunks) != 1 {
+		t.Fatalf("expected single hunk for multiple close changes, got %d hunks", len(result.Hunks))
 	}
 
-	if changes[0].oldStart != 1 {
-		t.Errorf("change 0 oldStart: expected 1, got %d", changes[0].oldStart)
+	hunk := result.Hunks[0]
+	t.Logf("Hunk from real diff: OldStart=%d, OldCount=%d, NewStart=%d, NewCount=%d",
+		hunk.OldStart, hunk.OldCount, hunk.NewStart, hunk.NewCount)
+
+	deleteCount := 0
+	for _, line := range hunk.Lines {
+		if line.Type == LineDelete {
+			deleteCount++
+		}
 	}
-	if changes[0].oldEnd != 2 {
-		t.Errorf("change 0 oldEnd: expected 2, got %d", changes[0].oldEnd)
-	}
-	if len(changes[0].newLines) != 1 || changes[0].newLines[0] != "OURS2" {
-		t.Errorf("change 0 newLines: expected [OURS2], got %v", changes[0].newLines)
+	if deleteCount < 2 {
+		t.Fatalf("expected hunk to contain at least 2 delete operations for multiple changes, got %d", deleteCount)
 	}
 
-	if changes[1].oldStart != 5 {
-		t.Errorf("change 1 oldStart: expected 5, got %d", changes[1].oldStart)
-	}
-	if changes[1].oldEnd != 6 {
-		t.Errorf("change 1 oldEnd: expected 6, got %d", changes[1].oldEnd)
-	}
-	if len(changes[1].newLines) != 1 || changes[1].newLines[0] != "OURS6" {
-		t.Errorf("change 1 newLines: expected [OURS6], got %v", changes[1].newLines)
+	t.Log("Hunk lines (from buildHunks):")
+	for i, line := range hunk.Lines {
+		var prefix string
+		switch line.Type {
+		case LineEqual:
+			prefix = " "
+		case LineDelete:
+			prefix = "-"
+		case LineInsert:
+			prefix = "+"
+		}
+		t.Logf("  [%d] %s%s (OldLineNo=%d, NewLineNo=%d)",
+			i, prefix, line.Content, line.OldLineNo, line.NewLineNo)
 	}
 
-	if changes[2].oldStart != 8 {
-		t.Errorf("change 2 oldStart: expected 8, got %d", changes[2].oldStart)
+	changes := diffToChanges(result)
+	t.Logf("Generated %d changes from diffToChanges:", len(changes))
+	for i, ch := range changes {
+		t.Logf("  Change %d: oldStart=%d, oldEnd=%d, newLines=%v", i, ch.oldStart, ch.oldEnd, ch.newLines)
 	}
-	if changes[2].oldEnd != 9 {
-		t.Errorf("change 2 oldEnd: expected 9, got %d", changes[2].oldEnd)
+
+	expectedChangeCount := 3
+	if len(changes) != expectedChangeCount {
+		t.Fatalf("expected %d changes, got %d", expectedChangeCount, len(changes))
 	}
-	if len(changes[2].newLines) != 1 || changes[2].newLines[0] != "OURS9" {
-		t.Errorf("change 2 newLines: expected [OURS9], got %v", changes[2].newLines)
+
+	expectedChanges := []struct {
+		oldStart int
+		oldEnd   int
+		content  string
+	}{
+		{oldStart: 1, oldEnd: 2, content: "CHANGED2"},
+		{oldStart: 5, oldEnd: 6, content: "CHANGED6"},
+		{oldStart: 8, oldEnd: 9, content: "CHANGED9"},
+	}
+
+	for i, expected := range expectedChanges {
+		if i >= len(changes) {
+			t.Fatalf("missing change %d", i)
+		}
+		ch := changes[i]
+		if ch.oldStart != expected.oldStart {
+			t.Errorf("change %d oldStart: expected %d, got %d", i, expected.oldStart, ch.oldStart)
+		}
+		if ch.oldEnd != expected.oldEnd {
+			t.Errorf("change %d oldEnd: expected %d, got %d", i, expected.oldEnd, ch.oldEnd)
+		}
+		if len(ch.newLines) != 1 || ch.newLines[0] != expected.content {
+			t.Errorf("change %d newLines: expected [%s], got %v", i, expected.content, ch.newLines)
+		}
+	}
+
+	oldLines := splitLines(oldText)
+	newLines := splitLines(newText)
+	for _, ch := range changes {
+		if ch.oldStart < 0 || ch.oldStart >= len(oldLines) {
+			t.Errorf("change oldStart %d out of bounds [0, %d)", ch.oldStart, len(oldLines))
+		}
+		if ch.oldEnd < ch.oldStart || ch.oldEnd > len(oldLines) {
+			t.Errorf("change oldEnd %d invalid (oldStart=%d, len(oldLines)=%d)",
+				ch.oldEnd, ch.oldStart, len(oldLines))
+		}
+		for j := 0; j < len(ch.newLines); j++ {
+			newIdx := ch.oldStart + j
+			if newIdx >= len(newLines) {
+				t.Errorf("new index %d out of bounds for newLines length %d", newIdx, len(newLines))
+				continue
+			}
+			if newLines[newIdx] != ch.newLines[j] {
+				t.Errorf("change content mismatch at new index %d: expected %q, got %q",
+					newIdx, ch.newLines[j], newLines[newIdx])
+			}
+		}
 	}
 }
 
@@ -1206,31 +1247,189 @@ func TestThreeWayMerge_SingleHunkMultipleChanges(t *testing.T) {
 	ours := "line1\nOURS2\nline3\nline4\nline5\nOURS6\nline7\nline8\nOURS9\nline10\n"
 	theirs := "line1\nline2\nline3\nTHEIRS4\nline5\nline6\nline7\nTHEIRS8\nline9\nline10\n"
 
+	baseLines := splitLines(base)
+	oursLines := splitLines(ours)
+	theirsLines := splitLines(theirs)
+
+	oursDiff, err := Diff(base, ours)
+	if err != nil {
+		t.Fatalf("ours diff error: %v", err)
+	}
+	oursChanges := diffToChanges(oursDiff)
+	t.Logf("Ours changes (from diffToChanges): %d changes", len(oursChanges))
+	for i, ch := range oursChanges {
+		t.Logf("  [%d] oldStart=%d, oldEnd=%d, new=%v", i, ch.oldStart, ch.oldEnd, ch.newLines)
+	}
+
+	theirsDiff, err := Diff(base, theirs)
+	if err != nil {
+		t.Fatalf("theirs diff error: %v", err)
+	}
+	theirsChanges := diffToChanges(theirsDiff)
+	t.Logf("Theirs changes (from diffToChanges): %d changes", len(theirsChanges))
+	for i, ch := range theirsChanges {
+		t.Logf("  [%d] oldStart=%d, oldEnd=%d, new=%v", i, ch.oldStart, ch.oldEnd, ch.newLines)
+	}
+
+	expectedOursChanges := 3
+	if len(oursChanges) != expectedOursChanges {
+		t.Fatalf("expected %d ours changes, got %d", expectedOursChanges, len(oursChanges))
+	}
+
+	expectedTheirsChanges := 2
+	if len(theirsChanges) != expectedTheirsChanges {
+		t.Fatalf("expected %d theirs changes, got %d", expectedTheirsChanges, len(theirsChanges))
+	}
+
+	conflicts := detectConflicts(oursChanges, theirsChanges)
+	if len(conflicts) > 0 {
+		t.Errorf("expected no conflicts, got %d: %+v", len(conflicts), conflicts)
+	}
+
+	allChanges := mergeChanges(oursChanges, theirsChanges)
+	t.Logf("Merged changes (sorted by oldStart): %d changes", len(allChanges))
+	for i, ch := range allChanges {
+		t.Logf("  [%d] oldStart=%d, oldEnd=%d, new=%v", i, ch.oldStart, ch.oldEnd, ch.newLines)
+	}
+
+	expectedTotalChanges := 5
+	if len(allChanges) != expectedTotalChanges {
+		t.Fatalf("expected %d total merged changes, got %d", expectedTotalChanges, len(allChanges))
+	}
+
+	expectedSortedChanges := []struct {
+		oldStart int
+		oldEnd   int
+		content  string
+	}{
+		{oldStart: 1, oldEnd: 2, content: "OURS2"},
+		{oldStart: 3, oldEnd: 4, content: "THEIRS4"},
+		{oldStart: 5, oldEnd: 6, content: "OURS6"},
+		{oldStart: 7, oldEnd: 8, content: "THEIRS8"},
+		{oldStart: 8, oldEnd: 9, content: "OURS9"},
+	}
+
+	for i, expected := range expectedSortedChanges {
+		if i >= len(allChanges) {
+			t.Fatalf("missing merged change %d", i)
+		}
+		ch := allChanges[i]
+		if ch.oldStart != expected.oldStart {
+			t.Errorf("merged change %d oldStart: expected %d, got %d", i, expected.oldStart, ch.oldStart)
+		}
+		if ch.oldEnd != expected.oldEnd {
+			t.Errorf("merged change %d oldEnd: expected %d, got %d", i, expected.oldEnd, ch.oldEnd)
+		}
+		if len(ch.newLines) != 1 || ch.newLines[0] != expected.content {
+			t.Errorf("merged change %d newLines: expected [%s], got %v", i, expected.content, ch.newLines)
+		}
+	}
+
 	result, err := ThreeWayMerge(base, ours, theirs)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("merge error: %v", err)
 	}
 	if result.HasConflicts {
-		t.Error("should not have conflicts for non-overlapping changes")
+		t.Fatal("should not have conflicts for non-overlapping changes")
 	}
 
-	expectedChanges := []string{"OURS2", "THEIRS4", "OURS6", "THEIRS8", "OURS9"}
-	for _, expected := range expectedChanges {
-		if !strings.Contains(result.Text, expected) {
-			t.Errorf("merged text should contain %q", expected)
+	mergedLines := splitLines(result.Text)
+	t.Log("Final merged result (line by line):")
+	for i, line := range mergedLines {
+		t.Logf("  [%d] %s", i, line)
+	}
+
+	expectedMerged := []string{
+		"line1",
+		"OURS2",
+		"line3",
+		"THEIRS4",
+		"line5",
+		"OURS6",
+		"line7",
+		"THEIRS8",
+		"OURS9",
+		"line10",
+	}
+
+	if len(mergedLines) != len(expectedMerged) {
+		t.Fatalf("expected %d merged lines, got %d", len(expectedMerged), len(mergedLines))
+	}
+
+	for i, expected := range expectedMerged {
+		if i >= len(mergedLines) {
+			t.Errorf("line %d: expected %q, got <missing>", i, expected)
+			continue
+		}
+		if mergedLines[i] != expected {
+			t.Errorf("line %d: expected %q, got %q", i, expected, mergedLines[i])
 		}
 	}
 
-	unwantedChanges := []string{"line2", "line4", "line6", "line8", "line9"}
-	for _, unwanted := range unwantedChanges {
-		if strings.Contains(result.Text, unwanted+"\n") {
-			t.Errorf("merged text should not contain original %q", unwanted)
+	unchangedPositions := []int{0, 2, 4, 6, 9}
+	for _, pos := range unchangedPositions {
+		if pos >= len(baseLines) || pos >= len(mergedLines) {
+			continue
+		}
+		if mergedLines[pos] != baseLines[pos] {
+			t.Errorf("line %d should be unchanged (from base): expected %q, got %q",
+				pos, baseLines[pos], mergedLines[pos])
 		}
 	}
 
-	expectedLineCount := 10
-	actualLines := len(splitLines(result.Text))
-	if actualLines != expectedLineCount {
-		t.Errorf("expected %d lines, got %d lines\nresult:\n%s", expectedLineCount, actualLines, result.Text)
+	oursChangedPositions := map[int]string{
+		1: "OURS2",
+		5: "OURS6",
+		8: "OURS9",
+	}
+	for pos, expected := range oursChangedPositions {
+		if pos >= len(mergedLines) {
+			t.Errorf("ours changed position %d out of bounds", pos)
+			continue
+		}
+		if mergedLines[pos] != expected {
+			t.Errorf("ours change at position %d: expected %q, got %q", pos, expected, mergedLines[pos])
+		}
+		if pos >= len(oursLines) {
+			continue
+		}
+		if mergedLines[pos] != oursLines[pos] {
+			t.Errorf("ours change at position %d should match ours text: expected %q, got %q",
+				pos, oursLines[pos], mergedLines[pos])
+		}
+	}
+
+	theirsChangedPositions := map[int]string{
+		3: "THEIRS4",
+		7: "THEIRS8",
+	}
+	for pos, expected := range theirsChangedPositions {
+		if pos >= len(mergedLines) {
+			t.Errorf("theirs changed position %d out of bounds", pos)
+			continue
+		}
+		if mergedLines[pos] != expected {
+			t.Errorf("theirs change at position %d: expected %q, got %q", pos, expected, mergedLines[pos])
+		}
+		if pos >= len(theirsLines) {
+			continue
+		}
+		if mergedLines[pos] != theirsLines[pos] {
+			t.Errorf("theirs change at position %d should match theirs text: expected %q, got %q",
+				pos, theirsLines[pos], mergedLines[pos])
+		}
+	}
+
+	applied := applyBothChanges(baseLines, oursChanges, theirsChanges)
+	appliedLines := splitLines(applied)
+	if len(appliedLines) != len(expectedMerged) {
+		t.Fatalf("applyBothChanges result length mismatch: expected %d, got %d",
+			len(expectedMerged), len(appliedLines))
+	}
+	for i := range expectedMerged {
+		if appliedLines[i] != expectedMerged[i] {
+			t.Errorf("applyBothChanges line %d: expected %q, got %q",
+				i, expectedMerged[i], appliedLines[i])
+		}
 	}
 }

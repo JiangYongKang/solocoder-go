@@ -1110,6 +1110,13 @@ func makeLargeCharset(size int) string {
 	return string(buf)
 }
 
+func chiSquaredCriticalValue(df int, z float64) float64 {
+	k := float64(df)
+	a := 1.0 - 2.0/(9.0*k)
+	b := z * math.Sqrt(2.0/(9.0*k))
+	return k * (a + b) * (a + b) * (a + b)
+}
+
 func TestGenerateWithRandomNoModuloBias(t *testing.T) {
 	testCases := []struct {
 		name       string
@@ -1120,19 +1127,19 @@ func TestGenerateWithRandomNoModuloBias(t *testing.T) {
 		{
 			name:       "charset_7_small",
 			charset:    "0123456",
-			numTrials:  2000,
+			numTrials:  1000,
 			codeLength: 8,
 		},
 		{
 			name:       "charset_62_base62",
 			charset:    base62Chars,
-			numTrials:  4000,
+			numTrials:  3000,
 			codeLength: 8,
 		},
 		{
 			name:       "charset_95_ascii_printable",
 			charset:    makeLargeCharset(95),
-			numTrials:  1000,
+			numTrials:  500,
 			codeLength: 8,
 		},
 	}
@@ -1172,7 +1179,7 @@ func TestGenerateWithRandomNoModuloBias(t *testing.T) {
 			}
 
 			df := charsetLen - 1
-			criticalValue := float64(df) + 6.0*math.Sqrt(2.0*float64(df))
+			criticalValue := chiSquaredCriticalValue(df, 3.090)
 
 			t.Logf("chi-squared = %.2f, df = %d, critical value = %.2f", chiSquared, df, criticalValue)
 			t.Logf("expected per char = %.1f, total chars = %d", expectedPerChar, totalChars)

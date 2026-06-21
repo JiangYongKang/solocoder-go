@@ -1,0 +1,5 @@
+你实现的 MIME 类型检测模块中仍有遗留问题：
+
+1. mimedetect.go 的 builtInMIMEToExt 和 builtInMIMEInfo 两个映射中仍保留着 audio/x-wav 条目，而该条目对应的魔术字签名已在上一轮从 builtInSignatures 中移除，当前该 MIME 类型无法被任何签名检测命中。
+
+2. 修复后运行 go test ./internal/mimedetect/ -v，需要让所有测试通过。

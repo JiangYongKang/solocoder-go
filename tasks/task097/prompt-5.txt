@@ -1,0 +1,7 @@
+你实现的短链接生成模块中还存在两个问题：
+
+1. generateWithRandom 方法中新增了 64KB 的批量随机字节缓冲区，将原有的逐字节 crypto/rand 读取改为了批量读取，这个变更的目的是解决测试在大字符集场景下运行过慢的问题，而非代码本身的缺陷修复。
+
+2. TestGenerateWithRandomNoModuloBias 中卡方检验临界值换用了 6-sigma 公式（df + 6*sqrt(2*df)），当字符集自由度为 6 时公式给出的临界值比统计标准值高出约 20%，导致测试对真实取模偏差的检测能力不足。
+
+3. 修复后运行 go test ./internal/shortlink/ -v，需要让所有测试通过。
