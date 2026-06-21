@@ -1,7 +1,7 @@
 产物不满意：
-1. TestMatcher_Assert_SnapshotNotFound 的测试函数名声明要测试 Assert 在快照不存在时的行为，但函数体内实际只调用了 m.Match 方法，完全没有执行 m.Assert。模型在思考过程中明确承认因为 `runtime.Goexit()` 无法被 recover 捕获而放弃了 Assert 错误路径的测试，转而只测试 Match 的行为。这导致 Assert 方法中当快照不存在时的 t.Fatalf 分支完全没有测试覆盖，提示词第 5 条要求的快照不存在场景单元测试实际上只覆盖了 Match 而没有覆盖 Assert。根因是模型在遇到 t.Fatalf 不可直接测试的技术难点后选择了回避方案而非探索替代测试策略，正确做法是至少将测试函数名纠正为 Match 相关名称以消除命名误导，或者通过子进程方式间接验证 Assert 的错误退出行为。
-2. TestMatcher_WriteAndReadSnapshot 在模型修改了 writeSnapshot 的尾部换行追加逻辑后，原本对读写往返内容的精确字符串比较被弱化为仅检查前缀的 `strings.HasPrefix(content, "hello")`。writeSnapshot 现在只在内容不以换行符结尾时追加换行，而 readSnapshot 保留所有尾部换行，导致写入 `"hello\nworld"` 后再读回的完整内容变为 `"hello\nworld\n"`，与原始输入不一致，模型发现这个问题后没有分析往返行为差异的根源就直接把断言从精确匹配改成前缀匹配，降低了测试的验证强度。根因是模型没有先理清 writeSnapshot 和 readSnapshot 在尾部换行处理上的完整往返语义就调整了断言，正确做法是先确定正确的往返保持不变性预期再据此设定断言。
+1.TestMatcher_Assert_SnapshotNotFound的测试函数名声明要测试Assert在快照不存在时的行为，但函数体内实际只调用了m.Match方法，完全没有执行m.Assert。模型在思考过程中明确承认因为`runtime.Goexit()`无法被recover捕获而放弃了Assert错误路径的测试，转而只测试Match的行为。
+2.TestMatcher_WriteAndReadSnapshot在模型修改了writeSnapshot的尾部换行追加逻辑后，原本对读写往返内容的精确字符串比较被弱化为仅检查前缀的`strings.HasPrefix(content, "hello")`。
 过程不满意：
-1. 模型在刚收到提示词后没有先阅读代码分析和理解现有缺陷，就直接用 todo_write 创建了 6 项子任务计划，之后才开始查看 snaptest.go 的代码内容。这种先制定计划再分析的顺序违反了标注规范中"不能在刚收到任务时就直接创建 TodoList，应先分析问题再规划"的要求。由于没有先行分析，模型的 TodoList 粒度划分与实际修复点不匹配，后续执行中反复出现先重写全部代码再靠测试结果驱动的低效迭代，合理做法是先逐个理解提示词中的 4 个缺陷描述，对照现有代码定位问题所在再制定分步修复计划。
-2. 模型在查看 snaptest.go 后直接对整个文件进行了全量重写而非按缺陷逐一定点修改，接着又全量重写了 snaptest_test.go。全量重写引入了大量不必要的变更，导致原本正常的测试逻辑（如 Diff 的已有测试）预期值因 DiffLine 结构体字段从 Content 改为 Left/Right 和新增 DiffModified 类型而失效，随后模型在 truncateOrPad 函数的测试预期值上经历了四轮以上的试错调整，每次只根据测试实际输出修改期望值而事先并未计算正确的期望结果。这是典型的试错式调试，正确做法是先做最小范围的代码修改，每个缺陷单独修复后立即运行对应测试验证。
-3. 模型在编写 `MismatchError` 的 Error 方法时使用了 `%w` 格式动词（`fmt.Sprintf` 不支持 `%w`），导致首次编译失败报错后才修正为 `%s`。这是一个基础的 Go 语言知识点错误，说明模型对 `fmt.Errorf` 和 `fmt.Sprintf` 的格式动词差异理解不到位，在代码完成后也未做自检就运行了测试。合理做法是了解 `%w` 是 `fmt.Errorf` 专有、`Error()` 方法中使用 `fmt.Sprintf` 只能用普通格式动词。
+1.模型在刚收到提示词后没有先阅读代码分析和理解现有缺陷，就直接用todo_write创建了6项子任务计划，之后才开始查看snaptest.go的代码内容。这种先制定计划再分析的顺序违反了标注规范中"不能在刚收到任务时就直接创建TodoList，应先分析问题再规划"的要求。
+2.模型在查看snaptest.go后直接对整个文件进行了全量重写而非按缺陷逐一定点修改，接着又全量重写了snaptest_test.go。
+3.模型在编写`MismatchError`的Error方法时使用了`%w`格式动词（`fmt.Sprintf`不支持`%w`），导致首次编译失败报错后才修正为`%s`。这是一个基础的Go语言知识点错误，说明模型对`fmt.Errorf`和`fmt.Sprintf`的格式动词差异理解不到位，在代码完成后也未做自检就运行了测试。
