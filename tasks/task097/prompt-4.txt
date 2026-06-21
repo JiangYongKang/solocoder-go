@@ -1,0 +1,7 @@
+你实现的短链接生成模块中上一次修复存在两个遗留问题：
+
+1. generateWithHash 方法原有的边界保护代码被完全删除，当前实现假设 config.Length 不会超过哈希十六进制输出长度。如果某条不经过 NewManagerWithConfig 校验的调用路径传入了超长 Length，hashHex[0:config.Length] 会发生切片越界 panic。
+
+2. TestGenerateWithRandomNoModuloBias 中卡方检验的临界值计算使用了 df 乘以 1.65 的简化公式，该公式仅在字符集大小为 62（df=61）时结果碰巧接近真实临界值。换用更小的字符集时该公式误差会急剧增大，测试不具备通用性。
+
+3. 修复后运行 go test ./internal/shortlink/ -v，需要让所有测试通过。

@@ -1,0 +1,7 @@
+你实现的 MIME 类型检测模块中签名修复完成后存在两个遗留问题：
+
+1. TestRIFFHeaderAmbiguity 测试原有的 8 字节输入数据在 image/webp 和 audio/wav 的签名改为 offset=8 后，数据长度已不足以让新签名命中，该测试每次都会回退到 application/octet-stream，不再触发 RIFF 类型的检测路径。
+
+2. validMIMEs 映射中仍残留着 audio/x-wav 条目，而该条目的魔术字签名已从 builtInSignatures 中删除，对应的 MIME 类型已无法被检测到。
+
+3. 修复后运行 go test ./internal/mimedetect/ -v，需要让所有测试通过。

@@ -804,8 +804,8 @@ func TestConcurrency(t *testing.T) {
 	t.Run("verify node count", func(t *testing.T) {
 		nodeCount := hr.NodeCount()
 		maxPossibleNodes := numGoroutines * 5
-		if nodeCount < 0 || nodeCount > maxPossibleNodes {
-			t.Errorf("node count %d out of expected range [0, %d]", nodeCount, maxPossibleNodes)
+		if nodeCount > maxPossibleNodes {
+			t.Errorf("node count %d exceeds maximum expected %d", nodeCount, maxPossibleNodes)
 		}
 	})
 

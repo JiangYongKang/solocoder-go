@@ -253,12 +253,20 @@ func (m *Manager) generateWithHash(originalURL string, config HashStrategyConfig
 		hashBytes := h.Sum(nil)
 		hashHex := hex.EncodeToString(hashBytes)
 
-		var startPos int
-		if config.Length < len(hashHex) {
-			startPos = (attempt * 2) % (len(hashHex) - config.Length)
+		targetLen := config.Length
+		if targetLen <= 0 {
+			targetLen = len(hashHex)
+		}
+		if targetLen > len(hashHex) {
+			targetLen = len(hashHex)
 		}
 
-		shortCode := hashHex[startPos : startPos+config.Length]
+		var startPos int
+		if targetLen < len(hashHex) {
+			startPos = (attempt * 2) % (len(hashHex) - targetLen)
+		}
+
+		shortCode := hashHex[startPos : startPos+targetLen]
 
 		m.mu.RLock()
 		_, exists := m.links[shortCode]
@@ -274,17 +282,27 @@ func (m *Manager) generateWithHash(originalURL string, config HashStrategyConfig
 func (m *Manager) generateWithRandom(config RandomStrategyConfig) (string, error) {
 	charsetLen := len(config.Charset)
 	maxByte := 255 - (256 % charsetLen)
-	buf := make([]byte, 1)
+	const bufSize = 65536
+	buf := make([]byte, bufSize)
+	bufPos := bufSize
+
+	refillBuf := func() error {
+		_, err := rand.Read(buf)
+		bufPos = 0
+		return err
+	}
 
 	for attempt := 0; attempt < config.MaxRetries; attempt++ {
 		shortCode := make([]byte, config.Length)
 		idx := 0
 		for idx < config.Length {
-			_, err := rand.Read(buf)
-			if err != nil {
-				return "", err
+			if bufPos >= bufSize {
+				if err := refillBuf(); err != nil {
+					return "", err
+				}
 			}
-			b := buf[0]
+			b := buf[bufPos]
+			bufPos++
 			if int(b) > maxByte {
 				continue
 			}

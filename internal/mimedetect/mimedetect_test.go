@@ -249,8 +249,8 @@ func TestDetectFromBytesShortForOffset(t *testing.T) {
 	d := NewDetector()
 	data := []byte{0x52, 0x49, 0x46, 0x46}
 	mime := d.DetectFromBytes(data)
-	if mime != "image/webp" && mime != "audio/wav" && mime != "audio/x-wav" {
-		t.Logf("detected: %s (this is expected as multiple types share RIFF header)", mime)
+	if mime != OctetStream {
+		t.Errorf("expected octet-stream for 4-byte RIFF header (too short for offset-8 signatures), got %s", mime)
 	}
 }
 
@@ -920,16 +920,18 @@ func TestFullWorkflow(t *testing.T) {
 func TestRIFFHeaderAmbiguity(t *testing.T) {
 	d := NewDetector()
 
-	data := []byte{0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00}
+	data := make([]byte, 12)
+	copy(data[0:], []byte{0x52, 0x49, 0x46, 0x46})
+	copy(data[4:], []byte{0x08, 0x00, 0x00, 0x00})
+	copy(data[8:], []byte{0x57, 0x45, 0x42, 0x50})
 	mime := d.DetectFromBytes(data)
 
 	validMIMEs := map[string]bool{
-		"image/webp":  true,
-		"audio/wav":   true,
-		"audio/x-wav": true,
+		"image/webp": true,
+		"audio/wav":  true,
 	}
 	if !validMIMEs[mime] {
-		t.Logf("RIFF header detected as %s (acceptable due to shared magic bytes)", mime)
+		t.Errorf("RIFF header with WEBP format should be detected as image/webp, got %s", mime)
 	}
 }
 

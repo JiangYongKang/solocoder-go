@@ -1,0 +1,7 @@
+你实现的文本差异与补丁引擎模块中上一次修复存在遗留问题：
+
+1. 新增的 TestDiffToChanges_SingleHunkMultipleChanges 测试手工赋值了 DiffResult 的行号字段直接传给 diffToChanges，没有经由 buildHunks 从真实文本生成行号序列。diffToChanges 的行号来自调用方输入，如果 buildHunks 输出的行号和手工填的行号规律不一致，测试验证的结果无法代表真实场景。
+
+2. TestThreeWayMerge_SingleHunkMultipleChanges 合并结果的断言只检查了内容是否包含，没有对变更块坐标做精确校验。坐标错位时合并结果的行位置会偏移，仅靠内容检查无法发现这类问题。
+
+3. 修复后运行 go test ./internal/diffpatch/ -v，需要让所有测试通过。

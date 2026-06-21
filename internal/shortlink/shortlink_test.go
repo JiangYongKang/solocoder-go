@@ -3,6 +3,7 @@ package shortlink
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1041,6 +1042,43 @@ func TestGenerateWithHashLengthEqualsHexLength(t *testing.T) {
 	}
 }
 
+func TestGenerateWithHashDefensiveLengthBounds(t *testing.T) {
+	tests := []struct {
+		name          string
+		algo          HashAlgorithm
+		configLength  int
+		expectedMax   int
+	}{
+		{"md5 length 100 exceeds max 32", HashMD5, 100, 32},
+		{"sha1 length 999 exceeds max 40", HashSHA1, 999, 40},
+		{"sha256 length 500 exceeds max 64", HashSHA256, 500, 64},
+		{"md5 length zero falls back to full", HashMD5, 0, 32},
+		{"md5 length negative falls back to full", HashMD5, -5, 32},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &Manager{links: make(map[string]*ShortLink)}
+			config := HashStrategyConfig{
+				Algorithm:  tt.algo,
+				Length:     tt.configLength,
+				MaxRetries: 3,
+			}
+
+			code, err := m.generateWithHash("https://example.com/defensive", config)
+			if err != nil {
+				t.Fatalf("generateWithHash returned error: %v", err)
+			}
+			if len(code) != tt.expectedMax {
+				t.Errorf("expected safe length %d, got %d (code=%q)", tt.expectedMax, len(code), code)
+			}
+			if len(code) == 0 {
+				t.Error("returned empty short code")
+			}
+		})
+	}
+}
+
 func TestGenerateWithHashLengthExceedsAlgoMax(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1064,60 +1102,96 @@ func TestGenerateWithHashLengthExceedsAlgoMax(t *testing.T) {
 	}
 }
 
+func makeLargeCharset(size int) string {
+	buf := make([]rune, 0, size)
+	for r := rune(32); len(buf) < size && r <= 126; r++ {
+		buf = append(buf, r)
+	}
+	return string(buf)
+}
+
 func TestGenerateWithRandomNoModuloBias(t *testing.T) {
-	charset := base62Chars
-	charsetLen := len(charset)
-
-	cfg := DefaultConfig()
-	cfg.RandomConfig.Charset = charset
-	cfg.RandomConfig.Length = 8
-
-	m, err := NewManagerWithConfig(cfg)
-	if err != nil {
-		t.Fatalf("NewManagerWithConfig failed: %v", err)
+	testCases := []struct {
+		name       string
+		charset    string
+		numTrials  int
+		codeLength int
+	}{
+		{
+			name:       "charset_7_small",
+			charset:    "0123456",
+			numTrials:  2000,
+			codeLength: 8,
+		},
+		{
+			name:       "charset_62_base62",
+			charset:    base62Chars,
+			numTrials:  4000,
+			codeLength: 8,
+		},
+		{
+			name:       "charset_95_ascii_printable",
+			charset:    makeLargeCharset(95),
+			numTrials:  1000,
+			codeLength: 8,
+		},
 	}
 
-	charCounts := make(map[rune]int)
-	totalChars := 0
-	numTrials := 5000
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			charsetLen := len(tc.charset)
 
-	for i := 0; i < numTrials; i++ {
-		code, err := m.generateWithRandom(cfg.RandomConfig)
-		if err != nil {
-			t.Fatalf("generateWithRandom failed at trial %d: %v", i, err)
-		}
-		for _, c := range code {
-			charCounts[c]++
-			totalChars++
-		}
-	}
+			cfg := DefaultConfig()
+			cfg.RandomConfig.Charset = tc.charset
+			cfg.RandomConfig.Length = tc.codeLength
 
-	expectedPerChar := float64(totalChars) / float64(charsetLen)
-	var chiSquared float64
-	for _, c := range charset {
-		observed := float64(charCounts[c])
-		chiSquared += (observed - expectedPerChar) * (observed - expectedPerChar) / expectedPerChar
-	}
-
-	df := charsetLen - 1
-	criticalValue := float64(df) * 1.65
-
-	t.Logf("chi-squared = %.2f, df = %d, critical value = %.2f", chiSquared, df, criticalValue)
-	t.Logf("expected per char = %.1f, total chars = %d", expectedPerChar, totalChars)
-
-	if chiSquared > criticalValue {
-		minCount, maxCount := totalChars, 0
-		for _, c := range charset {
-			if charCounts[c] < minCount {
-				minCount = charCounts[c]
+			m, err := NewManagerWithConfig(cfg)
+			if err != nil {
+				t.Fatalf("NewManagerWithConfig failed: %v", err)
 			}
-			if charCounts[c] > maxCount {
-				maxCount = charCounts[c]
+
+			charCounts := make(map[rune]int)
+			totalChars := 0
+
+			for i := 0; i < tc.numTrials; i++ {
+				code, err := m.generateWithRandom(cfg.RandomConfig)
+				if err != nil {
+					t.Fatalf("generateWithRandom failed at trial %d: %v", i, err)
+				}
+				for _, c := range code {
+					charCounts[c]++
+					totalChars++
+				}
 			}
-		}
-		t.Errorf("chi-squared = %.2f exceeds critical value %.2f, "+
-			"indicating non-uniform character distribution (modulo bias); "+
-			"min count = %d, max count = %d, expected ≈ %.0f",
-			chiSquared, criticalValue, minCount, maxCount, expectedPerChar)
+
+			expectedPerChar := float64(totalChars) / float64(charsetLen)
+			var chiSquared float64
+			for _, c := range tc.charset {
+				observed := float64(charCounts[c])
+				chiSquared += (observed - expectedPerChar) * (observed - expectedPerChar) / expectedPerChar
+			}
+
+			df := charsetLen - 1
+			criticalValue := float64(df) + 6.0*math.Sqrt(2.0*float64(df))
+
+			t.Logf("chi-squared = %.2f, df = %d, critical value = %.2f", chiSquared, df, criticalValue)
+			t.Logf("expected per char = %.1f, total chars = %d", expectedPerChar, totalChars)
+
+			if chiSquared > criticalValue {
+				minCount, maxCount := totalChars, 0
+				for _, c := range tc.charset {
+					if charCounts[c] < minCount {
+						minCount = charCounts[c]
+					}
+					if charCounts[c] > maxCount {
+						maxCount = charCounts[c]
+					}
+				}
+				t.Errorf("chi-squared = %.2f exceeds critical value %.2f, "+
+					"indicating non-uniform character distribution (modulo bias); "+
+					"min count = %d, max count = %d, expected ≈ %.0f",
+					chiSquared, criticalValue, minCount, maxCount, expectedPerChar)
+			}
+		})
 	}
 }

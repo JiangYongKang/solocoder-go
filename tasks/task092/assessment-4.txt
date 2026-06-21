@@ -1,0 +1,9 @@
+产物不满意：
+1. diffpatch_test.go 的 TestDiffToChanges_SingleHunkMultipleChanges 测试仍然手工构造 DiffResult 直接传入 diffToChanges，没有经由 buildHunks 从真实文本生成行号序列，这与提示词第 1 条明确要求"不应手工赋值行号"完全矛盾。模型创建了 debug_test.go 来验证 buildHunks 的行号规律，确认手工数据与真实输出一致后，便认为无需修改原测试。但提示词的本意是要求测试走完整 diff 流程，确保未来 buildHunks 内部逻辑变化时测试仍能反映真实场景。当前测试如果 buildHunks 的行号生成规则被修改，手工构造的行号数据不会跟着变，测试就成了永远通过的虚假保障。正确做法是把测试改为先对两段真实文本调用 Diff 拿到 DiffResult，再传给 diffToChanges 验证输出。
+2. diffpatch_test.go 的 TestThreeWayMerge_SingleHunkMultipleChanges 合并结果的断言仍然只使用 strings.Contains 检查内容是否包含，以及校验行数是否为 10，但没有对变更块坐标做任何精确校验，提示词第 2 条明确要求的坐标验证完全未被实现。如果 diffToChanges 输出的 oldStart 或 oldEnd 偏移了一行，合并结果中 OURS2 可能被放到了 line3 的位置，Contains 检查仍会通过因为它只是确认结果文本中"有"这个内容，而不会检查它"在第几个位置"。以当前 10 行的测试数据为例，如果坐标整体偏移一行导致 line1 丢失而 line10 变成重复行，总行数仍是 10，Contains 检查和行数校验会全部通过。正确做法是将 mergedLines 按索引逐一断言，例如验证 mergedLines[1] 等于 OURS2、mergedLines[3] 等于 THEIRS4 等。
+3. debug_test.go 作为本轮仅有的新增文件是一个纯粹的诊断辅助工具，其中 TestDebug_BuildHunksLineNumbers 函数只使用 t.Logf 和 fmt.Println 输出调试信息，没有任何 t.Errorf 或 t.Fatal 断言。这个文件在调查阶段有价值，但作为产物遗留代码毫无意义，fmt.Println 还会在 go test 输出中产生不受控制的字符串，干扰测试结果的可读性。完成调查后应将此文件删除。
+
+过程不满意：
+1. 模型在整个 session-cot-4.md 的可见记录中，第一步操作依然是调用 todo_write 创建 4 项子任务计划，而此时尚未阅读任何代码文件。这与前两轮标注（assessment-2 和 assessment-3）已反复指出的"先计划后分析的投机模式"完全一致，模型在所有轮次中都没有建立"先分析现状再规划"的工作习惯。由于缺少对代码现状的充分理解，模型后续创建 debug_test.go 进行诊断调查实际是在补前期省略的分析步骤，最终导致花了精力理解坐标系统后却忽略了提示词中两项显式需求。
+2. session-cot-4.md 在第 41 行被截断，截断点正好在写入 debug_test.go 文件之后。可见记录显示模型完成了读取 myers.go 和 merge.go 以及创建诊断文件，但之后的实际修复操作、测试运行过程全部不可见。从产物状态反推，模型在截断后的过程中没有对两个测试做任何修改，说明模型可能在完成坐标系统理解后错误地认为"手工数据匹配真实输出"即等于任务完成，对提示词的两项测试质量要求产生了理解偏差。
+3. 模型创建 debug_test.go 来验证 buildHunks 的行号规律，这个调查行为本身是合理的，但模型没有将调查结论转化为对现有测试的重构，而是把这个诊断文件留在了代码中并将测试通过的表面结果等同于需求完成。正确的做法是在调查确认行号规律后，将 TestDiffToChanges_SingleHunkMultipleChanges 重写为走完整 Diff 流程的端到端测试，并为 TestThreeWayMerge_SingleHunkMultipleChanges 增加索引级坐标断言，然后删除临时诊断文件。
