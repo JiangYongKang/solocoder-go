@@ -58,17 +58,19 @@ type Schema struct {
 type FieldSchema struct {
     Path         string            // 点分隔的嵌套路径，如 "database.host"
     Type         string            // 字段类型提示，供文档或扩展使用
-    Required     bool              // 是否为必填字段
+    Required     bool              // 必填字段语法糖（等价于追加一条 RuleRequired）
     DefaultValue interface{}       // 字段的默认值
     Rules        []*ValidationRule // 针对该字段的校验规则列表
 }
 ```
 
+> **必填校验说明（统一语义）**：`FieldSchema.Required` 与 `ValidationRule{Type: RuleRequired}` 完全等价，调用方可任选其一。若同时设置，也只会执行一次必填校验。必填语义统一为：**字段缺失 或 值为空（nil/空串/空切片/空映射/空指针）** 均判定为校验失败，底层均通过 `isEmpty()` 判据与 `ErrFieldRequired` 错误报告，调用方不会感知到两套机制。
+
 **校验规则 ValidationRule**：
 
 | 规则类型 | 触发条件 | 相关参数 |
 |---------|---------|---------|
-| `RuleRequired` | 字段值为空（nil、空串、空切片/映射） | - |
+| `RuleRequired` | 字段缺失 或 值为空（nil、空串、空切片/映射/指针） | - |
 | `RuleMinValue` | 数值小于 `MinValue` | `MinValue` |
 | `RuleMaxValue` | 数值大于 `MaxValue` | `MaxValue` |
 | `RuleMinLength` | 字符串/切片/映射长度小于 `MinLen` | `MinLen` |
@@ -125,31 +127,38 @@ NewHotConfig(path, schema, options)
    ▼
 Load() / Start()
    │
-   ├─ ① 文件存在性检查 → 不存在返回 ErrFileNotFound
+   ├─ ① 安全文件读取（TOCTOU 防护，最多 3 次重试）
+   │    ├─ pre-Stat：记录 mtime₁ + size₁
+   │    ├─ ReadFile：读取文件原始字节
+   │    ├─ post-Stat：记录 mtime₂ + size₂
+   │    ├─ 若 mtime₁==mtime₂ && size₁==size₂ → 读取一致，使用内容与 mtime₂
+   │    └─ 否则等待 5ms 重试，最终次不一致则使用最后一次结果
    │
-   ├─ ② 读取文件原始字节
-   │
-   ├─ ③ 根据扩展名选择解析器
+   ├─ ② 根据扩展名选择解析器
    │    ├─ .json        → JSON 解析器
    │    ├─ .yaml/.yml   → YAML 解析器
    │    └─ .toml        → TOML 解析器
    │
-   ├─ ④ 解析为 map[string]interface{}
+   ├─ ③ 解析为 map[string]interface{}
    │    └─ 失败分支：FailOnError? 抛错 : (已有快照? 保留 : 空map)
+   │
+   ├─ ④ Schema 规范化（必填校验统一语义）
+   │    └─ 若 Field.Required=true 且未显式添加 RuleRequired
+   │       → 自动前置注入一条 RuleRequired 规则
    │
    ├─ ⑤ 应用默认值（填充缺失字段）
    │    └─ ApplyDefaults(data, schema)
    │
    ├─ ⑥ 配置校验
-   │    ├─ ValidateConfig(data, schema)
+   │    ├─ ValidateConfig(data, schema) （含必填的两种语法糖）
    │    └─ 失败分支：
    │         ├─ FailOnError=true  → 抛出 AggregateValidationError
    │         └─ UseDefaultOnError → 将失败字段替换为默认值
    │
    ├─ ⑦ 与上一版快照比对（DeepEqual）
-   │    └─ 内容相同则跳过，不递增版本
+   │    └─ 内容相同则跳过，不递增版本，只更新 lastModTime
    │
-   └─ ⑧ 更新快照（版本号 +1，记录时间戳与格式）
+   └─ ⑧ 更新快照（版本号 +1，记录时间戳/格式/最后一致的 mtime）
 ```
 
 ### 3.2 运行时热加载（自动监听）
@@ -163,12 +172,16 @@ Load() / Start()
    └─ mtime 变化 → 投递 fileEvent 到 eventCh
                         │
                         ▼
-               eventLoop (事件处理协程)
+               eventLoop (事件处理协程，无数据竞争设计)
+                  │
+                  ├─ 接收 evt，声明局部变量 currentEvent = evt（栈上捕获）
                   │
                   ├─ DebounceTimer（防抖）
-                  │    └─ 窗口内新事件重置定时器
+                  │    ├─ 窗口内新事件重置定时器
+                  │    └─ 定时器闭包直接捕获 currentEvent 的局部副本
+                  │         （不通过共享变量传递，避免跨协程竞争）
                   │
-                  └─ processEvent()
+                  └─ processEvent(currentEvent)
                        │
                        ├─ 持有写锁重新走 3.1 的 ①~⑧ 流程
                        │
@@ -466,6 +479,9 @@ internal/hotconfig/
 4. **防抖合并**：短时间内连续写入文件会被合并为一次回调，避免业务抖动
 5. **优雅降级**：默认策略下任何错误都不中断服务；推荐始终配置默认值，即使配置文件完全丢失也能以最低可用模式启动
 6. **路径约定**：所有嵌套字段使用点号分隔的扁平路径（`database.host`），兼容 JSON/YAML/TOML 任意嵌套结构
+7. **事件无竞争传递**：`eventLoop` 通过**栈上局部变量闭包捕获**将 `fileEvent` 从事件协程传递给定时器协程，不使用跨协程共享的 pending 变量，从根源避免数据竞争
+8. **TOCTOU 安全读取**：`loadLocked` 采用 **pre-Stat → ReadFile → post-Stat** 的一致性校验读取流程，比较两次 `mtime+size`，不一致则重试（最多 3 次，间隔 5ms），确保读取到的文件内容与最终记录的 `lastModTime` 是匹配的快照，避免轮询漏检
+9. **必填校验单一语义**：`FieldSchema.Required` 在 `ValidateConfig` 入口处自动规范化为 `RuleRequired` 规则，两套 API 完全等价，均使用同一套 `isEmpty()` 判据与 `ErrFieldRequired` 错误输出，调用方无需区分使用场景
 
 ---
 

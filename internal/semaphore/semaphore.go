@@ -94,10 +94,11 @@ func (s *Semaphore) Release() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.held > 0 {
-		s.held--
+	if s.held <= 0 {
+		return
 	}
 
+	s.held--
 	s.dispatchWaiters()
 }
 

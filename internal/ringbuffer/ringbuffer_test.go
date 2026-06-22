@@ -1,8 +1,10 @@
 package ringbuffer
 
 import (
+	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNewRingBuffer(t *testing.T) {
@@ -616,5 +618,226 @@ func TestAlternateReadWrite(t *testing.T) {
 		if val != exp {
 			t.Errorf("expected %d, got %d", exp, val)
 		}
+	}
+}
+
+func TestHighWaterCallbackNoDeadlock(t *testing.T) {
+	cfg := Config{
+		Capacity:      10,
+		HighWaterMark: 5,
+	}
+	rb, _ := NewRingBufferWithConfig[int](cfg)
+
+	triggered := make(chan struct{}, 1)
+	done := make(chan struct{}, 1)
+
+	rb.OnHighWater(func() {
+		rb.Len()
+		rb.IsEmpty()
+		rb.IsFull()
+		rb.GetStrategy()
+		triggered <- struct{}{}
+	})
+
+	rb.OnLowWater(func() {
+		rb.Len()
+		rb.Cap()
+		done <- struct{}{}
+	})
+
+	go func() {
+		for i := 0; i < 5; i++ {
+			rb.Write(i)
+		}
+	}()
+
+	select {
+	case <-triggered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock detected: high water callback did not complete within timeout")
+	}
+
+	go func() {
+		for i := 0; i < 3; i++ {
+			rb.Read()
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock detected: low water callback did not complete within timeout")
+	}
+}
+
+func TestSetHighWaterMarkCallbackNoDeadlock(t *testing.T) {
+	rb, _ := NewRingBuffer[int](10)
+
+	triggered := make(chan struct{}, 1)
+
+	rb.OnHighWater(func() {
+		rb.Len()
+		rb.IsFull()
+		rb.Read()
+		triggered <- struct{}{}
+	})
+
+	for i := 0; i < 7; i++ {
+		rb.Write(i)
+	}
+
+	go func() {
+		rb.SetHighWaterMark(5)
+	}()
+
+	select {
+	case <-triggered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock detected: SetHighWaterMark callback did not complete within timeout")
+	}
+}
+
+func TestReadClearsSlotReferenceType(t *testing.T) {
+	type bigStruct struct {
+		data [1024]byte
+	}
+
+	rb, _ := NewRingBuffer[*bigStruct](3)
+
+	obj1 := &bigStruct{}
+	obj2 := &bigStruct{}
+	obj3 := &bigStruct{}
+
+	runtime.SetFinalizer(obj1, func(b *bigStruct) {})
+	runtime.SetFinalizer(obj2, func(b *bigStruct) {})
+	runtime.SetFinalizer(obj3, func(b *bigStruct) {})
+
+	rb.Write(obj1)
+	rb.Write(obj2)
+	rb.Write(obj3)
+
+	_, ok := rb.Read()
+	if !ok {
+		t.Fatal("read failed")
+	}
+
+	runtime.GC()
+	runtime.GC()
+	runtime.GC()
+
+	if rb.Len() != 2 {
+		t.Errorf("expected length 2, got %d", rb.Len())
+	}
+
+	val2, ok := rb.Read()
+	if !ok {
+		t.Fatal("read failed")
+	}
+	if val2 != obj2 {
+		t.Error("expected to read obj2")
+	}
+
+	val3, ok := rb.Read()
+	if !ok {
+		t.Fatal("read failed")
+	}
+	if val3 != obj3 {
+		t.Error("expected to read obj3")
+	}
+
+	if !rb.IsEmpty() {
+		t.Error("expected buffer to be empty")
+	}
+}
+
+func TestOverwriteClearsSlotReferenceType(t *testing.T) {
+	type node struct {
+		value int
+	}
+
+	cfg := Config{
+		Capacity: 3,
+		Strategy: Overwrite,
+	}
+	rb, _ := NewRingBufferWithConfig[*node](cfg)
+
+	n1 := &node{value: 1}
+	n2 := &node{value: 2}
+	n3 := &node{value: 3}
+	n4 := &node{value: 4}
+
+	rb.Write(n1)
+	rb.Write(n2)
+	rb.Write(n3)
+
+	runtime.SetFinalizer(n1, func(n *node) {})
+
+	rb.Write(n4)
+
+	runtime.GC()
+	runtime.GC()
+	runtime.GC()
+
+	if rb.Len() != 3 {
+		t.Errorf("expected length 3, got %d", rb.Len())
+	}
+
+	val, ok := rb.Read()
+	if !ok {
+		t.Fatal("read failed")
+	}
+	if val != n2 {
+		t.Errorf("expected n2, got value %d", val.value)
+	}
+}
+
+func TestHighWaterCallbackCallsWriteNoDeadlock(t *testing.T) {
+	cfg := Config{
+		Capacity:      10,
+		HighWaterMark: 5,
+	}
+	rb, _ := NewRingBufferWithConfig[int](cfg)
+
+	triggered := make(chan struct{}, 1)
+
+	rb.OnHighWater(func() {
+		rb.Write(999)
+		rb.Read()
+		rb.Len()
+		triggered <- struct{}{}
+	})
+
+	go func() {
+		for i := 0; i < 5; i++ {
+			rb.Write(i)
+		}
+	}()
+
+	select {
+	case <-triggered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock detected: callback calling Write/Read caused deadlock")
+	}
+}
+
+func TestClearAfterReadNoLeak(t *testing.T) {
+	type payload struct {
+		values []int
+	}
+
+	rb, _ := NewRingBuffer[*payload](5)
+
+	for i := 0; i < 5; i++ {
+		rb.Write(&payload{values: make([]int, 1000)})
+	}
+
+	for i := 0; i < 3; i++ {
+		rb.Read()
+	}
+
+	rb.Clear()
+
+	if rb.Len() != 0 {
+		t.Errorf("expected length 0 after clear, got %d", rb.Len())
 	}
 }

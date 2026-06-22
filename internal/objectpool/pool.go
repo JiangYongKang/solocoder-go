@@ -3,6 +3,7 @@ package objectpool
 import (
 	"container/list"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,6 +12,7 @@ import (
 var (
 	ErrPoolClosed    = errors.New("objectpool: pool is closed")
 	ErrPoolExhausted = errors.New("objectpool: pool exhausted")
+	ErrNilObject     = errors.New("objectpool: cannot return nil object")
 	ErrNotBorrowed   = errors.New("objectpool: object was not borrowed from this pool")
 )
 
@@ -165,14 +167,22 @@ func (p *Pool[T]) Acquire() (T, error) {
 }
 
 func (p *Pool[T]) getIdle() (*idleEntry[T], bool) {
-	for {
-		e := p.idleList.Front()
-		if e == nil {
-			return nil, false
-		}
-		ic := e.Value.(*idleEntry[T])
-		p.idleList.Remove(e)
-		return ic, true
+	e := p.idleList.Front()
+	if e == nil {
+		return nil, false
+	}
+	ic := e.Value.(*idleEntry[T])
+	p.idleList.Remove(e)
+	return ic, true
+}
+
+func isNil[T any](v T) bool {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
 	}
 }
 
@@ -181,6 +191,11 @@ func (p *Pool[T]) Release(obj T) error {
 	if p.closed {
 		p.mu.Unlock()
 		return ErrPoolClosed
+	}
+
+	if isNil(obj) {
+		p.mu.Unlock()
+		return ErrNilObject
 	}
 
 	key := any(obj)

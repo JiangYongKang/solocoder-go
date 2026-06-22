@@ -1,0 +1,5 @@
+你实现的 trie 模块存在以下问题需要修复：
+1. docs/trie.md 需求文档在"4.1 单词插入机制"中途截断，精确查找、前缀匹配、通配符搜索、最大匹配前缀查询的算法机制说明全部缺失，使用示例章节也不存在。
+2. Search 方法对空字符串静默返回 (nil, false) 而不返回错误，与同文件中 Insert（ErrEmptyWord）、PrefixMatch（ErrEmptyPrefix）、WildcardSearch（ErrEmptyPattern）等方法对空输入抛出错误的约定不一致。
+3. 修复后运行 go test ./internal/trie/ -v，需要让所有测试通过。
+4. 在 docs/trie.md 中更新模块需求文档。

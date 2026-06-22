@@ -1,0 +1,7 @@
+你实现的 cliparser 模块存在以下问题需要修复：
+1. AddOption 中 opt 为 nil、opt.Target 为 nil 以及 AddCommand 中 cmd 为 nil 三种不同错误条件均返回同一个 ErrNilTarget，调用方无法区分具体失败原因。
+2. Execute 方法在子命令匹配到但 Handler 为 nil 时返回 ErrCommandNotFound，错误信息与实际情况矛盾，使用者无法判断是命令未注册还是处理器未设置。
+3. parseLongOption 处理布尔类型时，--flag= 空值格式调用 strconv.ParseBool("") 报错，而 --flag=false 正常，两种写法行为不一致。
+4. ErrUnknownOption 被用于"长名和短名均为空"的校验，ErrDuplicateOption 被用于命令名重复注册，两处错误消息与实际场景语义不匹配。
+5. 修复后运行 go test ./internal/cliparser/ -v，需要让所有测试通过。
+6. 在 docs/cliparser.md 中更新模块需求文档。

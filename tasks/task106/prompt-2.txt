@@ -1,0 +1,6 @@
+你实现的 objectpool 模块存在以下问题需要修复：
+1. Release 方法缺少对 nil 对象的显式校验，调用方传入 nil 对象时得到 ErrNotBorrowed 而非更能表达问题本质的错误。
+2. getIdle 方法内部存在一个 for 循环，但循环体永远只执行一次迭代，属于无意义的死代码结构。
+3. docs/objectpool.md 文档第 6 节描述空闲回收"从链表尾部开始移除"，但 reclaimIdle 实际实现是全量遍历时间阈值判断，文档描述与代码行为不一致。
+4. 修复后运行 go test ./internal/objectpool/ -v，需要让所有测试通过。
+5. 在 docs/objectpool.md 中更新模块需求文档。

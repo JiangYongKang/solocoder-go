@@ -132,6 +132,14 @@ func (m *EnvManager) LoadGroup(prefix string, configs ...*EnvConfig) (*EnvGroup,
 		}
 	}
 
+	for key, cfg := range cfgMap {
+		if cfg.Sensitive && cfg.Default != "" {
+			if _, exists := values[key]; !exists {
+				values[key] = cfg.Default
+			}
+		}
+	}
+
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("%w: %s", ErrMissingRequired, strings.Join(missing, ", "))
 	}
@@ -160,16 +168,16 @@ func (g *EnvGroup) Get(key string) (string, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
+	if cfg, ok := g.config[key]; ok && cfg.Sensitive {
+		return "", fmt.Errorf("envmgr: cannot directly read sensitive value '%s', use GetSensitive", key)
+	}
+
 	val, exists := g.values[key]
 	if !exists {
 		if cfg, ok := g.config[key]; ok && cfg.Default != "" {
 			return cfg.Default, nil
 		}
 		return "", fmt.Errorf("%w: %s", ErrKeyNotFound, key)
-	}
-
-	if cfg, ok := g.config[key]; ok && cfg.Sensitive {
-		return "", fmt.Errorf("envmgr: cannot directly read sensitive value '%s', use GetSensitive", key)
 	}
 
 	return val, nil

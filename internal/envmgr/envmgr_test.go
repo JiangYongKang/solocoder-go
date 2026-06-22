@@ -1011,3 +1011,161 @@ func TestEmptyPrefixMatchesAll(t *testing.T) {
 		t.Errorf("expected 3 values with empty prefix, got %d", len(all))
 	}
 }
+
+func TestSensitiveDefaultNotBypassed(t *testing.T) {
+	mgr, err := NewEnvManager()
+	if err != nil {
+		t.Fatalf("NewEnvManager failed: %v", err)
+	}
+
+	mockEnvs := []string{
+		"APP_NAME=myapp",
+	}
+	mgr.setEnvSource(mockEnvSource(mockEnvs))
+
+	configs := []*EnvConfig{
+		{Key: "NAME", Required: true},
+		{Key: "SECRET", Required: false, Sensitive: true, Default: "changeme"},
+	}
+
+	group, err := mgr.LoadGroup("APP_", configs...)
+	if err != nil {
+		t.Fatalf("LoadGroup failed: %v", err)
+	}
+
+	_, err = group.Get("SECRET")
+	if err == nil {
+		t.Fatal("expected error when directly reading sensitive value with default")
+	}
+	if !strings.Contains(err.Error(), "sensitive") {
+		t.Errorf("error should mention sensitive, got: %v", err)
+	}
+
+	_, err = group.GetString("SECRET")
+	if err == nil {
+		t.Fatal("expected error when directly reading sensitive value via GetString")
+	}
+
+	all := group.GetAll()
+	if all["SECRET"] != "[ENCRYPTED]" {
+		t.Errorf("expected '[ENCRYPTED]' for sensitive default value, got '%s'", all["SECRET"])
+	}
+
+	sv, err := mgr.GetSensitive(group, "SECRET")
+	if err != nil {
+		t.Fatalf("GetSensitive failed: %v", err)
+	}
+
+	plaintext, err := sv.Decrypt()
+	if err != nil {
+		t.Fatalf("Decrypt failed: %v", err)
+	}
+	if plaintext != "changeme" {
+		t.Errorf("expected default 'changeme', got '%s'", plaintext)
+	}
+}
+
+func TestSensitiveRequiredWithDefaultEncrypted(t *testing.T) {
+	mgr, err := NewEnvManager()
+	if err != nil {
+		t.Fatalf("NewEnvManager failed: %v", err)
+	}
+
+	mockEnvs := []string{
+		"APP_NAME=myapp",
+	}
+	mgr.setEnvSource(mockEnvSource(mockEnvs))
+
+	configs := []*EnvConfig{
+		{Key: "NAME", Required: true},
+		{Key: "SECRET", Required: true, Sensitive: true, Default: "fallback"},
+	}
+
+	group, err := mgr.LoadGroup("APP_", configs...)
+	if err != nil {
+		t.Fatalf("LoadGroup failed: %v", err)
+	}
+
+	_, err = group.Get("SECRET")
+	if err == nil {
+		t.Fatal("sensitive required+default value should not be directly readable")
+	}
+
+	sv, err := mgr.GetSensitive(group, "SECRET")
+	if err != nil {
+		t.Fatalf("GetSensitive failed: %v", err)
+	}
+
+	plaintext, err := sv.Decrypt()
+	if err != nil {
+		t.Fatalf("Decrypt failed: %v", err)
+	}
+	if plaintext != "fallback" {
+		t.Errorf("expected default 'fallback', got '%s'", plaintext)
+	}
+}
+
+func TestSensitiveEnvVarOverridesDefault(t *testing.T) {
+	mgr, err := NewEnvManager()
+	if err != nil {
+		t.Fatalf("NewEnvManager failed: %v", err)
+	}
+
+	mockEnvs := []string{
+		"APP_SECRET=actualvalue",
+	}
+	mgr.setEnvSource(mockEnvSource(mockEnvs))
+
+	configs := []*EnvConfig{
+		{Key: "SECRET", Required: false, Sensitive: true, Default: "changeme"},
+	}
+
+	group, err := mgr.LoadGroup("APP_", configs...)
+	if err != nil {
+		t.Fatalf("LoadGroup failed: %v", err)
+	}
+
+	sv, err := mgr.GetSensitive(group, "SECRET")
+	if err != nil {
+		t.Fatalf("GetSensitive failed: %v", err)
+	}
+
+	plaintext, err := sv.Decrypt()
+	if err != nil {
+		t.Fatalf("Decrypt failed: %v", err)
+	}
+	if plaintext != "actualvalue" {
+		t.Errorf("expected 'actualvalue' from env, got '%s'", plaintext)
+	}
+}
+
+func TestSensitiveNoDefaultNotInValues(t *testing.T) {
+	mgr, err := NewEnvManager()
+	if err != nil {
+		t.Fatalf("NewEnvManager failed: %v", err)
+	}
+
+	mockEnvs := []string{
+		"APP_NAME=myapp",
+	}
+	mgr.setEnvSource(mockEnvSource(mockEnvs))
+
+	configs := []*EnvConfig{
+		{Key: "NAME", Required: true},
+		{Key: "SECRET", Required: false, Sensitive: true},
+	}
+
+	group, err := mgr.LoadGroup("APP_", configs...)
+	if err != nil {
+		t.Fatalf("LoadGroup failed: %v", err)
+	}
+
+	if group.Exists("SECRET") {
+		t.Error("SECRET without default and not set should not exist in values")
+	}
+
+	_, err = mgr.GetSensitive(group, "SECRET")
+	if err == nil {
+		t.Fatal("expected error for missing sensitive key without default")
+	}
+}

@@ -567,6 +567,9 @@ func TestCustomProbability(t *testing.T) {
 	}
 
 	lvlHighProb := sl.Level()
+	if lvlHighProb <= 1 {
+		t.Errorf("High prob (0.9) level = %d, expected > 1 for 1000 elements", lvlHighProb)
+	}
 
 	cfgLow := &Config{MaxLevel: 32, P: 0.01}
 	slLow, _ := New[int, string](cfgLow)
@@ -574,10 +577,26 @@ func TestCustomProbability(t *testing.T) {
 		slLow.Insert(i, "val")
 	}
 	lvlLowProb := slLow.Level()
+	if lvlLowProb <= 1 {
+		t.Errorf("Low prob (0.01) level = %d, expected > 1 for 1000 elements", lvlLowProb)
+	}
 
-	if lvlHighProb < lvlLowProb {
-		t.Logf("Note: High prob (%.2f) level = %d, Low prob (%.2f) level = %d",
-			0.9, lvlHighProb, 0.01, lvlLowProb)
+	if lvlHighProb <= lvlLowProb {
+		t.Errorf("High prob level (%d) should be > low prob level (%d), but got lvlHigh <= lvlLow",
+			lvlHighProb, lvlLowProb)
+	}
+
+	allHigh := sl.All()
+	for i, p := range allHigh {
+		if p.Key != i {
+			t.Errorf("High prob All()[%d].Key = %d, want %d", i, p.Key, i)
+		}
+	}
+	allLow := slLow.All()
+	for i, p := range allLow {
+		if p.Key != i {
+			t.Errorf("Low prob All()[%d].Key = %d, want %d", i, p.Key, i)
+		}
 	}
 }
 
@@ -644,6 +663,33 @@ func TestConcurrentSafe(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		<-done
+	}
+
+	if sl.Len() != 2*n {
+		t.Errorf("After concurrent inserts: Len() = %d, want %d", sl.Len(), 2*n)
+	}
+
+	for i := 0; i < 2*n; i++ {
+		val, ok := sl.Search(i)
+		if !ok {
+			t.Errorf("Search(%d) not found after concurrent inserts", i)
+		}
+		if ok && val != i {
+			t.Errorf("Search(%d) = %d, want %d", i, val, i)
+		}
+	}
+
+	all := sl.All()
+	if len(all) != 2*n {
+		t.Errorf("All() len = %d, want %d", len(all), 2*n)
+	}
+	for i, p := range all {
+		if p.Key != i {
+			t.Errorf("All()[%d].Key = %d, want %d (ordering broken)", i, p.Key, i)
+		}
+		if p.Value != i {
+			t.Errorf("All()[%d].Value = %d, want %d", i, p.Value, i)
+		}
 	}
 }
 

@@ -18,7 +18,7 @@ func TestTrie_Insert(t *testing.T) {
 		t.Errorf("expected size 1, got %d", trie.Size())
 	}
 
-	data, exists := trie.Search("hello")
+	data, exists, _ := trie.Search("hello")
 	if !exists {
 		t.Error("expected 'hello' to exist")
 	}
@@ -39,14 +39,14 @@ func TestTrie_Insert_OverwriteData(t *testing.T) {
 	trie := NewTrie()
 
 	_ = trie.Insert("hello", "value1")
-	data1, _ := trie.Search("hello")
+	data1, _, _ := trie.Search("hello")
 	if data1 != "value1" {
 		t.Errorf("expected data 'value1', got %v", data1)
 	}
 
 	_ = trie.Insert("hello", "value2")
 
-	data2, _ := trie.Search("hello")
+	data2, _, _ := trie.Search("hello")
 	if data2 != "value2" {
 		t.Errorf("expected data 'value2' after overwrite, got %v", data2)
 	}
@@ -64,7 +64,7 @@ func TestTrie_Insert_NilData(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	data, exists := trie.Search("test")
+	data, exists, _ := trie.Search("test")
 	if !exists {
 		t.Error("expected 'test' to exist")
 	}
@@ -86,7 +86,7 @@ func TestTrie_Insert_PrefixWords(t *testing.T) {
 	}
 
 	for _, w := range words {
-		data, exists := trie.Search(w)
+		data, exists, _ := trie.Search(w)
 		if !exists {
 			t.Errorf("expected %q to exist", w)
 		}
@@ -110,17 +110,27 @@ func TestTrie_Search(t *testing.T) {
 		{"app", true, "abbreviation"},
 		{"appl", false, nil},
 		{"banana", false, nil},
-		{"", false, nil},
 	}
 
 	for _, tt := range tests {
-		data, exists := trie.Search(tt.word)
+		data, exists, err := trie.Search(tt.word)
+		if err != nil {
+			t.Fatalf("Search(%q): unexpected error: %v", tt.word, err)
+		}
 		if exists != tt.expected {
 			t.Errorf("Search(%q): expected exists=%v, got %v", tt.word, tt.expected, exists)
 		}
 		if tt.expected && data != tt.data {
 			t.Errorf("Search(%q): expected data=%v, got %v", tt.word, tt.data, data)
 		}
+	}
+}
+
+func TestTrie_Search_EmptyWord(t *testing.T) {
+	trie := NewTrie()
+	_, _, err := trie.Search("")
+	if err != ErrEmptyWord {
+		t.Errorf("expected ErrEmptyWord, got %v", err)
 	}
 }
 
@@ -140,17 +150,17 @@ func TestTrie_Delete(t *testing.T) {
 		t.Errorf("expected size 2, got %d", trie.Size())
 	}
 
-	_, exists := trie.Search("hello")
+	_, exists, _ := trie.Search("hello")
 	if exists {
 		t.Error("expected 'hello' to be deleted")
 	}
 
-	_, exists = trie.Search("hell")
+	_, exists, _ = trie.Search("hell")
 	if !exists {
 		t.Error("expected 'hell' to still exist")
 	}
 
-	_, exists = trie.Search("help")
+	_, exists, _ = trie.Search("help")
 	if !exists {
 		t.Error("expected 'help' to still exist")
 	}
@@ -193,14 +203,14 @@ func TestTrie_Delete_LeafCleanup(t *testing.T) {
 
 	_ = trie.Delete("abc")
 
-	_, exists := trie.Search("ab")
+	_, exists, _ := trie.Search("ab")
 	if !exists {
 		t.Error("expected 'ab' to still exist after deleting 'abc'")
 	}
 
 	_ = trie.Delete("ab")
 
-	_, exists = trie.Search("a")
+	_, exists, _ = trie.Search("a")
 	if !exists {
 		t.Error("expected 'a' to still exist after deleting 'ab'")
 	}
@@ -648,7 +658,7 @@ func TestTrie_Unicode(t *testing.T) {
 	_ = trie.Insert("你好世界", "hello world")
 	_ = trie.Insert("hello", "english")
 
-	data, exists := trie.Search("你好")
+	data, exists, _ := trie.Search("你好")
 	if !exists {
 		t.Error("expected '你好' to exist")
 	}
@@ -680,7 +690,7 @@ func TestTrie_MixedCase(t *testing.T) {
 	_ = trie.Insert("Apple", "fruit")
 	_ = trie.Insert("apple", "company")
 
-	data1, exists1 := trie.Search("Apple")
+	data1, exists1, _ := trie.Search("Apple")
 	if !exists1 {
 		t.Error("expected 'Apple' to exist")
 	}
@@ -688,7 +698,7 @@ func TestTrie_MixedCase(t *testing.T) {
 		t.Errorf("expected data 'fruit', got %v", data1)
 	}
 
-	data2, exists2 := trie.Search("apple")
+	data2, exists2, _ := trie.Search("apple")
 	if !exists2 {
 		t.Error("expected 'apple' to exist")
 	}
@@ -704,7 +714,7 @@ func TestTrie_SpecialCharacters(t *testing.T) {
 	_ = trie.Insert("key=value", "pair")
 	_ = trie.Insert("path/to/file", "filepath")
 
-	data, exists := trie.Search("user@example.com")
+	data, exists, _ := trie.Search("user@example.com")
 	if !exists {
 		t.Error("expected 'user@example.com' to exist")
 	}
@@ -761,7 +771,7 @@ func TestConcurrent_TrieInsertSameWord(t *testing.T) {
 		t.Errorf("expected size 1, got %d", trie.Size())
 	}
 
-	data, _ := trie.Search("test")
+	data, _, _ := trie.Search("test")
 	if data != "data" {
 		t.Errorf("expected data 'data', got %v", data)
 	}
@@ -793,7 +803,7 @@ func TestConcurrent_TrieReadWrite(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			_, _ = trie.PrefixMatch("app")
-			_, _ = trie.Search("apple")
+			_, _, _ = trie.Search("apple")
 			_, _ = trie.WildcardSearch("app*")
 			_, _ = trie.LongestMatch("application")
 			_ = trie.Size()
@@ -815,7 +825,7 @@ func TestTrie_SearchResultDataIntegrity(t *testing.T) {
 	expected := CustomData{ID: 42, Name: "test"}
 	_ = trie.Insert("key", expected)
 
-	data, exists := trie.Search("key")
+	data, exists, _ := trie.Search("key")
 	if !exists {
 		t.Fatal("expected 'key' to exist")
 	}
@@ -838,7 +848,7 @@ func TestTrie_Delete_ClearsData(t *testing.T) {
 
 	_ = trie.Insert("test", "new_data")
 
-	data, _ := trie.Search("test")
+	data, _, _ := trie.Search("test")
 	if data != "new_data" {
 		t.Errorf("expected 'new_data', got %v", data)
 	}

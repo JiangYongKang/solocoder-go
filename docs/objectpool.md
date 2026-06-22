@@ -89,6 +89,7 @@ type DestroyFunc[T any] func(T)           // 对象销毁函数签名
 |----------|------|----------|
 | `ErrPoolClosed` | 对象池已关闭 | 已关闭的池上调用 Acquire/Release |
 | `ErrPoolExhausted` | 对象池耗尽 | 无空闲对象且达到 MaxCap，WaitTimeout=0 或等待超时 |
+| `ErrNilObject` | nil 对象 | 归还 nil 对象到池中（仅对可空类型生效） |
 | `ErrNotBorrowed` | 对象未借出 | 归还的对象不属于此池（外部对象、重复归还等） |
 
 ## 4. 对象生命周期管理流程
@@ -161,6 +162,9 @@ Acquire()
 Release(obj)
    │
    ├─ mu.Lock() → 检查 closed → 返回 ErrPoolClosed
+   │
+   ├─ 检查 obj 是否为 nil（仅对可空类型生效）
+   │     └─ 是 nil → 返回 ErrNilObject
    │
    ├─ 从 active 查找 idleEntry 元数据
    │     └─ 不存在 → 返回 ErrNotBorrowed（外部对象、重复归还等）
@@ -239,7 +243,12 @@ Close()
 工厂函数 `Factory[T]` 返回 `(T, error)`，销毁函数 `DestroyFunc[T]` 接收 `T` 参数，与池的泛型参数一致。
 
 **关于 nil 对象的处理：**
-由于 Go 泛型中 `any(nil_pointer)` 不等于 `nil`（接口持有类型信息），本模块不在 `Release` 中做特殊的 nil 检查。所有未通过 `Acquire` 获取的对象（包括 nil 对象）在 `Release` 时都会返回 `ErrNotBorrowed`。
+本模块在 `Release` 中使用反射做显式的 nil 检查，使用 `isNil[T]` 辅助函数判断对象是否为 nil。该函数仅对可空类型（Chan、Func、Interface、Map、Pointer、Slice）生效，对值类型（int、string、struct 等）始终返回 false。
+
+- 对可空类型传入 nil → 返回 `ErrNilObject`，明确告知调用方问题本质
+- 对值类型传入零值 → 不视为 nil，继续执行后续逻辑，最终返回 `ErrNotBorrowed`（值类型本身就不能为 nil）
+
+nil 检查在活跃集合查找之前执行，确保调用方能够快速定位问题，而非得到语义模糊的 `ErrNotBorrowed`。
 
 ## 6. LRU 策略说明
 
@@ -247,9 +256,31 @@ Close()
 
 - **归还 (Release)**：将对象插入链表头部（最近使用）
 - **借出 (Acquire)**：从链表头部开始取（优先取最近使用的）
-- **超量回收**：从链表尾部开始移除（最久未使用的优先被回收）
 
-这种策略保证了热点对象被持续复用，而冷对象在资源紧张时优先被释放。
+这种策略保证了热点对象被持续复用，而冷对象在空闲超时时被回收。
+
+### 6.1 空闲超时回收遍历顺序
+
+空闲对象回收时，`reclaimIdle` 从链表头部开始全量遍历，逐个检查 `lastUsed` 是否超过 `MaxIdleTime`：
+
+```go
+for e := p.idleList.Front(); e != nil; {
+    ic := e.Value.(*idleEntry[T])
+    next := e.Next()
+    if now.Sub(ic.lastUsed) > p.cfg.MaxIdleTime {
+        p.idleList.Remove(e)
+        expired = append(expired, ic)
+        atomic.AddInt32(&p.count, -1)
+    }
+    e = next
+}
+```
+
+- 遍历顺序：从链表头部到尾部（LRU 顺序从新到旧）
+- 回收条件：`now - lastUsed > MaxIdleTime`，与链表位置无关
+- 回收时保留元数据中满足空闲时间阈值的对象，不受链表位置影响
+
+这种全量遍历时间阈值判断的策略确保所有超时对象都被正确回收，而不受 LRU 链表位置影响。
 
 ## 7. 线程安全与性能优化说明
 

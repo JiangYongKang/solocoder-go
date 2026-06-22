@@ -69,9 +69,9 @@ func (t *Trie) Insert(word string, data interface{}) error {
 	return nil
 }
 
-func (t *Trie) Search(word string) (interface{}, bool) {
+func (t *Trie) Search(word string) (interface{}, bool, error) {
 	if word == "" {
-		return nil, false
+		return nil, false, ErrEmptyWord
 	}
 
 	t.mu.RLock()
@@ -80,12 +80,12 @@ func (t *Trie) Search(word string) (interface{}, bool) {
 	node := t.root
 	for _, ch := range word {
 		if node.children[ch] == nil {
-			return nil, false
+			return nil, false, nil
 		}
 		node = node.children[ch]
 	}
 
-	return node.data, node.isEnd
+	return node.data, node.isEnd, nil
 }
 
 func (t *Trie) Delete(word string) error {

@@ -24,8 +24,8 @@ func TestNewParser(t *testing.T) {
 func TestAddOption_Nil(t *testing.T) {
 	p := NewParser("test")
 	err := p.AddOption(nil)
-	if !errors.Is(err, ErrNilTarget) {
-		t.Errorf("expected ErrNilTarget, got %v", err)
+	if !errors.Is(err, ErrNilOption) {
+		t.Errorf("expected ErrNilOption, got %v", err)
 	}
 }
 
@@ -53,8 +53,8 @@ func TestAddOption_NoName(t *testing.T) {
 		Target: &s,
 	}
 	err := p.AddOption(opt)
-	if !errors.Is(err, ErrUnknownOption) {
-		t.Errorf("expected ErrUnknownOption, got %v", err)
+	if !errors.Is(err, ErrOptionNoName) {
+		t.Errorf("expected ErrOptionNoName, got %v", err)
 	}
 }
 
@@ -946,8 +946,8 @@ func TestExecute_NoHandler(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	err = p.Execute()
-	if !errors.Is(err, ErrCommandNotFound) {
-		t.Errorf("expected ErrCommandNotFound, got %v", err)
+	if !errors.Is(err, ErrNoHandler) {
+		t.Errorf("expected ErrNoHandler, got %v", err)
 	}
 }
 
@@ -983,8 +983,8 @@ func TestExecute_HandlerError(t *testing.T) {
 func TestAddCommand_Nil(t *testing.T) {
 	p := NewParser("test")
 	err := p.AddCommand(nil)
-	if !errors.Is(err, ErrNilTarget) {
-		t.Errorf("expected ErrNilTarget, got %v", err)
+	if !errors.Is(err, ErrNilCommand) {
+		t.Errorf("expected ErrNilCommand, got %v", err)
 	}
 }
 
@@ -992,8 +992,8 @@ func TestAddCommand_EmptyName(t *testing.T) {
 	p := NewParser("test")
 	cmd := NewCommand("")
 	err := p.AddCommand(cmd)
-	if !errors.Is(err, ErrUnknownCommand) {
-		t.Errorf("expected ErrUnknownCommand, got %v", err)
+	if !errors.Is(err, ErrCommandNoName) {
+		t.Errorf("expected ErrCommandNoName, got %v", err)
 	}
 }
 
@@ -1004,16 +1004,16 @@ func TestAddCommand_Duplicate(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	err = p.AddCommand(NewCommand("add"))
-	if !errors.Is(err, ErrDuplicateOption) {
-		t.Errorf("expected ErrDuplicateOption, got %v", err)
+	if !errors.Is(err, ErrDuplicateCommand) {
+		t.Errorf("expected ErrDuplicateCommand, got %v", err)
 	}
 }
 
 func TestAddPositionalArg_Nil(t *testing.T) {
 	p := NewParser("test")
 	err := p.AddPositionalArg(nil)
-	if !errors.Is(err, ErrNilTarget) {
-		t.Errorf("expected ErrNilTarget, got %v", err)
+	if !errors.Is(err, ErrNilArg) {
+		t.Errorf("expected ErrNilArg, got %v", err)
 	}
 }
 
@@ -1028,8 +1028,8 @@ func TestAddPositionalArg_NilTarget(t *testing.T) {
 func TestCommand_AddOption_Nil(t *testing.T) {
 	c := NewCommand("test")
 	err := c.AddOption(nil)
-	if !errors.Is(err, ErrNilTarget) {
-		t.Errorf("expected ErrNilTarget, got %v", err)
+	if !errors.Is(err, ErrNilOption) {
+		t.Errorf("expected ErrNilOption, got %v", err)
 	}
 }
 
@@ -1057,8 +1057,8 @@ func TestCommand_AddOption_Duplicate(t *testing.T) {
 func TestCommand_AddPositionalArg_Nil(t *testing.T) {
 	c := NewCommand("test")
 	err := c.AddPositionalArg(nil)
-	if !errors.Is(err, ErrNilTarget) {
-		t.Errorf("expected ErrNilTarget, got %v", err)
+	if !errors.Is(err, ErrNilArg) {
+		t.Errorf("expected ErrNilArg, got %v", err)
 	}
 }
 
@@ -1311,6 +1311,13 @@ func TestErrorStrings(t *testing.T) {
 		{"ErrDuplicateOption", ErrDuplicateOption, "cliparser: duplicate option definition"},
 		{"ErrNilTarget", ErrNilTarget, "cliparser: nil target pointer"},
 		{"ErrCommandNotFound", ErrCommandNotFound, "cliparser: command not found"},
+		{"ErrNilOption", ErrNilOption, "cliparser: nil option"},
+		{"ErrNilCommand", ErrNilCommand, "cliparser: nil command"},
+		{"ErrNilArg", ErrNilArg, "cliparser: nil positional argument"},
+		{"ErrNoHandler", ErrNoHandler, "cliparser: no handler set for command"},
+		{"ErrOptionNoName", ErrOptionNoName, "cliparser: option has neither long nor short name"},
+		{"ErrDuplicateCommand", ErrDuplicateCommand, "cliparser: duplicate command name"},
+		{"ErrCommandNoName", ErrCommandNoName, "cliparser: command name is empty"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1318,6 +1325,79 @@ func TestErrorStrings(t *testing.T) {
 				t.Errorf("expected %q, got %q", tt.msg, tt.err.Error())
 			}
 		})
+	}
+}
+
+func TestCommand_AddOption_NoName(t *testing.T) {
+	c := NewCommand("test")
+	var s string
+	err := c.AddOption(&Option{
+		Type:   StringType,
+		Target: &s,
+	})
+	if !errors.Is(err, ErrOptionNoName) {
+		t.Errorf("expected ErrOptionNoName, got %v", err)
+	}
+}
+
+func TestParse_BoolOption_EmptyEquals(t *testing.T) {
+	p := NewParser("test")
+	var flag bool
+	err := p.AddOption(&Option{
+		Long:   "flag",
+		Type:   BoolType,
+		Target: &flag,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	err = p.Parse([]string{"--flag="})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !flag {
+		t.Error("expected flag true when --flag= (empty value)")
+	}
+}
+
+func TestParse_BoolOption_TrueEquals(t *testing.T) {
+	p := NewParser("test")
+	var flag bool
+	err := p.AddOption(&Option{
+		Long:   "flag",
+		Type:   BoolType,
+		Target: &flag,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	err = p.Parse([]string{"--flag=true"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !flag {
+		t.Error("expected flag true when --flag=true")
+	}
+}
+
+func TestParse_BoolOption_FalseEquals(t *testing.T) {
+	p := NewParser("test")
+	var flag bool
+	err := p.AddOption(&Option{
+		Long:   "flag",
+		Type:   BoolType,
+		Target: &flag,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	flag = true
+	err = p.Parse([]string{"--flag=false"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if flag {
+		t.Error("expected flag false when --flag=false")
 	}
 }
 

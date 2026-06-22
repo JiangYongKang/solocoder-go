@@ -19,6 +19,13 @@ var (
 	ErrDuplicateOption   = errors.New("cliparser: duplicate option definition")
 	ErrNilTarget         = errors.New("cliparser: nil target pointer")
 	ErrCommandNotFound   = errors.New("cliparser: command not found")
+	ErrNilOption         = errors.New("cliparser: nil option")
+	ErrNilCommand        = errors.New("cliparser: nil command")
+	ErrNilArg            = errors.New("cliparser: nil positional argument")
+	ErrNoHandler         = errors.New("cliparser: no handler set for command")
+	ErrOptionNoName      = errors.New("cliparser: option has neither long nor short name")
+	ErrDuplicateCommand  = errors.New("cliparser: duplicate command name")
+	ErrCommandNoName     = errors.New("cliparser: command name is empty")
 )
 
 type OptionType int
@@ -78,13 +85,13 @@ func NewParser(appName string) *Parser {
 
 func (p *Parser) AddOption(opt *Option) error {
 	if opt == nil {
-		return ErrNilTarget
+		return ErrNilOption
 	}
 	if opt.Target == nil {
 		return ErrNilTarget
 	}
 	if opt.Long == "" && opt.Short == "" {
-		return ErrUnknownOption
+		return ErrOptionNoName
 	}
 	if opt.Long != "" {
 		if _, exists := p.optionsMap["--"+opt.Long]; exists {
@@ -107,13 +114,13 @@ func (p *Parser) AddOption(opt *Option) error {
 
 func (p *Parser) AddCommand(cmd *Command) error {
 	if cmd == nil {
-		return ErrNilTarget
+		return ErrNilCommand
 	}
 	if cmd.Name == "" {
-		return ErrUnknownCommand
+		return ErrCommandNoName
 	}
 	if _, exists := p.commandsMap[cmd.Name]; exists {
-		return fmt.Errorf("%w: %s", ErrDuplicateOption, cmd.Name)
+		return fmt.Errorf("%w: %s", ErrDuplicateCommand, cmd.Name)
 	}
 	cmd.optionsMap = make(map[string]*Option)
 	for _, opt := range cmd.Options {
@@ -131,7 +138,7 @@ func (p *Parser) AddCommand(cmd *Command) error {
 
 func (p *Parser) AddPositionalArg(arg *PositionalArg) error {
 	if arg == nil {
-		return ErrNilTarget
+		return ErrNilArg
 	}
 	if arg.Target == nil {
 		return ErrNilTarget
@@ -277,11 +284,15 @@ func (p *Parser) parseLongOption(arg string, args []string, i *int) (*Option, st
 
 	if opt.Type == BoolType {
 		if hasValue {
-			b, err := strconv.ParseBool(value)
-			if err != nil {
-				return nil, "", fmt.Errorf("%w: %s=%s", ErrInvalidType, name, value)
+			if value == "" {
+				setOptionValue(opt, true)
+			} else {
+				b, err := strconv.ParseBool(value)
+				if err != nil {
+					return nil, "", fmt.Errorf("%w: %s=%s", ErrInvalidType, name, value)
+				}
+				setOptionValue(opt, b)
 			}
-			setOptionValue(opt, b)
 		} else {
 			setOptionValue(opt, true)
 		}
@@ -455,8 +466,11 @@ func bindPositionalArgs(parsedArgs []string, argDefs []*PositionalArg) error {
 }
 
 func (p *Parser) Execute() error {
-	if p.parsedCmd == nil || p.parsedCmd.Handler == nil {
+	if p.parsedCmd == nil {
 		return ErrCommandNotFound
+	}
+	if p.parsedCmd.Handler == nil {
+		return ErrNoHandler
 	}
 	return p.parsedCmd.Handler()
 }
@@ -474,13 +488,13 @@ func NewCommand(name string) *Command {
 
 func (c *Command) AddOption(opt *Option) error {
 	if opt == nil {
-		return ErrNilTarget
+		return ErrNilOption
 	}
 	if opt.Target == nil {
 		return ErrNilTarget
 	}
 	if opt.Long == "" && opt.Short == "" {
-		return ErrUnknownOption
+		return ErrOptionNoName
 	}
 	if opt.Long != "" {
 		if _, exists := c.optionsMap["--"+opt.Long]; exists {
@@ -503,7 +517,7 @@ func (c *Command) AddOption(opt *Option) error {
 
 func (c *Command) AddPositionalArg(arg *PositionalArg) error {
 	if arg == nil {
-		return ErrNilTarget
+		return ErrNilArg
 	}
 	if arg.Target == nil {
 		return ErrNilTarget

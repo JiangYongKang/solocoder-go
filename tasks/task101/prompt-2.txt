@@ -1,0 +1,6 @@
+你实现的 filewatcher 模块存在以下问题需要修复：
+1. ErrNoWatchedDir 被声明为 sentinel error 但全模块没有任何函数返回该错误，Start() 在 watchedDir 为空时静默返回而不通知调用方启动失败原因。
+2. filewatcher_test.go 中自行定义了 stringsHasSuffix 函数，其功能与标准库 strings.HasSuffix 完全重复。
+3. New() 构造函数在配置无效时直接 panic 终止程序，不符合 Go 库代码不应主动 panic 的惯例。
+4. 修复后运行 go test ./internal/filewatcher/ -v，需要让所有测试通过。
+5. 在 docs/filewatcher.md 中更新模块需求文档。

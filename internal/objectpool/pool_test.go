@@ -388,8 +388,28 @@ func TestRelease_NilObject(t *testing.T) {
 	defer p.Close()
 
 	err = p.Release(nil)
-	if err == nil {
-		t.Error("expected error for nil object")
+	if err != ErrNilObject {
+		t.Errorf("expected ErrNilObject, got %v", err)
+	}
+}
+
+func TestRelease_NilObject_ValueType(t *testing.T) {
+	var counter int64
+	p, err := NewPool[int](Config[int]{
+		MaxCap: 2,
+		Factory: func() (int, error) {
+			return int(atomic.AddInt64(&counter, 1)), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer p.Close()
+
+	var zero int
+	err = p.Release(zero)
+	if err != ErrNotBorrowed {
+		t.Errorf("expected ErrNotBorrowed for value type zero (value types cannot be nil), got %v", err)
 	}
 }
 

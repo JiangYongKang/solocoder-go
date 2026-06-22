@@ -85,12 +85,8 @@ type FileWatcher struct {
 	onDelete EventCallback
 }
 
-func New() *FileWatcher {
-	fw, err := NewWithConfig(DefaultConfig())
-	if err != nil {
-		panic("filewatcher: DefaultConfig is invalid: " + err.Error())
-	}
-	return fw
+func New() (*FileWatcher, error) {
+	return NewWithConfig(DefaultConfig())
 }
 
 func NewWithConfig(cfg Config) (*FileWatcher, error) {
@@ -232,19 +228,19 @@ func (fw *FileWatcher) OnDelete(cb EventCallback) error {
 	return nil
 }
 
-func (fw *FileWatcher) Start() {
+func (fw *FileWatcher) Start() error {
 	fw.mu.Lock()
 	if fw.stopped {
 		fw.mu.Unlock()
-		return
+		return ErrWatcherStopped
 	}
 	if fw.running {
 		fw.mu.Unlock()
-		return
+		return nil
 	}
 	if fw.watchedDir == "" {
 		fw.mu.Unlock()
-		return
+		return ErrNoWatchedDir
 	}
 	fw.running = true
 	fw.stopCh = make(chan struct{})
@@ -252,6 +248,7 @@ func (fw *FileWatcher) Start() {
 
 	fw.wg.Add(1)
 	go fw.pollLoop()
+	return nil
 }
 
 func (fw *FileWatcher) Stop() {

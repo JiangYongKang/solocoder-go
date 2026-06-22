@@ -402,8 +402,9 @@ func TestFairModeOrdering(t *testing.T) {
 	s, _ := New(0, true)
 
 	const numGoroutines = 5
-	results := make([]int, numGoroutines)
+	acquireOrder := make(chan int, numGoroutines)
 	ready := make([]chan struct{}, numGoroutines)
+	continueRelease := make(chan struct{}, numGoroutines)
 
 	for i := 0; i < numGoroutines; i++ {
 		ready[i] = make(chan struct{})
@@ -416,8 +417,8 @@ func TestFairModeOrdering(t *testing.T) {
 			defer wg.Done()
 			close(ready[id])
 			s.Acquire(0)
-			results[id] = id
-			time.Sleep(10 * time.Millisecond)
+			acquireOrder <- id
+			<-continueRelease
 			s.Release()
 		}(i)
 		<-ready[i]
@@ -432,23 +433,20 @@ func TestFairModeOrdering(t *testing.T) {
 	s.IncreasePermits(1)
 
 	for i := 0; i < numGoroutines; i++ {
-		time.Sleep(30 * time.Millisecond)
+		select {
+		case id := <-acquireOrder:
+			if id != i {
+				t.Errorf("expected goroutine %d to acquire at position %d, got goroutine %d", i, i, id)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timeout waiting for goroutine %d to acquire", i)
+		}
+		continueRelease <- struct{}{}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	wg.Wait()
-
-	firstAcquirer := -1
-	for i := 0; i < numGoroutines; i++ {
-		if results[i] == i {
-			if firstAcquirer == -1 {
-				firstAcquirer = i
-			}
-		}
-	}
-
-	if firstAcquirer != 0 {
-		t.Errorf("expected goroutine 0 to acquire first (FIFO order), got goroutine %d", firstAcquirer)
-	}
+	close(acquireOrder)
 }
 
 func TestConcurrentAcquireRelease(t *testing.T) {

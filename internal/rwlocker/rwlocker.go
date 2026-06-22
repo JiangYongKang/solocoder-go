@@ -250,6 +250,16 @@ func (rw *RWLocker) unregisterHolder() {
 	removeGoroutineLockInfo(gid, rw)
 }
 
+func (rw *RWLocker) waitForWriterWaiting() error {
+	rw.upgradeMu.Lock()
+	for rw.writerWaiting {
+		rw.upgradeCond.Wait()
+	}
+	rw.readerCount++
+	rw.upgradeMu.Unlock()
+	return nil
+}
+
 func (rw *RWLocker) RLock() error {
 	if err := rw.checkDeadlock(LockTypeRead); err != nil {
 		return err
@@ -258,46 +268,52 @@ func (rw *RWLocker) RLock() error {
 	start := time.Now()
 
 	if rw.readTimeout <= 0 {
+		if err := rw.waitForWriterWaiting(); err != nil {
+			return err
+		}
 		rw.mu.RLock()
 		rw.registerHolder(LockTypeRead)
-		rw.upgradeMu.Lock()
-		rw.readerCount++
-		rw.upgradeMu.Unlock()
 		rw.incSuccess(LockTypeRead, time.Since(start))
 		return nil
 	}
 
-	result := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
+		rw.upgradeMu.Lock()
+		for rw.writerWaiting {
+			rw.upgradeCond.Wait()
+		}
+		rw.readerCount++
+		rw.upgradeMu.Unlock()
 		rw.mu.RLock()
-		result <- nil
+		close(done)
 	}()
 
-	var timer *time.Timer
-	timer = time.AfterFunc(rw.readTimeout, func() {
+	timer := time.NewTimer(rw.readTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		rw.registerHolder(LockTypeRead)
+		rw.incSuccess(LockTypeRead, time.Since(start))
+		return nil
+	case <-timer.C:
 		rw.incTimeout()
-		result <- &TimeoutError{
+		go func() {
+			<-done
+			rw.upgradeMu.Lock()
+			rw.readerCount--
+			if rw.writerWaiting && rw.readerCount == 0 {
+				rw.upgradeCond.Broadcast()
+			}
+			rw.upgradeMu.Unlock()
+			rw.mu.RUnlock()
+		}()
+		return &TimeoutError{
 			LockType: string(LockTypeRead),
 			Timeout:  rw.readTimeout,
 		}
-	})
-	defer timer.Stop()
-
-	err := <-result
-	if err != nil {
-		go func() {
-			<-result
-			rw.mu.RUnlock()
-		}()
-		return err
 	}
-
-	rw.registerHolder(LockTypeRead)
-	rw.upgradeMu.Lock()
-	rw.readerCount++
-	rw.upgradeMu.Unlock()
-	rw.incSuccess(LockTypeRead, time.Since(start))
-	return nil
 }
 
 func (rw *RWLocker) RUnlock() error {
@@ -340,37 +356,34 @@ func (rw *RWLocker) Lock() error {
 		return nil
 	}
 
-	result := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
 		rw.mu.Lock()
-		result <- nil
+		close(done)
 	}()
 
-	var timer *time.Timer
-	timer = time.AfterFunc(rw.writeTimeout, func() {
+	timer := time.NewTimer(rw.writeTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		rw.registerHolder(LockTypeWrite)
+		rw.upgradeMu.Lock()
+		rw.writerActive = true
+		rw.upgradeMu.Unlock()
+		rw.incSuccess(LockTypeWrite, time.Since(start))
+		return nil
+	case <-timer.C:
 		rw.incTimeout()
-		result <- &TimeoutError{
+		go func() {
+			<-done
+			rw.mu.Unlock()
+		}()
+		return &TimeoutError{
 			LockType: string(LockTypeWrite),
 			Timeout:  rw.writeTimeout,
 		}
-	})
-	defer timer.Stop()
-
-	err := <-result
-	if err != nil {
-		go func() {
-			<-result
-			rw.mu.Unlock()
-		}()
-		return err
 	}
-
-	rw.registerHolder(LockTypeWrite)
-	rw.upgradeMu.Lock()
-	rw.writerActive = true
-	rw.upgradeMu.Unlock()
-	rw.incSuccess(LockTypeWrite, time.Since(start))
-	return nil
 }
 
 func (rw *RWLocker) Unlock() error {
@@ -392,9 +405,6 @@ func (rw *RWLocker) Unlock() error {
 }
 
 func (rw *RWLocker) TryUpgrade(mode UpgradeMode, timeout time.Duration) error {
-	rw.incUpgradeRequest()
-	start := time.Now()
-
 	var myReadCount int
 	if rw.enableDeadlockDetect {
 		gid := getGoroutineID()
@@ -416,6 +426,9 @@ func (rw *RWLocker) TryUpgrade(mode UpgradeMode, timeout time.Duration) error {
 	} else {
 		myReadCount = 1
 	}
+
+	rw.incUpgradeRequest()
+	start := time.Now()
 
 	rw.upgradeMu.Lock()
 	currentReaders := rw.readerCount
@@ -439,6 +452,7 @@ func (rw *RWLocker) TryUpgrade(mode UpgradeMode, timeout time.Duration) error {
 		rw.upgradeMu.Lock()
 		rw.writerWaiting = false
 		rw.writerActive = true
+		rw.upgradeCond.Broadcast()
 		rw.upgradeMu.Unlock()
 
 		rw.registerHolder(LockTypeWrite)
@@ -490,6 +504,7 @@ func (rw *RWLocker) TryUpgrade(mode UpgradeMode, timeout time.Duration) error {
 			rw.writerWaiting = false
 			remainingReaders := rw.readerCount
 			rw.readerCount += myReadCount
+			rw.upgradeCond.Broadcast()
 			rw.upgradeMu.Unlock()
 			rw.incTimeout()
 
@@ -507,6 +522,7 @@ func (rw *RWLocker) TryUpgrade(mode UpgradeMode, timeout time.Duration) error {
 		rw.upgradeCond.Wait()
 	}
 	rw.writerWaiting = false
+	rw.upgradeCond.Broadcast()
 	rw.upgradeMu.Unlock()
 
 	rw.mu.Lock()
@@ -524,18 +540,30 @@ func (rw *RWLocker) TryRLock() (bool, error) {
 	if err := rw.checkDeadlock(LockTypeRead); err != nil {
 		return false, err
 	}
+
+	rw.upgradeMu.Lock()
+	if rw.writerWaiting {
+		rw.upgradeMu.Unlock()
+		return false, nil
+	}
+	rw.readerCount++
+	rw.upgradeMu.Unlock()
+
 	rw.incRequest(LockTypeRead)
 	start := time.Now()
 
 	ok := rw.mu.TryRLock()
 	if !ok {
+		rw.upgradeMu.Lock()
+		rw.readerCount--
+		if rw.writerWaiting && rw.readerCount == 0 {
+			rw.upgradeCond.Broadcast()
+		}
+		rw.upgradeMu.Unlock()
 		return false, nil
 	}
 
 	rw.registerHolder(LockTypeRead)
-	rw.upgradeMu.Lock()
-	rw.readerCount++
-	rw.upgradeMu.Unlock()
 	rw.incSuccess(LockTypeRead, time.Since(start))
 	return true, nil
 }

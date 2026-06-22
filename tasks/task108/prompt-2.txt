@@ -1,0 +1,6 @@
+你实现的 rwlocker 模块存在以下问题需要修复：
+1. RLock 和 Lock 的带超时路径存在 goroutine 泄漏：锁获取成功后超时回调 goroutine 向缓冲通道发送 TimeoutError 时因无人读取而永久阻塞。
+2. TryUpgrade 阻塞模式存在写者饥饿：升级 goroutine 设置 writerWaiting 标记后，RLock 和 TryRLock 入口未检查该标记阻止新读者进入，高并发读场景下 readerCount 无法归零导致升级无限等待。
+3. TryUpgrade 中 incUpgradeRequest 在检查当前 goroutine 是否持有读锁之前被调用，未持有读锁的无效升级请求也被计入统计。
+4. 修复后运行 go test ./internal/rwlocker/ -v，需要让所有测试通过。
+5. 在 docs/rwlocker.md 中更新模块需求文档。

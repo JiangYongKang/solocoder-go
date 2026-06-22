@@ -98,20 +98,28 @@ func (rb *RingBuffer[T]) Write(value T) bool
 ```
 
 **NoOverwrite 模式：
-1. 检查缓冲区是否已满 (count == capacity)
-2. 如果已满，直接返回 false
-3. 否则，将值写入 writePos 位置
-4. writePos 向后移动一位 (模 capacity)
-5. count 加 1
-6. 检查高水位告警，返回 true
+1. 获取互斥锁
+2. 检查缓冲区是否已满 (count == capacity)
+3. 如果已满，释放锁，返回 false
+4. 否则，将值写入 writePos 位置
+5. writePos 向后移动一位 (模 capacity)
+6. count 加 1
+7. 检查高水位状态，记录需触发的回调（若有）
+8. 释放互斥锁
+9. 若有待执行的回调，在锁外执行回调，返回 true
 
 **Overwrite 模式：
-1. 检查缓冲区是否已满 (count == capacity)
-2. 如果已满，readPos 向后移动一位（丢弃最旧数据），count 减 1
-3. 将值写入 writePos 位置
-4. writePos 向后移动一位 (模 capacity)
-5. count 加 1
-6. 检查高水位告警，返回 true
+1. 获取互斥锁
+2. 检查缓冲区是否已满 (count == capacity)
+3. 如果已满：
+   - 将 readPos 位置的槽位置零（防止引用类型内存泄漏）
+   - readPos 向后移动一位（丢弃最旧数据），count 减 1
+4. 将值写入 writePos 位置
+5. writePos 向后移动一位 (模 capacity)
+6. count 加 1
+7. 检查高水位状态，记录需触发的回调（若有）
+8. 释放互斥锁
+9. 若有待执行的回调，在锁外执行回调，返回 true
 
 ### 4.3 读取操作 (Read)
 
@@ -119,12 +127,16 @@ func (rb *RingBuffer[T]) Write(value T) bool
 func (rb *RingBuffer[T]) Read() (T, bool)
 ```
 
-1. 检查缓冲区是否为空 (count == 0)
-2. 如果为空，返回零值和 false
-3. 否则，读取 readPos 位置的值
-4. readPos 向后移动一位 (模 capacity)
-5. count 减 1
-6. 检查高水位告警，返回读取的值和 true
+1. 获取互斥锁
+2. 检查缓冲区是否为空 (count == 0)
+3. 如果为空，释放锁，返回零值和 false
+4. 否则，读取 readPos 位置的值
+5. **将 readPos 位置的槽位置零**（防止引用类型内存泄漏，确保 GC 可以回收已读取对象）
+6. readPos 向后移动一位 (模 capacity)
+7. count 减 1
+8. 检查高水位状态，记录需触发的回调（若有）
+9. 释放互斥锁
+10. 若有待执行的回调，在锁外执行回调，返回读取的值和 true
 
 ### 4.4 环绕示例
 
@@ -385,3 +397,116 @@ fmt.Println(rb.IsEmpty()) // true
 - 所有公共方法都加锁保护，支持多 goroutine 安全访问
 - 写入和读取操作都是非阻塞的，不会等待条件满足
 - 适用于生产者-消费者模式等并发场景
+
+## 11. 死锁预防设计
+
+### 11.1 问题背景
+
+高水位告警回调 (`onHighWater` / `onLowWater`) 如果在持有互斥锁的状态下直接调用，而回调函数内部又尝试调用任何需要获取同一把锁的 RingBuffer 方法（如 `Read`、`Write`、`Len` 等），就会导致经典的"自死锁"（同一个 goroutine 试图重复获取已持有的不可重入锁）。
+
+### 11.2 设计方案：锁外执行回调
+
+采用"状态记录 + 锁外回调"的两阶段模式，从根本上避免死锁：
+
+**阶段一：持有锁，仅修改状态，记录回调**
+- `Write`、`Read`、`SetHighWaterMark` 在持有锁期间：
+  - 完成所有缓冲区状态的修改（读写指针移动、count 更新、highWaterAlarm 标志切换）
+  - 调用 `checkWaterMarkLocked` 仅检测状态变化，**不直接执行回调**
+  - 将需要触发的回调函数引用返回（`func()` 类型），保存到局部变量
+
+**阶段二：释放锁后，安全执行回调**
+- 调用 `rb.mu.Unlock()` 完全释放互斥锁
+- 检查返回的回调函数是否为 `nil`
+- 若回调非空，在**无锁状态**下执行回调函数
+
+### 11.3 关键代码模式
+
+```go
+// Write 方法中的两阶段模式
+func (rb *RingBuffer[T]) Write(value T) bool {
+    rb.mu.Lock()
+    // ... 状态修改（持有锁）...
+    callback := rb.checkWaterMarkLocked(overwrote)  // 仅记录回调，不执行
+    rb.mu.Unlock()                                   // 先释放锁
+
+    if callback != nil {
+        callback()                                   // 锁外执行回调，无死锁风险
+    }
+    return true
+}
+
+// checkWaterMarkLocked: 仅返回回调，不执行
+func (rb *RingBuffer[T]) checkWaterMarkLocked(overwrote bool) func() {
+    if rb.count >= rb.highWater && !rb.highWaterAlarm {
+        rb.highWaterAlarm = true
+        return rb.onHighWater  // 返回回调引用
+    } else if ... {
+        rb.highWaterAlarm = false
+        return rb.onLowWater   // 返回回调引用
+    }
+    return nil
+}
+```
+
+### 11.4 安全性保证
+
+| 场景 | 旧实现（锁内调回调） | 新实现（锁外调回调） |
+|------|---------------------|---------------------|
+| 回调中调用 `rb.Len()` | **死锁** | 正常执行 |
+| 回调中调用 `rb.Read()` | **死锁** | 正常执行 |
+| 回调中调用 `rb.Write()` | **死锁** | 正常执行 |
+| 回调中调用 `rb.SetHighWaterMark()` | **死锁** | 正常执行 |
+| 状态一致性 | 有保证 | 有保证（状态已在锁内完成修改） |
+
+## 12. 内存安全设计
+
+### 12.1 问题背景
+
+当泛型参数 `T` 为引用类型（指针、slice、map、chan、接口等）时，`Read` 操作只复制指针值然后推进读指针，但底层数组对应槽位仍保留着原对象的引用。这会导致：
+- 已被"读取消费"的对象仍然被缓冲区数组引用
+- Go 垃圾回收器 (GC) 认为这些对象仍然可达，无法回收
+- 长时间运行会造成内存泄漏，尤其当对象较大或持有更多引用时
+
+### 12.2 清零策略
+
+在以下操作中，将不再使用的数组槽位显式设置为泛型类型零值 `var zero T`：
+
+**1. Read 操作：读取后清零读指针槽位**
+```go
+value := rb.buf[rb.readPos]
+rb.buf[rb.readPos] = zero   // 关键：断开引用链，使 GC 可回收
+rb.readPos = (rb.readPos + 1) % rb.capacity
+```
+
+**2. Overwrite 模式 Write 操作：覆盖前先清零被丢弃槽位**
+```go
+if rb.strategy == Overwrite && rb.count == rb.capacity {
+    rb.buf[rb.readPos] = zero   // 清零最旧数据的槽位
+    rb.readPos = (rb.readPos + 1) % rb.capacity
+    rb.count--
+}
+```
+
+**3. Clear 操作：遍历整个缓冲区清零所有槽位**
+```go
+var zero T
+for i := range rb.buf {
+    rb.buf[i] = zero
+}
+```
+
+### 12.3 零值语义说明
+
+Go 泛型的零值 (`var zero T`) 对于不同类型的表现：
+- **值类型** (int, struct, float64 等)：零值为该类型的默认值，清零不影响 GC（本身不涉及引用）
+- **指针类型** (*T)：零值为 `nil`，清零后对象不再被引用，GC 可正常回收
+- **Slice / Map / Chan**：零值为 `nil`，底层数组/哈希表/队列失去引用后可被回收
+- **接口类型** (interface{})：零值为 `nil`，若接口持有动态值引用，清零后动态值可被回收
+- **字符串** (string)：虽然 string 是不可变值类型，但清零可使其指向的底层字节数组更早被回收
+
+### 12.4 性能影响
+
+清零操作是 O(1) 的单元素赋值（Clear 除外为 O(n)），开销极小：
+- 对于值类型：仅一次内存写，开销可忽略
+- 对于引用类型：一次指针写 (`nil`)，相比 GC 回收大量内存的收益，代价可忽略
+- 不引入额外的内存分配

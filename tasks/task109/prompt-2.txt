@@ -1,0 +1,5 @@
+你实现的 skiplist 模块存在以下问题需要修复：
+1. TestCustomProbability 测试只使用 t.Logf 记录层数差异而不调用 t.Errorf 做断言，即使 randomLevel 始终返回相同值测试也不会失败，概率因子功能无法被有效验证。
+2. TestConcurrentSafe 并发测试在所有 goroutine 完成后从未验证最终元素数量和数据完整性，如果锁定缺陷导致插入丢失测试不会报错。
+3. 修复后运行 go test ./internal/skiplist/ -v，需要让所有测试通过。
+4. 在 docs/skiplist.md 中更新模块需求文档。

@@ -1,0 +1,10 @@
+产物不满意：
+1. rwlocker.go 中 waitForWriterWaiting 方法始终返回 nil 却声明了 error 返回类型，函数签名暗示有可能失败但实际实现中不存在任何错误路径，在 RLock 无超时路径中 if err := rw.waitForWriterWaiting() 的错误处理分支变成不可达的死代码。原因是方法设计时未考虑实际语义就拷贝了带 error 签名的模板，应将返回值改为 void 或在方法内部保留可能的错误返回路径。
+2. rwlocker_test.go 中新增的五个测试用例均未对 goroutine 泄漏修复做显式验证，TestReadLockTimeout 和 TestWriteLockTimeout 等已有测试只覆盖了超时行为但没有通过 runtime.NumGoroutine 快照对比来确认锁获取成功或超时后后台 goroutine 和清理 goroutine 均正常退出。由于 goroutine 泄漏不会导致测试直接失败，当前测试套件无法有效防止修复退化，应新增专门的泄漏检测测试用例。
+3. docs/rwlocker.md 第 2.2 节新增的"超时实现机制"小节描述了 done channel + time.NewTimer + select 模式，但未说明 Lock 超时路径的清理 goroutine 与 RLock 超时路径清理的不同之处：Lock 只做 mu.Unlock 而 RLock 还需回退 readerCount 并广播 upgradeCond。文档将两者混在一起用"避免 goroutine 泄漏"一笔带过，缺少分别说明使读者无法理解两种锁在超时清理逻辑上的差异。
+
+过程不满意：
+1. 模型在 session-cot-2.md 开头第一步直接执行 view_files 读取源码后，第二步未经任何分析就直接用 todo_write 创建了 6 项任务计划，此时还未对三个 BUG 的关联关系和修改范围做系统性评估。正确流程应先分析三个问题的代码位置、相互依赖关系和影响范围，再制定按依赖顺序执行的修复计划，而非在读完文件后立即划分任务粒度。
+2. 模型在修复 rwlocker.go 后首次运行测试发现失败，判断为"新增的 4 个测试有逻辑错误"，随后连续对 rwlocker_test.go 执行了至少四次 edit_file_search_replace 操作来修正测试设计。这反映出模型在写测试时未先仔细分析 TryUpgrade 的调用契约，即 TryUpgrade 必须由持有读锁的同一 goroutine 调用否则注册表找不到持有者，导致初始测试代码结构就不正确，正确做法是在编写测试前先理解被测函数的调用前置条件。
+3. 模型在更新 docs/rwlocker.md 时新增了"写者饥饿防护机制"作为第 5 章，但未提前规划这会引发后续所有章节（死锁检测、使用示例、错误常量速查、性能说明）的编号重排，随后至少执行了 10 次 search_by_regex 和 edit_file_search_replace 操作来逐个修复章节编号和小节编号。如果模型在插入新章前先列出完整的章节结构变更计划，只需 2-3 次替换即可完成全部编号调整，当前的多轮修补式操作说明模型缺乏对文档结构变更的全局预判。
+4. 模型在思考过程中明确提出"由于三个修复都在同一个文件中且相互关联，我将一次性重写 rwlocker.go 来修复所有问题"，这种"大爆炸"式修复思路不符合缺陷修复任务中尽量做最小范围变更的原则。虽然最终代码变更范围实际控制在受影响的函数内而非真的全量重写，但这种表述暴露了模型倾向于整体替换而非逐点精确定位修复的行为模式。

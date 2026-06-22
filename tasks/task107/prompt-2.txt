@@ -1,0 +1,5 @@
+你实现的 semaphore 模块存在以下问题需要修复：
+1. TestFairModeOrdering 测试只验证了等待队列中第一个获取者的 FIFO 顺序，未验证后续 goroutine 的完整获取链路，对公平模式核心需求的验证不充分。
+2. Release 方法在 held 已为零时仍然无条件调用 dispatchWaiters，将释放许可的语义与批量唤醒等待者的调度逻辑耦合在同一方法内。
+3. 修复后运行 go test ./internal/semaphore/ -v，需要让所有测试通过。
+4. 在 docs/semaphore.md 中更新模块需求文档。

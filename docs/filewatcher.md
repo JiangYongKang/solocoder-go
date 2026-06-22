@@ -176,7 +176,7 @@ type FileWatcher struct {
 ### 4.1 监听流程总览
 
 ```
-New() / NewWithConfig()
+New() (*FileWatcher, error) / NewWithConfig(Config) (*FileWatcher, error)
        │
        ▼
     Watch(dir)  ──  设置监听目录，执行初始扫描，建立文件状态基线
@@ -187,7 +187,7 @@ New() / NewWithConfig()
   OnDelete(cb) ─┘
        │
        ▼
-    Start()  ──  启动后台轮询协程
+    Start() error  ──  启动后台轮询协程，失败返回错误
        │
        ▼
   [ 轮询循环 ]
@@ -340,18 +340,19 @@ watchedDir/
 #### 4.6.3 Start 流程
 
 ```
-Start()
+Start() error
    │
    ├─ mu.Lock()
-   ├─ stopped == true → mu.Unlock()，直接返回（已停止无法重启）
-   ├─ running == true → mu.Unlock()，直接返回（幂等）
-   ├─ watchedDir == "" → mu.Unlock()，直接返回（未设置监听目录）
+   ├─ stopped == true → mu.Unlock()，返回 ErrWatcherStopped（已停止无法重启）
+   ├─ running == true → mu.Unlock()，返回 nil（幂等，已在运行）
+   ├─ watchedDir == "" → mu.Unlock()，返回 ErrNoWatchedDir（未设置监听目录）
    ├─ running = true
    ├─ stopCh = make(chan struct{})
    ├─ mu.Unlock()
    │
    ├─ wg.Add(1)
-   └─ 启动 pollLoop 后台协程
+   ├─ 启动 pollLoop 后台协程
+   └─ 返回 nil
 ```
 
 #### 4.6.4 Stop 流程
@@ -375,7 +376,7 @@ Stop()
 **不可逆停止约定：**
 - `Stop()` 一旦调用，`stopped` 标记永久设置为 `true`，监听器进入终态
 - 停止后，`Watch()`、`OnCreate()`、`OnModify()`、`OnDelete()` 均返回 `ErrWatcherStopped`
-- `Start()` 在已停止状态下调用会被静默忽略，不会重启
+- `Start()` 在已停止状态下调用返回 `ErrWatcherStopped`，不会重启
 - 如需重新使用，必须创建新的 `FileWatcher` 实例
 
 **资源安全：**
@@ -467,7 +468,9 @@ func main() {
         fmt.Printf("[删除] %s\n", evt.Path)
     })
 
-    fw.Start()
+    if err := fw.Start(); err != nil {
+        log.Fatalf("启动监听器失败: %v", err)
+    }
     defer fw.Stop()
 
     fmt.Printf("正在监听目录: %s\n", fw.WatchedDir())
@@ -491,7 +494,10 @@ type ConfigManager struct {
 }
 
 func NewConfigManager(configPath string) (*ConfigManager, error) {
-    fw := filewatcher.New()
+    fw, err := filewatcher.New()
+    if err != nil {
+        return nil, err
+    }
 
     cm := &ConfigManager{
         watcher: fw,
@@ -507,7 +513,9 @@ func NewConfigManager(configPath string) (*ConfigManager, error) {
         }
     })
 
-    fw.Start()
+    if err := fw.Start(); err != nil {
+        return nil, err
+    }
     return cm, nil
 }
 
@@ -527,7 +535,7 @@ fw, _ := filewatcher.NewWithConfig(filewatcher.Config{
 })
 
 _ = fw.Watch("/var/log")
-fw.Start()
+_ = fw.Start()
 // 只有 .log 后缀和 test_ 开头的文件会触发事件
 ```
 
@@ -544,7 +552,7 @@ if fw.IsRunning() {
 
 ```go
 // 启动监听器
-fw.Start()
+_ = fw.Start()
 
 // 监听关闭信号
 go func() {
@@ -583,7 +591,8 @@ func TestFileWatcher_CreateEvent(t *testing.T) {
     err := fw.Watch(tmpDir)
     require.NoError(t, err)
 
-    fw.Start()
+    err = fw.Start()
+    require.NoError(t, err)
     defer fw.Stop()
 
     time.Sleep(50 * time.Millisecond)

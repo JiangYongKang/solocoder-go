@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,7 +13,10 @@ import (
 )
 
 func TestNew(t *testing.T) {
-	fw := New()
+	fw, err := New()
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
 	if fw == nil {
 		t.Fatal("New returned nil")
 	}
@@ -70,7 +74,7 @@ func TestWatch_NonExistentDir(t *testing.T) {
 	tmpDir := t.TempDir()
 	nonExistentDir := filepath.Join(tmpDir, "definitely", "does", "not", "exist")
 
-	fw := New()
+	fw, _ := New()
 	err := fw.Watch(nonExistentDir)
 	if !errors.Is(err, ErrDirNotExist) {
 		t.Errorf("expected ErrDirNotExist, got %v", err)
@@ -85,7 +89,7 @@ func TestWatch_FileInsteadOfDir(t *testing.T) {
 	defer os.Remove(tmpFile.Name())
 	tmpFile.Close()
 
-	fw := New()
+	fw, _ := New()
 	err = fw.Watch(tmpFile.Name())
 	if !errors.Is(err, ErrDirNotExist) {
 		t.Errorf("expected ErrDirNotExist for file path, got %v", err)
@@ -95,7 +99,7 @@ func TestWatch_FileInsteadOfDir(t *testing.T) {
 func TestWatch_Success(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	fw := New()
+	fw, _ := New()
 	err := fw.Watch(tmpDir)
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
@@ -134,7 +138,10 @@ func TestWatch_InitialFilesNotTriggerEvents(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(100 * time.Millisecond)
@@ -150,7 +157,7 @@ func TestWatch_InitialFilesNotTriggerEvents(t *testing.T) {
 }
 
 func TestOnCreate_NilCallback(t *testing.T) {
-	fw := New()
+	fw, _ := New()
 	err := fw.OnCreate(nil)
 	if !errors.Is(err, ErrNilCallback) {
 		t.Errorf("expected ErrNilCallback, got %v", err)
@@ -158,7 +165,7 @@ func TestOnCreate_NilCallback(t *testing.T) {
 }
 
 func TestOnModify_NilCallback(t *testing.T) {
-	fw := New()
+	fw, _ := New()
 	err := fw.OnModify(nil)
 	if !errors.Is(err, ErrNilCallback) {
 		t.Errorf("expected ErrNilCallback, got %v", err)
@@ -166,7 +173,7 @@ func TestOnModify_NilCallback(t *testing.T) {
 }
 
 func TestOnDelete_NilCallback(t *testing.T) {
-	fw := New()
+	fw, _ := New()
 	err := fw.OnDelete(nil)
 	if !errors.Is(err, ErrNilCallback) {
 		t.Errorf("expected ErrNilCallback, got %v", err)
@@ -255,7 +262,10 @@ func TestFileCreateEvent(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -275,13 +285,9 @@ func TestFileCreateEvent(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if !stringsHasSuffix(lastCreatePath, "newfile.txt") {
+	if !strings.HasSuffix(lastCreatePath, "newfile.txt") {
 		t.Errorf("expected create event path ending with newfile.txt, got %s", lastCreatePath)
 	}
-}
-
-func stringsHasSuffix(s, suffix string) bool {
-	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
 }
 
 func TestFileModifyEvent(t *testing.T) {
@@ -311,7 +317,10 @@ func TestFileModifyEvent(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -359,7 +368,10 @@ func TestFileDeleteEvent(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -378,7 +390,7 @@ func TestFileDeleteEvent(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if !stringsHasSuffix(lastDeletePath, "delete-me.txt") {
+	if !strings.HasSuffix(lastDeletePath, "delete-me.txt") {
 		t.Errorf("expected delete event path ending with delete-me.txt, got %s", lastDeletePath)
 	}
 }
@@ -416,7 +428,10 @@ func TestRecursiveDirectory(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -458,7 +473,10 @@ func TestDebounce_DuplicateEventsMerged(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -503,7 +521,10 @@ func TestFilter_FileExtensions(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -554,7 +575,10 @@ func TestFilter_FileExtensions_WithoutDot(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -604,7 +628,10 @@ func TestFilter_FilePatterns(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -673,7 +700,10 @@ func TestFilter_ExcludeDirs(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -736,7 +766,10 @@ func TestFilter_IncludePatterns(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -766,21 +799,27 @@ func TestFilter_IncludePatterns(t *testing.T) {
 func TestStartStop_Idempotent(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	fw := New()
+	fw, _ := New()
 	err := fw.Watch(tmpDir)
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("first Start failed: %v", err)
+	}
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("second Start (idempotent) failed: %v", err)
+	}
 
 	fw.Stop()
 	fw.Stop()
 
 	done := make(chan struct{})
 	go func() {
-		fw.Start()
+		_ = fw.Start()
 		fw.Stop()
 		close(done)
 	}()
@@ -793,7 +832,7 @@ func TestStartStop_Idempotent(t *testing.T) {
 }
 
 func TestStop_RejectsCallbacksRegistration(t *testing.T) {
-	fw := New()
+	fw, _ := New()
 	fw.Stop()
 
 	err := fw.OnCreate(func(evt Event) {})
@@ -815,7 +854,7 @@ func TestStop_RejectsCallbacksRegistration(t *testing.T) {
 func TestStop_RejectsWatch(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	fw := New()
+	fw, _ := New()
 	fw.Stop()
 
 	err := fw.Watch(tmpDir)
@@ -825,8 +864,11 @@ func TestStop_RejectsWatch(t *testing.T) {
 }
 
 func TestStart_WithoutWatch(t *testing.T) {
-	fw := New()
-	fw.Start()
+	fw, _ := New()
+	err := fw.Start()
+	if !errors.Is(err, ErrNoWatchedDir) {
+		t.Errorf("expected ErrNoWatchedDir when starting without Watch, got %v", err)
+	}
 	if fw.IsRunning() {
 		t.Error("should not be running without watched directory")
 	}
@@ -836,7 +878,7 @@ func TestStart_WithoutWatch(t *testing.T) {
 func TestIsRunning(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	fw := New()
+	fw, _ := New()
 	err := fw.Watch(tmpDir)
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
@@ -846,7 +888,10 @@ func TestIsRunning(t *testing.T) {
 		t.Error("should not be running before Start")
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	if !fw.IsRunning() {
 		t.Error("should be running after Start")
 	}
@@ -860,23 +905,29 @@ func TestIsRunning(t *testing.T) {
 func TestStart_AfterStop(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	fw := New()
+	fw, _ := New()
 	err := fw.Watch(tmpDir)
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	fw.Stop()
 
-	fw.Start()
+	err = fw.Start()
+	if !errors.Is(err, ErrWatcherStopped) {
+		t.Errorf("expected ErrWatcherStopped, got %v", err)
+	}
 	if fw.IsRunning() {
 		t.Error("Start after Stop should not restart the watcher")
 	}
 }
 
 func TestStop_WithoutStart(t *testing.T) {
-	fw := New()
+	fw, _ := New()
 	fw.Stop()
 
 	err := fw.OnCreate(func(evt Event) {})
@@ -918,7 +969,10 @@ func TestMultipleCallbacks(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -983,7 +1037,10 @@ func TestDebounce_CreateAndModifySameFile(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -1039,7 +1096,10 @@ func TestConcurrent_FileOperations(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -1098,7 +1158,7 @@ func TestWatchedFileCount(t *testing.T) {
 		}
 	}
 
-	fw := New()
+	fw, _ := New()
 	err = fw.Watch(tmpDir)
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
@@ -1160,7 +1220,10 @@ func TestFilter_Combined(t *testing.T) {
 		t.Fatalf("Watch failed: %v", err)
 	}
 
-	fw.Start()
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer fw.Stop()
 
 	time.Sleep(50 * time.Millisecond)
@@ -1190,7 +1253,7 @@ func TestFilter_Combined(t *testing.T) {
 }
 
 func TestPassesFilters_NoFilters(t *testing.T) {
-	fw := New()
+	fw, _ := New()
 
 	if !fw.passesFilters("/any/file.txt") {
 		t.Error("should pass with no filters")
@@ -1201,7 +1264,7 @@ func TestPassesFilters_NoFilters(t *testing.T) {
 }
 
 func TestIsExcludedDir_NoExcludes(t *testing.T) {
-	fw := New()
+	fw, _ := New()
 
 	if fw.isExcludedDir("/tmp/test") {
 		t.Error("should not exclude with no exclude dirs")

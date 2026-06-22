@@ -431,14 +431,21 @@ $ todo list --limit=50 -f pending
 | `ErrTooManyArgs` | 提供的位置参数数量多于定义 |
 | `ErrTooFewArgs` | 提供的位置参数数量少于定义 |
 | `ErrShortOptionFormat` | 注册短选项时名称长度不为 1 |
-| `ErrDuplicateOption` | 重复注册相同名称的选项或子命令 |
+| `ErrDuplicateOption` | 重复注册相同名称的选项 |
 | `ErrNilTarget` | Option 或 PositionalArg 的目标指针为 nil |
-| `ErrCommandNotFound` | Execute() 时未找到可执行的命令或 Handler |
+| `ErrCommandNotFound` | Execute() 时未匹配到任何子命令（parsedCmd 为 nil） |
+| `ErrNilOption` | AddOption() 传入的 Option 指针为 nil |
+| `ErrNilCommand` | AddCommand() 传入的 Command 指针为 nil |
+| `ErrNilArg` | AddPositionalArg() 传入的 PositionalArg 指针为 nil |
+| `ErrNoHandler` | Execute() 时子命令已匹配但 Handler 未设置 |
+| `ErrOptionNoName` | Option 同时缺少长名和短名（Long 和 Short 均为空） |
+| `ErrDuplicateCommand` | 重复注册相同名称的子命令 |
+| `ErrCommandNoName` | 注册子命令时名称为空字符串 |
 
 **典型错误场景**：
-- 注册期错误：`ErrNilTarget`、`ErrShortOptionFormat`、`ErrDuplicateOption`、`ErrUnknownCommand`（空命令名）等，应在开发阶段通过程序初始化检查避免
+- 注册期错误：`ErrNilOption`、`ErrNilCommand`、`ErrNilArg`、`ErrNilTarget`、`ErrOptionNoName`、`ErrCommandNoName`、`ErrShortOptionFormat`、`ErrDuplicateOption`、`ErrDuplicateCommand` 等，应在开发阶段通过程序初始化检查避免
 - 解析期错误：`ErrUnknownOption`、`ErrMissingValue`、`ErrInvalidType`、`ErrUnknownCommand`、`ErrNoCommand`、`ErrTooManyArgs`、`ErrTooFewArgs`，通常由用户输入导致，应友好提示用户
-- 执行期错误：`ErrCommandNotFound`、Handler 自定义错误
+- 执行期错误：`ErrCommandNotFound`（无匹配子命令）、`ErrNoHandler`（有匹配但无处理器）、Handler 自定义错误
 
 ## 6. 设计要点与约束
 
@@ -474,15 +481,25 @@ $ todo list --limit=50 -f pending
 - 组合串中出现的第一个非布尔选项会终止组合解析，其后续字符（或下一个参数）作为该选项的值
 - 纯布尔组合可任意长度，每个字符对应一个标志
 
+### 6.6 布尔选项等号赋值规则
+
+布尔选项使用 `--flag=value` 形式时的行为：
+- `--flag=true` / `--flag=1` / `--flag=TRUE` 等 → 设为 `true`
+- `--flag=false` / `--flag=0` / `--flag=FALSE` 等 → 设为 `false`
+- `--flag=`（等号后为空）→ 视为 `--flag` 不带值，设为 `true`
+- `--flag`（无等号）→ 设为 `true`
+
+`--flag=` 空值形式与 `--flag` 行为一致，均设为 `true`，确保两种写法的行为一致性，避免空值导致 `strconv.ParseBool("")` 报错。
+
 ## 7. 测试覆盖
 
-单元测试覆盖了以下场景（共 76 个测试用例）：
+单元测试覆盖了以下场景（共 81 个测试用例）：
 
 **基础结构测试**：
 - Parser 和 Command 创建
-- 各种 nil/空参数的注册期错误
-- 重复注册、格式错误等边界情况
-- 所有错误变量的字符串校验
+- 各种 nil/空参数的注册期错误（`ErrNilOption`、`ErrNilCommand`、`ErrNilArg`、`ErrNilTarget`、`ErrOptionNoName`、`ErrCommandNoName` 等细分错误）
+- 重复注册、格式错误等边界情况（`ErrDuplicateOption` 用于选项重复，`ErrDuplicateCommand` 用于命令重复）
+- 所有 18 个错误变量的字符串校验
 
 **选项解析测试**：
 - 长选项独立传值（`--name value`）
@@ -490,7 +507,8 @@ $ todo list --limit=50 -f pending
 - 短选项独立传值（`-n value`）
 - 短选项拼接传值（`-nvalue`）
 - 布尔选项的出现/缺失语义
-- 布尔选项的显式赋值
+- 布尔选项的显式赋值（`--flag=true`, `--flag=false`）
+- 布尔选项空等号赋值（`--flag=` 视为 `true`）
 - int / float / string / bool 四种类型的解析和类型转换
 - 非法类型值的错误返回
 - 长短选项绑定一致性
@@ -508,7 +526,7 @@ $ todo list --limit=50 -f pending
 - 子命令内部选项解析（长短选项、等号、组合等）
 - 子命令级默认值
 - 子命令 Handler 执行和错误透传
-- Execute 边界错误
+- Execute 边界错误（无命令 vs 无 Handler 分别返回不同错误）
 
 **位置参数测试**：
 - string / int / float / bool 四种类型位置参数绑定

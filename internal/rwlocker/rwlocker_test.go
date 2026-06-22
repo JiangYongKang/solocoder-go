@@ -952,6 +952,249 @@ func TestConcurrentReadWrite(t *testing.T) {
 	}
 }
 
+func TestRLockBlockedDuringUpgrade(t *testing.T) {
+	rw := New(nil)
+
+	if err := rw.RLock(); err != nil {
+		t.Fatalf("RLock failed: %v", err)
+	}
+
+	upgradeStarted := make(chan bool, 1)
+	upgradeDone := make(chan error, 1)
+	go func() {
+		if err := rw.RLock(); err != nil {
+			t.Errorf("RLock in upgrade goroutine failed: %v", err)
+			return
+		}
+		upgradeStarted <- true
+		err := rw.TryUpgrade(UpgradeBlocking, 3*time.Second)
+		upgradeDone <- err
+		if err == nil {
+			rw.Unlock()
+		}
+	}()
+
+	<-upgradeStarted
+	time.Sleep(50 * time.Millisecond)
+
+	readerAcquired := make(chan bool, 1)
+	go func() {
+		if err := rw.RLock(); err != nil {
+			t.Errorf("RLock after upgrade: %v", err)
+			return
+		}
+		readerAcquired <- true
+		rw.RUnlock()
+	}()
+
+	select {
+	case <-readerAcquired:
+		t.Error("RLock should be blocked while writerWaiting is true during upgrade")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	rw.RUnlock()
+
+	select {
+	case err := <-upgradeDone:
+		if err != nil {
+			t.Fatalf("TryUpgrade should have succeeded: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TryUpgrade should have completed after other readers released")
+	}
+
+	select {
+	case <-readerAcquired:
+	case <-time.After(500 * time.Millisecond):
+		t.Error("RLock should have acquired lock after upgrade completed")
+	}
+}
+
+func TestTryRLockRejectedDuringUpgrade(t *testing.T) {
+	rw := New(nil)
+
+	if err := rw.RLock(); err != nil {
+		t.Fatalf("RLock failed: %v", err)
+	}
+
+	upgradeStarted := make(chan bool, 1)
+	upgradeDone := make(chan error, 1)
+	go func() {
+		if err := rw.RLock(); err != nil {
+			t.Errorf("RLock in upgrade goroutine failed: %v", err)
+			return
+		}
+		upgradeStarted <- true
+		err := rw.TryUpgrade(UpgradeBlocking, 3*time.Second)
+		upgradeDone <- err
+		if err == nil {
+			rw.Unlock()
+		}
+	}()
+
+	<-upgradeStarted
+	time.Sleep(50 * time.Millisecond)
+
+	ok, err := rw.TryRLock()
+	if err != nil {
+		t.Errorf("TryRLock should not return error during upgrade, got: %v", err)
+	}
+	if ok {
+		t.Error("TryRLock should return false when writerWaiting is true")
+		rw.RUnlock()
+	}
+
+	rw.RUnlock()
+
+	select {
+	case err := <-upgradeDone:
+		if err != nil {
+			t.Fatalf("TryUpgrade should have succeeded: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TryUpgrade should have completed")
+	}
+}
+
+func TestUpgradeNoStarvationUnderConcurrentReads(t *testing.T) {
+	rw := New(nil)
+
+	if err := rw.RLock(); err != nil {
+		t.Fatalf("initial RLock failed: %v", err)
+	}
+
+	upgradeStarted := make(chan bool, 1)
+	upgradeDone := make(chan error, 1)
+	go func() {
+		if err := rw.RLock(); err != nil {
+			t.Errorf("RLock in upgrade goroutine failed: %v", err)
+			return
+		}
+		upgradeStarted <- true
+		err := rw.TryUpgrade(UpgradeBlocking, 3*time.Second)
+		upgradeDone <- err
+		if err == nil {
+			rw.Unlock()
+		}
+	}()
+
+	<-upgradeStarted
+	time.Sleep(50 * time.Millisecond)
+
+	for i := 0; i < 10; i++ {
+		ok, _ := rw.TryRLock()
+		if ok {
+			t.Errorf("TryRLock attempt %d should be rejected during upgrade", i)
+			rw.RUnlock()
+		}
+	}
+
+	rw.RUnlock()
+
+	select {
+	case err := <-upgradeDone:
+		if err != nil {
+			t.Fatalf("TryUpgrade should have succeeded: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TryUpgrade timed out - writer starvation detected")
+	}
+}
+
+func TestUpgradeRequestNotCountedForInvalidAttempt(t *testing.T) {
+	rw := New(nil)
+
+	err := rw.TryUpgrade(UpgradeNonBlocking, 0)
+	if err == nil {
+		t.Error("TryUpgrade without read lock should fail")
+	}
+
+	stats := rw.GetStats()
+	if stats == nil {
+		t.Fatal("GetStats returned nil")
+	}
+	if stats.UpgradeRequests != 0 {
+		t.Errorf("invalid upgrade request should not be counted, got UpgradeRequests=%d", stats.UpgradeRequests)
+	}
+
+	rw.Lock()
+	err = rw.TryUpgrade(UpgradeNonBlocking, 0)
+	if err == nil {
+		t.Error("TryUpgrade with write lock should fail")
+		rw.Unlock()
+		return
+	}
+	rw.Unlock()
+
+	stats = rw.GetStats()
+	if stats.UpgradeRequests != 0 {
+		t.Errorf("invalid upgrade request with write lock should not be counted, got UpgradeRequests=%d", stats.UpgradeRequests)
+	}
+
+	rw.RLock()
+	err = rw.TryUpgrade(UpgradeNonBlocking, 0)
+	if err != nil {
+		t.Fatalf("valid upgrade should succeed: %v", err)
+	}
+	rw.Unlock()
+
+	stats = rw.GetStats()
+	if stats.UpgradeRequests != 1 {
+		t.Errorf("valid upgrade request should be counted, got UpgradeRequests=%d", stats.UpgradeRequests)
+	}
+	if stats.UpgradeSuccess != 1 {
+		t.Errorf("upgrade success should be counted, got UpgradeSuccess=%d", stats.UpgradeSuccess)
+	}
+}
+
+func TestRLockTimeoutDuringWriterWaiting(t *testing.T) {
+	rw := New(&Config{
+		ReadTimeout: 50 * time.Millisecond,
+	})
+
+	if err := rw.RLock(); err != nil {
+		t.Fatalf("RLock failed: %v", err)
+	}
+
+	upgradeStarted := make(chan bool, 1)
+	upgradeDone := make(chan error, 1)
+	go func() {
+		if err := rw.RLock(); err != nil {
+			t.Errorf("RLock in upgrade goroutine failed: %v", err)
+			return
+		}
+		upgradeStarted <- true
+		err := rw.TryUpgrade(UpgradeBlocking, 500*time.Millisecond)
+		upgradeDone <- err
+		if err == nil {
+			rw.Unlock()
+		}
+	}()
+
+	<-upgradeStarted
+	time.Sleep(20 * time.Millisecond)
+
+	err := rw.RLock()
+	if err == nil {
+		t.Error("RLock should have timed out during writerWaiting")
+		rw.RUnlock()
+	} else if !errors.Is(err, ErrLockTimeout) {
+		t.Errorf("expected ErrLockTimeout, got %v", err)
+	}
+
+	rw.RUnlock()
+
+	select {
+	case err := <-upgradeDone:
+		if err != nil {
+			t.Errorf("TryUpgrade should have succeeded: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("TryUpgrade should have completed")
+	}
+}
+
 func TestNoTimeoutConfiguration(t *testing.T) {
 	rw := New(&Config{
 		ReadTimeout:  0,

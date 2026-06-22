@@ -29,6 +29,12 @@
 - 超时时间为 0 表示无限等待（与标准库行为一致）
 - 超时后返回 `TimeoutError`，调用方可通过 `errors.Is(err, ErrLockTimeout)` 判断
 
+**超时实现机制**：
+- 使用 `done` channel + `time.NewTimer` + `select` 模式实现超时控制
+- 锁获取在后台 goroutine 中执行，通过 `close(done)` 通知成功
+- 超时分支启动清理 goroutine 等待后台锁获取完成后立即释放，避免 goroutine 泄漏
+- 对于读锁超时，清理时还需回退 `readerCount` 并在必要时通知 `upgradeCond`
+
 ### 2.3 锁竞争统计
 
 自动收集锁的使用统计数据，帮助排查性能瓶颈：
@@ -214,6 +220,8 @@ RWLocker 的配置结构体。
     ↓ 否
 返回 UpgradeError
     ↓ 是
+记录 incUpgradeRequest（仅有效请求计入统计）
+    ↓
 获取 upgradeMu，计算其他读锁数量
     ↓
 其他读锁数量 > 0？
@@ -226,15 +234,18 @@ RWLocker 的配置结构体。
         ↓
         释放所有自身持有的读锁（mu.RUnlock N 次）
         ↓
+        此时 RLock/TryRLock 入口检查 writerWaiting，阻止新读者进入
+        ↓
         启动超时定时器（如配置了 timeout）
         ↓
         重新获取 upgradeMu
         ↓
         循环等待 readerCount == 0：
-            ├─ 超时 → 恢复 readerCount，重新获取读锁，返回超时错误
+            ├─ 超时 → 清除 writerWaiting，恢复 readerCount，Broadcast 唤醒阻塞的 RLock，
+            │         重新获取读锁，返回超时错误
             └─ 被唤醒且 readerCount == 0 → 退出循环
         ↓
-        清除 writerWaiting，释放 upgradeMu
+        清除 writerWaiting，Broadcast 唤醒阻塞的 RLock
         ↓
         获取写锁（mu.Lock）
         ↓
@@ -249,10 +260,52 @@ RWLocker 的配置结构体。
 - 升级前先释放自身读锁，避免与其他等待写锁的 goroutine 产生死锁
 - 使用 `upgradeCond` 条件变量在读者释放锁时通知等待升级的写者
 - 阻塞模式下如果超时，会重新获取读锁保证状态一致性
+- **写者饥饿防护**：阻塞升级设置 `writerWaiting` 标记后，`RLock` 和 `TryRLock` 入口会检查该标记，阻止新读者进入，确保 `readerCount` 能归零从而升级成功
+- 升级完成或超时退出时，均会调用 `upgradeCond.Broadcast()` 唤醒所有因 `writerWaiting` 而阻塞的读锁请求
+- **统计准确性**：`incUpgradeRequest()` 仅在读锁持有校验通过后才调用，无效升级请求不计入统计
 
-## 5. 死锁检测工作机制
+## 5. 写者饥饿防护机制
 
-### 5.1 单 goroutine 死锁检测
+当 goroutine 调用 `TryUpgrade(UpgradeBlocking)` 等待其他读者释放锁时，如果新读者不断进入，`readerCount` 可能永远无法归零，导致升级 goroutine 无限等待，即"写者饥饿"问题。
+
+### 5.1 防护策略
+
+本模块通过 `writerWaiting` 标记实现写者饥饿防护：
+
+**RLock 入口检查**：
+- 无超时路径：`waitForWriterWaiting()` 在 `upgradeMu` 保护下循环检查 `writerWaiting`，若为 true 则在 `upgradeCond` 上等待，直到升级完成或超时后被唤醒
+- 有超时路径：后台 goroutine 同样先通过 `waitForWriterWaiting` 逻辑，超时后启动清理 goroutine 回退 `readerCount` 并释放底层锁
+
+**TryRLock 入口检查**：
+- 在 `upgradeMu` 保护下检查 `writerWaiting`，若为 true 则直接返回 `(false, nil)`，不增加 `readerCount`
+- 若底层 `mu.TryRLock()` 失败，回退已增加的 `readerCount` 并在必要时通知 `upgradeCond`
+
+**升级完成/退出时广播**：
+- 升级成功：设置 `writerWaiting = false` 后调用 `upgradeCond.Broadcast()`，唤醒所有等待的 RLock
+- 升级超时退出：同样清除 `writerWaiting` 并 `Broadcast`，确保被阻塞的 RLock 能继续执行
+
+### 5.2 流程示意
+
+```
+TryUpgrade 设置 writerWaiting = true
+    ↓
+RLock 调用 → waitForWriterWaiting()
+    → writerWaiting == true → upgradeCond.Wait() 阻塞
+    ↓
+TryRLock 调用 → 检查 writerWaiting == true → 返回 false
+    ↓
+最后一个 RUnlock → readerCount == 0 → upgradeCond.Broadcast()
+    ↓
+TryUpgrade 醒来 → 获取写锁
+    ↓
+TryUpgrade 完成 → writerWaiting = false → upgradeCond.Broadcast()
+    ↓
+被阻塞的 RLock 醒来 → writerWaiting == false → 继续获取读锁
+```
+
+## 6. 死锁检测工作机制
+
+### 6.1 单 goroutine 死锁检测
 
 通过全局的 goroutine → 锁持有者注册表实现：
 
@@ -276,7 +329,7 @@ lockHolder 包含：goroutineID、lockType、acquireTime、count
 | 读锁 | 允许（重入，count++） | 禁止（返回死锁错误） |
 | 写锁 | 禁止（返回死锁错误） | 禁止（返回死锁错误） |
 
-### 5.2 锁持有时间告警
+### 6.2 锁持有时间告警
 
 在释放锁时检查持有时长：
 
@@ -298,9 +351,9 @@ holder.count > 1？
         从注册表中移除该 holder 记录
 ```
 
-## 6. 使用示例
+## 7. 使用示例
 
-### 6.1 基础使用
+### 7.1 基础使用
 
 ```go
 package main
@@ -333,7 +386,7 @@ func main() {
 }
 ```
 
-### 6.2 带超时配置
+### 7.2 带超时配置
 
 ```go
 lock := rwlocker.New(&rwlocker.Config{
@@ -355,7 +408,7 @@ if err := lock.Lock(); err != nil {
 defer lock.Unlock()
 ```
 
-### 6.3 读锁升级
+### 7.3 读锁升级
 
 ```go
 lock := rwlocker.New(nil)
@@ -386,7 +439,7 @@ defer lock.Unlock()
 updateData()
 ```
 
-### 6.4 竞争统计与监控
+### 7.4 竞争统计与监控
 
 ```go
 lock := rwlocker.New(&rwlocker.Config{
@@ -425,7 +478,7 @@ go func() {
 }()
 ```
 
-### 6.5 锁持有时间告警
+### 7.5 锁持有时间告警
 
 ```go
 lock := rwlocker.New(&rwlocker.Config{
@@ -446,7 +499,7 @@ lock := rwlocker.New(&rwlocker.Config{
 })
 ```
 
-## 7. 错误常量速查
+## 8. 错误常量速查
 
 | 常量 | 说明 |
 |------|------|
@@ -457,7 +510,7 @@ lock := rwlocker.New(&rwlocker.Config{
 | `ErrInvalidTimeout` | 配置的超时时间无效（负数） |
 | `ErrHoldDurationExceeded` | 锁持有时间超过阈值（告警用） |
 
-## 8. 性能说明
+## 9. 性能说明
 
 - 启用死锁检测会在每次加锁/解锁时增加 goroutine ID 获取和注册表查询的开销，对性能敏感的场景可通过 `EnableDeadlockDetect: false` 关闭
 - 启用统计功能会在每次加锁/解锁时增加原子计数操作，开销较小

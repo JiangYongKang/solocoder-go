@@ -1,0 +1,6 @@
+你实现的 hotconfig 模块存在以下问题需要修复：
+1. eventLoop 方法中的 pendingEvent 变量被 eventLoop 协程和 time.AfterFunc 定时器协程同时访问，缺乏同步保护存在数据竞争。
+2. loadLocked 方法在 os.ReadFile 之后才调用 os.Stat 获取文件修改时间，两次操作之间存在 TOCTOU 窗口，如果中间文件被修改会导致后续轮询漏掉变更。
+3. validator.go 的必填校验存在两套互有重叠的机制：FieldSchema.Required 和 ValidationRule RuleRequired，使用不同判据却报相同错误，调用方无法区分何时该用哪种。
+4. 修复后运行 go test ./internal/hotconfig/ -v，需要让所有测试通过。
+5. 在 docs/hotconfig.md 中更新模块需求文档。

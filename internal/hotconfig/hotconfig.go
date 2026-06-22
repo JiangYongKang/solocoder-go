@@ -62,13 +62,42 @@ func (hc *HotConfig) Load() error {
 }
 
 func (hc *HotConfig) loadLocked() (bool, error) {
-	if _, err := os.Stat(hc.path); os.IsNotExist(err) {
-		return false, fmt.Errorf("%w: %s", ErrFileNotFound, hc.path)
-	}
+	const maxRetries = 3
+	var (
+		data    []byte
+		info    os.FileInfo
+		readErr error
+	)
 
-	data, err := os.ReadFile(hc.path)
-	if err != nil {
-		return false, fmt.Errorf("failed to read config file: %w", err)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		preInfo, err := os.Stat(hc.path)
+		if os.IsNotExist(err) {
+			return false, fmt.Errorf("%w: %s", ErrFileNotFound, hc.path)
+		}
+		if err != nil {
+			return false, fmt.Errorf("failed to stat config file: %w", err)
+		}
+
+		data, readErr = os.ReadFile(hc.path)
+		if readErr != nil {
+			return false, fmt.Errorf("failed to read config file: %w", readErr)
+		}
+
+		postInfo, err := os.Stat(hc.path)
+		if err != nil {
+			return false, fmt.Errorf("failed to re-stat config file: %w", err)
+		}
+
+		if preInfo.ModTime().Equal(postInfo.ModTime()) && preInfo.Size() == postInfo.Size() {
+			info = postInfo
+			break
+		}
+
+		info = postInfo
+		if attempt == maxRetries-1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	parsedData, format, err := ParseFile(hc.path, data)
@@ -95,7 +124,7 @@ func (hc *HotConfig) loadLocked() (bool, error) {
 	}
 
 	if hc.snapshot != nil && reflect.DeepEqual(hc.snapshot.Data, withDefaults) {
-		if info, err := os.Stat(hc.path); err == nil {
+		if info != nil {
 			hc.lastModTime = info.ModTime()
 		}
 		return false, nil
@@ -111,7 +140,7 @@ func (hc *HotConfig) loadLocked() (bool, error) {
 		Version:   hc.version,
 	}
 
-	if info, err := os.Stat(hc.path); err == nil {
+	if info != nil {
 		hc.lastModTime = info.ModTime()
 	}
 
@@ -207,7 +236,6 @@ func (hc *HotConfig) eventLoop() {
 	defer hc.wg.Done()
 
 	var debounceTimer *time.Timer
-	var pendingEvent *fileEvent
 
 	for {
 		select {
@@ -218,7 +246,7 @@ func (hc *HotConfig) eventLoop() {
 			return
 
 		case evt := <-hc.eventCh:
-			pendingEvent = evt
+			currentEvent := evt
 			debounce := hc.options.DebounceTime
 			if debounce <= 0 {
 				debounce = 100 * time.Millisecond
@@ -227,7 +255,7 @@ func (hc *HotConfig) eventLoop() {
 				debounceTimer.Stop()
 			}
 			debounceTimer = time.AfterFunc(debounce, func() {
-				hc.processEvent(pendingEvent)
+				hc.processEvent(currentEvent)
 			})
 		}
 	}

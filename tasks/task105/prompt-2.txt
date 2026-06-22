@@ -1,0 +1,5 @@
+你实现的 ringbuffer 模块存在以下问题需要修复：
+1. checkWaterMarkLocked 在持有互斥锁状态下直接调用 onHighWater 和 onLowWater 回调，如果调用方在回调中执行任何需要获取该锁的操作会导致死锁。
+2. Read 方法取出元素并推进读指针后没有将原数组槽位清零，当泛型参数为引用类型时残留指针会阻止 GC 回收已读取对象造成内存泄漏。
+3. 修复后运行 go test ./internal/ringbuffer/ -v，需要让所有测试通过。
+4. 在 docs/ringbuffer.md 中更新模块需求文档。

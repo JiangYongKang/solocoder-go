@@ -16,21 +16,15 @@ func ValidateConfig(data map[string]interface{}, schema *Schema) error {
 	var errors []*ValidationError
 
 	for _, field := range schema.Fields {
-		value, exists := getNestedValue(data, field.Path)
+		normalizedField := normalizeFieldSchema(field)
+		value, exists := getNestedValue(data, normalizedField.Path)
 
 		if !exists {
-			if field.Required {
-				errors = append(errors, &ValidationError{
-					Field:   field.Path,
-					Message: "field is required but missing",
-					Err:     ErrFieldRequired,
-				})
-			}
-			continue
+			value = nil
 		}
 
-		for _, rule := range field.Rules {
-			if err := validateRule(field.Path, value, rule); err != nil {
+		for _, rule := range normalizedField.Rules {
+			if err := validateRule(normalizedField.Path, value, rule); err != nil {
 				errors = append(errors, err)
 			}
 		}
@@ -41,6 +35,34 @@ func ValidateConfig(data map[string]interface{}, schema *Schema) error {
 	}
 
 	return nil
+}
+
+func normalizeFieldSchema(field *FieldSchema) *FieldSchema {
+	hasRequiredRule := false
+	for _, r := range field.Rules {
+		if r.Type == RuleRequired {
+			hasRequiredRule = true
+			break
+		}
+	}
+
+	if !field.Required && hasRequiredRule {
+		return field
+	}
+
+	rulesCopy := make([]*ValidationRule, 0, len(field.Rules)+1)
+	if field.Required && !hasRequiredRule {
+		rulesCopy = append(rulesCopy, &ValidationRule{Type: RuleRequired})
+	}
+	rulesCopy = append(rulesCopy, field.Rules...)
+
+	return &FieldSchema{
+		Path:         field.Path,
+		Type:         field.Type,
+		Required:     field.Required,
+		DefaultValue: field.DefaultValue,
+		Rules:        rulesCopy,
+	}
 }
 
 func validateRule(fieldPath string, value interface{}, rule *ValidationRule) *ValidationError {
