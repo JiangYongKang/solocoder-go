@@ -557,20 +557,26 @@ func TestCustomProbability(t *testing.T) {
 	const fixedSeed = 42
 
 	t.Run("fixed seed makes level comparison deterministic", func(t *testing.T) {
-		slHigh, err := New[int, string](&Config{MaxLevel: 32, P: 0.9})
+		slHigh, err := New[int, string](&Config{
+			MaxLevel:     32,
+			P:            0.9,
+			RandomSource: rand.New(rand.NewSource(fixedSeed)),
+		})
 		if err != nil {
 			t.Fatalf("New(high) error = %v", err)
 		}
-		slHigh.random = rand.New(rand.NewSource(fixedSeed))
 		for i := 0; i < n; i++ {
 			slHigh.Insert(i, "val")
 		}
 
-		slLow, err := New[int, string](&Config{MaxLevel: 32, P: 0.01})
+		slLow, err := New[int, string](&Config{
+			MaxLevel:     32,
+			P:            0.01,
+			RandomSource: rand.New(rand.NewSource(fixedSeed)),
+		})
 		if err != nil {
 			t.Fatalf("New(low) error = %v", err)
 		}
-		slLow.random = rand.New(rand.NewSource(fixedSeed))
 		for i := 0; i < n; i++ {
 			slLow.Insert(i, "val")
 		}
@@ -591,32 +597,70 @@ func TestCustomProbability(t *testing.T) {
 		}
 	})
 
-	t.Run("randomLevel distribution matches P", func(t *testing.T) {
-		sl, _ := New[int, string](&Config{MaxLevel: 32, P: 0.5})
-		sl.random = rand.New(rand.NewSource(fixedSeed))
-
-		const samples = 10000
-		levelCounts := make(map[int]int)
-		for i := 0; i < samples; i++ {
-			lvl := sl.randomLevel()
-			levelCounts[lvl]++
+	t.Run("randomLevel distribution strictly matches P", func(t *testing.T) {
+		type expectedCase struct {
+			p              float64
+			targetAtLeast2 float64
+			targetAtLeast3 float64
+			targetAtLeast4 float64
+			tolerance      float64
+		}
+		cases := []expectedCase{
+			{p: 0.5, targetAtLeast2: 0.50, targetAtLeast3: 0.250, targetAtLeast4: 0.1250, tolerance: 0.015},
+			{p: 0.25, targetAtLeast2: 0.25, targetAtLeast3: 0.0625, targetAtLeast4: 0.0156, tolerance: 0.012},
 		}
 
-		level1Count := levelCounts[1]
-		if level1Count == 0 {
-			t.Fatal("No level-1 nodes produced")
-		}
-		proportionAtLeast2 := float64(samples-level1Count) / float64(samples)
-		if proportionAtLeast2 < 0.3 || proportionAtLeast2 > 0.7 {
-			t.Errorf("Proportion of nodes with level >= 2 = %.3f, expected near 0.5 for P=0.5",
-				proportionAtLeast2)
+		const samples = 50000
+		for _, c := range cases {
+			sl, _ := New[int, string](&Config{
+				MaxLevel:     32,
+				P:            c.p,
+				RandomSource: rand.New(rand.NewSource(fixedSeed)),
+			})
+
+			atLeast2, atLeast3, atLeast4 := 0, 0, 0
+			for i := 0; i < samples; i++ {
+				lvl := sl.randomLevel()
+				if lvl >= 2 {
+					atLeast2++
+				}
+				if lvl >= 3 {
+					atLeast3++
+				}
+				if lvl >= 4 {
+					atLeast4++
+				}
+			}
+
+			prop2 := float64(atLeast2) / samples
+			prop3 := float64(atLeast3) / samples
+			prop4 := float64(atLeast4) / samples
+
+			if absFloat(prop2-c.targetAtLeast2) > c.tolerance {
+				t.Errorf("P=%.2f: level>=2 proportion = %.4f, want %.4f (±%.4f)",
+					c.p, prop2, c.targetAtLeast2, c.tolerance)
+			}
+			if absFloat(prop3-c.targetAtLeast3) > c.tolerance {
+				t.Errorf("P=%.2f: level>=3 proportion = %.4f, want %.4f (±%.4f)",
+					c.p, prop3, c.targetAtLeast3, c.tolerance)
+			}
+			if absFloat(prop4-c.targetAtLeast4) > c.tolerance {
+				t.Errorf("P=%.2f: level>=4 proportion = %.4f, want %.4f (±%.4f)",
+					c.p, prop4, c.targetAtLeast4, c.tolerance)
+			}
 		}
 	})
 
 	t.Run("data integrity with various P values", func(t *testing.T) {
 		for _, p := range []float64{0.01, 0.25, 0.5, 0.9} {
-			sl, _ := New[int, string](&Config{MaxLevel: 32, P: p})
-			sl.random = rand.New(rand.NewSource(fixedSeed))
+			sl, err := New[int, string](&Config{
+				MaxLevel:     32,
+				P:            p,
+				RandomSource: rand.New(rand.NewSource(fixedSeed)),
+			})
+			if err != nil {
+				t.Fatalf("New(P=%.2f) error = %v", p, err)
+			}
 			for i := 0; i < n; i++ {
 				sl.Insert(i, "val")
 			}
@@ -634,6 +678,46 @@ func TestCustomProbability(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("SetRandomSeed is equivalent to RandomSource in Config", func(t *testing.T) {
+		slA, _ := New[int, int](&Config{MaxLevel: 32, P: 0.5})
+		slA.SetRandomSeed(fixedSeed)
+		for i := 0; i < 200; i++ {
+			slA.Insert(i, i)
+		}
+
+		slB, _ := New[int, int](&Config{
+			MaxLevel:     32,
+			P:            0.5,
+			RandomSource: rand.New(rand.NewSource(fixedSeed)),
+		})
+		for i := 0; i < 200; i++ {
+			slB.Insert(i, i)
+		}
+
+		if slA.Level() != slB.Level() {
+			t.Errorf("SetRandomSeed vs RandomSource: levels differ: %d vs %d",
+				slA.Level(), slB.Level())
+		}
+		allA := slA.All()
+		allB := slB.All()
+		if len(allA) != len(allB) {
+			t.Fatalf("SetRandomSeed vs RandomSource: lengths differ: %d vs %d", len(allA), len(allB))
+		}
+		for i := range allA {
+			if allA[i].Key != allB[i].Key || allA[i].Value != allB[i].Value {
+				t.Errorf("SetRandomSeed vs RandomSource: element %d differs: %v vs %v",
+					i, allA[i], allB[i])
+			}
+		}
+	})
+}
+
+func absFloat(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 func TestLargeInsert(t *testing.T) {

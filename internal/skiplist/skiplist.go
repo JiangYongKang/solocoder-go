@@ -14,8 +14,9 @@ const (
 )
 
 type Config struct {
-	MaxLevel int
-	P        float64
+	MaxLevel     int
+	P            float64
+	RandomSource *rand.Rand
 }
 
 func DefaultConfig() *Config {
@@ -110,6 +111,11 @@ func New[K cmp.Ordered, V any](configs ...*Config) (*SkipList[K, V], error) {
 		forward: make([]*node[K, V], cfg.MaxLevel),
 	}
 
+	rng := cfg.RandomSource
+	if rng == nil {
+		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+
 	return &SkipList[K, V]{
 		header:   header,
 		tail:     nil,
@@ -117,8 +123,14 @@ func New[K cmp.Ordered, V any](configs ...*Config) (*SkipList[K, V], error) {
 		length:   0,
 		maxLevel: cfg.MaxLevel,
 		p:        cfg.P,
-		random:   rand.New(rand.NewSource(time.Now().UnixNano())),
+		random:   rng,
 	}, nil
+}
+
+func (sl *SkipList[K, V]) SetRandomSeed(seed int64) {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	sl.random = rand.New(rand.NewSource(seed))
 }
 
 func (sl *SkipList[K, V]) randomLevel() int {

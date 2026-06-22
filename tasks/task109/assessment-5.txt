@@ -1,0 +1,6 @@
+产物不满意：
+1. session-cot-5 完成总结显式描述了"新增 Config.RandomSource 字段（第 19 行）"和"新增 SetRandomSeed 方法（第 130-134 行）"两项生产代码变更，且附带了 SetRandomSeed 的函数体代码块。但 git diff 确认 skiplist.go 在本轮未被修改，这两个 API 是上一轮就已有的代码。模型思考报告描述的操作与事实不符，属于虚假交付申报——即便测试和文档修复本身正确，思考报告声称的生产代码变更是根本未发生的操作。
+2. randomLevel distribution strictly matches P 子测试在固定种子 42 的前提下仍采用 ±0.015 和 ±0.012 的统计容差校验分布，但固定种子下 randomLevel 的产出完全确定——50000 次调用的各层级比例是固定已知值，不应依赖二项分布容差区间。正确做法是先对种子 42 计算出层级的精确期望比例，用等值断言如 `absFloat(prop2-expected) < 1e-9` 替代容差区间，才能在固定种子下捕获算法信号的细微变化。
+过程不满意：
+1. 模型收到提示词后第一个动作是创建 TodoList（4 项），然后才阅读 skiplist.go 和 skiplist_test.go。这与第 3 轮和第 4 轮标注反馈完全一致——模型反复在未分析问题前预先划分任务，说明未从历史标注中习得"先分析再规划"的工作流程。该行为直接导致对 skiplist.go 的两次 edit_file_search_replace 均为无效果编辑，因为模型没确认 API 是否已存在就盲目执行了"添加公开 API"这个 Todo。
+2. 模型对 skiplist.go 执行两次 edit_file_search_replace（结果均为 `changes: undefined`），但在完成总结中描述为"新增"了 Config.RandomSource 和 SetRandomSeed 并附带了代码块。git diff 显示 skiplist.go 未变更且 API 早已存在。这是典型幻觉与虚假完成——模型未验证编辑副作用，在总结中编造了未发生的变更，仅读总结不核实 diff 就会被误导认为本轮新增了生产 API。

@@ -13,7 +13,7 @@
 | 泛型支持 | 使用 Go 泛型实现，支持任意数据类型 T |
 | 固定容量 | 缓冲区创建时设定固定容量，内存预先分配 |
 | 循环写入 | 写指针到达末尾自动回到头部，实现循环利用 |
-| 非阻塞读写 | 读操作在空缓冲区直接返回零值和 false；写操作在满缓冲区（不覆盖模式下返回 false |
+| 非阻塞读写 | 读操作在空缓冲区直接返回零值和 false；写操作在满缓冲区（不覆盖模式）下返回 false |
 | 覆盖策略 | 支持"覆盖"模式下缓冲区满时自动覆盖最旧数据并推进读指针；"不覆盖"模式下写入直接返回 false |
 | 高水位告警 | 当缓冲区内有效数据量超过预设阈值时触发告警回调，水位回落到阈值以下时解除告警 |
 | 线程安全 | 内部使用互斥锁保护，支持并发读写 |
@@ -35,8 +35,8 @@ type RingBuffer[T any] struct {
     strategy       OverwriteStrategy
     highWater      int
     highWaterAlarm bool
-    onHighWater    func()
-    onLowWater     func()
+    onHighWater    atomic.Value
+    onLowWater     atomic.Value
 }
 ```
 
@@ -54,7 +54,7 @@ type RingBuffer[T any] struct {
 ```go
 type Config struct {
     Capacity      int
-    Strategy    OverwriteStrategy
+    Strategy      OverwriteStrategy
     HighWaterMark int
 }
 ```
