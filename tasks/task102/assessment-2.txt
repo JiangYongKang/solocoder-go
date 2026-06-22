@@ -1,6 +1,6 @@
 产物不满意：
-1. hotconfig.go 的 loadLocked 方法在修复 TOCTOU 时，对 post-Stat 返回的错误直接包装为 `failed to re-stat config file` 而不使用 `ErrFileNotFound` 哨兵错误，而修复前的原始代码对文件不存在的判断使用了 `errors.Is(err, ErrFileNotFound)`。如果在 ReadFile 成功后的极短窗口内配置文件被删除，post-Stat 会返回文件不存在错误，此时调用方的 `errors.Is` 将无法匹配到 `ErrFileNotFound` 而得到一条通用错误信息。根因是只考虑了正常路径下的重试一致性而没有覆盖文件突然消失的边界情况，应在 post-Stat 失败时仍然用 `os.IsNotExist` 判断并返回带 `ErrFileNotFound` 的错误。
-2. validator.go 的 normalizeFieldSchema 函数在处理 `Required=false` 且未配置 `RuleRequired` 的字段时，虽然语义上不需要做任何规范化，但仍然无条件分配了一个新的 FieldSchema 副本返回，而 `Required=false` 且没有 `RuleRequired` 是最常见的字段声明模式，每次都创建临时对象增加了校验路径上的内存分配。这不是逻辑错误而是不必要的性能开销，原因是在设计分支时只关注了需要做规范化的三种情况而忽略了 "无需任何处理直接返回原始指针" 的最常见分支，应在该分支也做早期返回。
+1. hotconfig.go 的 loadLocked 修复 TOCTOU 时，post-Stat 返回的错误直接包装成通用消息没用 ErrFileNotFound 哨兵错误。如果 ReadFile 后文件被删，post-Stat 返回文件不存在时调用方 errors.Is 匹配不到 ErrFileNotFound。根因是只考虑了正常路径没覆盖文件突然消失的边界，应在 post-Stat 失败时用 os.IsNotExist 判断返回带 ErrFileNotFound 的错误。
+2. validator.go 的 normalizeFieldSchema 在处理 Required=false 且没配置 RuleRequired 的字段时，虽然不需要做规范化，但还是每次都分配了一个新 FieldSchema 副本返回。这种最常见字段声明模式也每次创建临时对象，增加了校验路径的内存分配开销。这不是逻辑错误但没必要浪费性能，应该在该分支直接返回原指针，实现零分配。
 
 过程不满意：
 1. 模型在收到提示词后第一个操作就是调用 todo_write 创建了 5 项子任务计划，之后才开始用 view_files 阅读 hotconfig.go 和 validator.go 的源代码。这种先规划再分析的模式导致 todo 的粒度是先验假设而非基于实际代码结构得出的，不过由于本轮三个修复点对应关系明确，粒度过粗的问题未造成实际的返工。正确做法是先阅读需求文档和现有代码，理解问题范围和模块边界后再制定执行计划。

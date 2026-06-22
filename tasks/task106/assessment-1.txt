@@ -1,8 +1,8 @@
 产物不满意：
-1. Release 方法缺少对 nil 对象的显式校验。模型最初实现了 ErrNilObject 并在 Release 开头检查 nil，但在遇到 `any(nil *testObj)` 不等于 nil 的 Go 泛型陷阱后，直接删除了 ErrNilObject 定义和全部 nil 检查代码，改为依赖 map 查找失败返回 ErrNotBorrowed 的副作用来间接防御。这是典型的生产代码向测试妥协：因为写不出泛型下的 nil 判断就选择删除功能逻辑。后果是当调用方误传 nil 对象时得到的是 `ErrNotBorrowed` 而非更明确的 `ErrNilObject`，错误语义不准确，排查困难。正确做法是保留 ErrNilObject，通过 reflect 包的 Value.IsNil 在指针类型参数下做显式检测。
+1. Release 缺少对 nil 的显式校验。模型最初实现了 ErrNilObject 并在 Release 检查 nil，遇到 any(nil *testObj) != nil 的泛型陷阱后，直接删除 ErrNilObject 和全部 nil 检查，改为依赖 map 查找失败返回 ErrNotBorrowed 间接防御。生产代码向测试妥协——泛型下 nil 判不出就删功能。正确做法是保留 ErrNilObject，用 reflect.Value.IsNil 在指针参数下检测。
 2. getIdle 方法内部存在一个无意义的 for 循环。该函数逻辑只有两条路径：idleList 为空则直接 return，不为空则取出链表头部元素并 return，for 循环永远只执行一次迭代。这个死代码结构暴露了模型编写时未仔细审视控制流，可能曾计划在循环内做惰性过滤但最终没实现，留下了无用外壳。虽然不影响功能，但增加了阅读时的认知负担。应将 for 循环删除，改为 `if e := p.idleList.Front(); e != nil { ... }` 的简单条件判断。
 3. 文档第 6 节声称空闲回收"从链表尾部开始移除，最久未使用的优先被回收"，但 reclaimIdle 实际实现是持锁遍历整个空闲链表，通过 `now.Sub(ic.lastUsed) > MaxIdleTime` 做全量时间阈值判断，既不是从尾部开始也不是基于链表位置的 LRU 淘汰。文档描述与代码行为矛盾，且使用的"超量回收"术语描述超时回收场景存在概念歧义，会误导读者以为存在容量驱动的淘汰逻辑。应修正为"回收器遍历空闲链表，将超过 MaxIdleTime 的对象移除并调用销毁回调"。
 过程不满意：
 1. 模型刚收到提示词后尚未分析项目结构和代码规范，就直接用 todo_write 创建了 5 项子任务计划，之后才开始查看项目目录、阅读 connpool 和 bulkhead 代码。这是先规划后分析的反模式，规划的粒度划分与实际需求边界的匹配全凭运气，虽然本次功能收敛在单包下未导致重规划，但方法本身存在隐患。正确做法是先通读需求文档，了解 go.mod 和已有模块的代码风格，理清接口边界后再制定分步计划。
-2. 在 TestRelease_NilObject 测试失败后，模型面对 `any(nil_pointer) != nil` 的 Go 泛型特性，没有尝试用 `reflect.ValueOf` 或类型断言来维持显式 nil 校验语义，而是选择直接删除 ErrNilObject 并移除 Release 的 nil 检查，同时修改测试期望来让测试通过。从思考轨迹看，模型将问题归因为"已知的 Go 陷阱"后就放弃攻克，转而砍掉受阻功能以求全。这是试错式调试的变种：遇阻后不是分析根因找替代方案，而是回退需求范围。正确做法是研究 reflect 包实现泛型下的 nil 检测，保留防御代码。
+2. TestRelease_NilObject 测试失败后，模型面对 any(nil_pointer) != nil 的 Go 泛型特性，没尝试用 reflect 维持显式 nil 校验，而是选择删除 ErrNilObject 并移除 nil 检查，同时改测试期望来让测试过。从思考轨迹看，模型把问题归为"已知 Go 陷阱"就放弃攻克，转而砍功能求全。这是试错式调试的变种：遇阻后不回退需求范围找替代方案而是直接放弃。正确做法是研究 reflect 实现泛型下 nil 检测保留防御代码。
 3. 修复两个失败测试时，模型没有先仔细阅读每个失败用例的输出和调用栈来定位根因，而是直接 read 了刚写好的 pool.go（属于已知上下文），然后连续做了三处 search_replace——分别修改错误定义、Release 方法和测试期望，最后一次性跑了全量测试。这种批量修改再统一验证的方式在复杂场景下容易引入新问题且难以追溯到具体改动。正确做法是每次只改一处失败点，对应跑一次测试确认后再改下一个，保证每次修改都有测试反馈做兜底。

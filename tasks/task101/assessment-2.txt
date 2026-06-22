@@ -1,5 +1,5 @@
 产物不满意：
-1. Start() 方法签名从无返回值改为返回 error 后，在 already running 状态与 normal start 状态均返回 nil，调用方无法区分"刚启动成功"和"早已在运行"两种语义。当调用方需要知道是否触发了实际启动动作时（例如做初始化操作），只能依赖 IsRunning 做额外查询，增加了使用时的心智负担。根因是模型只考虑了错误返回分支，未区分幂等成功的 nil 与新启动成功的 nil 的语义差异。正确做法是为 already running 分支也返回一个 sentinel error 如 ErrAlreadyStarted，让调用方能显式判断状态。
+1. Start() 方法签名从无返回值改为返回 error 后，already running 和正常启动两个状态都返回 nil，调用方分不出到底是刚启动成功还是早就在运行了。要做初始化操作的话只能额外调 IsRunning 再查一次，增加了使用负担。根因是只考虑了错误返回分支，没区分幂等成功的 nil 与新启动成功的 nil 的语义差异。正确做法是给 already running 也返回一个 sentinel error 如 ErrAlreadyStarted，让调用方能显式判断状态。
 2. 模型在 filewatcher.go 的 Start() 方法中新增了 stopped 状态下返回 ErrWatcherStopped 的逻辑，但提示词第 1 条只要求修复 watchedDir 为空时静默返回的问题，并未要求新增 stopped 状态的显式错误返回值。虽然这个改动本身是合理的防御性编程，但它属于超出提示词范围的需求扩展，可能在不经意间改变了已有调用方的兼容预期——原本 Stop 后再 Start 是静默忽略，现在变成显式报错。
 过程不满意：
 1. 模型在刚收到提示词后未经分析就直接创建了 6 项 TodoList（会话记录第 1 行），随后才开始用 view_files 读取 filewatcher.go 和 filewatcher_test.go 的代码。对照标注规范中"不能在刚收到任务时就直接创建 TodoList"的要求，模型应先在提示词中梳理三个修复点的语义和影响范围，再根据代码结构规划任务粒度，而不是用默认的固定条目数仓促规划。

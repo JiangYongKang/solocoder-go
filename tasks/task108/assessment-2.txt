@@ -1,7 +1,7 @@
 产物不满意：
 1. rwlocker.go 中 waitForWriterWaiting 方法始终返回 nil 却声明了 error 返回类型，函数签名暗示有可能失败但实际实现中不存在任何错误路径，在 RLock 无超时路径中 if err := rw.waitForWriterWaiting() 的错误处理分支变成不可达的死代码。原因是方法设计时未考虑实际语义就拷贝了带 error 签名的模板，应将返回值改为 void 或在方法内部保留可能的错误返回路径。
 2. rwlocker_test.go 中新增的五个测试用例均未对 goroutine 泄漏修复做显式验证，TestReadLockTimeout 和 TestWriteLockTimeout 等已有测试只覆盖了超时行为但没有通过 runtime.NumGoroutine 快照对比来确认锁获取成功或超时后后台 goroutine 和清理 goroutine 均正常退出。由于 goroutine 泄漏不会导致测试直接失败，当前测试套件无法有效防止修复退化，应新增专门的泄漏检测测试用例。
-3. docs/rwlocker.md 第 2.2 节新增的"超时实现机制"小节描述了 done channel + time.NewTimer + select 模式，但未说明 Lock 超时路径的清理 goroutine 与 RLock 超时路径清理的不同之处：Lock 只做 mu.Unlock 而 RLock 还需回退 readerCount 并广播 upgradeCond。文档将两者混在一起用"避免 goroutine 泄漏"一笔带过，缺少分别说明使读者无法理解两种锁在超时清理逻辑上的差异。
+3. docs/rwlocker.md 第 2.2 节新增的超时机制小节描述了 done channel + time.NewTimer + select 模式，但没区分 Lock 和 RLock 超时清理的不同：Lock 只做 mu.Unlock 而 RLock 还需回退 readerCount 并广播 upgradeCond。文档把两者混在一起用"避免 goroutine 泄漏"带过，读者无法理解两种锁在清理逻辑上的差异。
 
 过程不满意：
 1. 模型在 session-cot-2.md 开头第一步直接执行 view_files 读取源码后，第二步未经任何分析就直接用 todo_write 创建了 6 项任务计划，此时还未对三个 BUG 的关联关系和修改范围做系统性评估。正确流程应先分析三个问题的代码位置、相互依赖关系和影响范围，再制定按依赖顺序执行的修复计划，而非在读完文件后立即划分任务粒度。

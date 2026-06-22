@@ -1,5 +1,5 @@
 产物不满意：
-1. ringbuffer_test.go 的 TestReadClearsSlotReferenceType 和 TestOverwriteClearsSlotReferenceType 声称通过 finalizer 验证内存泄漏修复，但 finalizer 回调 `func(b *bigStruct) {}` 不产生任何可观测副作用，测试全程没有断言 finalizer 是否被实际调用。两个用例最终只验证了剩余元素可正常读取和长度正确，这些断言即使删掉 Read 里的 `rb.buf[rb.readPos] = zero` 清零行也不会失败，导致清零修复失去回归覆盖，内存泄漏相关的代码变更保护完全依赖人工审查而非自动化测试。
+1. ringbuffer_test.go 的 TestReadClearsSlotReferenceType 和 TestOverwriteClearsSlotReferenceType 声称用 finalizer 验证内存泄漏修复，但 finalizer 回调不产生任何可观测副作用，测试没断言 finalizer 是否被实际调用。两个用例只验证了剩余元素可读取和长度正确，即使删掉读出的清零行也不会失败，导致清零修复失去回归覆盖。内存泄漏相关代码变更保护完全依赖人工审查而非自动化测试。
 2. ringbuffer.go 的 Write 和 Read 方法用显式 Unlock 替代了旧版 defer Unlock，虽然当前在锁和显式 Unlock 之间只有无 panic 风险的简单操作，但移除了 defer 等于放弃了 Go 语言惯用的"锁释放一定执行"的防御性保护。一旦后续有人在锁内错误返回路径中加入可能 panic 的代码，锁就会永久泄漏，而旧实现通过 defer 天然覆盖所有返回路径和 panic 场景。
 3. ringbuffer.go 的 checkWaterMarkLocked 在锁内返回待执行的回调引用，而 OnHighWater 和 OnLowWater 的赋值同样在锁内操作。goroutine A 在 Write 触发高水位并释放锁后、执行回调前的间隙里，goroutine B 可通过 OnHighWater 将回调替换为新函数，导致 A 执行的是 B 设置前的旧回调，在回调频繁变更的并发场景下告警动作与当前配置不一致。
 
