@@ -533,3 +533,61 @@ lock := rwlocker.New(&rwlocker.Config{
 - 启用死锁检测会在每次加锁/解锁时增加 goroutine ID 获取和注册表查询的开销，对性能敏感的场景可通过 `EnableDeadlockDetect: false` 关闭
 - 启用统计功能会在每次加锁/解锁时增加原子计数操作，开销较小
 - goroutine ID 通过解析 `runtime.Stack()` 输出获取，该操作有一定开销，高并发场景下如需极致性能可考虑关闭死锁检测
+
+## 10. 测试可靠性设计
+
+### 10.1 避免全局 goroutine 计数的不可靠性
+
+**问题**：使用 `runtime.NumGoroutine()` 前后差值判断泄漏存在固有缺陷：
+- Go 运行时会启动/退出后台 goroutine（GC worker、finalizer 等），差值受全局运行时状态影响
+- 容差阈值（如 `before+5`）既可能漏报实际泄漏，也可能误报运行时行为
+- 无法精确归因于「单个清理 goroutine 是否退出」
+
+**修复策略**：用「锁状态正确性 + 统计一致性 + 最终锁所有权验证」三层验证替代全局计数：
+
+| 验证层 | 验证内容 | 证明的不变量 |
+|--------|----------|--------------|
+| 单次迭代内 | RLock 后 `ReaderCount()==1`，RUnlock 后 `==0` | 每一次操作都正确维护内部状态 |
+| 所有迭代后 | `ReadRequests == ReadSuccess == iterations`、`TimeoutCount==0`、`DeadlockDetected==0` | 统计计数器与实际操作一一对应，无幽灵请求 |
+| 最终屏障锁 | N 轮 RLock/RUnlock 后 `Lock()` 可立即成功 | 没有泄漏的读者仍然持有读锁（否则写锁会被阻塞） |
+| 最终屏障锁 | N 轮 Lock/Unlock 后并发 RLock 可全部成功 | 没有泄漏的写者仍然持有写锁 |
+
+### 10.2 确定性屏障替代固定 time.Sleep
+
+**问题**：超时清理路径测试中的 `time.Sleep(80ms)` / `time.Sleep(100ms)` 缺乏确定性：
+- 高负载系统中清理 goroutine 调度延迟可能超过固定等待，导致断言失败（误报）
+- 轻负载系统中清理早已完成却仍需等待余量时长，浪费测试时间
+- 无法提供「cleanup 已完成」的绝对保证
+
+**修复策略**：利用锁本身的互斥语义作为「cleanup 完成」的确定性信号。具体模式：
+
+**RLock 超时场景的屏障模式**（cleanup goroutine 仍持有 `mu.RLock`）：
+```
+调用方 rw.Unlock() 释放写锁
+    ↓
+cleanup goroutine 被调度 → readerCount-- → Broadcast() → mu.RUnlock()
+    ↓ （如何确认上一步已执行完毕？）
+调用方执行 rw.Lock()：
+  → 写锁需要所有现存读者释放
+  → 若 cleanup goroutine 的 mu.RUnlock() 尚未执行，Lock() 会阻塞
+  → Lock() 返回的那一瞬间，100% 确定 cleanup goroutine 已完成所有清理动作
+    ↓
+此时读取 readerCount 等状态，断言完全可靠
+```
+
+**Lock 超时场景的屏障模式**（cleanup goroutine 仍持有 `mu.Lock`）：
+```
+调用方 rw.RUnlock() 释放读锁
+    ↓
+cleanup goroutine 被调度 → mu.Unlock()
+    ↓ （如何确认上一步已执行完毕？）
+调用方执行 rw.RLock()：
+  → 读锁需要写锁已释放
+  → 若 cleanup goroutine 的 mu.Unlock() 尚未执行，RLock() 会阻塞
+  → RLock() 返回的那一瞬间，100% 确定 cleanup goroutine 已完成
+```
+
+**屏障选择的互补原则**：屏障操作的锁类型必须与 cleanup goroutine 持有的锁类型**互斥**，才能形成强制同步。即：
+- RLock 超时（cleanup 持读锁）→ 用 **Lock()** 做屏障（互斥）
+- Lock 超时（cleanup 持写锁）→ 用 **RLock()** 做屏障（互斥）
+- 同时 Config 中屏障锁类型的超时配置必须为 0（无限等待），确保屏障本身不会因超时而提前返回失去确定性

@@ -2,7 +2,6 @@ package rwlocker
 
 import (
 	"errors"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1214,7 +1213,10 @@ func TestRLockTimeoutCleanupGoroutineNoLeak(t *testing.T) {
 
 	rw.Unlock()
 
-	time.Sleep(80 * time.Millisecond)
+	if err := rw.Lock(); err != nil {
+		t.Fatalf("Lock should succeed deterministically once cleanup goroutine releases RLock: %v", err)
+	}
+	rw.Unlock()
 
 	if rw.ReaderCount() != 0 {
 		t.Errorf("readerCount should be 0 after RLock timeout cleanup, got %d", rw.ReaderCount())
@@ -1251,7 +1253,10 @@ func TestLockTimeoutCleanupGoroutineNoLeak(t *testing.T) {
 
 	rw.RUnlock()
 
-	time.Sleep(80 * time.Millisecond)
+	if err := rw.RLock(); err != nil {
+		t.Fatalf("RLock should succeed deterministically once cleanup goroutine releases write lock: %v", err)
+	}
+	rw.RUnlock()
 
 	if rw.IsWriterActive() {
 		t.Error("writerActive should be false after Lock timeout cleanup and reader released")
@@ -1270,47 +1275,100 @@ func TestLockTimeoutCleanupGoroutineNoLeak(t *testing.T) {
 	}
 }
 
-func TestRLockSuccessPathNoGoroutineLeak(t *testing.T) {
+func TestRLockSuccessPathStateIntegrity(t *testing.T) {
 	rw := New(&Config{
 		ReadTimeout: 500 * time.Millisecond,
+		EnableStats: true,
 	})
 
-	before := runtime.NumGoroutine()
-
-	for i := 0; i < 20; i++ {
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
 		if err := rw.RLock(); err != nil {
 			t.Fatalf("RLock %d failed: %v", i, err)
 		}
-		rw.RUnlock()
+		if rw.ReaderCount() != 1 {
+			t.Errorf("iteration %d: expected readerCount=1, got %d", i, rw.ReaderCount())
+		}
+		if err := rw.RUnlock(); err != nil {
+			t.Fatalf("RUnlock %d failed: %v", i, err)
+		}
+		if rw.ReaderCount() != 0 {
+			t.Errorf("iteration %d: expected readerCount=0 after RUnlock, got %d", i, rw.ReaderCount())
+		}
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	if err := rw.Lock(); err != nil {
+		t.Fatalf("Lock should succeed after all RLock/RUnlock cycles (proves no leaked reader holds lock): %v", err)
+	}
+	if rw.IsWriterActive() != true {
+		t.Error("writerActive should be true")
+	}
+	rw.Unlock()
 
-	after := runtime.NumGoroutine()
-	if after > before+5 {
-		t.Errorf("potential goroutine leak: before=%d, after=%d", before, after)
+	stats := rw.GetStats()
+	if stats.ReadRequests != iterations {
+		t.Errorf("expected ReadRequests=%d, got %d", iterations, stats.ReadRequests)
+	}
+	if stats.ReadSuccess != iterations {
+		t.Errorf("expected ReadSuccess=%d, got %d", iterations, stats.ReadSuccess)
+	}
+	if stats.TimeoutCount != 0 {
+		t.Errorf("expected TimeoutCount=0, got %d", stats.TimeoutCount)
+	}
+	if stats.DeadlockDetected != 0 {
+		t.Errorf("expected DeadlockDetected=0, got %d", stats.DeadlockDetected)
 	}
 }
 
-func TestLockSuccessPathNoGoroutineLeak(t *testing.T) {
+func TestLockSuccessPathStateIntegrity(t *testing.T) {
 	rw := New(&Config{
 		WriteTimeout: 500 * time.Millisecond,
+		EnableStats:  true,
 	})
 
-	before := runtime.NumGoroutine()
-
-	for i := 0; i < 20; i++ {
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
 		if err := rw.Lock(); err != nil {
 			t.Fatalf("Lock %d failed: %v", i, err)
 		}
-		rw.Unlock()
+		if !rw.IsWriterActive() {
+			t.Errorf("iteration %d: expected writerActive=true", i)
+		}
+		if err := rw.Unlock(); err != nil {
+			t.Fatalf("Unlock %d failed: %v", i, err)
+		}
+		if rw.IsWriterActive() {
+			t.Errorf("iteration %d: expected writerActive=false after Unlock", i)
+		}
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	var wg sync.WaitGroup
+	const readers = 5
+	wg.Add(readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			defer wg.Done()
+			if err := rw.RLock(); err != nil {
+				t.Errorf("RLock failed (proves no leaked writer holds lock): %v", err)
+				return
+			}
+			rw.RUnlock()
+		}()
+	}
+	wg.Wait()
 
-	after := runtime.NumGoroutine()
-	if after > before+5 {
-		t.Errorf("potential goroutine leak: before=%d, after=%d", before, after)
+	stats := rw.GetStats()
+	if stats.WriteRequests != iterations {
+		t.Errorf("expected WriteRequests=%d, got %d", iterations, stats.WriteRequests)
+	}
+	if stats.WriteSuccess != iterations {
+		t.Errorf("expected WriteSuccess=%d, got %d", iterations, stats.WriteSuccess)
+	}
+	if stats.TimeoutCount != 0 {
+		t.Errorf("expected TimeoutCount=0, got %d", stats.TimeoutCount)
+	}
+	if stats.DeadlockDetected != 0 {
+		t.Errorf("expected DeadlockDetected=0, got %d", stats.DeadlockDetected)
 	}
 }
 
@@ -1338,7 +1396,10 @@ func TestRLockTimeoutReaderCountCleanup(t *testing.T) {
 
 	<-writerReleased
 
-	time.Sleep(100 * time.Millisecond)
+	if err := rw.Lock(); err != nil {
+		t.Fatalf("Lock should succeed deterministically once cleanup goroutine releases RLock: %v", err)
+	}
+	rw.Unlock()
 
 	count := rw.ReaderCount()
 	if count != 0 {
@@ -1375,6 +1436,11 @@ func TestLockTimeoutSubsequentAcquire(t *testing.T) {
 	}
 
 	<-holderDone
+
+	if err := rw.RLock(); err != nil {
+		t.Fatalf("RLock should succeed deterministically once cleanup goroutine releases write lock: %v", err)
+	}
+	rw.RUnlock()
 
 	if err := rw.Lock(); err != nil {
 		t.Fatalf("Lock should succeed after holder released: %v", err)

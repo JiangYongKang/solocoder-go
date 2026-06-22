@@ -1,0 +1,4 @@
+你实现的 skiplist 模块存在以下问题需要修复：
+1. TestCustomProbability 将单次确定性比较改为多次试验取均值后，核心断言 avgHigh <= avgLow 仍然是基于真实随机行为的概率性比较，极端随机波动仍可能导致测试误报失败。
+2. 修复后运行 go test ./internal/skiplist/ -v，需要让所有测试通过。
+3. 在 docs/skiplist.md 中更新模块需求文档。

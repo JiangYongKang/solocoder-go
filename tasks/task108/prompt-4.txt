@@ -1,0 +1,5 @@
+你实现的 rwlocker 模块存在以下问题需要修复：
+1. goroutine 泄漏回归测试使用 runtime.NumGoroutine 全局计数差值判断泄漏，但运行时后台 goroutine 的启动和退出会影响差值，无法精确判定单个清理 goroutine 的退出行为。
+2. 超时清理路径的测试使用 time.Sleep 固定等待 cleanup goroutine 完成，不同负载下等待时长不够或浪费，无法提供 cleanup 已完成的确定性保证。
+3. 修复后运行 go test ./internal/rwlocker/ -v，需要让所有测试通过。
+4. 在 docs/rwlocker.md 中更新模块需求文档。

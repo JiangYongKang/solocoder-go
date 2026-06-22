@@ -376,7 +376,7 @@ func demoStringAndProb() {
 | **分页** | Limit 限制、Offset 偏移、Limit+Offset 组合、Offset>=总数、Limit=0（无限制） |
 | **边界** | 单元素操作、负整数范围、边界附近的查询、First/Last/Clear |
 | **类型支持** | int 键、string 键、float64 键 |
-| **概率配置** | 多次试验（5 次）取平均层数，比较 P=0.9 与 P=0.01 的均值差异以验证概率机制（避免单次随机波动导致的误报），每次试验检查 Len/Level 结构属性，单独验证数据遍历完整性 |
+| **概率配置** | 使用固定种子 RNG（同包访问 `random` 字段注入 `rand.New(rand.NewSource(42))`）使层数比较完全确定性，断言 P=0.9 层数 > P=0.01 层数；直接调用 `randomLevel()` 统计 10000 次采样中 level≥2 的比例，验证分布与 P 值一致；遍历 P∈{0.01,0.25,0.5,0.9} 下插入后的 All() 有序性 |
 | **压力** | 10000 条大数据量插入/查找/范围 |
 | **并发** | 多 goroutine 同时 Insert/Search，验证并发完成后元素总数、逐键查找正确性、All() 遍历有序性与值一致性 |
 | **基准测试** | Insert/Search/Delete 的 Benchmark |

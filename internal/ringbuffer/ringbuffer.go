@@ -3,6 +3,7 @@ package ringbuffer
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -17,6 +18,8 @@ const (
 	Overwrite
 )
 
+var noopCallback = func() {}
+
 type RingBuffer[T any] struct {
 	mu             sync.Mutex
 	buf            []T
@@ -27,8 +30,8 @@ type RingBuffer[T any] struct {
 	strategy       OverwriteStrategy
 	highWater      int
 	highWaterAlarm bool
-	onHighWater    func()
-	onLowWater     func()
+	onHighWater    atomic.Value
+	onLowWater     atomic.Value
 }
 
 type Config struct {
@@ -65,6 +68,8 @@ func NewRingBufferWithConfig[T any](cfg Config) (*RingBuffer[T], error) {
 		strategy:  cfg.Strategy,
 		highWater: cfg.HighWaterMark,
 	}
+	rb.onHighWater.Store(noopCallback)
+	rb.onLowWater.Store(noopCallback)
 
 	return rb, nil
 }
@@ -86,16 +91,7 @@ func (rb *RingBuffer[T]) SetHighWaterMark(mark int) error {
 		}
 
 		rb.highWater = mark
-
-		if rb.highWater > 0 {
-			if rb.count >= rb.highWater && !rb.highWaterAlarm {
-				rb.highWaterAlarm = true
-				needHigh = true
-			} else if rb.count < rb.highWater && rb.highWaterAlarm {
-				rb.highWaterAlarm = false
-				needLow = true
-			}
-		}
+		needHigh, needLow = rb.checkWaterMarkLocked(false)
 	}()
 
 	if err != nil {
@@ -108,15 +104,17 @@ func (rb *RingBuffer[T]) SetHighWaterMark(mark int) error {
 }
 
 func (rb *RingBuffer[T]) OnHighWater(fn func()) {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-	rb.onHighWater = fn
+	if fn == nil {
+		fn = noopCallback
+	}
+	rb.onHighWater.Store(fn)
 }
 
 func (rb *RingBuffer[T]) OnLowWater(fn func()) {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-	rb.onLowWater = fn
+	if fn == nil {
+		fn = noopCallback
+	}
+	rb.onLowWater.Store(fn)
 }
 
 func (rb *RingBuffer[T]) Write(value T) bool {
@@ -267,26 +265,10 @@ func (rb *RingBuffer[T]) checkWaterMarkLocked(overwrote bool) (needHigh bool, ne
 }
 
 func (rb *RingBuffer[T]) dispatchCallbacks(needHigh bool, needLow bool) {
-	var (
-		highCb func()
-		lowCb  func()
-	)
-
-	if needHigh || needLow {
-		rb.mu.Lock()
-		if needHigh {
-			highCb = rb.onHighWater
-		}
-		if needLow {
-			lowCb = rb.onLowWater
-		}
-		rb.mu.Unlock()
+	if needHigh {
+		rb.onHighWater.Load().(func())()
 	}
-
-	if highCb != nil {
-		highCb()
-	}
-	if lowCb != nil {
-		lowCb()
+	if needLow {
+		rb.onLowWater.Load().(func())()
 	}
 }

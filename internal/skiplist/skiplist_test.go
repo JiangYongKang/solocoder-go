@@ -1,6 +1,7 @@
 package skiplist
 
 import (
+	"math/rand"
 	"testing"
 )
 
@@ -552,67 +553,87 @@ func TestStringKeys(t *testing.T) {
 }
 
 func TestCustomProbability(t *testing.T) {
-	const trials = 5
 	const n = 1000
+	const fixedSeed = 42
 
-	sumHigh := 0
-	sumLow := 0
-
-	for i := 0; i < trials; i++ {
-		cfgHigh := &Config{MaxLevel: 32, P: 0.9}
-		slHigh, err := New[int, string](cfgHigh)
+	t.Run("fixed seed makes level comparison deterministic", func(t *testing.T) {
+		slHigh, err := New[int, string](&Config{MaxLevel: 32, P: 0.9})
 		if err != nil {
 			t.Fatalf("New(high) error = %v", err)
 		}
-		for j := 0; j < n; j++ {
-			slHigh.Insert(j, "val")
+		slHigh.random = rand.New(rand.NewSource(fixedSeed))
+		for i := 0; i < n; i++ {
+			slHigh.Insert(i, "val")
 		}
-		if slHigh.Len() != n {
-			t.Errorf("High prob trial %d: Len() = %d, want %d", i, slHigh.Len(), n)
+
+		slLow, err := New[int, string](&Config{MaxLevel: 32, P: 0.01})
+		if err != nil {
+			t.Fatalf("New(low) error = %v", err)
 		}
+		slLow.random = rand.New(rand.NewSource(fixedSeed))
+		for i := 0; i < n; i++ {
+			slLow.Insert(i, "val")
+		}
+
 		lvlHigh := slHigh.Level()
-		if lvlHigh <= 1 {
-			t.Errorf("High prob (0.9) trial %d: level = %d, expected > 1", i, lvlHigh)
-		}
-		sumHigh += lvlHigh
-
-		cfgLow := &Config{MaxLevel: 32, P: 0.01}
-		slLow, _ := New[int, string](cfgLow)
-		for j := 0; j < n; j++ {
-			slLow.Insert(j, "val")
-		}
-		if slLow.Len() != n {
-			t.Errorf("Low prob trial %d: Len() = %d, want %d", i, slLow.Len(), n)
-		}
 		lvlLow := slLow.Level()
+
+		if lvlHigh <= 1 {
+			t.Errorf("P=0.9 with fixed seed: level = %d, expected > 1", lvlHigh)
+		}
 		if lvlLow <= 1 {
-			t.Errorf("Low prob (0.01) trial %d: level = %d, expected > 1", i, lvlLow)
+			t.Errorf("P=0.01 with fixed seed: level = %d, expected > 1", lvlLow)
 		}
-		sumLow += lvlLow
-	}
-
-	avgHigh := sumHigh / trials
-	avgLow := sumLow / trials
-
-	if avgHigh <= avgLow {
-		t.Errorf("Average level with P=0.9 (%d over %d trials) should be > P=0.01 (%d); "+
-			"probability mechanism may not be working correctly", avgHigh, trials, avgLow)
-	}
-
-	cfgCheck := &Config{MaxLevel: 32, P: 0.5}
-	slCheck, _ := New[int, string](cfgCheck)
-	for i := 0; i < n; i++ {
-		slCheck.Insert(i, "val")
-	}
-	all := slCheck.All()
-	if len(all) != n {
-		t.Fatalf("Data integrity check: All() len = %d, want %d", len(all), n)
-	}
-	for i, p := range all {
-		if p.Key != i {
-			t.Errorf("Data integrity: All()[%d].Key = %d, want %d", i, p.Key, i)
+		if lvlHigh <= lvlLow {
+			t.Errorf("With fixed seed %d, P=0.9 level (%d) must be > P=0.01 level (%d); "+
+				"if this fails the P parameter is not being used in randomLevel",
+				fixedSeed, lvlHigh, lvlLow)
 		}
-	}
+	})
+
+	t.Run("randomLevel distribution matches P", func(t *testing.T) {
+		sl, _ := New[int, string](&Config{MaxLevel: 32, P: 0.5})
+		sl.random = rand.New(rand.NewSource(fixedSeed))
+
+		const samples = 10000
+		levelCounts := make(map[int]int)
+		for i := 0; i < samples; i++ {
+			lvl := sl.randomLevel()
+			levelCounts[lvl]++
+		}
+
+		level1Count := levelCounts[1]
+		if level1Count == 0 {
+			t.Fatal("No level-1 nodes produced")
+		}
+		proportionAtLeast2 := float64(samples-level1Count) / float64(samples)
+		if proportionAtLeast2 < 0.3 || proportionAtLeast2 > 0.7 {
+			t.Errorf("Proportion of nodes with level >= 2 = %.3f, expected near 0.5 for P=0.5",
+				proportionAtLeast2)
+		}
+	})
+
+	t.Run("data integrity with various P values", func(t *testing.T) {
+		for _, p := range []float64{0.01, 0.25, 0.5, 0.9} {
+			sl, _ := New[int, string](&Config{MaxLevel: 32, P: p})
+			sl.random = rand.New(rand.NewSource(fixedSeed))
+			for i := 0; i < n; i++ {
+				sl.Insert(i, "val")
+			}
+			if sl.Len() != n {
+				t.Errorf("P=%.2f: Len() = %d, want %d", p, sl.Len(), n)
+			}
+			all := sl.All()
+			if len(all) != n {
+				t.Errorf("P=%.2f: All() len = %d, want %d", p, len(all), n)
+			}
+			for i, pair := range all {
+				if pair.Key != i {
+					t.Errorf("P=%.2f: All()[%d].Key = %d, want %d", p, i, pair.Key, i)
+				}
+			}
+		}
+	})
 }
 
 func TestLargeInsert(t *testing.T) {

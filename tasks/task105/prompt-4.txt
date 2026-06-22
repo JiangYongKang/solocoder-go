@@ -1,0 +1,5 @@
+你实现的 ringbuffer 模块存在以下问题需要修复：
+1. dispatchCallbacks 方法从持锁读取回调到无锁执行之间存在时间窗口，在此期间回调可能被替换，导致执行的回调不是执行时刻的最新注册版本，与文档中对回调语义的描述不一致。
+2. SetHighWaterMark 方法中水位检查逻辑与 Write 和 Read 中的 checkWaterMarkLocked 存在重复，高水位告警的触发和解除条件在两处独立维护。
+3. 修复后运行 go test ./internal/ringbuffer/ -v，需要让所有测试通过。
+4. 在 docs/ringbuffer.md 中更新模块需求文档。
