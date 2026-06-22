@@ -128,9 +128,9 @@ NewHotConfig(path, schema, options)
 Load() / Start()
    │
    ├─ ① 安全文件读取（TOCTOU 防护，最多 3 次重试）
-   │    ├─ pre-Stat：记录 mtime₁ + size₁
+   │    ├─ pre-Stat：记录 mtime₁ + size₁（文件不存在返回 ErrFileNotFound）
    │    ├─ ReadFile：读取文件原始字节
-   │    ├─ post-Stat：记录 mtime₂ + size₂
+   │    ├─ post-Stat：记录 mtime₂ + size₂（文件被删除也返回 ErrFileNotFound，而非通用错误）
    │    ├─ 若 mtime₁==mtime₂ && size₁==size₂ → 读取一致，使用内容与 mtime₂
    │    └─ 否则等待 5ms 重试，最终次不一致则使用最后一次结果
    │
@@ -480,8 +480,8 @@ internal/hotconfig/
 5. **优雅降级**：默认策略下任何错误都不中断服务；推荐始终配置默认值，即使配置文件完全丢失也能以最低可用模式启动
 6. **路径约定**：所有嵌套字段使用点号分隔的扁平路径（`database.host`），兼容 JSON/YAML/TOML 任意嵌套结构
 7. **事件无竞争传递**：`eventLoop` 通过**栈上局部变量闭包捕获**将 `fileEvent` 从事件协程传递给定时器协程，不使用跨协程共享的 pending 变量，从根源避免数据竞争
-8. **TOCTOU 安全读取**：`loadLocked` 采用 **pre-Stat → ReadFile → post-Stat** 的一致性校验读取流程，比较两次 `mtime+size`，不一致则重试（最多 3 次，间隔 5ms），确保读取到的文件内容与最终记录的 `lastModTime` 是匹配的快照，避免轮询漏检
-9. **必填校验单一语义**：`FieldSchema.Required` 在 `ValidateConfig` 入口处自动规范化为 `RuleRequired` 规则，两套 API 完全等价，均使用同一套 `isEmpty()` 判据与 `ErrFieldRequired` 错误输出，调用方无需区分使用场景
+8. **TOCTOU 安全读取**：`loadLocked` 采用 **pre-Stat → ReadFile → post-Stat** 的一致性校验读取流程，比较两次 `mtime+size`，不一致则重试（最多 3 次，间隔 5ms），确保读取到的文件内容与最终记录的 `lastModTime` 是匹配的快照，避免轮询漏检。pre-Stat 和 post-Stat 均对 `os.IsNotExist` 做特殊处理并包装为 `ErrFileNotFound`，确保 ReadFile 后文件被外部删除时，调用方仍可通过 `errors.Is(err, ErrFileNotFound)` 准确匹配
+9. **必填校验单一语义**：`FieldSchema.Required` 在 `ValidateConfig` 入口处自动规范化为 `RuleRequired` 规则，两套 API 完全等价，均使用同一套 `isEmpty()` 判据与 `ErrFieldRequired` 错误输出，调用方无需区分使用场景。规范化函数 `normalizeFieldSchema` 对最常用模式（`Required=false` 且无 `RuleRequired`）直接返回原始字段指针，零额外分配；仅在 `Required=true` 且缺少 `RuleRequired` 时才创建新的 `FieldSchema` 副本并注入规则
 
 ---
 

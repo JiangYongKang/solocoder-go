@@ -1,0 +1,6 @@
+你实现的 ringbuffer 模块存在以下问题需要修复：
+1. TestReadClearsSlotReferenceType 和 TestOverwriteClearsSlotReferenceType 通过 finalizer 验证内存泄漏修复，但 finalizer 回调为空函数体且测试全程没有断言 finalizer 是否实际被调用，即使删除 Read 中的槽位清零代码这两个测试也会通过。
+2. Write 和 Read 方法中用显式 Unlock 替代了 defer Unlock，虽然当前锁内无 panic 风险但移除了 defer 带来的防御性保护。
+3. checkWaterMarkLocked 在释放锁后执行回调，在释锁与回调执行之间另一 goroutine 可通过 OnHighWater 或 OnLowWater 替换回调函数，导致执行的可能是已过时的回调。
+4. 修复后运行 go test ./internal/ringbuffer/ -v，需要让所有测试通过。
+5. 在 docs/ringbuffer.md 中更新模块需求文档。

@@ -1,0 +1,4 @@
+你实现的 skiplist 模块存在以下问题需要修复：
+1. TestCustomProbability 中用单次运行的高概率层数与低概率层数做确定性比较来验证概率机制，在极端随机波动下层数可能碰巧相等导致测试误报失败，用确定性断言验证概率行为不够稳健。
+2. 修复后运行 go test ./internal/skiplist/ -v，需要让所有测试通过。
+3. 在 docs/skiplist.md 中更新模块需求文档。

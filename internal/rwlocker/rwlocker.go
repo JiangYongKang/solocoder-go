@@ -250,14 +250,13 @@ func (rw *RWLocker) unregisterHolder() {
 	removeGoroutineLockInfo(gid, rw)
 }
 
-func (rw *RWLocker) waitForWriterWaiting() error {
+func (rw *RWLocker) waitForWriterWaiting() {
 	rw.upgradeMu.Lock()
 	for rw.writerWaiting {
 		rw.upgradeCond.Wait()
 	}
 	rw.readerCount++
 	rw.upgradeMu.Unlock()
-	return nil
 }
 
 func (rw *RWLocker) RLock() error {
@@ -268,9 +267,7 @@ func (rw *RWLocker) RLock() error {
 	start := time.Now()
 
 	if rw.readTimeout <= 0 {
-		if err := rw.waitForWriterWaiting(); err != nil {
-			return err
-		}
+		rw.waitForWriterWaiting()
 		rw.mu.RLock()
 		rw.registerHolder(LockTypeRead)
 		rw.incSuccess(LockTypeRead, time.Since(start))

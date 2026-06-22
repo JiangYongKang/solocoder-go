@@ -222,7 +222,8 @@ type Parser struct {
 ### 3.3 执行阶段（可选）
 
 - 解析成功后，调用 `Execute()` 触发当前匹配子命令的 `Handler` 函数
-- 若未匹配子命令或未设置 Handler → 返回 `ErrCommandNotFound`
+- 若未匹配子命令（`parsedCmd == nil`）→ 返回 `ErrCommandNotFound`
+- 若子命令已匹配但未设置 `Handler` → 返回 `ErrNoHandler`
 - Handler 返回的错误由 `Execute()` 透传
 
 ## 4. 使用示例

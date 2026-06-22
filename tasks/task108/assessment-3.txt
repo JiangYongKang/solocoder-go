@@ -1,0 +1,7 @@
+产物不满意：
+1. TestRLockSuccessPathNoGoroutineLeak 和 TestLockSuccessPathNoGoroutineLeak 使用 runtime.NumGoroutine 前后对比判断 goroutine 泄漏，差值阈值设为 5。runtime 的 GC、定时器等后台 goroutine 随时可能启动或退出与测试行为无关，该判断方法在 CI 环境中极易产生 flaky test。同时阈值 5 过于宽松，真实泄漏在 5 个以内会被完全掩盖。提示词要求验证超时后后台 goroutine 是否正常退出，但全局 goroutine 计数差值无法精确判定单个清理 goroutine 的退出行为。正确做法应使用 sync.WaitGroup 让清理 goroutine 显式通知退出。
+2. TestRLockTimeoutCleanupGoroutineNoLeak 使用 time.Sleep(80ms)、TestRLockTimeoutReaderCountCleanup 使用 time.Sleep(100ms) 作为 cleanup goroutine 的完成等待机制。硬编码等待时间与系统负载高度耦合，高负载 CI 环境下清理 goroutine 可能来不及执行导致 readerCount 未归零的 flaky 失败。提示词要求确认后台 goroutine 正常退出，基于 sleep 的等待无法提供确定性保证，应采用 channel 显式同步信号消除时序脆弱性。
+
+过程不满意：
+1. 模型编写 TestRLockTimeoutReaderCountCleanup 第一版时在主 goroutine 中先获取 RLock 再调用 Lock，触发模块的 checkDeadlock 死锁检测导致测试直接报错。这暴露了模型在编写测试前未理解 rwlocker.go 中死锁检测方法的规则：同一 goroutine 持有读锁后不能请求写锁。应先在分析阶段阅读 checkDeadlock 的实现理解死锁检测矩阵，从而设计正确的测试 goroutine 结构。
+2. 模型在 TestRLockTimeoutReaderCountCleanup 上经历两轮失败后直接重写整个测试逻辑。第一次失败时未分析根因是 cleanup goroutine 未完成还是测试逻辑设计错误，直接扩大 time.Sleep 时间；第二次仍失败后换方案重写。整个过程未尝试用 channel 做显式完成同步从根本上消除时序不确定性，而是通过调整 sleep 时长和重写来绕过问题，属于典型的试错式调试。

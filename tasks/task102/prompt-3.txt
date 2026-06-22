@@ -1,0 +1,5 @@
+你实现的 hotconfig 模块存在以下问题需要修复：
+1. loadLocked 方法在 ReadFile 成功后如果配置文件被外部删除，post-Stat 返回的错误被包装为通用错误信息，调用方的 errors.Is(err, ErrFileNotFound) 无法匹配。
+2. normalizeFieldSchema 在 Required=false 且未配置 RuleRequired 的字段上仍然分配了新的 FieldSchema 副本，这是最常用的声明模式却产生了不必要的内存分配。
+3. 修复后运行 go test ./internal/hotconfig/ -v，需要让所有测试通过。
+4. 在 docs/hotconfig.md 中更新模块需求文档。

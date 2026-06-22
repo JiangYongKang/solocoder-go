@@ -196,7 +196,7 @@ func (t *Trie) LongestMatch(query string) (SearchResult, error)
 
 | 错误 | 触发场景 |
 |------|----------|
-| `ErrEmptyWord` | 插入或删除空单词 |
+| `ErrEmptyWord` | 插入、删除或精确查找空单词 |
 | `ErrEmptyPrefix` | 前缀匹配时空前缀 |
 | `ErrEmptyPattern` | 通配符搜索时空模式 |
 | `ErrEmptyQuery` | 最大匹配查询时空查询 |
@@ -335,10 +335,10 @@ trie.Insert("hell", "data")
 err := trie.Delete("hello")
 // err = nil
 
-_, exists := trie.Search("hello")
+_, exists, _ := trie.Search("hello")
 // exists = false
 
-_, exists = trie.Search("hell")
+_, exists, _ = trie.Search("hell")
 // exists = true（路径节点被保留，因为 "hell" 仍然存在）
 
 // 删除不存在的单词

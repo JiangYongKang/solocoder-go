@@ -1,0 +1,4 @@
+你实现的 cliparser 模块存在以下问题需要修复：
+1. docs/cliparser.md 第 3.3 节执行阶段描述仍写着"若未匹配子命令或未设置 Handler → 返回 ErrCommandNotFound"，但代码中这两个场景已分别返回 ErrCommandNotFound 和 ErrNoHandler，文档与代码行为不一致。
+2. 修复后运行 go test ./internal/cliparser/ -v，需要让所有测试通过。
+3. 在 docs/cliparser.md 中更新模块需求文档。

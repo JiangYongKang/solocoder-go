@@ -84,6 +84,9 @@ func (hc *HotConfig) loadLocked() (bool, error) {
 		}
 
 		postInfo, err := os.Stat(hc.path)
+		if os.IsNotExist(err) {
+			return false, fmt.Errorf("%w: %s", ErrFileNotFound, hc.path)
+		}
 		if err != nil {
 			return false, fmt.Errorf("failed to re-stat config file: %w", err)
 		}

@@ -170,6 +170,7 @@ type FileWatcher struct {
 | `ErrNilCallback` | 回调函数为空 | 调用 `OnCreate`、`OnModify`、`OnDelete` 时传入 nil 回调函数 |
 | `ErrNoWatchedDir` | 未设置监听目录 | 启动监听器时未调用 `Watch()` 设置监听目录 |
 | `ErrDirNotExist` | 监听目录不存在 | 调用 `Watch()` 时传入的目录不存在或不是目录 |
+| `ErrAlreadyRunning` | 监听器已在运行 | 调用 `Start()` 时监听器已经处于运行状态，用于区分首次启动和重复启动 |
 
 ## 4. 核心机制详解
 
@@ -344,7 +345,7 @@ Start() error
    │
    ├─ mu.Lock()
    ├─ stopped == true → mu.Unlock()，返回 ErrWatcherStopped（已停止无法重启）
-   ├─ running == true → mu.Unlock()，返回 nil（幂等，已在运行）
+   ├─ running == true → mu.Unlock()，返回 ErrAlreadyRunning（已在运行，区分首次启动）
    ├─ watchedDir == "" → mu.Unlock()，返回 ErrNoWatchedDir（未设置监听目录）
    ├─ running = true
    ├─ stopCh = make(chan struct{})
@@ -352,7 +353,7 @@ Start() error
    │
    ├─ wg.Add(1)
    ├─ 启动 pollLoop 后台协程
-   └─ 返回 nil
+   └─ 返回 nil（首次启动成功）
 ```
 
 #### 4.6.4 Stop 流程
@@ -377,7 +378,14 @@ Stop()
 - `Stop()` 一旦调用，`stopped` 标记永久设置为 `true`，监听器进入终态
 - 停止后，`Watch()`、`OnCreate()`、`OnModify()`、`OnDelete()` 均返回 `ErrWatcherStopped`
 - `Start()` 在已停止状态下调用返回 `ErrWatcherStopped`，不会重启
+- `Start()` 在已运行状态下调用返回 `ErrAlreadyRunning`，调用方可据此区分首次启动和重复启动
 - 如需重新使用，必须创建新的 `FileWatcher` 实例
+
+**Start() 返回值语义：**
+- `nil`：首次启动成功，后台轮询协程已启动
+- `ErrAlreadyRunning`：监听器已在运行，调用方无需重复执行初始化操作
+- `ErrNoWatchedDir`：未设置监听目录，需先调用 `Watch()`
+- `ErrWatcherStopped`：监听器已永久停止，需创建新实例
 
 **资源安全：**
 - `Start()` 和 `Stop()` 均支持幂等调用，重复调用无副作用
@@ -569,7 +577,36 @@ go func() {
 <-doneCh
 ```
 
-### 6.6 单元测试风格的模拟场景
+### 6.6 区分首次启动与重复启动
+
+```go
+// 封装一个安全的启动函数，在首次启动时执行额外的初始化操作
+func StartWatcher(fw *filewatcher.FileWatcher) error {
+    err := fw.Start()
+    if err == nil {
+        // 首次启动成功，执行初始化操作（如日志记录、指标上报等）
+        log.Println("文件监听器首次启动成功")
+        return nil
+    }
+    if errors.Is(err, filewatcher.ErrAlreadyRunning) {
+        // 监听器已在运行，无需重复初始化
+        log.Println("文件监听器已在运行，跳过重复启动")
+        return nil
+    }
+    // 其他错误（如未设置监听目录、已停止等）
+    return err
+}
+
+// 多次调用，只有第一次会执行初始化
+if err := StartWatcher(fw); err != nil {
+    log.Fatalf("启动失败: %v", err)
+}
+if err := StartWatcher(fw); err != nil {
+    log.Fatalf("启动失败: %v", err)
+}
+```
+
+### 6.7 单元测试风格的模拟场景
 
 ```go
 func TestFileWatcher_CreateEvent(t *testing.T) {
@@ -635,7 +672,7 @@ docs/
 | **防抖去重** | `TestDebounce_DuplicateEventsMerged`、`TestDebounce_CreateAndModifySameFile` | 短时间多次事件的合并、不同事件类型独立防抖 |
 | **过滤规则** | `TestFilter_FileExtensions`、`TestFilter_FilePatterns`、`TestFilter_ExcludeDirs`、`TestFilter_IncludePatterns`、`TestFilter_Combined` | 各种过滤规则及组合使用 |
 | **扩展名处理** | `TestFilter_FileExtensions_WithoutDot`、`TestNormalizeExtensions` | 扩展名自动补全点号、大小写归一化 |
-| **生命周期** | `TestStartStop_Idempotent`、`TestIsRunning`、`TestStart_WithoutWatch` | 幂等启停、运行状态查询、未配置目录启动 |
+| **生命周期** | `TestStartStop_Idempotent`、`TestIsRunning`、`TestStart_WithoutWatch`、`TestStart_AlreadyRunning` | 幂等启停、运行状态查询、未配置目录启动、重复启动返回 ErrAlreadyRunning |
 | **停止状态** | `TestStop_RejectsCallbacksRegistration`、`TestStop_RejectsWatch`、`TestStart_AfterStop`、`TestStop_WithoutStart` | Stop 后操作受限、不可逆、未启动时停止 |
 | **多回调** | `TestMultipleCallbacks` | 三种回调同时注册，各事件独立触发 |
 | **并发安全** | `TestConcurrent_FileOperations` | 多 goroutine 并发创建文件，事件检测正确 |

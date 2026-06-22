@@ -398,64 +398,128 @@ fmt.Println(rb.IsEmpty()) // true
 - 写入和读取操作都是非阻塞的，不会等待条件满足
 - 适用于生产者-消费者模式等并发场景
 
-## 11. 死锁预防设计
+## 11. 死锁预防与回调调度设计
 
 ### 11.1 问题背景
 
 高水位告警回调 (`onHighWater` / `onLowWater`) 如果在持有互斥锁的状态下直接调用，而回调函数内部又尝试调用任何需要获取同一把锁的 RingBuffer 方法（如 `Read`、`Write`、`Len` 等），就会导致经典的"自死锁"（同一个 goroutine 试图重复获取已持有的不可重入锁）。
 
-### 11.2 设计方案：锁外执行回调
+此外，如果使用显式 `Unlock` 而不是 `defer`，当锁内逻辑发生 panic 时会导致锁泄漏。
 
-采用"状态记录 + 锁外回调"的两阶段模式，从根本上避免死锁：
+### 11.2 设计方案：IIFE + defer + 三阶段回调调度
 
-**阶段一：持有锁，仅修改状态，记录回调**
-- `Write`、`Read`、`SetHighWaterMark` 在持有锁期间：
-  - 完成所有缓冲区状态的修改（读写指针移动、count 更新、highWaterAlarm 标志切换）
-  - 调用 `checkWaterMarkLocked` 仅检测状态变化，**不直接执行回调**
-  - 将需要触发的回调函数引用返回（`func()` 类型），保存到局部变量
+采用三层防御机制：
 
-**阶段二：释放锁后，安全执行回调**
-- 调用 `rb.mu.Unlock()` 完全释放互斥锁
-- 检查返回的回调函数是否为 `nil`
-- 若回调非空，在**无锁状态**下执行回调函数
+**第一层：IIFE 包裹锁内逻辑 + defer Unlock**
 
-### 11.3 关键代码模式
+使用立即执行函数（IIFE）包裹所有锁内操作，内部通过 `defer rb.mu.Unlock()` 保证即使发生 panic 锁也会被释放，同时锁内逻辑的结果通过闭包外层变量传递。
 
 ```go
-// Write 方法中的两阶段模式
 func (rb *RingBuffer[T]) Write(value T) bool {
-    rb.mu.Lock()
-    // ... 状态修改（持有锁）...
-    callback := rb.checkWaterMarkLocked(overwrote)  // 仅记录回调，不执行
-    rb.mu.Unlock()                                   // 先释放锁
+    var (
+        needHigh bool
+        needLow  bool
+        result   bool
+    )
 
-    if callback != nil {
-        callback()                                   // 锁外执行回调，无死锁风险
-    }
-    return true
-}
+    func() {
+        rb.mu.Lock()
+        defer rb.mu.Unlock()  // 防御性解锁：panic 也不会泄漏锁
 
-// checkWaterMarkLocked: 仅返回回调，不执行
-func (rb *RingBuffer[T]) checkWaterMarkLocked(overwrote bool) func() {
-    if rb.count >= rb.highWater && !rb.highWaterAlarm {
-        rb.highWaterAlarm = true
-        return rb.onHighWater  // 返回回调引用
-    } else if ... {
-        rb.highWaterAlarm = false
-        return rb.onLowWater   // 返回回调引用
-    }
-    return nil
+        if rb.strategy == NoOverwrite && rb.count == rb.capacity {
+            result = false
+            return  // defer 保证锁被释放
+        }
+
+        // ... 状态修改 ...
+        needHigh, needLow = rb.checkWaterMarkLocked(overwrote)
+        result = true
+    }()  // IIFE 结束时 defer 自动释放锁
+
+    // 锁已释放，安全执行回调
+    rb.dispatchCallbacks(needHigh, needLow)
+    return result
 }
 ```
 
+**第二层：checkWaterMarkLocked 只记录状态标志，不捕获回调**
+
+`checkWaterMarkLocked` 不再返回函数引用，只返回两个布尔标志 `needHigh` 和 `needLow`，表示是否需要触发高/低水位回调。这样做避免了在状态修改阶段就绑定具体的回调函数。
+
+```go
+func (rb *RingBuffer[T]) checkWaterMarkLocked(overwrote bool) (needHigh bool, needLow bool) {
+    if rb.count >= rb.highWater && !rb.highWaterAlarm {
+        rb.highWaterAlarm = true
+        return true, false  // 只返回标志，不捕获回调
+    } else if rb.count < rb.highWater && rb.highWaterAlarm && !overwrote {
+        rb.highWaterAlarm = false
+        return false, true
+    }
+    return false, false
+}
+```
+
+**第三层：dispatchCallbacks 在执行前重新读取最新回调**
+
+独立的 `dispatchCallbacks` 方法在锁完全释放后被调用。它会**再次短暂获取锁**，读取当前最新注册的回调函数引用，然后释放锁后在无锁状态下执行。
+
+这样确保即使在"状态修改"和"回调执行"之间有另一 goroutine 通过 `OnHighWater` / `OnLowWater` 替换了回调函数，执行的也始终是最新注册的版本。
+
+```go
+func (rb *RingBuffer[T]) dispatchCallbacks(needHigh bool, needLow bool) {
+    var (
+        highCb func()
+        lowCb  func()
+    )
+
+    if needHigh || needLow {
+        rb.mu.Lock()
+        if needHigh {
+            highCb = rb.onHighWater  // 读取最新注册的回调
+        }
+        if needLow {
+            lowCb = rb.onLowWater
+        }
+        rb.mu.Unlock()
+    }
+
+    // 无锁状态下执行回调
+    if highCb != nil {
+        highCb()
+    }
+    if lowCb != nil {
+        lowCb()
+    }
+}
+```
+
+### 11.3 回调时序与语义
+
+完整的执行时序如下：
+
+```
+T1: 获取锁
+T2: 修改缓冲区状态（指针移动、count 更新）
+T3: checkWaterMarkLocked 检测水位变化，设置 highWaterAlarm 标志，返回 needHigh/needLow 标志
+T4: defer 释放锁
+T5: （时间窗口：其他 goroutine 可调用 OnHighWater/OnLowWater 替换回调）
+T6: dispatchCallbacks 再次获取锁
+T7: 读取最新的 onHighWater/onLowWater 函数引用
+T8: 释放锁
+T9: 无锁状态下执行回调
+```
+
+**语义保证**：回调总是使用执行时刻（T9）之前最新注册的版本，而非状态变化时刻（T3）的版本。
+
 ### 11.4 安全性保证
 
-| 场景 | 旧实现（锁内调回调） | 新实现（锁外调回调） |
-|------|---------------------|---------------------|
+| 场景 | 旧实现（锁内调回调 + 显式 Unlock） | 新实现（IIFE + defer + dispatchCallbacks） |
+|------|----------------------------------|--------------------------------------------|
 | 回调中调用 `rb.Len()` | **死锁** | 正常执行 |
 | 回调中调用 `rb.Read()` | **死锁** | 正常执行 |
 | 回调中调用 `rb.Write()` | **死锁** | 正常执行 |
-| 回调中调用 `rb.SetHighWaterMark()` | **死锁** | 正常执行 |
+| 锁内 panic | **锁泄漏** | 正常（defer 自动解锁） |
+| 回调在 T5 窗口被替换 | 执行旧版（过时）回调 | 执行最新版回调 |
 | 状态一致性 | 有保证 | 有保证（状态已在锁内完成修改） |
 
 ## 12. 内存安全设计

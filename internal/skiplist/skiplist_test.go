@@ -552,50 +552,65 @@ func TestStringKeys(t *testing.T) {
 }
 
 func TestCustomProbability(t *testing.T) {
-	cfg := &Config{MaxLevel: 32, P: 0.9}
-	sl, err := New[int, string](cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
+	const trials = 5
+	const n = 1000
 
-	for i := 0; i < 1000; i++ {
-		sl.Insert(i, "val")
-	}
+	sumHigh := 0
+	sumLow := 0
 
-	if sl.Len() != 1000 {
-		t.Errorf("Len() = %d, want 1000", sl.Len())
-	}
-
-	lvlHighProb := sl.Level()
-	if lvlHighProb <= 1 {
-		t.Errorf("High prob (0.9) level = %d, expected > 1 for 1000 elements", lvlHighProb)
-	}
-
-	cfgLow := &Config{MaxLevel: 32, P: 0.01}
-	slLow, _ := New[int, string](cfgLow)
-	for i := 0; i < 1000; i++ {
-		slLow.Insert(i, "val")
-	}
-	lvlLowProb := slLow.Level()
-	if lvlLowProb <= 1 {
-		t.Errorf("Low prob (0.01) level = %d, expected > 1 for 1000 elements", lvlLowProb)
-	}
-
-	if lvlHighProb <= lvlLowProb {
-		t.Errorf("High prob level (%d) should be > low prob level (%d), but got lvlHigh <= lvlLow",
-			lvlHighProb, lvlLowProb)
-	}
-
-	allHigh := sl.All()
-	for i, p := range allHigh {
-		if p.Key != i {
-			t.Errorf("High prob All()[%d].Key = %d, want %d", i, p.Key, i)
+	for i := 0; i < trials; i++ {
+		cfgHigh := &Config{MaxLevel: 32, P: 0.9}
+		slHigh, err := New[int, string](cfgHigh)
+		if err != nil {
+			t.Fatalf("New(high) error = %v", err)
 		}
+		for j := 0; j < n; j++ {
+			slHigh.Insert(j, "val")
+		}
+		if slHigh.Len() != n {
+			t.Errorf("High prob trial %d: Len() = %d, want %d", i, slHigh.Len(), n)
+		}
+		lvlHigh := slHigh.Level()
+		if lvlHigh <= 1 {
+			t.Errorf("High prob (0.9) trial %d: level = %d, expected > 1", i, lvlHigh)
+		}
+		sumHigh += lvlHigh
+
+		cfgLow := &Config{MaxLevel: 32, P: 0.01}
+		slLow, _ := New[int, string](cfgLow)
+		for j := 0; j < n; j++ {
+			slLow.Insert(j, "val")
+		}
+		if slLow.Len() != n {
+			t.Errorf("Low prob trial %d: Len() = %d, want %d", i, slLow.Len(), n)
+		}
+		lvlLow := slLow.Level()
+		if lvlLow <= 1 {
+			t.Errorf("Low prob (0.01) trial %d: level = %d, expected > 1", i, lvlLow)
+		}
+		sumLow += lvlLow
 	}
-	allLow := slLow.All()
-	for i, p := range allLow {
+
+	avgHigh := sumHigh / trials
+	avgLow := sumLow / trials
+
+	if avgHigh <= avgLow {
+		t.Errorf("Average level with P=0.9 (%d over %d trials) should be > P=0.01 (%d); "+
+			"probability mechanism may not be working correctly", avgHigh, trials, avgLow)
+	}
+
+	cfgCheck := &Config{MaxLevel: 32, P: 0.5}
+	slCheck, _ := New[int, string](cfgCheck)
+	for i := 0; i < n; i++ {
+		slCheck.Insert(i, "val")
+	}
+	all := slCheck.All()
+	if len(all) != n {
+		t.Fatalf("Data integrity check: All() len = %d, want %d", len(all), n)
+	}
+	for i, p := range all {
 		if p.Key != i {
-			t.Errorf("Low prob All()[%d].Key = %d, want %d", i, p.Key, i)
+			t.Errorf("Data integrity: All()[%d].Key = %d, want %d", i, p.Key, i)
 		}
 	}
 }

@@ -1,0 +1,6 @@
+你实现的 rwlocker 模块存在以下问题需要修复：
+1. waitForWriterWaiting 方法始终返回 nil 却声明了 error 返回类型，导致 RLock 中 if err := rw.waitForWriterWaiting() 的错误处理分支变成不可达代码。
+2. 超时路径的 goroutine 泄漏修复缺乏回归测试保护，现有测试只验证超时行为但不确认锁获取成功或超时后后台 goroutine 是否正常退出。
+3. docs/rwlocker.md 第 2.2 节将 Lock 和 RLock 的超时清理描述混在一起，但 Lock 超时路径只需 mu.Unlock 而 RLock 还需回退 readerCount 并广播 upgradeCond，两种锁的清理逻辑不同但文档未区分说明。
+4. 修复后运行 go test ./internal/rwlocker/ -v，需要让所有测试通过。
+5. 在 docs/rwlocker.md 中更新模块需求文档。

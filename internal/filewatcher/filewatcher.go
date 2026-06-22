@@ -15,6 +15,7 @@ var (
 	ErrNilCallback       = errors.New("filewatcher: nil callback")
 	ErrNoWatchedDir      = errors.New("filewatcher: no watched directory")
 	ErrDirNotExist       = errors.New("filewatcher: watched directory does not exist")
+	ErrAlreadyRunning    = errors.New("filewatcher: watcher is already running")
 )
 
 type EventType int
@@ -236,7 +237,7 @@ func (fw *FileWatcher) Start() error {
 	}
 	if fw.running {
 		fw.mu.Unlock()
-		return nil
+		return ErrAlreadyRunning
 	}
 	if fw.watchedDir == "" {
 		fw.mu.Unlock()

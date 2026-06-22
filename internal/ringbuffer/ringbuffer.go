@@ -70,31 +70,39 @@ func NewRingBufferWithConfig[T any](cfg Config) (*RingBuffer[T], error) {
 }
 
 func (rb *RingBuffer[T]) SetHighWaterMark(mark int) error {
-	rb.mu.Lock()
+	var (
+		needHigh bool
+		needLow  bool
+		err      error
+	)
 
-	if mark < 0 || mark > rb.capacity {
-		rb.mu.Unlock()
-		return ErrInvalidHighWater
-	}
+	func() {
+		rb.mu.Lock()
+		defer rb.mu.Unlock()
 
-	rb.highWater = mark
-
-	var callback func()
-	if rb.highWater > 0 {
-		if rb.count >= rb.highWater && !rb.highWaterAlarm {
-			rb.highWaterAlarm = true
-			callback = rb.onHighWater
-		} else if rb.count < rb.highWater && rb.highWaterAlarm {
-			rb.highWaterAlarm = false
-			callback = rb.onLowWater
+		if mark < 0 || mark > rb.capacity {
+			err = ErrInvalidHighWater
+			return
 		}
+
+		rb.highWater = mark
+
+		if rb.highWater > 0 {
+			if rb.count >= rb.highWater && !rb.highWaterAlarm {
+				rb.highWaterAlarm = true
+				needHigh = true
+			} else if rb.count < rb.highWater && rb.highWaterAlarm {
+				rb.highWaterAlarm = false
+				needLow = true
+			}
+		}
+	}()
+
+	if err != nil {
+		return err
 	}
 
-	rb.mu.Unlock()
-
-	if callback != nil {
-		callback()
-	}
+	rb.dispatchCallbacks(needHigh, needLow)
 
 	return nil
 }
@@ -112,60 +120,74 @@ func (rb *RingBuffer[T]) OnLowWater(fn func()) {
 }
 
 func (rb *RingBuffer[T]) Write(value T) bool {
-	rb.mu.Lock()
+	var (
+		needHigh bool
+		needLow  bool
+		result   bool
+	)
 
-	if rb.strategy == NoOverwrite && rb.count == rb.capacity {
-		rb.mu.Unlock()
-		return false
-	}
+	func() {
+		rb.mu.Lock()
+		defer rb.mu.Unlock()
 
-	overwrote := false
-	var zero T
-	if rb.strategy == Overwrite && rb.count == rb.capacity {
-		rb.buf[rb.readPos] = zero
-		rb.readPos = (rb.readPos + 1) % rb.capacity
-		rb.count--
-		overwrote = true
-	}
+		if rb.strategy == NoOverwrite && rb.count == rb.capacity {
+			result = false
+			return
+		}
 
-	rb.buf[rb.writePos] = value
-	rb.writePos = (rb.writePos + 1) % rb.capacity
-	rb.count++
+		overwrote := false
+		var zero T
+		if rb.strategy == Overwrite && rb.count == rb.capacity {
+			rb.buf[rb.readPos] = zero
+			rb.readPos = (rb.readPos + 1) % rb.capacity
+			rb.count--
+			overwrote = true
+		}
 
-	callback := rb.checkWaterMarkLocked(overwrote)
+		rb.buf[rb.writePos] = value
+		rb.writePos = (rb.writePos + 1) % rb.capacity
+		rb.count++
 
-	rb.mu.Unlock()
+		needHigh, needLow = rb.checkWaterMarkLocked(overwrote)
+		result = true
+	}()
 
-	if callback != nil {
-		callback()
-	}
+	rb.dispatchCallbacks(needHigh, needLow)
 
-	return true
+	return result
 }
 
 func (rb *RingBuffer[T]) Read() (T, bool) {
-	rb.mu.Lock()
+	var (
+		needHigh bool
+		needLow  bool
+		value    T
+		ok       bool
+	)
 
-	var zero T
-	if rb.count == 0 {
-		rb.mu.Unlock()
-		return zero, false
-	}
+	func() {
+		rb.mu.Lock()
+		defer rb.mu.Unlock()
 
-	value := rb.buf[rb.readPos]
-	rb.buf[rb.readPos] = zero
-	rb.readPos = (rb.readPos + 1) % rb.capacity
-	rb.count--
+		var zero T
+		if rb.count == 0 {
+			value = zero
+			ok = false
+			return
+		}
 
-	callback := rb.checkWaterMarkLocked(false)
+		value = rb.buf[rb.readPos]
+		rb.buf[rb.readPos] = zero
+		rb.readPos = (rb.readPos + 1) % rb.capacity
+		rb.count--
 
-	rb.mu.Unlock()
+		needHigh, needLow = rb.checkWaterMarkLocked(false)
+		ok = true
+	}()
 
-	if callback != nil {
-		callback()
-	}
+	rb.dispatchCallbacks(needHigh, needLow)
 
-	return value, true
+	return value, ok
 }
 
 func (rb *RingBuffer[T]) Peek() (T, bool) {
@@ -216,6 +238,7 @@ func (rb *RingBuffer[T]) GetStrategy() OverwriteStrategy {
 
 func (rb *RingBuffer[T]) Clear() {
 	rb.mu.Lock()
+	defer rb.mu.Unlock()
 
 	var zero T
 	for i := range rb.buf {
@@ -225,22 +248,45 @@ func (rb *RingBuffer[T]) Clear() {
 	rb.writePos = 0
 	rb.count = 0
 	rb.highWaterAlarm = false
-
-	rb.mu.Unlock()
 }
 
-func (rb *RingBuffer[T]) checkWaterMarkLocked(overwrote bool) func() {
+func (rb *RingBuffer[T]) checkWaterMarkLocked(overwrote bool) (needHigh bool, needLow bool) {
 	if rb.highWater <= 0 {
-		return nil
+		return false, false
 	}
 
 	if rb.count >= rb.highWater && !rb.highWaterAlarm {
 		rb.highWaterAlarm = true
-		return rb.onHighWater
+		return true, false
 	} else if rb.count < rb.highWater && rb.highWaterAlarm && !overwrote {
 		rb.highWaterAlarm = false
-		return rb.onLowWater
+		return false, true
 	}
 
-	return nil
+	return false, false
+}
+
+func (rb *RingBuffer[T]) dispatchCallbacks(needHigh bool, needLow bool) {
+	var (
+		highCb func()
+		lowCb  func()
+	)
+
+	if needHigh || needLow {
+		rb.mu.Lock()
+		if needHigh {
+			highCb = rb.onHighWater
+		}
+		if needLow {
+			lowCb = rb.onLowWater
+		}
+		rb.mu.Unlock()
+	}
+
+	if highCb != nil {
+		highCb()
+	}
+	if lowCb != nil {
+		lowCb()
+	}
 }

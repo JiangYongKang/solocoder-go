@@ -46,14 +46,16 @@ func normalizeFieldSchema(field *FieldSchema) *FieldSchema {
 		}
 	}
 
-	if !field.Required && hasRequiredRule {
+	if !field.Required {
+		return field
+	}
+
+	if hasRequiredRule {
 		return field
 	}
 
 	rulesCopy := make([]*ValidationRule, 0, len(field.Rules)+1)
-	if field.Required && !hasRequiredRule {
-		rulesCopy = append(rulesCopy, &ValidationRule{Type: RuleRequired})
-	}
+	rulesCopy = append(rulesCopy, &ValidationRule{Type: RuleRequired})
 	rulesCopy = append(rulesCopy, field.Rules...)
 
 	return &FieldSchema{

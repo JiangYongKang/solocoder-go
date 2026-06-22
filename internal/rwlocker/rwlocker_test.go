@@ -2,6 +2,7 @@ package rwlocker
 
 import (
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1193,6 +1194,192 @@ func TestRLockTimeoutDuringWriterWaiting(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("TryUpgrade should have completed")
 	}
+}
+
+func TestRLockTimeoutCleanupGoroutineNoLeak(t *testing.T) {
+	rw := New(&Config{
+		ReadTimeout: 50 * time.Millisecond,
+	})
+
+	rw.Lock()
+
+	err := rw.RLock()
+	if err == nil {
+		t.Error("RLock should have timed out")
+		rw.RUnlock()
+	}
+	if !errors.Is(err, ErrLockTimeout) {
+		t.Errorf("expected ErrLockTimeout, got %v", err)
+	}
+
+	rw.Unlock()
+
+	time.Sleep(80 * time.Millisecond)
+
+	if rw.ReaderCount() != 0 {
+		t.Errorf("readerCount should be 0 after RLock timeout cleanup, got %d", rw.ReaderCount())
+	}
+
+	if err := rw.RLock(); err != nil {
+		t.Fatalf("RLock should succeed after previous timeout: %v", err)
+	}
+	if rw.ReaderCount() != 1 {
+		t.Errorf("expected 1 reader, got %d", rw.ReaderCount())
+	}
+	rw.RUnlock()
+
+	if rw.ReaderCount() != 0 {
+		t.Errorf("readerCount should be 0 after RUnlock, got %d", rw.ReaderCount())
+	}
+}
+
+func TestLockTimeoutCleanupGoroutineNoLeak(t *testing.T) {
+	rw := New(&Config{
+		WriteTimeout: 50 * time.Millisecond,
+	})
+
+	rw.RLock()
+
+	err := rw.Lock()
+	if err == nil {
+		t.Error("Lock should have timed out")
+		rw.Unlock()
+	}
+	if !errors.Is(err, ErrLockTimeout) {
+		t.Errorf("expected ErrLockTimeout, got %v", err)
+	}
+
+	rw.RUnlock()
+
+	time.Sleep(80 * time.Millisecond)
+
+	if rw.IsWriterActive() {
+		t.Error("writerActive should be false after Lock timeout cleanup and reader released")
+	}
+
+	if err := rw.Lock(); err != nil {
+		t.Fatalf("Lock should succeed after previous timeout: %v", err)
+	}
+	if !rw.IsWriterActive() {
+		t.Error("writerActive should be true after Lock succeeds")
+	}
+	rw.Unlock()
+
+	if rw.IsWriterActive() {
+		t.Error("writerActive should be false after Unlock")
+	}
+}
+
+func TestRLockSuccessPathNoGoroutineLeak(t *testing.T) {
+	rw := New(&Config{
+		ReadTimeout: 500 * time.Millisecond,
+	})
+
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < 20; i++ {
+		if err := rw.RLock(); err != nil {
+			t.Fatalf("RLock %d failed: %v", i, err)
+		}
+		rw.RUnlock()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	after := runtime.NumGoroutine()
+	if after > before+5 {
+		t.Errorf("potential goroutine leak: before=%d, after=%d", before, after)
+	}
+}
+
+func TestLockSuccessPathNoGoroutineLeak(t *testing.T) {
+	rw := New(&Config{
+		WriteTimeout: 500 * time.Millisecond,
+	})
+
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < 20; i++ {
+		if err := rw.Lock(); err != nil {
+			t.Fatalf("Lock %d failed: %v", i, err)
+		}
+		rw.Unlock()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	after := runtime.NumGoroutine()
+	if after > before+5 {
+		t.Errorf("potential goroutine leak: before=%d, after=%d", before, after)
+	}
+}
+
+func TestRLockTimeoutReaderCountCleanup(t *testing.T) {
+	rw := New(&Config{
+		ReadTimeout: 30 * time.Millisecond,
+	})
+
+	writerReleased := make(chan struct{})
+	go func() {
+		rw.Lock()
+		time.Sleep(200 * time.Millisecond)
+		rw.Unlock()
+		close(writerReleased)
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	err := rw.RLock()
+	if err == nil {
+		t.Error("RLock should have timed out while writer holds lock")
+		rw.RUnlock()
+	} else if !errors.Is(err, ErrLockTimeout) {
+		t.Errorf("expected ErrLockTimeout, got %v", err)
+	}
+
+	<-writerReleased
+
+	time.Sleep(100 * time.Millisecond)
+
+	count := rw.ReaderCount()
+	if count != 0 {
+		t.Errorf("readerCount should be 0 after RLock timeout cleanup, got %d", count)
+	}
+
+	if err := rw.RLock(); err != nil {
+		t.Fatalf("RLock should succeed after cleanup: %v", err)
+	}
+	if rw.ReaderCount() != 1 {
+		t.Errorf("expected 1 reader after new RLock, got %d", rw.ReaderCount())
+	}
+	rw.RUnlock()
+}
+
+func TestLockTimeoutSubsequentAcquire(t *testing.T) {
+	rw := New(&Config{
+		WriteTimeout: 30 * time.Millisecond,
+	})
+
+	holderDone := make(chan struct{})
+	go func() {
+		rw.Lock()
+		time.Sleep(200 * time.Millisecond)
+		rw.Unlock()
+		close(holderDone)
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	err := rw.Lock()
+	if err == nil {
+		t.Error("Lock should have timed out")
+		rw.Unlock()
+	}
+
+	<-holderDone
+
+	if err := rw.Lock(); err != nil {
+		t.Fatalf("Lock should succeed after holder released: %v", err)
+	}
+	rw.Unlock()
 }
 
 func TestNoTimeoutConfiguration(t *testing.T) {

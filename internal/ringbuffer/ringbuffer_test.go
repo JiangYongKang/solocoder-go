@@ -1,7 +1,6 @@
 package ringbuffer
 
 import (
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -698,33 +697,39 @@ func TestSetHighWaterMarkCallbackNoDeadlock(t *testing.T) {
 }
 
 func TestReadClearsSlotReferenceType(t *testing.T) {
-	type bigStruct struct {
-		data [1024]byte
+	type payload struct {
+		value int
 	}
 
-	rb, _ := NewRingBuffer[*bigStruct](3)
+	rb, _ := NewRingBuffer[*payload](3)
 
-	obj1 := &bigStruct{}
-	obj2 := &bigStruct{}
-	obj3 := &bigStruct{}
-
-	runtime.SetFinalizer(obj1, func(b *bigStruct) {})
-	runtime.SetFinalizer(obj2, func(b *bigStruct) {})
-	runtime.SetFinalizer(obj3, func(b *bigStruct) {})
+	obj1 := &payload{value: 1}
+	obj2 := &payload{value: 2}
+	obj3 := &payload{value: 3}
 
 	rb.Write(obj1)
 	rb.Write(obj2)
 	rb.Write(obj3)
+
+	readPosBefore := rb.readPos
+	if readPosBefore != 0 {
+		t.Fatalf("expected readPos 0, got %d", readPosBefore)
+	}
+	if rb.buf[0] != obj1 {
+		t.Fatal("buf[0] should contain obj1 before Read")
+	}
 
 	_, ok := rb.Read()
 	if !ok {
 		t.Fatal("read failed")
 	}
 
-	runtime.GC()
-	runtime.GC()
-	runtime.GC()
-
+	if rb.buf[0] != nil {
+		t.Error("buf[0] should be nil (zero value) after Read - slot was not cleared")
+	}
+	if rb.readPos != 1 {
+		t.Errorf("expected readPos 1 after Read, got %d", rb.readPos)
+	}
 	if rb.Len() != 2 {
 		t.Errorf("expected length 2, got %d", rb.Len())
 	}
@@ -734,7 +739,10 @@ func TestReadClearsSlotReferenceType(t *testing.T) {
 		t.Fatal("read failed")
 	}
 	if val2 != obj2 {
-		t.Error("expected to read obj2")
+		t.Errorf("expected obj2, got %v", val2)
+	}
+	if rb.buf[1] != nil {
+		t.Error("buf[1] should be nil after Read")
 	}
 
 	val3, ok := rb.Read()
@@ -742,7 +750,10 @@ func TestReadClearsSlotReferenceType(t *testing.T) {
 		t.Fatal("read failed")
 	}
 	if val3 != obj3 {
-		t.Error("expected to read obj3")
+		t.Errorf("expected obj3, got %v", val3)
+	}
+	if rb.buf[2] != nil {
+		t.Error("buf[2] should be nil after Read")
 	}
 
 	if !rb.IsEmpty() {
@@ -765,18 +776,36 @@ func TestOverwriteClearsSlotReferenceType(t *testing.T) {
 	n2 := &node{value: 2}
 	n3 := &node{value: 3}
 	n4 := &node{value: 4}
+	n5 := &node{value: 5}
 
 	rb.Write(n1)
 	rb.Write(n2)
 	rb.Write(n3)
 
-	runtime.SetFinalizer(n1, func(n *node) {})
+	if rb.buf[0] != n1 {
+		t.Fatal("buf[0] should contain n1 before overwrite")
+	}
+	if rb.buf[1] != n2 {
+		t.Fatal("buf[1] should contain n2 before overwrite")
+	}
+	if rb.buf[2] != n3 {
+		t.Fatal("buf[2] should contain n3 before overwrite")
+	}
 
 	rb.Write(n4)
 
-	runtime.GC()
-	runtime.GC()
-	runtime.GC()
+	if rb.buf[0] != n4 {
+		t.Errorf("buf[0] should contain n4 (new data overwrote old slot), got %v", rb.buf[0])
+	}
+	if rb.buf[1] != n2 {
+		t.Error("buf[1] should still contain n2")
+	}
+	if rb.buf[2] != n3 {
+		t.Error("buf[2] should still contain n3")
+	}
+	if rb.readPos != 1 {
+		t.Errorf("expected readPos 1 after overwrite, got %d", rb.readPos)
+	}
 
 	if rb.Len() != 3 {
 		t.Errorf("expected length 3, got %d", rb.Len())
@@ -787,7 +816,37 @@ func TestOverwriteClearsSlotReferenceType(t *testing.T) {
 		t.Fatal("read failed")
 	}
 	if val != n2 {
-		t.Errorf("expected n2, got value %d", val.value)
+		t.Errorf("expected n2 (oldest remaining), got value %v", val)
+	}
+	if rb.buf[1] != nil {
+		t.Error("buf[1] should be nil after Read - slot was not cleared")
+	}
+
+	val2, ok := rb.Read()
+	if !ok {
+		t.Fatal("second read failed")
+	}
+	if val2 != n3 {
+		t.Errorf("expected n3, got value %v", val2)
+	}
+	if rb.buf[2] != nil {
+		t.Error("buf[2] should be nil after Read")
+	}
+
+	val3, ok := rb.Read()
+	if !ok {
+		t.Fatal("third read failed")
+	}
+	if val3 != n4 {
+		t.Errorf("expected n4, got value %v", val3)
+	}
+	if rb.buf[0] != nil {
+		t.Error("buf[0] should be nil after Read")
+	}
+
+	rb.Write(n5)
+	if rb.buf[1] != n5 {
+		t.Errorf("buf[1] should contain n5 after wrap-around write, got %v", rb.buf[1])
 	}
 }
 
@@ -839,5 +898,51 @@ func TestClearAfterReadNoLeak(t *testing.T) {
 
 	if rb.Len() != 0 {
 		t.Errorf("expected length 0 after clear, got %d", rb.Len())
+	}
+}
+
+func TestCallbackUsesLatestRegistered(t *testing.T) {
+	cfg := Config{
+		Capacity:      10,
+		HighWaterMark: 5,
+	}
+	rb, _ := NewRingBufferWithConfig[int](cfg)
+
+	originalCallbackCalled := make(chan struct{}, 1)
+	newCallbackCalled := make(chan struct{}, 1)
+
+	rb.OnHighWater(func() {
+		originalCallbackCalled <- struct{}{}
+	})
+
+	triggerReady := make(chan struct{}, 1)
+	callbackReplaced := make(chan struct{}, 1)
+
+	go func() {
+		for i := 0; i < 4; i++ {
+			rb.Write(i)
+		}
+		triggerReady <- struct{}{}
+
+		<-callbackReplaced
+
+		rb.Write(4)
+	}()
+
+	<-triggerReady
+
+	rb.OnHighWater(func() {
+		newCallbackCalled <- struct{}{}
+	})
+
+	close(callbackReplaced)
+
+	select {
+	case <-newCallbackCalled:
+		t.Log("New callback was called as expected (dispatch uses latest registered callback)")
+	case <-originalCallbackCalled:
+		t.Error("Original callback was called - callback should use latest registered version at dispatch time")
+	case <-time.After(5 * time.Second):
+		t.Fatal("No callback was called within timeout")
 	}
 }

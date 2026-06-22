@@ -1,0 +1,4 @@
+你实现的 filewatcher 模块存在以下问题需要修复：
+1. Start() 方法在已处于运行状态时仍然返回 nil，与首次启动成功返回 nil 无法区分。当调用方需要在首次启动时执行初始化操作时，无法通过返回值判断是刚启动还是早已在运行。
+2. 修复后运行 go test ./internal/filewatcher/ -v，需要让所有测试通过。
+3. 在 docs/filewatcher.md 中更新模块需求文档。

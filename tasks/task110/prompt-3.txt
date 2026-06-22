@@ -1,0 +1,5 @@
+你实现的 trie 模块存在以下问题需要修复：
+1. docs/trie.md 错误定义表中 ErrEmptyWord 的触发场景只写了插入或删除空单词，没有包含 Search 方法对空字符串返回该错误的情况，与代码实际行为不一致。
+2. docs/trie.md 中单词删除示例的 Search 调用仍使用两个返回值格式，但 Search 方法签名已改为返回三个值，示例代码无法编译。
+3. 修复后运行 go test ./internal/trie/ -v，需要让所有测试通过。
+4. 在 docs/trie.md 中更新模块需求文档。

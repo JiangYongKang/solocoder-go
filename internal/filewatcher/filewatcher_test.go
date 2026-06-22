@@ -810,8 +810,8 @@ func TestStartStop_Idempotent(t *testing.T) {
 		t.Fatalf("first Start failed: %v", err)
 	}
 	err = fw.Start()
-	if err != nil {
-		t.Fatalf("second Start (idempotent) failed: %v", err)
+	if !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("second Start should return ErrAlreadyRunning, got %v", err)
 	}
 
 	fw.Stop()
@@ -872,6 +872,34 @@ func TestStart_WithoutWatch(t *testing.T) {
 	if fw.IsRunning() {
 		t.Error("should not be running without watched directory")
 	}
+	fw.Stop()
+}
+
+func TestStart_AlreadyRunning(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	fw, _ := New()
+	err := fw.Watch(tmpDir)
+	if err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+
+	err = fw.Start()
+	if err != nil {
+		t.Fatalf("first Start failed: %v", err)
+	}
+	if !fw.IsRunning() {
+		t.Fatal("watcher should be running after Start")
+	}
+
+	err = fw.Start()
+	if !errors.Is(err, ErrAlreadyRunning) {
+		t.Errorf("expected ErrAlreadyRunning when starting already running watcher, got %v", err)
+	}
+	if !fw.IsRunning() {
+		t.Error("watcher should still be running after second Start")
+	}
+
 	fw.Stop()
 }
 

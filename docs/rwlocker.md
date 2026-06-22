@@ -30,10 +30,28 @@
 - 超时后返回 `TimeoutError`，调用方可通过 `errors.Is(err, ErrLockTimeout)` 判断
 
 **超时实现机制**：
-- 使用 `done` channel + `time.NewTimer` + `select` 模式实现超时控制
+
+两种锁均使用 `done` channel + `time.NewTimer` + `select` 模式实现超时控制：
 - 锁获取在后台 goroutine 中执行，通过 `close(done)` 通知成功
 - 超时分支启动清理 goroutine 等待后台锁获取完成后立即释放，避免 goroutine 泄漏
-- 对于读锁超时，清理时还需回退 `readerCount` 并在必要时通知 `upgradeCond`
+
+**写锁（Lock）超时清理**：
+
+写锁超时后的清理逻辑较为简单：
+1. 后台 goroutine 通过 `mu.Lock()` 获取写锁后 `close(done)`
+2. 若超时分支选中 `timer.C`，启动清理 goroutine：等待 `<-done` 后调用 `mu.Unlock()` 释放写锁
+3. 写锁不涉及 `readerCount` 和 `upgradeCond`，清理只需释放底层互斥锁即可
+
+**读锁（RLock）超时清理**：
+
+读锁超时后的清理逻辑更复杂，需要回退 `readerCount` 并处理升级等待通知：
+1. 后台 goroutine 先通过 `waitForWriterWaiting()` 检查 `writerWaiting` 标记，确认无写者等待升级后递增 `readerCount`，再通过 `mu.RLock()` 获取读锁后 `close(done)`
+2. 若超时分支选中 `timer.C`，启动清理 goroutine：等待 `<-done` 后执行以下步骤：
+   - 获取 `upgradeMu`，递减 `readerCount`
+   - 若 `writerWaiting == true` 且 `readerCount == 0`，调用 `upgradeCond.Broadcast()` 通知等待升级的写者
+   - 释放 `upgradeMu`
+   - 调用 `mu.RUnlock()` 释放底层读锁
+3. 之所以需要回退 `readerCount` 并通知 `upgradeCond`，是因为后台 goroutine 在获取 `mu.RLock` 前已递增了 `readerCount`，而调用方并未实际持有读锁，若不回退将导致等待升级的写者永远看不到 `readerCount` 归零
 
 ### 2.3 锁竞争统计
 
