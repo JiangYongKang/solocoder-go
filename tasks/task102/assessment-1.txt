@@ -1,0 +1,8 @@
+产物不满意：
+1. hotconfig.go 的 eventLoop 方法中存在数据竞争，pendingEvent 变量被 eventLoop 协程和 time.AfterFunc 创建的定时器协程同时访问却没有任何同步保护。当文件频繁变更导致防抖定时器被反复重置时，定时器协程读取 pendingEvent 时可能读到 eventLoop 协程正在写入的中间状态，导致回调拿到错误的文件事件甚至空指针。根因是 shared-memory 并发模型下缺少互斥锁或 channel 传递来保护跨协程共享变量，应将 pendingEvent 通过闭包传递给 AfterFunc 而非共享变量，或改用 sync.Mutex 保护对它的读写。
+2. hotconfig.go 的 loadLocked 方法在通过 os.ReadFile 读取文件内容之后才调用 os.Stat 获取文件修改时间并记录到 lastModTime，形成一个读取-记录的 TOCTOU 窗口。如果在 os.ReadFile 和 os.Stat 之间文件恰好被外部程序再次修改，那么 lastModTime 记录的将是比实际解析数据更新的时间戳，导致后续 pollLoop 的 checkFileChange 认为文件自上次后没有变化而漏掉下一次变更。正确做法是在 os.ReadFile 之前先获取并保存文件 mtime，确保记录的时间戳与本次解析的数据对应一致。
+3. validator.go 的校验系统对"必填"有两种互相重叠的实现方式：FieldSchema.Required 布尔字段在 ValidateConfig 中校验字段是否存在于配置 map 中，而 ValidationRule 的 RuleRequired 规则类型在 validateRule 中校验字段值是否为空。这两种方式使用不同的判据、不同的触发时机、报的却是同一个 ErrFieldRequired 错误，开发者不知道该用哪一个来声明必填约束。应该统一为一种必填声明方式，比如只保留 FieldSchema.Required 来控制字段存在性和非空性，移除 RuleRequired 避免混淆。
+过程不满意：
+1. 模型在开始编写 hotconfig 代码之前，先读取了 internal/fallback/ 目录下 fallback.go、config.go、types.go、errors.go 四个文件，又浏览了 internal/validator/ 目录结构。这两个包与配置热加载模块的功能需求完全无关，模型阅读它们纯属浪费时间和上下文窗口。这反映出模型对任务范围的理解有偏差，没有聚焦到提示词要求的 hotconfig 包上。正确做法是先通读 prompt-1.txt 明确需求边界，只探查与当前任务直接相关的目录和依赖，不应去翻看项目内其他无关业务包。
+2. 模型在初探项目结构后未经任何需求分析就直接用 todo_write 创建了 9 项子任务计划，然后才按计划依次写 errors.go、types.go、parser.go、validator.go、hotconfig.go。这种操作顺序颠倒了分析与规划的主次，TodoList 本质上只是把"写 N 个文件"逐条列了出来，并没有反映出对各子功能的依赖关系和交互接口的思考。正确流程应该先分析提示词需求的四个模块（解析、监听、校验、默认值）如何协作，梳理出核心数据流和调用链后再制定有逻辑依赖关系的执行计划。
+3. 模型在第一轮运行测试发现多个失败后，先后至少三次用 view_files 重新打开 hotconfig.go 查看、用 edit_file_search_replace 修改、再重新查看。其中对 loadLocked 的返回值签名从单返回值改为双返回值又在调用方逐处适配，反映出没有在一开始就设计好变更检测的返回值语义。这种反复翻看同一文件并在多处试验性修改的行为属于试错式调试，正确的做法是先阅读每个失败用例的报错信息全文，定位出错的准确位置和原因，再对每一处做最小范围的定向修改，而不是反复动同一个文件的不同位置碰运气。

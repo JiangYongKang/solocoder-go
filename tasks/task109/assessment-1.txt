@@ -1,0 +1,7 @@
+产物不满意：
+1. TestCustomProbability 测试只使用了 t.Logf 记录高概率和低概率层数差异，当高概率层数意外低于低概率时测试不调用 t.Errorf 失败而是打印 Note 日志后静默通过。这导致提示词第 4 条的概率因子功能无法被有效验证：即使 randomLevel 始终返回 1 不论 P 取值，该测试也不会报错。应在大量插入后对层数做统计断言，例如对 P=0.9 配置至少期望层数大于某个合理下限，用多次采样均值而非单次随机结果验证概率有效性。
+2. TestConcurrentSafe 并发测试启动了三个 goroutine 分别执行 Insert 和 Search，但全部完成后从未验证 Len() 是否等于 2000。如果锁定机制存在缺陷导致部分插入被静默丢失，测试不会报任何错误而照常通过。测试只覆盖了并发不死的保障，完全未触及数据完整性校验。应在所有 goroutine 完成后断言最终元素数量等于总插入量，并抽样验证已插入的元素均可通过 Search 找到。
+3. 初始版本 Range 函数中直接使用 options = opts[0] 将用户传入的指针整体替换 DefaultRangeOptions，导致用户只设 Limit 时 StartInclusive 和 EndInclusive 因 Go bool 零值被错误置为 false 而预期应为 true。虽然模型后续通过 DefaultRangeOptions 加链式调用修复了此问题，但该修复过程揭示了模型在设计 API 时对零值与默认值语义冲突缺乏预判，属于架构设计阶段的前置缺陷。
+过程不满意：
+1. 模型在收到提示词后仅浏览了目录结构和 lsm 包下已有实现，未逐条分析按序插入删除、精确查找、范围查询、概率层高配置四项需求，就直接用 todo_write 创建 4 项子任务计划。未经需求分析先定计划导致 RangeOptions 设计后续出现大幅调整，从零值覆盖到链式调用 API 重写。第一步的任务拆分未覆盖开闭区间和分页 API 设计细节，属于规划粒度与需求不匹配。
+2. 首次 go test 发现 TestDelete 和 TestRange 失败后，模型采取试错式调试：先改测试期望值，再改 skiplist.go 中 Range 的 opts 逻辑，又回头改测试的 RangeOptions 构造，三轮来回编辑仍未解决零值问题。直到第四次才引入 DefaultRangeOptions 加链式调用方案，前三次均未系统分析 bool 零值覆盖默认值这一根因，只在代码和测试间修补表象，属于典型试错循环。
